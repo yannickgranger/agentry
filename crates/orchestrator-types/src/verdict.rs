@@ -3,7 +3,7 @@
 //! Appended to `agentry:verdicts` stream. Drives the dashboard's verdict-history
 //! view and satisfies the "no verdict, no close" drift rule.
 
-use crate::{Ts, brief::BriefId, event::Verdict as EventVerdict, now};
+use crate::{brief::BriefId, event::Verdict as EventVerdict, now, Ts};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -74,7 +74,10 @@ mod tests {
 
     #[test]
     fn event_verdict_maps() {
-        assert_eq!(VerdictKind::from(EventVerdict::Shipped), VerdictKind::Shipped);
+        assert_eq!(
+            VerdictKind::from(EventVerdict::Shipped),
+            VerdictKind::Shipped
+        );
         assert_eq!(VerdictKind::from(EventVerdict::Failed), VerdictKind::Failed);
     }
 }

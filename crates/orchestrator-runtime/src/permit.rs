@@ -74,8 +74,8 @@ pub fn verify(permit: &WorkPermit, pub_key: &VerifyingKey) -> Result<()> {
         .signature
         .as_ref()
         .ok_or_else(|| Error::Config("permit has no signature".into()))?;
-    let sig_bytes = hex::decode(sig_hex)
-        .map_err(|e| Error::Config(format!("signature hex decode: {e}")))?;
+    let sig_bytes =
+        hex::decode(sig_hex).map_err(|e| Error::Config(format!("signature hex decode: {e}")))?;
     let sig_arr: [u8; 64] = sig_bytes
         .as_slice()
         .try_into()
@@ -97,9 +97,7 @@ pub fn tool_allowed(permit: &WorkPermit, tool: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use orchestrator_types::{
-        BriefId, PermitScope, RoleName, ToolAllowlist, WorkPermit, now,
-    };
+    use orchestrator_types::{now, BriefId, PermitScope, RoleName, ToolAllowlist, WorkPermit};
 
     fn sample_permit() -> WorkPermit {
         WorkPermit {

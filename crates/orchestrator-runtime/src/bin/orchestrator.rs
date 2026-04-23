@@ -5,7 +5,7 @@
 //! `orchestrator abort --all` — abort all running briefs.
 
 use clap::{Parser, Subcommand};
-use orchestrator_runtime::{Config, Result, permit, redis_io, seed};
+use orchestrator_runtime::{permit, redis_io, seed, Config, Result};
 use orchestrator_types::Brief;
 use std::path::PathBuf;
 
@@ -60,7 +60,10 @@ async fn main() -> Result<()> {
             let brief: Brief = serde_json::from_str(&text)?;
             let mut conn = redis_io::connect(&cfg.redis.url).await?;
             let id = redis_io::submit_brief(&mut conn, &brief).await?;
-            println!("{{\"submitted\":true,\"brief_id\":\"{}\",\"stream_id\":\"{}\"}}", brief.id, id);
+            println!(
+                "{{\"submitted\":true,\"brief_id\":\"{}\",\"stream_id\":\"{}\"}}",
+                brief.id, id
+            );
         }
         Cmd::Seed => {
             seed::seed_m0(&cfg).await?;
@@ -93,10 +96,7 @@ async fn main() -> Result<()> {
                 std::process::exit(2);
             }
             permit::generate_and_save(path)?;
-            println!(
-                "{{\"generated\":true,\"path\":\"{}\"}}",
-                path.display()
-            );
+            println!("{{\"generated\":true,\"path\":\"{}\"}}", path.display());
         }
         Cmd::Abort { all } => {
             if all {

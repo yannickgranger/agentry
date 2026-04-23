@@ -6,13 +6,14 @@
 //!   - Message routing between roles: M4+.
 
 use crate::{
-    Error, Result, permit as permit_mod, redis_io,
+    permit as permit_mod, redis_io,
     spawner::{PodmanSpawner, RoutedMessage, Spawner, TeamContext},
+    Error, Result,
 };
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use orchestrator_types::{
-    AgentRole, Brief, BriefId, PermitOverrides, PermitScope, RoleName, ToolAllowlist, Verdict,
-    VerdictKind, VersionedRef, WorkPermit, apply_overrides, now,
+    apply_overrides, now, AgentRole, Brief, BriefId, PermitOverrides, PermitScope, RoleName,
+    ToolAllowlist, Verdict, VerdictKind, VersionedRef, WorkPermit,
 };
 use redis::aio::ConnectionManager;
 use std::collections::HashMap;
@@ -21,7 +22,7 @@ use std::sync::Arc;
 /// Run the daemon loop forever using the given `Config`.
 pub async fn run(cfg: &crate::Config) -> Result<()> {
     let mut conn = redis_io::connect(&cfg.redis.url).await?;
-    tracing::info!(url = %cfg.redis.url.split('@').last().unwrap_or("?"), "connected to Redis");
+    tracing::info!(url = %cfg.redis.url.rsplit('@').next().unwrap_or("?"), "connected to Redis");
 
     // Load signing key. Fail loudly if missing.
     let key_path = &cfg.signing.key_path;
@@ -74,10 +75,7 @@ async fn handle_brief(
     let team = redis_io::fetch_team(conn, &brief.topology).await?;
 
     if team.roles.is_empty() {
-        return Err(Error::Config(format!(
-            "team {} has no roles",
-            team.name.0
-        )));
+        return Err(Error::Config(format!("team {} has no roles", team.name.0)));
     }
 
     // Accumulated outbox from all upstream roles; sliced per role on dispatch.

@@ -1,11 +1,11 @@
 //! Typed configuration via figment.
 //!
 //! Load order (later wins):
-//!   1. Code defaults (`Config::default()`).
-//!   2. `~/.config/agentry/agentry.toml` (optional, 0600 recommended).
-//!   3. Env vars prefixed `AGENTRY_`, nested by `__`
-//!      (e.g. `AGENTRY_REDIS__URL`, `AGENTRY_DASHBOARD__PORT`,
-//!       `AGENTRY_SIGNING__KEY_PATH`).
+//! 1. Code defaults (`Config::default()`).
+//! 2. `~/.config/agentry/agentry.toml` (optional, 0600 recommended).
+//! 3. Env vars prefixed `AGENTRY_`, nested by `__`
+//!    (e.g. `AGENTRY_REDIS__URL`, `AGENTRY_DASHBOARD__PORT`,
+//!    `AGENTRY_SIGNING__KEY_PATH`).
 //!
 //! **NOT managed here:** per-role LLM API keys (`XAI_API_KEY`, `GEMINI_API_KEY`).
 //! Those are per-role `passthru_env` — the central config has no business
