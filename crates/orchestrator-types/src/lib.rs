@@ -22,16 +22,21 @@ pub use role::{AgentRole, Mount, RoleName, SubstrateClass};
 pub use team::{MessageEdge, PermitOverrides, TeamName, TeamTopology};
 
 /// Apply a `PermitOverrides` payload to an already-minted permit, in place.
+///
 /// Orthogonal narrowing:
-///   * `fs_write` non-empty → drop all existing `fs:write:*` scope entries and
-///     add `fs:write:<p>` for each listed path (intersection becomes the list).
-///   * `fs_read` the same.
-///   * `tool_allowlist` non-empty → intersect the permit's allowlist with the
-///     override list (permit keeps only tools present in BOTH).
+/// - `fs_write` non-empty → drop all existing `fs:write:*` scope entries and
+///   add `fs:write:<p>` for each listed path (intersection becomes the list).
+/// - `fs_read` the same.
+/// - `tool_allowlist` non-empty → intersect the permit's allowlist with the
+///   override list (permit keeps only tools present in BOTH).
+///
 /// Empty fields are no-ops (baseline scope preserved).
 pub fn apply_overrides(permit: &mut WorkPermit, o: &PermitOverrides) {
     if !o.fs_write.is_empty() {
-        permit.permit_scope.0.retain(|s| !s.starts_with("fs:write:"));
+        permit
+            .permit_scope
+            .0
+            .retain(|s| !s.starts_with("fs:write:"));
         for p in &o.fs_write {
             permit.permit_scope.0.push(format!("fs:write:{p}"));
         }
@@ -55,7 +60,11 @@ pub fn apply_overrides(permit: &mut WorkPermit, o: &PermitOverrides) {
 ///   2. If `tool` is filesystem-write-ish (`write`, `edit`) and `args.path` is
 ///      a string, it must match one of the permit's `fs:write:*` scope entries.
 ///      Match is literal-suffix for M6; glob matching is a later milestone.
-pub fn check_tool_call(permit: &WorkPermit, tool: &str, args: &serde_json::Value) -> Result<(), String> {
+pub fn check_tool_call(
+    permit: &WorkPermit,
+    tool: &str,
+    args: &serde_json::Value,
+) -> Result<(), String> {
     if !permit.allows(tool) {
         return Err(format!("unauthorized tool call: {tool}"));
     }
@@ -107,8 +116,15 @@ mod apply_overrides_tests {
             ..Default::default()
         };
         apply_overrides(&mut p, &o);
-        assert!(!p.permit_scope.0.iter().any(|s| s == "fs:write:/workspace/**"));
-        assert!(p.permit_scope.0.contains(&"fs:write:/workspace/a.rs".into()));
+        assert!(!p
+            .permit_scope
+            .0
+            .iter()
+            .any(|s| s == "fs:write:/workspace/**"));
+        assert!(p
+            .permit_scope
+            .0
+            .contains(&"fs:write:/workspace/a.rs".into()));
         // fs:read untouched.
         assert!(p.permit_scope.0.contains(&"fs:read:/workspace/**".into()));
     }

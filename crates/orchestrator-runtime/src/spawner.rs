@@ -9,7 +9,7 @@
 //!
 //! For M0: only Podman is implemented. Other substrates come later.
 
-use crate::{Error, Result, permit as permit_mod, redis_io};
+use crate::{permit as permit_mod, redis_io, Error, Result};
 use async_trait::async_trait;
 use ed25519_dalek::VerifyingKey;
 use orchestrator_types::{
@@ -209,7 +209,9 @@ impl Spawner for PodmanSpawner {
                     // Enforce permit on tool calls: any call outside the allowlist
                     // OR outside the narrowed fs scope kills the container.
                     if let EventKind::ToolCall { call } = &ev.kind {
-                        append_audit(conn, &brief.id, agent_id, &call.tool, &call.args).await.ok();
+                        append_audit(conn, &brief.id, agent_id, &call.tool, &call.args)
+                            .await
+                            .ok();
                         if let Err(reason) =
                             orchestrator_types::check_tool_call(permit, &call.tool, &call.args)
                         {
@@ -269,13 +271,20 @@ impl Spawner for PodmanSpawner {
                 Some(v) => (VerdictKind::from(v), None),
                 None => (
                     VerdictKind::Failed,
-                    Some(format!("agent exited without done event (code={:?})", status.code())),
+                    Some(format!(
+                        "agent exited without done event (code={:?})",
+                        status.code()
+                    )),
                 ),
             }
         };
 
         let verdict = Verdict::new(brief.id.clone(), verdict_kind);
-        let verdict = if let Some(r) = reason { verdict.with_reason(r) } else { verdict };
+        let verdict = if let Some(r) = reason {
+            verdict.with_reason(r)
+        } else {
+            verdict
+        };
 
         Ok(AgentOutcome {
             handle: AgentHandle {
@@ -285,17 +294,6 @@ impl Spawner for PodmanSpawner {
             verdict,
             outbox,
         })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn container_name_format() {
-        let n = PodmanSpawner::container_name("agt_abcd");
-        assert_eq!(n, "agentry-agt_abcd");
     }
 }
 
@@ -328,3 +326,14 @@ async fn append_audit(
 // Silence unused imports in M0 (full use comes in later milestones).
 #[allow(dead_code)]
 fn _used(_: EventKind, _: BriefId) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn container_name_format() {
+        let n = PodmanSpawner::container_name("agt_abcd");
+        assert_eq!(n, "agentry-agt_abcd");
+    }
+}

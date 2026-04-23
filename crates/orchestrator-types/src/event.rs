@@ -4,7 +4,7 @@
 //! runner mirrors every event to `agentry:brief:{id}:trace`. The permit broker
 //! subscribes and enforces tool allowlists.
 
-use crate::{Ts, now};
+use crate::{now, Ts};
 use serde::{Deserialize, Serialize};
 
 /// Verdict emitted by an agent at the end of its run.
@@ -29,27 +29,18 @@ pub struct ToolCall {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EventKind {
     /// Agent is running; payload is freeform.
-    Event {
-        payload: serde_json::Value,
-    },
+    Event { payload: serde_json::Value },
     /// Agent is about to call a tool. Permit broker checks against allowlist.
-    ToolCall {
-        call: ToolCall,
-    },
+    ToolCall { call: ToolCall },
     /// Agent has a message for another role — content ends up in `to`'s inbox.
     Message {
         to: String,
         payload: serde_json::Value,
     },
     /// Human-readable log line.
-    Log {
-        level: String,
-        msg: String,
-    },
+    Log { level: String, msg: String },
     /// Agent is done; terminal.
-    Done {
-        verdict: Verdict,
-    },
+    Done { verdict: Verdict },
 }
 
 /// A stamped event.

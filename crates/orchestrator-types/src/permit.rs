@@ -4,8 +4,8 @@
 //! added in M3; M0 ships an unsigned structural draft so the runtime shape
 //! is fixed early.
 
-use crate::{Ts, brief::BriefId, role::RoleName};
 pub use crate::role::{PermitScope, ToolAllowlist};
+use crate::{brief::BriefId, role::RoleName, Ts};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

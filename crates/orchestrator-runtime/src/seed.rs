@@ -2,7 +2,7 @@
 //!
 //! Idempotent: overwrites existing records with current definitions.
 
-use crate::{Config, Result, redis_io};
+use crate::{redis_io, Config, Result};
 use orchestrator_types::{
     AgentRole, MessageEdge, Mount, PermitScope, RoleName, SubstrateClass, TeamName, TeamTopology,
     ToolAllowlist,

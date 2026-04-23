@@ -3,7 +3,7 @@
 //! Submitted on the `agentry:briefs` Redis stream. Immutable after submission.
 //! Scope changes = a new Brief with `parent_brief` set.
 
-use crate::{Ts, VersionedRef, now};
+use crate::{now, Ts, VersionedRef};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -27,21 +27,16 @@ impl fmt::Display for BriefId {
 }
 
 /// Escalation mode: how the brief handles decisions outside standing orders.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EscalationMode {
     /// No human involvement; team decides based on standing orders.
     Autonomous,
-    /// Human ack required at phase-end transitions.
+    /// Human ack required at phase-end transitions. Default — safest.
+    #[default]
     Supervised,
     /// Human decides every step.
     Manual,
-}
-
-impl Default for EscalationMode {
-    fn default() -> Self {
-        Self::Supervised
-    }
 }
 
 /// Hard budget caps for a brief. Permit broker enforces.
@@ -85,11 +80,7 @@ pub struct Brief {
 impl Brief {
     /// Build a new brief with a fresh id and current timestamp.
     #[must_use]
-    pub fn new(
-        submitted_by: impl Into<String>,
-        topology: VersionedRef,
-        payload: Payload,
-    ) -> Self {
+    pub fn new(submitted_by: impl Into<String>, topology: VersionedRef, payload: Payload) -> Self {
         Self {
             id: BriefId::fresh(),
             project: None,

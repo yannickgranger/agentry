@@ -4,8 +4,8 @@ use crate::{Error, Result};
 use orchestrator_types::{
     AgentRole, Brief, BriefId, Event, RoleName, TeamName, TeamTopology, Verdict, VersionedRef,
 };
-use redis::AsyncCommands;
 use redis::aio::ConnectionManager;
+use redis::AsyncCommands;
 
 /// Stream names.
 pub const STREAM_BRIEFS: &str = "agentry:briefs";
@@ -72,10 +72,7 @@ pub async fn fetch_role(
 }
 
 /// Fetch a team topology by versioned ref.
-pub async fn fetch_team(
-    conn: &mut ConnectionManager,
-    r: &VersionedRef,
-) -> Result<TeamTopology> {
+pub async fn fetch_team(conn: &mut ConnectionManager, r: &VersionedRef) -> Result<TeamTopology> {
     let key = r.redis_key("team");
     let raw: Option<String> = conn.get(&key).await?;
     let raw = raw.ok_or_else(|| Error::NotFound {

@@ -31,11 +31,10 @@ use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures::Stream;
-use orchestrator_runtime::{Config, redis_io};
+use orchestrator_runtime::{redis_io, Config};
 use orchestrator_types::{
-    AgentRole, Brief, MessageEdge, PermitScope, Project, ProjectSlug, RoleName, StandingOrders,
-    SubstrateClass, TeamName, TeamTopology, ToolAllowlist, brief::EscalationMode,
-    role::McpServer,
+    brief::EscalationMode, role::McpServer, AgentRole, Brief, MessageEdge, PermitScope, Project,
+    ProjectSlug, RoleName, StandingOrders, SubstrateClass, TeamName, TeamTopology, ToolAllowlist,
 };
 use redis::aio::ConnectionManager;
 use redis::streams::{StreamReadOptions, StreamReadReply};
@@ -169,7 +168,11 @@ impl<E: Into<anyhow::Error>> From<E> for AppError {
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         tracing::error!(error = %self.0, "handler error");
-        (StatusCode::INTERNAL_SERVER_ERROR, format!("error: {}", self.0)).into_response()
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("error: {}", self.0),
+        )
+            .into_response()
     }
 }
 
@@ -183,8 +186,10 @@ async fn index(State(app): State<AppState>) -> Result<Html<String>, AppError> {
         (v, b)
     };
 
-    let verdict_ids: std::collections::HashSet<String> =
-        verdicts.iter().filter_map(|v| v.get("brief").and_then(Value::as_str).map(String::from)).collect();
+    let verdict_ids: std::collections::HashSet<String> = verdicts
+        .iter()
+        .filter_map(|v| v.get("brief").and_then(Value::as_str).map(String::from))
+        .collect();
 
     let mut active_items = String::new();
     for b in briefs.iter().rev() {
@@ -207,7 +212,8 @@ async fn index(State(app): State<AppState>) -> Result<Html<String>, AppError> {
         ));
     }
     if active_items.is_empty() {
-        active_items.push_str(r#"<li class="text-slate-500 italic text-sm">No briefs in flight.</li>"#);
+        active_items
+            .push_str(r#"<li class="text-slate-500 italic text-sm">No briefs in flight.</li>"#);
     }
 
     let mut verdict_items = String::new();
@@ -259,7 +265,9 @@ fn render_verdict_li(v: &Value) -> String {
     let at = v.get("at").and_then(Value::as_str).unwrap_or("");
     let badge = match kind {
         "shipped" => "bg-emerald-900 text-emerald-200",
-        "failed" | "permit_violation" | "budget_exceeded" | "aborted" => "bg-rose-900 text-rose-200",
+        "failed" | "permit_violation" | "budget_exceeded" | "aborted" => {
+            "bg-rose-900 text-rose-200"
+        }
         "escalated" => "bg-amber-900 text-amber-200",
         _ => "bg-slate-800 text-slate-200",
     };
@@ -288,8 +296,7 @@ async fn brief_detail(
         events_html.push_str(&render_trace_li(ev));
     }
     if events_html.is_empty() {
-        events_html
-            .push_str(r#"<li class="text-slate-500 italic text-sm">No events yet.</li>"#);
+        events_html.push_str(r#"<li class="text-slate-500 italic text-sm">No events yet.</li>"#);
     }
 
     let body = format!(
@@ -359,10 +366,16 @@ fn render_trace_li(ev: &Value) -> String {
                 .and_then(|c| c.get("tool"))
                 .and_then(Value::as_str)
                 .unwrap_or("?");
-            let args = call.and_then(|c| c.get("args")).cloned().unwrap_or(Value::Null);
+            let args = call
+                .and_then(|c| c.get("args"))
+                .cloned()
+                .unwrap_or(Value::Null);
             (
                 "bg-indigo-900 text-indigo-200",
-                format!("{tool} {}", serde_json::to_string(&args).unwrap_or_default()),
+                format!(
+                    "{tool} {}",
+                    serde_json::to_string(&args).unwrap_or_default()
+                ),
             )
         }
         "message" => {
@@ -370,7 +383,10 @@ fn render_trace_li(ev: &Value) -> String {
             let payload = ev.get("payload").cloned().unwrap_or(Value::Null);
             (
                 "bg-cyan-900 text-cyan-200",
-                format!("to={to} {}", serde_json::to_string(&payload).unwrap_or_default()),
+                format!(
+                    "to={to} {}",
+                    serde_json::to_string(&payload).unwrap_or_default()
+                ),
             )
         }
         "log" => {
@@ -405,8 +421,7 @@ async fn sse_verdicts(
     tokio::spawn(async move {
         tail_stream(redis, "agentry:verdicts", "verdict", "verdict", tx).await;
     });
-    Sse::new(ReceiverStream::new(rx))
-        .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+    Sse::new(ReceiverStream::new(rx)).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
 }
 
 async fn sse_brief_trace(
@@ -417,10 +432,16 @@ async fn sse_brief_trace(
     let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(64);
     let redis = app.redis.clone();
     tokio::spawn(async move {
-        tail_stream(redis, Box::leak(stream.into_boxed_str()), "event", "event", tx).await;
+        tail_stream(
+            redis,
+            Box::leak(stream.into_boxed_str()),
+            "event",
+            "event",
+            tx,
+        )
+        .await;
     });
-    Sse::new(ReceiverStream::new(rx))
-        .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+    Sse::new(ReceiverStream::new(rx)).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
 }
 
 /// Tail a Redis stream from `$`, forwarding entries whose map-key `field` is a JSON
@@ -436,9 +457,7 @@ async fn tail_stream(
     loop {
         let read: Result<Option<StreamReadReply>, redis::RedisError> = {
             let mut c = redis.lock().await;
-            let opts = StreamReadOptions::default()
-                .block(5_000)
-                .count(16);
+            let opts = StreamReadOptions::default().block(5_000).count(16);
             c.xread_options(&[stream], &[&last_id], &opts).await
         };
         match read {
@@ -470,8 +489,9 @@ async fn fetch_recent_verdicts(
     conn: &mut ConnectionManager,
     count: usize,
 ) -> anyhow::Result<Vec<Value>> {
-    let reply: redis::streams::StreamRangeReply =
-        conn.xrevrange_count("agentry:verdicts", "+", "-", count).await?;
+    let reply: redis::streams::StreamRangeReply = conn
+        .xrevrange_count("agentry:verdicts", "+", "-", count)
+        .await?;
     let mut out = Vec::with_capacity(reply.ids.len());
     for entry in reply.ids {
         if let Some(body) = entry.map.get("verdict").and_then(redis_value_to_str) {
@@ -531,11 +551,7 @@ fn redis_value_to_str(v: &redis::Value) -> Option<String> {
 
 /// Find the next version for a given kind+name by scanning Redis keys.
 /// Returns 1 for a brand-new record; max_existing+1 otherwise.
-async fn next_version(
-    conn: &mut ConnectionManager,
-    kind: &str,
-    name: &str,
-) -> anyhow::Result<u32> {
+async fn next_version(conn: &mut ConnectionManager, kind: &str, name: &str) -> anyhow::Result<u32> {
     let pattern = format!("agentry:{kind}:{name}:v*");
     let mut max_v: u32 = 0;
     let mut cursor: u64 = 0;
@@ -737,10 +753,9 @@ async fn role_create(
     State(app): State<AppState>,
     Form(f): Form<RoleForm>,
 ) -> Result<Redirect, AppError> {
-    let substrate_class: SubstrateClass = serde_json::from_value(Value::String(
-        f.substrate_class.clone(),
-    ))
-    .map_err(|e| anyhow::anyhow!("invalid substrate_class: {e}"))?;
+    let substrate_class: SubstrateClass =
+        serde_json::from_value(Value::String(f.substrate_class.clone()))
+            .map_err(|e| anyhow::anyhow!("invalid substrate_class: {e}"))?;
 
     let mcp_servers: Vec<McpServer> = if f.mcp_servers_json.trim().is_empty() {
         Vec::new()
@@ -791,7 +806,12 @@ async fn teams_list(State(app): State<AppState>) -> Result<Html<String>, AppErro
         let roles = v
             .get("roles")
             .and_then(Value::as_array)
-            .map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", "))
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
             .unwrap_or_default();
         let terminal = v.get("terminal_role").and_then(Value::as_str).unwrap_or("");
         rows.push_str(&format!(
@@ -870,7 +890,9 @@ async fn team_create(
 ) -> Result<Redirect, AppError> {
     let roles: Vec<RoleName> = split_csv(&f.roles_csv).into_iter().map(RoleName).collect();
     if roles.is_empty() {
-        return Err(AppError(anyhow::anyhow!("team must have at least one role")));
+        return Err(AppError(anyhow::anyhow!(
+            "team must have at least one role"
+        )));
     }
     let edges: Vec<MessageEdge> = split_lines(&f.graph_lines)
         .iter()
@@ -994,10 +1016,9 @@ async fn project_create(
     State(app): State<AppState>,
     Form(f): Form<ProjectForm>,
 ) -> Result<Redirect, AppError> {
-    let default_escalation: EscalationMode = serde_json::from_value(Value::String(
-        f.default_escalation.clone(),
-    ))
-    .map_err(|e| anyhow::anyhow!("invalid default_escalation: {e}"))?;
+    let default_escalation: EscalationMode =
+        serde_json::from_value(Value::String(f.default_escalation.clone()))
+            .map_err(|e| anyhow::anyhow!("invalid default_escalation: {e}"))?;
 
     let project = Project {
         slug: ProjectSlug(f.slug.clone()),

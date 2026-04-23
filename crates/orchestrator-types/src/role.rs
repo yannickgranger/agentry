@@ -18,10 +18,11 @@ impl fmt::Display for RoleName {
 }
 
 /// Where the agent runs. User picks; orchestrator adapts.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SubstrateClass {
     /// Rootless podman on the dev box. Default.
+    #[default]
     Podman,
     /// Docker daemon.
     Docker,
@@ -31,12 +32,6 @@ pub enum SubstrateClass {
     Ssh,
     /// libvirt VM.
     Vm,
-}
-
-impl Default for SubstrateClass {
-    fn default() -> Self {
-        Self::Podman
-    }
 }
 
 /// What tools the agent is permitted to call. Names are stable symbolic ids;
