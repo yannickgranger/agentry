@@ -206,20 +206,22 @@ impl Spawner for PodmanSpawner {
             }
             match serde_json::from_str::<Event>(&line) {
                 Ok(ev) => {
-                    // Enforce permit on tool calls: any call outside the
-                    // allowlist kills the container immediately.
+                    // Enforce permit on tool calls: any call outside the allowlist
+                    // OR outside the narrowed fs scope kills the container.
                     if let EventKind::ToolCall { call } = &ev.kind {
                         append_audit(conn, &brief.id, agent_id, &call.tool, &call.args).await.ok();
-                        if !permit_mod::tool_allowed(permit, &call.tool) {
+                        if let Err(reason) =
+                            orchestrator_types::check_tool_call(permit, &call.tool, &call.args)
+                        {
                             tracing::warn!(
                                 brief = %brief.id,
                                 agent = %agent_id,
                                 tool = %call.tool,
+                                reason = %reason,
                                 "permit violation — killing container"
                             );
-                            permit_violation = Some(call.tool.clone());
+                            permit_violation = Some(reason);
                             redis_io::append_trace(conn, &brief.id, agent_id, &ev).await?;
-                            // Best-effort container stop.
                             let _ = tokio::process::Command::new("podman")
                                 .args(["stop", "-t", "1", &name])
                                 .output()
@@ -260,11 +262,8 @@ impl Spawner for PodmanSpawner {
 
         let status = child.wait().await?;
 
-        let (verdict_kind, reason) = if let Some(tool) = permit_violation.clone() {
-            (
-                VerdictKind::PermitViolation,
-                Some(format!("unauthorized tool call: {tool}")),
-            )
+        let (verdict_kind, reason) = if let Some(r) = permit_violation.clone() {
+            (VerdictKind::PermitViolation, Some(r))
         } else {
             match terminal.as_ref().and_then(Event::verdict) {
                 Some(v) => (VerdictKind::from(v), None),

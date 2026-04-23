@@ -1,0 +1,7 @@
+# narrowed-coder-agent — M6. Tries to write OUTSIDE the scope granted by the
+# synthesizer's permit_overrides. Broker must block and record permit_violation.
+FROM alpine:3.21
+RUN apk add --no-cache coreutils bash
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+ENTRYPOINT ["/entrypoint.sh"]

@@ -1,7 +1,10 @@
 # agentry — dev workflow
 
-# Environment
-export AGENTRY_REDIS_URL := "redis://:RedisRationalized2026@192.168.1.152:6379"
+# Environment — LOCAL podman Redis. NEVER prod.
+# Password lives at ~/.config/agentry/redis.password (600, gitignored).
+# Port 6380 to avoid collisions with any other local Redis.
+export AGENTRY_REDIS_PASSWORD := `cat ~/.config/agentry/redis.password 2>/dev/null || echo ""`
+export AGENTRY_REDIS_URL := "redis://:" + AGENTRY_REDIS_PASSWORD + "@127.0.0.1:6380"
 export AGENTRY_DASHBOARD_PORT := "7800"
 export RUST_LOG := env_var_or_default("RUST_LOG", "orchestrator=info,info")
 
@@ -48,8 +51,44 @@ build-m5a:
 build-m5b:
     cd containers/claude-agent && podman build -t agentry/claude-agent:v1 -f Containerfile .
 
+# Build M6 synthesizer + narrowed-coder images.
+build-m6:
+    cd containers/synthesizer-agent  && podman build -t agentry/synthesizer-agent:v1  -f Containerfile .
+    cd containers/narrowed-coder-agent && podman build -t agentry/narrowed-coder-agent:v1 -f Containerfile .
+
+# Start local dev Redis container on :6380. Idempotent.
+dev-redis-up:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p ~/.config/agentry
+    if [ ! -f ~/.config/agentry/redis.password ]; then
+        openssl rand -base64 24 | tr -d '\n/+=' > ~/.config/agentry/redis.password
+        chmod 600 ~/.config/agentry/redis.password
+        echo "generated a new dev redis password"
+    fi
+    PW=$(cat ~/.config/agentry/redis.password)
+    if podman container exists agentry-dev-redis; then
+        echo "agentry-dev-redis already exists; (re)starting..."
+        podman start agentry-dev-redis > /dev/null
+    else
+        podman volume inspect agentry-dev-redis-data >/dev/null 2>&1 || podman volume create agentry-dev-redis-data > /dev/null
+        podman run -d \
+            --name agentry-dev-redis \
+            -p 127.0.0.1:6380:6379 \
+            -v agentry-dev-redis-data:/data \
+            docker.io/library/redis:7-alpine \
+            redis-server --requirepass "$PW" --appendonly yes > /dev/null
+        echo "created agentry-dev-redis"
+    fi
+    sleep 1
+    redis-cli -h 127.0.0.1 -p 6380 -a "$PW" --no-auth-warning ping
+
+dev-redis-down:
+    -podman stop agentry-dev-redis
+    -podman rm agentry-dev-redis
+
 # Start dev infra (orchestratord + dashboard as user processes, podman for agents)
-dev-up: build build-echo
+dev-up: dev-redis-up build build-echo
     #!/usr/bin/env bash
     set -euo pipefail
     # Ensure Redis is reachable
@@ -97,7 +136,22 @@ verify-M0:
     ./target/release/orchestrator submit examples/verify-M0.json
     echo "Brief submitted. Waiting for verdict..."
     sleep 5
-    redis-cli -h 192.168.1.152 -p 6379 -a RedisRationalized2026 --no-auth-warning XREVRANGE agentry:verdicts + - COUNT 1
+    redis-cli -h 127.0.0.1 -p 6380 -a "$AGENTRY_REDIS_PASSWORD" --no-auth-warning XREVRANGE agentry:verdicts + - COUNT 1
+
+# Verify M6: synthesizer narrows coder's fs:write scope via permit_overrides.
+verify-M6:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    ./target/release/orchestrator submit examples/verify-M6.json
+    echo "Brief submitted. Waiting for broker to block out-of-scope write..."
+    sleep 6
+    echo "--- verdicts for this brief (expect last = permit_violation with fs:write reason) ---"
+    redis-cli -h 127.0.0.1 -p 6380 -a "$AGENTRY_REDIS_PASSWORD" --no-auth-warning XREVRANGE agentry:verdicts + - COUNT 3
+    echo "--- trace ---"
+    redis-cli -h 127.0.0.1 -p 6380 -a "$AGENTRY_REDIS_PASSWORD" --no-auth-warning XRANGE agentry:brief:brf_verify_m6:trace - +
+    echo ""
+    redis-cli -h 127.0.0.1 -p 6380 -a "$AGENTRY_REDIS_PASSWORD" --no-auth-warning XREVRANGE agentry:verdicts + - COUNT 2 \
+        | grep -q 'fs:write scope denied' && echo "M6 verify PASS" || (echo "M6 verify FAIL — expected narrow-scope denial"; exit 1)
 
 # Verify M5b: Claude Max via the host `claude` CLI — no Anthropic API spend.
 # Requires: host claude binary + ~/.claude/.credentials.json present (OAuth login done).
@@ -108,11 +162,11 @@ verify-M5b:
     echo "Brief submitted. Waiting for Claude Max reply (can take ~10s)..."
     sleep 15
     echo "--- verdict (expect kind=shipped) ---"
-    redis-cli -h 192.168.1.152 -p 6379 -a RedisRationalized2026 --no-auth-warning XREVRANGE agentry:verdicts + - COUNT 1
+    redis-cli -h 127.0.0.1 -p 6380 -a "$AGENTRY_REDIS_PASSWORD" --no-auth-warning XREVRANGE agentry:verdicts + - COUNT 1
     echo "--- trace ---"
-    redis-cli -h 192.168.1.152 -p 6379 -a RedisRationalized2026 --no-auth-warning XRANGE agentry:brief:brf_verify_m5b:trace - +
+    redis-cli -h 127.0.0.1 -p 6380 -a "$AGENTRY_REDIS_PASSWORD" --no-auth-warning XRANGE agentry:brief:brf_verify_m5b:trace - +
     echo "--- reply must contain 'pong' ---"
-    redis-cli -h 192.168.1.152 -p 6379 -a RedisRationalized2026 --no-auth-warning XRANGE agentry:brief:brf_verify_m5b:trace - + \
+    redis-cli -h 127.0.0.1 -p 6380 -a "$AGENTRY_REDIS_PASSWORD" --no-auth-warning XRANGE agentry:brief:brf_verify_m5b:trace - + \
         | grep -qi 'reply":"pong' && echo "M5b verify PASS" || (echo "M5b verify FAIL"; exit 1)
 
 # Verify M5a: call xAI Grok from inside a container; emit a reply event.
@@ -124,11 +178,11 @@ verify-M5a:
     echo "Brief submitted. Waiting for Grok reply..."
     sleep 10
     echo "--- verdict (expect kind=shipped) ---"
-    redis-cli -h 192.168.1.152 -p 6379 -a RedisRationalized2026 --no-auth-warning XREVRANGE agentry:verdicts + - COUNT 1
+    redis-cli -h 127.0.0.1 -p 6380 -a "$AGENTRY_REDIS_PASSWORD" --no-auth-warning XREVRANGE agentry:verdicts + - COUNT 1
     echo "--- trace ---"
-    redis-cli -h 192.168.1.152 -p 6379 -a RedisRationalized2026 --no-auth-warning XRANGE agentry:brief:brf_verify_m5a:trace - +
+    redis-cli -h 127.0.0.1 -p 6380 -a "$AGENTRY_REDIS_PASSWORD" --no-auth-warning XRANGE agentry:brief:brf_verify_m5a:trace - +
     echo "--- reply must contain 'pong' ---"
-    redis-cli -h 192.168.1.152 -p 6379 -a RedisRationalized2026 --no-auth-warning XRANGE agentry:brief:brf_verify_m5a:trace - + \
+    redis-cli -h 127.0.0.1 -p 6380 -a "$AGENTRY_REDIS_PASSWORD" --no-auth-warning XRANGE agentry:brief:brf_verify_m5a:trace - + \
         | grep -qi '"reply":"pong' && echo "M5a verify PASS" || (echo "M5a verify FAIL"; exit 1)
 
 # Verify M4: speaker emits a Message; listener receives it via team_context.
@@ -139,11 +193,11 @@ verify-M4:
     echo "Brief submitted. Waiting for team to complete..."
     sleep 8
     echo "--- verdict (expect kind=shipped) ---"
-    redis-cli -h 192.168.1.152 -p 6379 -a RedisRationalized2026 --no-auth-warning XREVRANGE agentry:verdicts + - COUNT 1
+    redis-cli -h 127.0.0.1 -p 6380 -a "$AGENTRY_REDIS_PASSWORD" --no-auth-warning XREVRANGE agentry:verdicts + - COUNT 1
     echo "--- trace events ---"
-    redis-cli -h 192.168.1.152 -p 6379 -a RedisRationalized2026 --no-auth-warning XRANGE agentry:brief:brf_verify_m4:trace - +
+    redis-cli -h 127.0.0.1 -p 6380 -a "$AGENTRY_REDIS_PASSWORD" --no-auth-warning XRANGE agentry:brief:brf_verify_m4:trace - +
     echo "--- listener must have a 'received_from=speaker-agent' event ---"
-    redis-cli -h 192.168.1.152 -p 6379 -a RedisRationalized2026 --no-auth-warning XRANGE agentry:brief:brf_verify_m4:trace - + \
+    redis-cli -h 127.0.0.1 -p 6380 -a "$AGENTRY_REDIS_PASSWORD" --no-auth-warning XRANGE agentry:brief:brf_verify_m4:trace - + \
         | grep -q 'received_from":"speaker-agent' && echo "M4 verify PASS" || (echo "M4 verify FAIL"; exit 1)
 
 # Verify M3: naughty agent attempts an unauthorized tool call; broker kills it.
@@ -154,11 +208,11 @@ verify-M3:
     echo "Brief submitted. Waiting for broker to kill the naughty agent..."
     sleep 6
     echo "--- verdict (expect kind=permit_violation) ---"
-    redis-cli -h 192.168.1.152 -p 6379 -a RedisRationalized2026 --no-auth-warning XREVRANGE agentry:verdicts + - COUNT 1
+    redis-cli -h 127.0.0.1 -p 6380 -a "$AGENTRY_REDIS_PASSWORD" --no-auth-warning XREVRANGE agentry:verdicts + - COUNT 1
     echo "--- audit stream (should record the unauthorized attempt) ---"
-    redis-cli -h 192.168.1.152 -p 6379 -a RedisRationalized2026 --no-auth-warning XRANGE agentry:brief:brf_verify_m3:audit - +
+    redis-cli -h 127.0.0.1 -p 6380 -a "$AGENTRY_REDIS_PASSWORD" --no-auth-warning XRANGE agentry:brief:brf_verify_m3:audit - +
     echo ""
-    redis-cli -h 192.168.1.152 -p 6379 -a RedisRationalized2026 --no-auth-warning XREVRANGE agentry:verdicts + - COUNT 1 \
+    redis-cli -h 127.0.0.1 -p 6380 -a "$AGENTRY_REDIS_PASSWORD" --no-auth-warning XREVRANGE agentry:verdicts + - COUNT 1 \
         | grep -q '"kind":"permit_violation"' && echo "M3 verify PASS" || (echo "M3 verify FAIL — expected permit_violation"; exit 1)
 
 # Verify M2: create a role + team via dashboard forms, run a brief on them.
@@ -195,7 +249,7 @@ verify-M2:
     echo "Brief submitted. Waiting for verdict..."
     sleep 5
     echo "--- verdict ---"
-    redis-cli -h 192.168.1.152 -p 6379 -a RedisRationalized2026 --no-auth-warning XREVRANGE agentry:verdicts + - COUNT 1
+    redis-cli -h 127.0.0.1 -p 6380 -a "$AGENTRY_REDIS_PASSWORD" --no-auth-warning XREVRANGE agentry:verdicts + - COUNT 1
     echo "M2 verify PASS"
 
 # Verify M1: replay a brief and check the dashboard renders it.
@@ -206,7 +260,7 @@ verify-M1:
     echo "Brief submitted. Waiting for verdict..."
     sleep 5
     echo "--- verdict on Redis ---"
-    redis-cli -h 192.168.1.152 -p 6379 -a RedisRationalized2026 --no-auth-warning XREVRANGE agentry:verdicts + - COUNT 1
+    redis-cli -h 127.0.0.1 -p 6380 -a "$AGENTRY_REDIS_PASSWORD" --no-auth-warning XREVRANGE agentry:verdicts + - COUNT 1
     echo ""
     echo "--- dashboard index reachable? ---"
     curl -sS http://localhost:${AGENTRY_DASHBOARD_PORT}/healthz

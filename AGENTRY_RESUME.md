@@ -47,7 +47,8 @@ Claude CLI, Grok CLI, Gemini CLI, Python script, shell script — anything that 
 
 ## Redis namespace & endpoints
 
-- Redis: `192.168.1.152:6379` (A0 redis LXC 401), auth: `RedisRationalized2026`
+- **Redis: LOCAL podman container** — `127.0.0.1:6380` (inside `agentry-dev-redis` container, port 6380 to avoid any collision). Password at `~/.config/agentry/redis.password` (0600, gitignored). `just dev-redis-up` brings it online idempotently.
+- **NEVER use prod Redis LXCs** for agentry dev. Both LXC 401 (`.152` — A0 session/memory) and LXC 522 (`.189` — PROD-AGENCY streams) are off-limits for this project's dev traffic.
 - All agentry keys live under `agentry:` prefix (clean-separated from v1 `agency:` graveyard)
 - Key streams:
   - `agentry:briefs` — brief submission inbox (XADD/XREAD)
@@ -119,7 +120,7 @@ Any future Claude session picking this up MUST:
 1. `cd /var/mnt/workspaces/agentry && git status && git log --oneline -20`
 2. Read `AGENTRY_RESUME.md` (this file) + `TODO.md` (next action) + `docs/PROPOSAL.md` (the full shape).
 3. `mcp__memory__get key="project:agentry:resume"` — supplementary Redis state (last milestone completed, current focus, open TODOs).
-4. `redis-cli -h 192.168.1.152 -a RedisRationalized2026 XREVRANGE agentry:verdicts + - COUNT 10` — verify last verdicts.
+4. `just verdicts` (or `redis-cli -h 127.0.0.1 -p 6380 -a "$(cat ~/.config/agentry/redis.password)" --no-auth-warning XREVRANGE agentry:verdicts + - COUNT 10`) — verify last verdicts.
 5. `just dev-up` if starting fresh work session; verify dev infra is up.
 6. Continue from "Next concrete action" in `TODO.md`.
 

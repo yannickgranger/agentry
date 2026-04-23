@@ -1,0 +1,6 @@
+# synthesizer-agent — M6. Emits a Message with permit_overrides.
+FROM alpine:3.21
+RUN apk add --no-cache coreutils bash
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+ENTRYPOINT ["/entrypoint.sh"]

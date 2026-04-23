@@ -11,10 +11,11 @@ use crate::{
 };
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use orchestrator_types::{
-    AgentRole, Brief, BriefId, PermitScope, RoleName, ToolAllowlist, Verdict, VerdictKind,
-    VersionedRef, WorkPermit, now,
+    AgentRole, Brief, BriefId, PermitOverrides, PermitScope, RoleName, ToolAllowlist, Verdict,
+    VerdictKind, VersionedRef, WorkPermit, apply_overrides, now,
 };
 use redis::aio::ConnectionManager;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Run the daemon loop forever.
@@ -81,10 +82,25 @@ async fn handle_brief(
 
     // Accumulated outbox from all upstream roles; sliced per role on dispatch.
     let mut all_messages: Vec<RoutedMessage> = Vec::new();
+    // Permit-narrowing overrides accumulated for a downstream role, keyed by role name.
+    // Populated by scanning upstream outbox messages against team.message_graph edges
+    // that declare `permit_overrides_from`.
+    let mut overrides_for: HashMap<String, PermitOverrides> = HashMap::new();
 
     for role_name in &team.roles {
         let role = fetch_role_any_version(conn, role_name).await?;
+
+        // Mint + narrow + sign.
         let mut permit = mint_permit(brief, &role)?;
+        if let Some(o) = overrides_for.get(&role.name.0) {
+            apply_overrides(&mut permit, o);
+            tracing::info!(
+                brief = %brief.id,
+                role = %role_name,
+                overrides = ?o,
+                "applied permit overrides from upstream"
+            );
+        }
         permit_mod::sign(&mut permit, signing_key)?;
 
         // Messages addressed to this role from any prior step.
@@ -107,10 +123,40 @@ async fn handle_brief(
             outbox_len = outcome.outbox.len(),
             "role completed"
         );
+
+        // Inspect this role's outbox: for each Message targeting a downstream
+        // role via an edge that declares `permit_overrides_from`, pull the
+        // override payload out and stash it for that role.
+        for msg in &outcome.outbox {
+            for edge in team
+                .message_graph
+                .iter()
+                .filter(|e| e.from == role.name && e.to.0 == msg.to)
+            {
+                if let Some(key) = &edge.permit_overrides_from {
+                    if let Some(value) = msg.payload.get(key) {
+                        match serde_json::from_value::<PermitOverrides>(value.clone()) {
+                            Ok(po) => {
+                                overrides_for.insert(edge.to.0.clone(), po);
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    brief = %brief.id,
+                                    from = %role.name,
+                                    to = %edge.to,
+                                    key = %key,
+                                    error = %e,
+                                    "upstream message had override key but payload didn't deserialize"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
         all_messages.extend(outcome.outbox);
 
         if !matches!(outcome.verdict.kind, VerdictKind::Shipped) {
-            // On non-shipped verdict, stop the team run.
             return Ok(());
         }
     }

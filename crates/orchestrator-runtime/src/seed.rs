@@ -188,8 +188,61 @@ pub async fn seed_m0() -> Result<()> {
     redis_io::save_role(&mut conn, &claude_echo).await?;
     redis_io::save_team(&mut conn, &claude_team).await?;
 
+    // M6: synthesizer + narrowed-coder. Synthesizer emits a Message with
+    // `permit_overrides.fs_write`, which the daemon applies to the coder's
+    // permit before spawn. Coder tries to write outside the scope → blocked.
+    let synthesizer = AgentRole {
+        name: RoleName("synthesizer".into()),
+        version: 1,
+        model: None,
+        system_prompt: None,
+        image: "localhost/agentry/synthesizer-agent:v1".into(),
+        substrate_class: SubstrateClass::Podman,
+        binaries: vec![],
+        mcp_servers: vec![],
+        tool_allowlist: ToolAllowlist(vec![]),
+        permit_scope: PermitScope(vec!["net:deny:*".into()]),
+        passthru_env: vec![],
+        mounts: vec![],
+    };
+    let narrowed_coder = AgentRole {
+        name: RoleName("narrowed-coder".into()),
+        version: 1,
+        model: None,
+        system_prompt: None,
+        image: "localhost/agentry/narrowed-coder-agent:v1".into(),
+        substrate_class: SubstrateClass::Podman,
+        binaries: vec![],
+        mcp_servers: vec![],
+        // The broad base — will be narrowed by synthesizer's Message.
+        tool_allowlist: ToolAllowlist(vec!["write".into(), "edit".into(), "read".into()]),
+        permit_scope: PermitScope(vec![
+            "fs:read:/workspace/**".into(),
+            "fs:write:/workspace/**".into(),
+            "net:deny:*".into(),
+        ]),
+        passthru_env: vec![],
+        mounts: vec![],
+    };
+    let narrowed_team = TeamTopology {
+        name: TeamName("narrowed-team".into()),
+        version: 1,
+        roles: vec![synthesizer.name.clone(), narrowed_coder.name.clone()],
+        message_graph: vec![orchestrator_types::MessageEdge {
+            from: synthesizer.name.clone(),
+            to: narrowed_coder.name.clone(),
+            permit_overrides_from: Some("permit_overrides".into()),
+        }],
+        terminal_role: narrowed_coder.name.clone(),
+        max_retries: 0,
+    };
+
+    redis_io::save_role(&mut conn, &synthesizer).await?;
+    redis_io::save_role(&mut conn, &narrowed_coder).await?;
+    redis_io::save_team(&mut conn, &narrowed_team).await?;
+
     tracing::info!(
-        "seeded: roles [echo, naughty, speaker, listener, grok-echo, claude-echo] v1, teams [echo, naughty, speaker-listener, grok-echo, claude-echo] v1"
+        "seeded: roles [echo, naughty, speaker, listener, grok-echo, claude-echo, synthesizer, narrowed-coder] v1; teams [echo, naughty, speaker-listener, grok-echo, claude-echo, narrowed-team] v1"
     );
     Ok(())
 }

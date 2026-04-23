@@ -1,0 +1,11 @@
+{
+  "id": "brf_verify_m6",
+  "project": null,
+  "topology": { "name": "narrowed-team", "version": 1 },
+  "payload": { "kind": "permit-narrowing-check" },
+  "budget": {},
+  "escalation": "autonomous",
+  "parent_brief": null,
+  "submitted_by": "verify-m6",
+  "submitted_at": "2026-04-23T12:00:00Z"
+}
