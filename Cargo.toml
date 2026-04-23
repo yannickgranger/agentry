@@ -45,6 +45,9 @@ askama = { version = "0.12", features = ["with-axum"] }
 # CLI
 clap = { version = "4", features = ["derive"] }
 
+# Config (typed, layered: defaults + TOML + env overlay)
+figment = { version = "0.10", features = ["toml", "env"] }
+
 [workspace.lints.rust]
 unsafe_code = "forbid"
 

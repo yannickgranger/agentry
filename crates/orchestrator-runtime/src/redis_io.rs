@@ -11,11 +11,9 @@ use redis::aio::ConnectionManager;
 pub const STREAM_BRIEFS: &str = "agentry:briefs";
 pub const STREAM_VERDICTS: &str = "agentry:verdicts";
 
-/// Open a Redis connection manager using the `AGENTRY_REDIS_URL` env var.
-/// Default: `redis://127.0.0.1:6379`.
-pub async fn connect() -> Result<ConnectionManager> {
-    let url = std::env::var("AGENTRY_REDIS_URL")
-        .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+/// Open a Redis connection manager from a pre-resolved URL.
+/// URL is typically `config.redis.url` (loaded via figment).
+pub async fn connect(url: &str) -> Result<ConnectionManager> {
     let client = redis::Client::open(url)?;
     let conn = ConnectionManager::new(client).await?;
     Ok(conn)

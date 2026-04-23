@@ -31,7 +31,7 @@ use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::Router;
 use futures::Stream;
-use orchestrator_runtime::redis_io;
+use orchestrator_runtime::{Config, redis_io};
 use orchestrator_types::{
     AgentRole, MessageEdge, PermitScope, Project, ProjectSlug, RoleName, StandingOrders,
     SubstrateClass, TeamName, TeamTopology, ToolAllowlist, brief::EscalationMode,
@@ -65,12 +65,10 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let port: u16 = std::env::var("AGENTRY_DASHBOARD_PORT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(7800);
+    let cfg = Config::load().map_err(|e| anyhow::anyhow!("config load: {e}"))?;
+    let port: u16 = cfg.dashboard.port;
 
-    let conn = redis_io::connect()
+    let conn = redis_io::connect(&cfg.redis.url)
         .await
         .map_err(|e| anyhow::anyhow!("redis connect: {e}"))?;
     let state = AppState {

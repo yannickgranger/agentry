@@ -2,15 +2,15 @@
 //!
 //! Idempotent: overwrites existing records with current definitions.
 
-use crate::{Result, redis_io};
+use crate::{Config, Result, redis_io};
 use orchestrator_types::{
     AgentRole, MessageEdge, Mount, PermitScope, RoleName, SubstrateClass, TeamName, TeamTopology,
     ToolAllowlist,
 };
 
-/// Seed the M0/M3 registry.
-pub async fn seed_m0() -> Result<()> {
-    let mut conn = redis_io::connect().await?;
+/// Seed the M0/M3 registry using the URL from `Config`.
+pub async fn seed_m0(cfg: &Config) -> Result<()> {
+    let mut conn = redis_io::connect(&cfg.redis.url).await?;
 
     let echo = AgentRole {
         name: RoleName("echo-agent".into()),

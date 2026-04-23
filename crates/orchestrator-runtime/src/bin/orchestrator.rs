@@ -5,7 +5,7 @@
 //! `orchestrator abort --all` — abort all running briefs.
 
 use clap::{Parser, Subcommand};
-use orchestrator_runtime::{Result, permit, redis_io, seed};
+use orchestrator_runtime::{Config, Result, permit, redis_io, seed};
 use orchestrator_types::Brief;
 use std::path::PathBuf;
 
@@ -53,20 +53,21 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+    let cfg = Config::load()?;
     match cli.cmd {
         Cmd::Submit { file } => {
             let text = tokio::fs::read_to_string(&file).await?;
             let brief: Brief = serde_json::from_str(&text)?;
-            let mut conn = redis_io::connect().await?;
+            let mut conn = redis_io::connect(&cfg.redis.url).await?;
             let id = redis_io::submit_brief(&mut conn, &brief).await?;
             println!("{{\"submitted\":true,\"brief_id\":\"{}\",\"stream_id\":\"{}\"}}", brief.id, id);
         }
         Cmd::Seed => {
-            seed::seed_m0().await?;
+            seed::seed_m0(&cfg).await?;
             println!("{{\"seeded\":true}}");
         }
         Cmd::Verdicts { count } => {
-            let mut conn = redis_io::connect().await?;
+            let mut conn = redis_io::connect(&cfg.redis.url).await?;
             use redis::AsyncCommands;
             let rev: redis::streams::StreamRangeReply = conn
                 .xrevrange_count(redis_io::STREAM_VERDICTS, "+", "-", count)
@@ -83,7 +84,7 @@ async fn main() -> Result<()> {
             }
         }
         Cmd::KeyGen { force } => {
-            let path = permit::key_path();
+            let path = permit::key_path_from(&cfg);
             if path.exists() && !force {
                 eprintln!(
                     "refusing to overwrite existing key at {} (use --force)",
@@ -91,7 +92,7 @@ async fn main() -> Result<()> {
                 );
                 std::process::exit(2);
             }
-            permit::generate_and_save(&path)?;
+            permit::generate_and_save(path)?;
             println!(
                 "{{\"generated\":true,\"path\":\"{}\"}}",
                 path.display()

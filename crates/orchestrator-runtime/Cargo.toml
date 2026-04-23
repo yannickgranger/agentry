@@ -30,6 +30,7 @@ clap.workspace = true
 ed25519-dalek.workspace = true
 rand_core.workspace = true
 hex.workspace = true
+figment.workspace = true
 
 [lints]
 workspace = true

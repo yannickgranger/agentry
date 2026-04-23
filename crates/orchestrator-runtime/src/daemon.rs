@@ -18,20 +18,20 @@ use redis::aio::ConnectionManager;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// Run the daemon loop forever.
-pub async fn run() -> Result<()> {
-    let mut conn = redis_io::connect().await?;
-    tracing::info!("connected to Redis");
+/// Run the daemon loop forever using the given `Config`.
+pub async fn run(cfg: &crate::Config) -> Result<()> {
+    let mut conn = redis_io::connect(&cfg.redis.url).await?;
+    tracing::info!(url = %cfg.redis.url.split('@').last().unwrap_or("?"), "connected to Redis");
 
     // Load signing key. Fail loudly if missing.
-    let key_path = permit_mod::key_path();
+    let key_path = &cfg.signing.key_path;
     if !key_path.exists() {
         return Err(Error::Config(format!(
             "signing key not found at {}. Run `orchestrator key-gen` first.",
             key_path.display()
         )));
     }
-    let signing_key = Arc::new(permit_mod::load_signing_key(&key_path)?);
+    let signing_key = Arc::new(permit_mod::load_signing_key(key_path)?);
     let verifying_key = Arc::new(signing_key.verifying_key());
     tracing::info!(key = %key_path.display(), "signing key loaded");
 

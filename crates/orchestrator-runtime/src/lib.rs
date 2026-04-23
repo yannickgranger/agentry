@@ -7,11 +7,14 @@
 
 #![forbid(unsafe_code)]
 
+pub mod config;
 pub mod daemon;
 pub mod errors;
 pub mod permit;
 pub mod redis_io;
 pub mod seed;
 pub mod spawner;
+
+pub use config::Config;
 
 pub use errors::{Error, Result};

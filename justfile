@@ -3,9 +3,19 @@
 # Environment — LOCAL podman Redis. NEVER prod.
 # Password lives at ~/.config/agentry/redis.password (600, gitignored).
 # Port 6380 to avoid collisions with any other local Redis.
+#
+# Config is loaded via figment (see config.rs). Load order:
+#   1. defaults in code
+#   2. ~/.config/agentry/agentry.toml (optional; see agentry.example.toml)
+#   3. env vars prefixed AGENTRY_ with nested keys split by __
+#
+# Env-var names use the figment __ nesting:
+#   AGENTRY_REDIS__URL           (maps to redis.url)
+#   AGENTRY_DASHBOARD__PORT      (maps to dashboard.port)
+#   AGENTRY_SIGNING__KEY_PATH    (maps to signing.key_path)
 export AGENTRY_REDIS_PASSWORD := `cat ~/.config/agentry/redis.password 2>/dev/null || echo ""`
-export AGENTRY_REDIS_URL := "redis://:" + AGENTRY_REDIS_PASSWORD + "@127.0.0.1:6380"
-export AGENTRY_DASHBOARD_PORT := "7800"
+export AGENTRY_REDIS__URL := "redis://:" + AGENTRY_REDIS_PASSWORD + "@127.0.0.1:6380"
+export AGENTRY_DASHBOARD__PORT := "7800"
 export RUST_LOG := env_var_or_default("RUST_LOG", "orchestrator=info,info")
 
 # Default
@@ -92,7 +102,7 @@ dev-up: dev-redis-up build build-echo
     #!/usr/bin/env bash
     set -euo pipefail
     # Ensure Redis is reachable
-    redis-cli -u "$AGENTRY_REDIS_URL" ping > /dev/null
+    redis-cli -u "$AGENTRY_REDIS__URL" ping > /dev/null
     # Seed roles + teams in Redis
     ./target/release/orchestrator seed
     # Start orchestratord + dashboard (background, pids in /tmp/agentry-*.pid)
@@ -103,7 +113,7 @@ dev-up: dev-redis-up build build-echo
     sleep 1
     echo "orchestratord pid: $(cat /tmp/agentry-orchestratord.pid)"
     echo "dashboard pid:    $(cat /tmp/agentry-dashboard.pid)"
-    echo "dashboard:        http://localhost:$AGENTRY_DASHBOARD_PORT"
+    echo "dashboard:        http://localhost:$AGENTRY_DASHBOARD__PORT"
 
 # Stop dev infra
 dev-down:
@@ -220,7 +230,7 @@ verify-M2:
     #!/usr/bin/env bash
     set -euo pipefail
     # 1. Create "printer" role via POST /roles (dashboard must be running).
-    curl -sS -X POST "http://localhost:${AGENTRY_DASHBOARD_PORT}/roles" \
+    curl -sS -X POST "http://localhost:${AGENTRY_DASHBOARD__PORT}/roles" \
         --data-urlencode "name=printer" \
         --data-urlencode "model=" \
         --data-urlencode "image=localhost/agentry/echo-agent:v1" \
@@ -232,7 +242,7 @@ verify-M2:
         --data-urlencode "mcp_servers_json=" \
         -o /dev/null -w "POST /roles -> HTTP %{http_code} (expect 303)\n"
     # 2. Create "printer-team" referencing the printer role.
-    curl -sS -X POST "http://localhost:${AGENTRY_DASHBOARD_PORT}/teams" \
+    curl -sS -X POST "http://localhost:${AGENTRY_DASHBOARD__PORT}/teams" \
         --data-urlencode "name=printer-team" \
         --data-urlencode "roles_csv=printer" \
         --data-urlencode "graph_lines=" \
@@ -241,9 +251,9 @@ verify-M2:
         -o /dev/null -w "POST /teams -> HTTP %{http_code} (expect 303)\n"
     # 3. Confirm records visible on dashboard listing pages.
     echo "--- /roles contains 'printer'? ---"
-    curl -sS "http://localhost:${AGENTRY_DASHBOARD_PORT}/roles" | grep -c ">printer<" || (echo "NOT FOUND"; exit 1)
+    curl -sS "http://localhost:${AGENTRY_DASHBOARD__PORT}/roles" | grep -c ">printer<" || (echo "NOT FOUND"; exit 1)
     echo "--- /teams contains 'printer-team'? ---"
-    curl -sS "http://localhost:${AGENTRY_DASHBOARD_PORT}/teams" | grep -c ">printer-team<" || (echo "NOT FOUND"; exit 1)
+    curl -sS "http://localhost:${AGENTRY_DASHBOARD__PORT}/teams" | grep -c ">printer-team<" || (echo "NOT FOUND"; exit 1)
     # 4. Submit the M2 brief (team: printer-team).
     ./target/release/orchestrator submit examples/verify-M2.json
     echo "Brief submitted. Waiting for verdict..."
@@ -263,15 +273,15 @@ verify-M1:
     redis-cli -h 127.0.0.1 -p 6380 -a "$AGENTRY_REDIS_PASSWORD" --no-auth-warning XREVRANGE agentry:verdicts + - COUNT 1
     echo ""
     echo "--- dashboard index reachable? ---"
-    curl -sS http://localhost:${AGENTRY_DASHBOARD_PORT}/healthz
+    curl -sS http://localhost:${AGENTRY_DASHBOARD__PORT}/healthz
     echo ""
     echo "--- index HTML contains brf_verify_m1? ---"
-    curl -sS http://localhost:${AGENTRY_DASHBOARD_PORT}/ | grep -c "brf_verify_m1" || (echo "NOT FOUND"; exit 1)
+    curl -sS http://localhost:${AGENTRY_DASHBOARD__PORT}/ | grep -c "brf_verify_m1" || (echo "NOT FOUND"; exit 1)
     echo "M1 verify PASS"
 
 # Tail verdicts stream
 verdicts:
-    redis-cli -u "$AGENTRY_REDIS_URL" XREAD COUNT 20 STREAMS agentry:verdicts 0
+    redis-cli -u "$AGENTRY_REDIS__URL" XREAD COUNT 20 STREAMS agentry:verdicts 0
 
 # Kill all active briefs (kill switch)
 abort-all:
@@ -281,4 +291,4 @@ abort-all:
 clean:
     just dev-down
     cargo clean
-    redis-cli -u "$AGENTRY_REDIS_URL" KEYS 'agentry:*' | xargs -r redis-cli -u "$AGENTRY_REDIS_URL" DEL
+    redis-cli -u "$AGENTRY_REDIS__URL" KEYS 'agentry:*' | xargs -r redis-cli -u "$AGENTRY_REDIS__URL" DEL

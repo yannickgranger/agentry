@@ -9,28 +9,17 @@
 //! their startup bundle. If they try to call a tool outside the allowlist,
 //! the broker kills the container and records a `permit_violation` verdict.
 
-use crate::{Error, Result};
+use crate::{Config, Error, Result};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use orchestrator_types::WorkPermit;
 use rand_core::OsRng;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-const KEY_ENV: &str = "AGENTRY_SIGNING_KEY";
-
-/// Default location for the signing key.
-fn default_key_path() -> PathBuf {
-    if let Some(home) = std::env::var_os("HOME") {
-        PathBuf::from(home).join(".config/agentry/signing.key")
-    } else {
-        PathBuf::from("/tmp/agentry-signing.key")
-    }
-}
-
-/// Resolve the signing-key path from env or default.
-pub fn key_path() -> PathBuf {
-    std::env::var_os(KEY_ENV)
-        .map(PathBuf::from)
-        .unwrap_or_else(default_key_path)
+/// Resolve the signing-key path from the loaded Config.
+/// Callers that don't already have a Config should call `Config::load()?` first.
+#[must_use]
+pub fn key_path_from(cfg: &Config) -> &Path {
+    &cfg.signing.key_path
 }
 
 /// Generate a fresh ed25519 keypair and write it to `path`. 0600 perms.

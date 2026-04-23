@@ -1,7 +1,7 @@
 //! orchestratord — the daemon binary.
 //! Reads briefs from Redis, spawns agent containers, records verdicts.
 
-use orchestrator_runtime::daemon;
+use orchestrator_runtime::{Config, daemon};
 
 #[tokio::main]
 async fn main() -> orchestrator_runtime::Result<()> {
@@ -11,6 +11,7 @@ async fn main() -> orchestrator_runtime::Result<()> {
                 .unwrap_or_else(|_| "orchestrator_runtime=info,info".into()),
         )
         .init();
-    tracing::info!("orchestratord starting");
-    daemon::run().await
+    let cfg = Config::load()?;
+    tracing::info!(dashboard_port = cfg.dashboard.port, "orchestratord starting");
+    daemon::run(&cfg).await
 }

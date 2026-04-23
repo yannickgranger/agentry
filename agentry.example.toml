@@ -1,0 +1,18 @@
+# agentry.example.toml — copy to `~/.config/agentry/agentry.toml` and edit.
+# Loaded by figment at binary startup. Env vars prefixed `AGENTRY_` with `__`
+# nesting (e.g. `AGENTRY_REDIS__URL`) override anything below.
+
+[redis]
+# LOCAL podman Redis only. NEVER the prod LXCs (.152 / .189).
+# In dev, the justfile composes this URL from ~/.config/agentry/redis.password
+# at each `just ...` invocation — you usually don't need to set this file.
+url = "redis://:PASSWORD@127.0.0.1:6380"
+
+[dashboard]
+# HTTP port for the Axum dashboard (read-only + form editor).
+port = 7800
+
+[signing]
+# ed25519 secret key, hex-encoded 32 bytes, 0600 perms. Created by
+# `orchestrator key-gen`. Keep off git forever.
+key_path = "/home/YOU/.config/agentry/signing.key"
