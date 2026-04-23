@@ -160,6 +160,33 @@ async fn handle_brief(
             return Ok(());
         }
     }
+
+    // Chain trigger: if every role shipped AND the brief's payload names a
+    // `next_brief_ref` (an absolute file path containing another Brief JSON),
+    // submit that brief to the queue. Orchestrator doesn't care what's in it;
+    // the next brief routes through whatever topology it names.
+    if let Some(next_ref) = brief.payload.get("next_brief_ref").and_then(|v| v.as_str()) {
+        match tokio::fs::read_to_string(next_ref).await {
+            Ok(text) => match serde_json::from_str::<Brief>(&text) {
+                Ok(next_brief) => {
+                    redis_io::submit_brief(conn, &next_brief).await?;
+                    tracing::info!(
+                        from = %brief.id,
+                        next = %next_brief.id,
+                        path = %next_ref,
+                        "chain trigger: next brief submitted"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(path=%next_ref, error=%e, "chain: next brief JSON parse failed");
+                }
+            },
+            Err(e) => {
+                tracing::warn!(path=%next_ref, error=%e, "chain: next brief file read failed");
+            }
+        }
+    }
+
     Ok(())
 }
 

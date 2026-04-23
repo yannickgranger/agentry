@@ -1,16 +1,17 @@
 # Next Concrete Action
 
-**Status:** **M0 → M7 ALL GREEN**, figment-configured, LOCAL-Redis-only. First real PR opened by agentry: https://agency.lab:3000/yg/agentry-toy/pulls/1
+**Status:** **M0 → M8 ALL GREEN.** Eleven verifies pass end-to-end on real infra + local podman Redis.
 
-Next: **M8 — triggers** (cron + webhook) so briefs fire without you submitting them by hand.
+Next: **M9 — first real qbot-core issue closed end-to-end** (the "we are up and running" gate from the original roadmap).
 
 ## HARD RULES (re-read every session)
 
 > **Redis: LOCAL podman only** (`127.0.0.1:6380`). Never LXC 401 (.152) or 522 (.189).
 > **Claude: Max subscription only** (host `claude` CLI + bind-mounted creds). Never Anthropic API.
 > **Cheap APIs OK:** Grok (xAI), Gemini (Google). Per-role `passthru_env`.
+> **PR-opening token** (`GITEA_TOKEN`) is per-role via `passthru_env`. Never broad-cast.
 
-## Done
+## Done — all 8 roadmap milestones + figment + prod-Redis fix
 
 | # | Scope | Commit | Proof |
 |---|-------|--------|-------|
@@ -21,20 +22,25 @@ Next: **M8 — triggers** (cron + webhook) so briefs fire without you submitting
 | M4 | inter-role message routing | `366b1b9` | speaker → listener |
 | M5a | cheap-API LLM (xAI Grok) | `38852b8` | grok-4-fast returned pong |
 | M5b | Claude Max via host CLI | `06a922e` | claude -p returned pong, zero API spend |
-| M6 + prod-Redis fix | permit_overrides narrow scope + migrate to local Redis | `89bc95f` | fs:write scope denied; 29 keys wiped from .152 |
-| figment | typed config (defaults + TOML + env overlay) | `bf3a81b` | 30 tests pass incl. anti-prod-Redis pin; TOML precedence proven |
-| M7 | shipper opens real PR on toy repo | see `git log` | PR #1 open at agency.lab:3000/yg/agentry-toy/pulls/1 |
+| M6 + prod-Redis fix | permit_overrides narrow scope + local podman Redis | `89bc95f` | fs:write scope denied; 29 keys wiped from .152 |
+| figment | typed config (defaults + TOML + env overlay) | `bf3a81b` | 30 tests incl. anti-prod-Redis pin |
+| M7 | shipper opens real PR on toy repo | `a72fe71` | PR #1 on yg/agentry-toy |
+| M8 | triggers (cron + webhook + chain) | see `git log` | chain A→B both shipped; webhook 401-unauth and 200-submit |
 
-## Replay (in order, idempotent)
+## Replay (in order)
 
 ```bash
 cd /var/mnt/workspaces/agentry
-export XAI_API_KEY=$(keepassxc-cli show -sa Password --no-password -k ~/agent-zero/key/claude.key ~/agent-zero/claude.kdbx "services/xai-grok")
+
+export AGENTRY_REDIS_PASSWORD=$(cat ~/.config/agentry/redis.password)
+export AGENTRY_REDIS__URL="redis://:${AGENTRY_REDIS_PASSWORD}@127.0.0.1:6380"
+export AGENTRY_DASHBOARD__PORT=7800
+export AGENTRY_WEBHOOK__SECRET=$(openssl rand -hex 16)
 export GITEA_TOKEN=$(keepassxc-cli show -sa Password --no-password -k ~/agent-zero/key/claude.key ~/agent-zero/claude.kdbx "gitea/agency.lab")
+export XAI_API_KEY=$(keepassxc-cli show -sa Password --no-password -k ~/agent-zero/key/claude.key ~/agent-zero/claude.kdbx "services/xai-grok")
 
 cargo build --release --workspace
 ./target/release/orchestrator key-gen --force || true
-
 just dev-redis-up
 for img in echo naughty speaker listener grok claude synthesizer narrowed-coder shipper; do
   podman image exists localhost/agentry/${img}-agent:v1 \
@@ -48,59 +54,59 @@ nohup ./target/release/orchestrator-dashboard > /tmp/agentry-dashboard.log 2>&1 
 sleep 1
 
 for m in 0 1 2 3 4 5a 5b 6 7; do just verify-M$m; done
+just verify-M8-chain
+just verify-M8-webhook
 ```
 
-## Known M7 quirk
+## M9 — first real qbot-core issue end-to-end
 
-`verify-M7.json` has a fixed branch name (`agentry-m7-pong`). First run opens PR #1. Second run: `git push` is a no-op (same content), PR API returns "pull request already exists", and the verify grep finds the OLD "PR opened" event in the existing trace stream. For a clean re-verify: delete `yg/agentry-toy` branch `agentry-m7-pong` on the forge, or pick a new brief id + branch for each run.
+This is the north-star "we are up and running" gate.
 
-Not a showstopper for M7 acceptance — the real proof (PR #1 on forge) stands. Fix if it bites.
+### Prerequisites (resolve with user before building)
 
-## M8 — triggers (next up)
+1. **Which qbot-core issue?** Target should be:
+   - Small, well-specced (typo fix, one clippy warning, one test rename).
+   - Touches ≤3 files.
+   - Has clear acceptance (`cargo clippy` clean, `cargo test` green).
+2. **Which coder model?**
+   - **Claude Max** via M5b substrate (`claude-echo` role template) — free under subscription.
+   - **Grok Code Fast** via M5a substrate — cheap but untested on real Rust.
+   - Lean: start with Claude Max; it's what the user already trusts.
+3. **Team topology for qbot-core work.** Proposal:
+   ```
+   archaeologist -> prescriber -> coder-claude -> reviewer -> shipper
+   ```
+   - `archaeologist`: read-only, uses grep/find on a cloned worktree. Produces facts.
+   - `prescriber`: read-only, synthesizes REUSE/CREATE decisions + `permit_overrides.fs_write` to scope coder.
+   - `coder-claude`: Claude Max in container, writes files within narrowed scope, runs `cargo check`.
+   - `reviewer`: reads diff, runs full `cargo test`, emits `approve` or `reject`.
+   - `shipper`: M7 shipper retargeted at `yg/qbot-core`, opens PR.
+4. **Do we merge automatically?** Lean: NO for M9. Shipper opens PR; human merges. Auto-merge is a separate scope.
 
-Goal: briefs fire without user pressing a button.
+### Architectural work needed (not just config)
 
-### Three trigger classes (all simple, all existing-OS shapes)
+- **Cloned worktree per team.** Each agent needs the qbot-core checkout. Options:
+  a) One worktree shared via bind mount (unsafe — parallel writes, which isn't a concern since roles are sequential, but still cross-context contamination).
+  b) Each agent clones its own. Wasteful but clean.
+  c) First role clones; subsequent roles bind-mount the same directory.
+  Lean: (c) — clone once in `archaeologist`, bind-mount through team.
+  Needs: a way to mark a role as "persists its workspace" + a way for downstream roles to inherit it. This is a NEW CONCEPT. Deferring to explicit design discussion before coding.
+- **Real quality signal.** `cargo check`/`cargo test` from a container takes minutes for qbot-core. Need resource allocation + timeout (podman `--timeout`), separate from the brief-level budget.
+- **MCP server for forge ops inside coder-claude.** Claude needs to read file history / blame / diff. Lean: mount `mcp-forge` into coder-claude's container (M5b-like pattern + mounts field already exists).
 
-1. **Cron trigger.** `crontab` or systemd timer runs `orchestrator submit path/to/brief.json` on schedule. Zero orchestrator code — the OS does the scheduling. Just committed example crontab entries + a `just trigger-install-cron <brief>` helper.
-2. **Webhook trigger.** Add a `POST /submit` endpoint on the dashboard that takes a brief JSON and forwards it to `agentry:briefs`. Token-guarded (shared-secret in env / figment config). `forge` webhook points at the dashboard; an issue comment like `/agentry ship fix-foo` triggers a brief.
-3. **Chain trigger.** When a brief emits verdict=shipped, if the brief's payload has `next_brief_ref: "path/to/next.json"`, the daemon submits that next brief. Tiny daemon change (~20 LOC).
+### Alternatives to M9
 
-### Subtasks
+If M9 feels too ambitious as the next step, three intermediate milestones that are each individually valuable:
 
-- `orchestrator-dashboard`: add `POST /submit` route, shared-secret auth via `config.webhook.secret`.
-- `config.rs`: new `WebhookConfig { secret: Option<String> }` section.
-- `daemon.rs`: on shipped verdict with `next_brief_ref`, load that brief file and submit.
-- `examples/trigger-cron.txt`: sample crontab.
-- `examples/verify-M8-webhook.sh`: curl the webhook with a token, assert a verdict appears.
-- `examples/verify-M8-chain.json`: brief A with `next_brief_ref` pointing to brief B; both should complete in order.
+- **M8.5 — parallel spawning** in one team. Currently all roles run sequentially. For real teams this is fine for linear pipelines but limits council patterns (archaeologist + spec-guardian + cfdb-auditor running in parallel). ~150 LOC.
+- **M8.6 — persistent workspace inheritance.** A role declares `workspace: persist`; downstream roles declare `workspace: inherit`, and the spawner bind-mounts the upstream container's workspace as read-only into the downstream. ~100 LOC.
+- **M8.7 — glob matching for fs scope.** Currently M6 does literal-path matching. For real work we need `fs:write:/workspace/src/**` style globs. Add `globset` crate. ~50 LOC.
 
-### Budget
-
-~150 LOC + one Axum route.
-
-### Invariants
-
-- Webhook secret is per-install, in `~/.config/agentry/agentry.toml`. Gitignored.
-- Chain triggers are bounded (max depth 5, say) to avoid runaway loops.
-- Old 9 verifies must still pass.
-
-## M9 — first real qbot-core issue
-
-Requires:
-- Claude-Max or Grok-backed coder role (we have the substrate from M5b / M5a).
-- Team topology like `archaeologist → prescriber → coder → reviewer → shipper`.
-- Shipper (M7) with scope expanded to `yg/qbot-core`.
-- A small, well-specced open issue on qbot-core (ideally a `clippy` warning or README typo) as the first target.
-
-Open questions for M9 (resolve BEFORE building):
-1. Which open qbot-core issue should be the first target?
-2. Which model should the coder role use? (Claude Max = Sonnet 4.6 / Opus 4.7 via CLI; Grok-Code-Fast is another option — cheap but untested for real Rust work.)
-3. Do we merge the PR ourselves (safe) or let agentry's shipper also be a merger (requires `forge:merge` scope + trust)?
+Recommend building at least M8.6 before M9 — qbot-core work really needs persistent workspace across roles.
 
 ## If this session ends mid-task
 
-- `git status` → commit as `wip(m8): ...`.
+- `git status` → commit as `wip(m9): ...`.
 - Update this TODO.
 - `mcp__memory__set key="project:agentry:resume"`.
 - Replay block above before new work.

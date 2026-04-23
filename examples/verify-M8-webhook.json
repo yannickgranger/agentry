@@ -1,0 +1,11 @@
+{
+  "id": "brf_verify_m8_webhook",
+  "project": null,
+  "topology": { "name": "echo-team", "version": 1 },
+  "payload": { "kind": "webhook-check", "msg": "submitted via POST /submit" },
+  "budget": {},
+  "escalation": "autonomous",
+  "parent_brief": null,
+  "submitted_by": "verify-m8-webhook",
+  "submitted_at": "2026-04-23T12:00:00Z"
+}

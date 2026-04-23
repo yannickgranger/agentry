@@ -152,6 +152,52 @@ verify-M0:
     sleep 5
     redis-cli -h 127.0.0.1 -p 6380 -a "$AGENTRY_REDIS_PASSWORD" --no-auth-warning XREVRANGE agentry:verdicts + - COUNT 1
 
+# Verify M8-chain: brief A's payload.next_brief_ref triggers brief B.
+verify-M8-chain:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # Stage brief B where orchestratord will find it (absolute path, matches chain-A's next_brief_ref).
+    cp examples/verify-M8-chain-B.json /tmp/agentry-verify-m8-chain-b.json
+    ./target/release/orchestrator submit examples/verify-M8-chain-A.json
+    echo "Submitted A. Waiting for chain..."
+    sleep 8
+    echo "--- last 2 verdicts (expect brf_verify_m8_chain_a + brf_verify_m8_chain_b, both shipped) ---"
+    redis-cli -h 127.0.0.1 -p 6380 -a "$AGENTRY_REDIS_PASSWORD" --no-auth-warning XREVRANGE agentry:verdicts + - COUNT 2
+    echo ""
+    got_b=$(redis-cli -h 127.0.0.1 -p 6380 -a "$AGENTRY_REDIS_PASSWORD" --no-auth-warning XREVRANGE agentry:verdicts + - COUNT 5 | grep -c 'brf_verify_m8_chain_b' || true)
+    got_a=$(redis-cli -h 127.0.0.1 -p 6380 -a "$AGENTRY_REDIS_PASSWORD" --no-auth-warning XREVRANGE agentry:verdicts + - COUNT 5 | grep -c 'brf_verify_m8_chain_a' || true)
+    [ "$got_a" -gt 0 ] && [ "$got_b" -gt 0 ] && echo "M8-chain verify PASS" || (echo "M8-chain verify FAIL (a=$got_a b=$got_b)"; exit 1)
+
+# Verify M8-webhook: POST /submit with shared-secret token -> brief flows.
+# Requires AGENTRY_WEBHOOK__SECRET set in dashboard env AND passed to curl.
+verify-M8-webhook:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ -z "${AGENTRY_WEBHOOK__SECRET:-}" ]; then
+        echo "AGENTRY_WEBHOOK__SECRET not set; generating one for this run"
+        export AGENTRY_WEBHOOK__SECRET=$(openssl rand -hex 16)
+        echo "regen'd: $AGENTRY_WEBHOOK__SECRET"
+        echo "NOTE: orchestratord/dashboard must also have this in their env; restart with it set"
+        exit 2
+    fi
+    echo "--- POST /submit with bad token (expect 401) ---"
+    code=$(curl -sS -o /dev/null -w "%{http_code}" \
+        -H "X-Agentry-Token: WRONG" \
+        -H "Content-Type: application/json" \
+        --data-binary @examples/verify-M8-webhook.json \
+        http://localhost:${AGENTRY_DASHBOARD__PORT}/submit)
+    [ "$code" = "401" ] && echo "bad token -> 401 OK" || (echo "expected 401, got $code"; exit 1)
+    echo "--- POST /submit with good token (expect 200) ---"
+    resp=$(curl -sS -X POST \
+        -H "X-Agentry-Token: $AGENTRY_WEBHOOK__SECRET" \
+        -H "Content-Type: application/json" \
+        --data-binary @examples/verify-M8-webhook.json \
+        http://localhost:${AGENTRY_DASHBOARD__PORT}/submit)
+    echo "$resp"
+    sleep 5
+    echo "--- verdict (expect kind=shipped for brf_verify_m8_webhook) ---"
+    redis-cli -h 127.0.0.1 -p 6380 -a "$AGENTRY_REDIS_PASSWORD" --no-auth-warning XREVRANGE agentry:verdicts + - COUNT 3 | grep -q 'brf_verify_m8_webhook' && echo "M8-webhook verify PASS" || (echo "M8-webhook verify FAIL"; exit 1)
+
 # Verify M7: shipper opens a real PR on yg/agentry-toy.
 # Requires GITEA_TOKEN in orchestratord's env (via keepassxc gitea/agency.lab).
 verify-M7:

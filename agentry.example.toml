@@ -16,3 +16,9 @@ port = 7800
 # ed25519 secret key, hex-encoded 32 bytes, 0600 perms. Created by
 # `orchestrator key-gen`. Keep off git forever.
 key_path = "/home/YOU/.config/agentry/signing.key"
+
+[webhook]
+# Optional shared secret for POST /submit. If unset, the webhook is
+# disabled (every call returns 401). Also settable via env:
+# AGENTRY_WEBHOOK__SECRET=<random-hex>.
+# secret = "replace-with-openssl-rand-hex-16"

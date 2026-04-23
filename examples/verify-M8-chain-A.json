@@ -1,0 +1,15 @@
+{
+  "id": "brf_verify_m8_chain_a",
+  "project": null,
+  "topology": { "name": "echo-team", "version": 1 },
+  "payload": {
+    "kind": "chain-first",
+    "msg": "first step — should trigger the second",
+    "next_brief_ref": "/tmp/agentry-verify-m8-chain-b.json"
+  },
+  "budget": {},
+  "escalation": "autonomous",
+  "parent_brief": null,
+  "submitted_by": "verify-m8-chain",
+  "submitted_at": "2026-04-23T12:00:00Z"
+}

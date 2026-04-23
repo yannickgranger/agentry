@@ -1,0 +1,11 @@
+{
+  "id": "brf_verify_m8_chain_b",
+  "project": null,
+  "topology": { "name": "echo-team", "version": 1 },
+  "payload": { "kind": "chain-second", "msg": "triggered by the daemon after A shipped" },
+  "budget": {},
+  "escalation": "autonomous",
+  "parent_brief": "brf_verify_m8_chain_a",
+  "submitted_by": "agentry-chain-trigger",
+  "submitted_at": "2026-04-23T12:00:00Z"
+}

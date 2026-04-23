@@ -25,15 +25,15 @@
 #![forbid(unsafe_code)]
 
 use axum::extract::{Form, Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
-use axum::Router;
+use axum::{Json, Router};
 use futures::Stream;
 use orchestrator_runtime::{Config, redis_io};
 use orchestrator_types::{
-    AgentRole, MessageEdge, PermitScope, Project, ProjectSlug, RoleName, StandingOrders,
+    AgentRole, Brief, MessageEdge, PermitScope, Project, ProjectSlug, RoleName, StandingOrders,
     SubstrateClass, TeamName, TeamTopology, ToolAllowlist, brief::EscalationMode,
     role::McpServer,
 };
@@ -54,6 +54,7 @@ const STREAM_BRIEFS: &str = "agentry:briefs";
 #[derive(Clone)]
 struct AppState {
     redis: Arc<tokio::sync::Mutex<ConnectionManager>>,
+    webhook_secret: Option<String>,
 }
 
 #[tokio::main]
@@ -73,6 +74,7 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("redis connect: {e}"))?;
     let state = AppState {
         redis: Arc::new(tokio::sync::Mutex::new(conn)),
+        webhook_secret: cfg.webhook.secret.clone(),
     };
 
     let app = Router::new()
@@ -81,6 +83,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/sse/verdicts", get(sse_verdicts))
         .route("/sse/brief/{id}/trace", get(sse_brief_trace))
         .route("/healthz", get(healthz))
+        // M8 webhook trigger
+        .route("/submit", post(webhook_submit))
         // M2 registry editor
         .route("/roles", get(roles_list))
         .route("/roles/new", get(role_new_form))
@@ -102,6 +106,54 @@ async fn main() -> anyhow::Result<()> {
 
 async fn healthz() -> &'static str {
     "ok"
+}
+
+// ---------- webhook trigger (M8) ----------
+
+/// POST /submit — accept a Brief JSON, forward to `agentry:briefs`.
+/// Guarded by a shared-secret in `X-Agentry-Token`. Returns 401 if the
+/// dashboard has no webhook secret configured (disabled), or if the token
+/// doesn't match.
+async fn webhook_submit(
+    State(app): State<AppState>,
+    headers: HeaderMap,
+    Json(brief): Json<Brief>,
+) -> Response {
+    let Some(expected) = app.webhook_secret.as_deref() else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            "webhook disabled (config.webhook.secret unset)",
+        )
+            .into_response();
+    };
+    let provided = headers
+        .get("x-agentry-token")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if provided != expected {
+        return (StatusCode::UNAUTHORIZED, "bad token").into_response();
+    }
+
+    let mut conn = app.redis.lock().await;
+    match redis_io::submit_brief(&mut conn, &brief).await {
+        Ok(stream_id) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "submitted": true,
+                "brief_id": brief.id.to_string(),
+                "stream_id": stream_id,
+            })),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "webhook submit failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("submit failed: {e}"),
+            )
+                .into_response()
+        }
+    }
 }
 
 // ---------- error wrapper so `?` works in handlers ----------

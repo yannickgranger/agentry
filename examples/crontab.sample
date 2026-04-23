@@ -1,0 +1,17 @@
+# Sample crontab entries for agentry — third M8 trigger class.
+#
+# Install with `crontab -e` and paste the relevant lines. ZERO orchestrator
+# code: the OS cron daemon runs `orchestrator submit` at the scheduled time.
+# The orchestrator only sees a new brief on `agentry:briefs`.
+#
+# Env the cron shell needs:
+#   AGENTRY_REDIS__URL (or a helper script that sources ~/.config/agentry/redis.password)
+# For simplicity we source the profile dot-file and trust that it sets
+# AGENTRY_REDIS__URL — the figment config loader will pick it up either
+# via env or via ~/.config/agentry/agentry.toml.
+
+# Morning plan: 09:00 Mon-Fri, kick off qbot-core daily steward.
+# 0 9 * * MON-FRI  . $HOME/.profile; /var/mnt/workspaces/agentry/target/release/orchestrator submit /var/mnt/workspaces/agentry/examples/verify-M0.json >> /var/log/agentry-cron.log 2>&1
+
+# Hourly idempotence ping (echo brief; cheap heartbeat).
+# 0 * * * * . $HOME/.profile; /var/mnt/workspaces/agentry/target/release/orchestrator submit /var/mnt/workspaces/agentry/examples/verify-M0.json >> /var/log/agentry-cron.log 2>&1

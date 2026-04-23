@@ -22,6 +22,8 @@ pub struct Config {
     pub redis: RedisConfig,
     pub dashboard: DashboardConfig,
     pub signing: SigningConfig,
+    #[serde(default)]
+    pub webhook: WebhookConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,6 +43,15 @@ pub struct SigningConfig {
     pub key_path: PathBuf,
 }
 
+/// Dashboard webhook trigger config. If `secret` is `None`, `POST /submit`
+/// returns 401 — webhook submission is disabled.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WebhookConfig {
+    /// Shared secret required in the `X-Agentry-Token` header.
+    #[serde(default)]
+    pub secret: Option<String>,
+}
+
 impl Default for Config {
     fn default() -> Self {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
@@ -54,6 +65,7 @@ impl Default for Config {
             signing: SigningConfig {
                 key_path: PathBuf::from(format!("{home}/.config/agentry/signing.key")),
             },
+            webhook: WebhookConfig::default(),
         }
     }
 }
