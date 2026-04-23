@@ -42,10 +42,10 @@ export XAI_API_KEY=$(keepassxc-cli show -sa Password --no-password -k ~/agent-ze
 cargo build --release --workspace
 ./target/release/orchestrator key-gen --force || true
 just dev-redis-up
-for img in echo naughty speaker listener grok claude synthesizer narrowed-coder shipper; do
-  podman image exists localhost/agentry/${img}-agent:v1 \
-    || (cd containers/${img}-agent && podman build -t agentry/${img}-agent:v1 -f Containerfile .)
-done
+# Agent containers are no longer pre-built: each role ships an inline
+# entrypoint_script and binaries list; the spawner installs packages on a
+# stock alpine:3.21 / debian:bookworm-slim base at spawn time. Podman pulls
+# those images on first use.
 ./target/release/orchestrator seed
 
 ps -eo pid,comm | awk '$2 ~ /^orchestrator/ {print $1}' | xargs -r kill -9

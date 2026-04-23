@@ -34,6 +34,17 @@ pub enum SubstrateClass {
     Vm,
 }
 
+/// Which package manager the spawner uses to install `binaries` at spawn time.
+/// Picked explicitly per role; no heuristic from image name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PackageManager {
+    /// Alpine — `apk add --no-cache <binaries>`.
+    Apk,
+    /// Debian/Ubuntu — `apt-get update && apt-get install -y <binaries>`.
+    Apt,
+}
+
 /// What tools the agent is permitted to call. Names are stable symbolic ids;
 /// the container runner maps them to actual binaries / MCP methods.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -89,12 +100,24 @@ pub struct AgentRole {
     pub model: Option<String>,
     /// System prompt (inline). Can reference a file as `@file://path` — resolver elsewhere.
     pub system_prompt: Option<String>,
-    /// Container image to spawn (fully qualified): `agentry/echo-agent:v1`.
+    /// Container image to spawn. Either a stock public image
+    /// (`alpine:3.21`, `debian:bookworm-slim`) with an `entrypoint_script`
+    /// provisioned at spawn, or a pre-built image embedding its own entrypoint
+    /// (legacy path — left supported for roles that genuinely need baking).
     pub image: String,
     /// Substrate to spawn on.
     #[serde(default)]
     pub substrate_class: SubstrateClass,
-    /// Extra binaries to install in the container at spawn.
+    /// Package manager to use when installing `binaries` at spawn.
+    pub package_manager: PackageManager,
+    /// Inline entrypoint script (bash). The spawner delivers it to the
+    /// container via the `AGENTRY_SCRIPT` env var, installs `binaries` via
+    /// `package_manager`, then execs it. Required — every role ships its
+    /// own script.
+    pub entrypoint_script: String,
+    /// Package names to install at spawn via `package_manager`. The spawner
+    /// always adds a baseline (`bash ca-certificates coreutils jq`); this
+    /// list is role-specific extras (e.g. `["git", "curl"]`).
     #[serde(default)]
     pub binaries: Vec<String>,
     /// MCP servers to mount.
@@ -129,9 +152,11 @@ mod tests {
             version: 3,
             model: Some("claude-opus-4-7".into()),
             system_prompt: Some("You are a Rust coder. Follow the contract.".into()),
-            image: "agentry/coder-rust:v3".into(),
+            image: "alpine:3.21".into(),
             substrate_class: SubstrateClass::Podman,
-            binaries: vec!["cargo".into(), "rustfmt".into()],
+            package_manager: PackageManager::Apk,
+            entrypoint_script: "#!/usr/bin/env bash\necho hello\n".into(),
+            binaries: vec!["git".into(), "curl".into()],
             mcp_servers: vec![McpServer {
                 name: "ra-query".into(),
                 image: Some("ghcr.io/yg/ra-query:v0.1".into()),
