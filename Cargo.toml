@@ -1,0 +1,50 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/orchestrator-types",
+    "crates/orchestrator-runtime",
+    "crates/orchestrator-dashboard",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+authors = ["yg"]
+license = "MIT"
+repository = "https://agency.lab:3000/yg/agentry"
+
+[workspace.dependencies]
+# Core
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Async + Redis
+redis = { version = "0.27", features = ["tokio-comp", "streams", "aio", "connection-manager"] }
+async-trait = "0.1"
+
+# Time + IDs
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v7", "serde"] }
+
+# HTTP + UI (dashboard)
+axum = { version = "0.8", features = ["macros"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["fs", "trace"] }
+askama = { version = "0.12", features = ["with-axum"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"

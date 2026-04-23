@@ -1,0 +1,32 @@
+[package]
+name = "orchestrator-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "orchestratord"
+path = "src/bin/orchestratord.rs"
+
+[[bin]]
+name = "orchestrator"
+path = "src/bin/orchestrator.rs"
+
+[dependencies]
+orchestrator-types = { path = "../orchestrator-types" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+redis.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+clap.workspace = true
+
+[lints]
+workspace = true

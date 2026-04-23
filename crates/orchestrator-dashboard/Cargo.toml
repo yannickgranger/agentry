@@ -1,0 +1,29 @@
+[package]
+name = "orchestrator-dashboard"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "orchestrator-dashboard"
+path = "src/main.rs"
+
+[dependencies]
+orchestrator-types = { path = "../orchestrator-types" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+redis.workspace = true
+chrono.workspace = true
+axum.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+askama.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,8 @@
+target/
+*.pid
+*.log
+/tmp/agentry-*
+.agentry-token
+.env
+.vscode/
+.idea/
