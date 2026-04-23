@@ -92,18 +92,12 @@ jobs:
           cd repo
           bash scripts/arch-check.sh
 
-      - name: Archive cfdb fact dump
+      - name: cfdb fact counts (diagnostic)
         if: always()
         run: |
           cd repo
           if [ -d ".cfdb/db-local" ]; then
-            /cache/cargo/bin/cfdb dump --db .cfdb/db-local --keyspace agentry > /tmp/agentry-facts.jsonl 2>/dev/null || true
-            wc -l /tmp/agentry-facts.jsonl 2>/dev/null || true
+            /cache/cargo/bin/cfdb dump --db .cfdb/db-local --keyspace agentry 2>/dev/null | wc -l | awk '{print "cfdb fact lines: " $1}'
+          else
+            echo "cfdb db-local not present — extract step did not complete"
           fi
-
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: agentry-cfdb-facts
-          path: /tmp/agentry-facts.jsonl
-          if-no-files-found: ignore
