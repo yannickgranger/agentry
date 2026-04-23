@@ -126,7 +126,10 @@ Any future Claude session picking this up MUST:
 
 **DO NOT** invent new primitives, add a new crate, or re-open deferred features. If tempted, stop and re-read drift rules above.
 
-## Known limitations (M0 / M1 / M2 / M3 / M4 / M5a / M5b)
+## Known limitations (M0 / M1 / M2 / M3 / M4 / M5a / M5b / M6 / M7)
+
+- **M7 verify is not idempotent by design.** Fixed branch name in `verify-M7.json`. First run opens the PR; subsequent runs find the existing PR event in the trace stream. Proof is on the forge, not the repeatability of the grep. Fix if it bites: randomize branch per run.
+
 
 - **SELinux + bind mounts:** rootless podman on Fedora/Silverblue requires `--security-opt label=disable` to read host-owned files. Spawner auto-adds it whenever `role.mounts` is non-empty. Don't use `:z`/`:Z` — they relabel the host path.
 - **Claude Max via bind-mounted binary + `~/.claude/.credentials.json`.** `settings.json` is also mounted read-only. Container's `HOME` is `/root`; `~/.claude` maps from the host.

@@ -241,8 +241,37 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
     redis_io::save_role(&mut conn, &narrowed_coder).await?;
     redis_io::save_team(&mut conn, &narrowed_team).await?;
 
+    // M7: shipper — opens PRs on the forge. Needs GITEA_TOKEN from orchestratord env.
+    let shipper = AgentRole {
+        name: RoleName("shipper".into()),
+        version: 1,
+        model: None,
+        system_prompt: None,
+        image: "localhost/agentry/shipper-agent:v1".into(),
+        substrate_class: SubstrateClass::Podman,
+        binaries: vec![],
+        mcp_servers: vec![],
+        tool_allowlist: ToolAllowlist(vec![]),
+        permit_scope: PermitScope(vec![
+            "net:allow:agency.lab".into(),
+            "forge:write:yg/agentry-toy".into(), // symbolic (no runtime enforcement yet)
+        ]),
+        passthru_env: vec!["GITEA_TOKEN".into()],
+        mounts: vec![],
+    };
+    let shipper_team = TeamTopology {
+        name: TeamName("shipper-solo-team".into()),
+        version: 1,
+        roles: vec![shipper.name.clone()],
+        message_graph: vec![],
+        terminal_role: shipper.name.clone(),
+        max_retries: 0,
+    };
+    redis_io::save_role(&mut conn, &shipper).await?;
+    redis_io::save_team(&mut conn, &shipper_team).await?;
+
     tracing::info!(
-        "seeded: roles [echo, naughty, speaker, listener, grok-echo, claude-echo, synthesizer, narrowed-coder] v1; teams [echo, naughty, speaker-listener, grok-echo, claude-echo, narrowed-team] v1"
+        "seeded: roles [echo, naughty, speaker, listener, grok-echo, claude-echo, synthesizer, narrowed-coder, shipper] v1; teams [echo, naughty, speaker-listener, grok-echo, claude-echo, narrowed-team, shipper-solo-team] v1"
     );
     Ok(())
 }

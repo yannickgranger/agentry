@@ -66,6 +66,10 @@ build-m6:
     cd containers/synthesizer-agent  && podman build -t agentry/synthesizer-agent:v1  -f Containerfile .
     cd containers/narrowed-coder-agent && podman build -t agentry/narrowed-coder-agent:v1 -f Containerfile .
 
+# Build M7 shipper image.
+build-m7:
+    cd containers/shipper-agent && podman build -t agentry/shipper-agent:v1 -f Containerfile .
+
 # Start local dev Redis container on :6380. Idempotent.
 dev-redis-up:
     #!/usr/bin/env bash
@@ -147,6 +151,22 @@ verify-M0:
     echo "Brief submitted. Waiting for verdict..."
     sleep 5
     redis-cli -h 127.0.0.1 -p 6380 -a "$AGENTRY_REDIS_PASSWORD" --no-auth-warning XREVRANGE agentry:verdicts + - COUNT 1
+
+# Verify M7: shipper opens a real PR on yg/agentry-toy.
+# Requires GITEA_TOKEN in orchestratord's env (via keepassxc gitea/agency.lab).
+verify-M7:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    ./target/release/orchestrator submit examples/verify-M7.json
+    echo "Brief submitted. Waiting for shipper to clone/push/PR..."
+    sleep 15
+    echo "--- verdict (expect kind=shipped) ---"
+    redis-cli -h 127.0.0.1 -p 6380 -a "$AGENTRY_REDIS_PASSWORD" --no-auth-warning XREVRANGE agentry:verdicts + - COUNT 1
+    echo "--- trace ---"
+    redis-cli -h 127.0.0.1 -p 6380 -a "$AGENTRY_REDIS_PASSWORD" --no-auth-warning XRANGE agentry:brief:brf_verify_m7:trace - +
+    echo "--- trace must have 'PR opened' with html_url ---"
+    redis-cli -h 127.0.0.1 -p 6380 -a "$AGENTRY_REDIS_PASSWORD" --no-auth-warning XRANGE agentry:brief:brf_verify_m7:trace - + \
+        | grep -q 'PR opened' && echo "M7 verify PASS" || (echo "M7 verify FAIL"; exit 1)
 
 # Verify M6: synthesizer narrows coder's fs:write scope via permit_overrides.
 verify-M6:
