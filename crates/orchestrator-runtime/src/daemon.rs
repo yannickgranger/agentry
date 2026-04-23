@@ -1,9 +1,10 @@
 //! Daemon: XREAD loop on `agentry:briefs`, per-brief orchestration.
 //!
-//! M0 scope:
-//!   - Single-role teams only (echo-team).
-//!   - Spawn → run → verdict → next.
-//!   - Message routing between roles: M4+.
+//! For each brief: fetch the team topology, then for each role in turn —
+//! mint + narrow + sign a permit, spawn the role's container, collect its
+//! outbox, propagate permit_overrides declared on the team's message_graph
+//! edges, append a verdict. If the terminal verdict is `Shipped` and the
+//! brief's payload names a `next_brief_ref`, submit that brief.
 
 use crate::{
     permit as permit_mod, redis_io,
@@ -205,7 +206,9 @@ async fn fetch_role_any_version(
     })
 }
 
-/// Mint an unsigned permit for M0. Signing lands in M3.
+/// Mint an unsigned permit from the brief's budget and the role's declared
+/// scope. The caller signs it via `permit::sign` before handing it to the
+/// spawner.
 fn mint_permit(brief: &Brief, role: &AgentRole) -> Result<WorkPermit> {
     let agent_id = format!("agt_{}", uuid::Uuid::now_v7());
     let permit_id = format!("prm_{}", uuid::Uuid::now_v7());

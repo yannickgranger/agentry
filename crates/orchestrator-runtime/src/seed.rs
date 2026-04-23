@@ -16,7 +16,23 @@ use orchestrator_types::{
 // Entrypoint scripts — inlined from what used to live in containers/*/entrypoint.sh.
 // Each is a self-contained bash program that reads the startup JSON bundle on
 // stdin (unless it ignores it) and emits NDJSON Events on stdout.
+//
+// Scripts that need structured jq-built events include `BASH_PRELUDE` at the
+// top (via concat!) to pull in shared `emit_event` / `emit_done` helpers.
+// Minimal scripts that only emit hand-formatted printf lines skip the prelude.
 // ---------------------------------------------------------------------------
+
+/// Bash helpers injected at the top of scripts that build structured events
+/// via jq. Defines `emit_event <payload-json>` and `emit_done <verdict>`.
+const BASH_PRELUDE: &str = r#"emit_event() {
+    jq -nc --arg at "$(date -Iseconds)" --argjson payload "$1" \
+        '{at:$at, type:"event", payload:$payload}'
+}
+emit_done() {
+    jq -nc --arg at "$(date -Iseconds)" --arg v "$1" \
+        '{at:$at, type:"done", verdict:$v}'
+}
+"#;
 
 const ECHO_SCRIPT: &str = r#"#!/usr/bin/env bash
 # Reads a startup JSON from stdin (ignored), emits one event + one terminal done.
@@ -73,15 +89,6 @@ prompt="$(jq -r '.brief.payload.prompt // "Hello?"' <<<"$bundle")"
 model="$(jq -r '.role.model // "grok-4-fast"' <<<"$bundle")"
 system="$(jq -r '.role.system_prompt // ""' <<<"$bundle")"
 
-emit_event() {
-    jq -nc --arg at "$(date -Iseconds)" --argjson payload "$1" \
-        '{at:$at, type:"event", payload:$payload}'
-}
-emit_done() {
-    jq -nc --arg at "$(date -Iseconds)" --arg v "$1" \
-        '{at:$at, type:"done", verdict:$v}'
-}
-
 if [ -z "${XAI_API_KEY:-}" ]; then
     emit_event '{"msg":"XAI_API_KEY not provided — role.passthru_env must include it and orchestratord env must set it"}'
     emit_done "failed"
@@ -120,15 +127,6 @@ const CLAUDE_SCRIPT: &str = r#"#!/usr/bin/env bash
 set -euo pipefail
 bundle="$(cat)"
 prompt="$(jq -r '.brief.payload.prompt // "Hello?"' <<<"$bundle")"
-
-emit_event() {
-    jq -nc --arg at "$(date -Iseconds)" --argjson payload "$1" \
-        '{at:$at, type:"event", payload:$payload}'
-}
-emit_done() {
-    jq -nc --arg at "$(date -Iseconds)" --arg v "$1" \
-        '{at:$at, type:"done", verdict:$v}'
-}
 
 # The bind-mount target directory must exist before podman mounts the creds
 # file into /root/.claude/. On a stock debian:bookworm-slim image HOME=/root
@@ -195,13 +193,6 @@ pr_title="$(jq -r '.brief.payload.pr_title' <<<"$bundle")"
 pr_body="$(jq -r '.brief.payload.pr_body' <<<"$bundle")"
 base_branch="$(jq -r '.brief.payload.base // "main"' <<<"$bundle")"
 forge_host="$(jq -r '.brief.payload.forge_host // "agency.lab:3000"' <<<"$bundle")"
-
-emit_event() {
-    jq -nc --arg at "$(date -Iseconds)" --argjson p "$1" '{at:$at, type:"event", payload:$p}'
-}
-emit_done() {
-    jq -nc --arg at "$(date -Iseconds)" --arg v "$1" '{at:$at, type:"done", verdict:$v}'
-}
 
 if [ -z "${GITEA_TOKEN:-}" ]; then
     emit_event '{"error":"GITEA_TOKEN not in env — role.passthru_env must include it"}'
@@ -289,7 +280,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         image: ALPINE.into(),
         substrate_class: SubstrateClass::Podman,
         package_manager: PackageManager::Apk,
-        entrypoint_script: Some(ECHO_SCRIPT.into()),
+        entrypoint_script: ECHO_SCRIPT.into(),
         binaries: vec![],
         mcp_servers: vec![],
         tool_allowlist: ToolAllowlist(vec![]),
@@ -315,7 +306,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         image: ALPINE.into(),
         substrate_class: SubstrateClass::Podman,
         package_manager: PackageManager::Apk,
-        entrypoint_script: Some(NAUGHTY_SCRIPT.into()),
+        entrypoint_script: NAUGHTY_SCRIPT.into(),
         binaries: vec![],
         mcp_servers: vec![],
         tool_allowlist: ToolAllowlist(vec!["read".into()]),
@@ -341,7 +332,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         image: ALPINE.into(),
         substrate_class: SubstrateClass::Podman,
         package_manager: PackageManager::Apk,
-        entrypoint_script: Some(SPEAKER_SCRIPT.into()),
+        entrypoint_script: SPEAKER_SCRIPT.into(),
         binaries: vec![],
         mcp_servers: vec![],
         tool_allowlist: ToolAllowlist(vec![]),
@@ -357,7 +348,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         image: ALPINE.into(),
         substrate_class: SubstrateClass::Podman,
         package_manager: PackageManager::Apk,
-        entrypoint_script: Some(LISTENER_SCRIPT.into()),
+        entrypoint_script: LISTENER_SCRIPT.into(),
         binaries: vec![],
         mcp_servers: vec![],
         tool_allowlist: ToolAllowlist(vec![]),
@@ -387,7 +378,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         image: ALPINE.into(),
         substrate_class: SubstrateClass::Podman,
         package_manager: PackageManager::Apk,
-        entrypoint_script: Some(GROK_SCRIPT.into()),
+        entrypoint_script: format!("{BASH_PRELUDE}{GROK_SCRIPT}"),
         binaries: vec!["curl".into()],
         mcp_servers: vec![],
         tool_allowlist: ToolAllowlist(vec![]),
@@ -416,7 +407,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         image: DEBIAN.into(),
         substrate_class: SubstrateClass::Podman,
         package_manager: PackageManager::Apt,
-        entrypoint_script: Some(CLAUDE_SCRIPT.into()),
+        entrypoint_script: format!("{BASH_PRELUDE}{CLAUDE_SCRIPT}"),
         binaries: vec![],
         mcp_servers: vec![],
         tool_allowlist: ToolAllowlist(vec![]),
@@ -460,7 +451,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         image: ALPINE.into(),
         substrate_class: SubstrateClass::Podman,
         package_manager: PackageManager::Apk,
-        entrypoint_script: Some(SYNTHESIZER_SCRIPT.into()),
+        entrypoint_script: SYNTHESIZER_SCRIPT.into(),
         binaries: vec![],
         mcp_servers: vec![],
         tool_allowlist: ToolAllowlist(vec![]),
@@ -476,7 +467,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         image: ALPINE.into(),
         substrate_class: SubstrateClass::Podman,
         package_manager: PackageManager::Apk,
-        entrypoint_script: Some(NARROWED_CODER_SCRIPT.into()),
+        entrypoint_script: NARROWED_CODER_SCRIPT.into(),
         binaries: vec![],
         mcp_servers: vec![],
         // Broad base — will be narrowed by synthesizer's Message.
@@ -511,7 +502,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         image: ALPINE.into(),
         substrate_class: SubstrateClass::Podman,
         package_manager: PackageManager::Apk,
-        entrypoint_script: Some(SHIPPER_SCRIPT.into()),
+        entrypoint_script: format!("{BASH_PRELUDE}{SHIPPER_SCRIPT}"),
         binaries: vec!["git".into(), "curl".into()],
         mcp_servers: vec![],
         tool_allowlist: ToolAllowlist(vec![]),

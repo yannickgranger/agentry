@@ -35,15 +35,10 @@ pub enum SubstrateClass {
 }
 
 /// Which package manager the spawner uses to install `binaries` at spawn time.
-/// Picked explicitly per role; no heuristic from image name. `None` disables
-/// install entirely (used when the base image already contains everything
-/// the entrypoint needs).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// Picked explicitly per role; no heuristic from image name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PackageManager {
-    /// No install at spawn — script runs directly. Default.
-    #[default]
-    None,
     /// Alpine — `apk add --no-cache <binaries>`.
     Apk,
     /// Debian/Ubuntu — `apt-get update && apt-get install -y <binaries>`.
@@ -113,16 +108,13 @@ pub struct AgentRole {
     /// Substrate to spawn on.
     #[serde(default)]
     pub substrate_class: SubstrateClass,
-    /// Package manager to use when installing `binaries` at spawn. `None`
-    /// skips install (base image has everything).
-    #[serde(default)]
+    /// Package manager to use when installing `binaries` at spawn.
     pub package_manager: PackageManager,
-    /// Inline entrypoint script (bash). When set, spawner delivers it to the
+    /// Inline entrypoint script (bash). The spawner delivers it to the
     /// container via the `AGENTRY_SCRIPT` env var, installs `binaries` via
-    /// `package_manager`, then execs it. When `None`, spawner falls back to
-    /// the image's baked ENTRYPOINT (legacy path).
-    #[serde(default)]
-    pub entrypoint_script: Option<String>,
+    /// `package_manager`, then execs it. Required — every role ships its
+    /// own script.
+    pub entrypoint_script: String,
     /// Package names to install at spawn via `package_manager`. The spawner
     /// always adds a baseline (`bash ca-certificates coreutils jq`); this
     /// list is role-specific extras (e.g. `["git", "curl"]`).
@@ -163,7 +155,7 @@ mod tests {
             image: "alpine:3.21".into(),
             substrate_class: SubstrateClass::Podman,
             package_manager: PackageManager::Apk,
-            entrypoint_script: Some("#!/usr/bin/env bash\necho hello\n".into()),
+            entrypoint_script: "#!/usr/bin/env bash\necho hello\n".into(),
             binaries: vec!["git".into(), "curl".into()],
             mcp_servers: vec![McpServer {
                 name: "ra-query".into(),
@@ -187,28 +179,6 @@ mod tests {
     #[test]
     fn default_substrate_is_podman() {
         assert_eq!(SubstrateClass::default(), SubstrateClass::Podman);
-    }
-
-    #[test]
-    fn default_package_manager_is_none() {
-        assert_eq!(PackageManager::default(), PackageManager::None);
-    }
-
-    #[test]
-    fn role_without_entrypoint_script_deserializes() {
-        // Backward-compat: old role JSON without entrypoint_script / package_manager
-        // fields must still deserialize cleanly, defaulting to None / PackageManager::None.
-        let json = r#"{
-            "name": "legacy-agent",
-            "version": 1,
-            "model": null,
-            "system_prompt": null,
-            "image": "agentry/legacy-agent:v1"
-        }"#;
-        let r: AgentRole = serde_json::from_str(json).expect("de");
-        assert!(r.entrypoint_script.is_none());
-        assert_eq!(r.package_manager, PackageManager::None);
-        assert!(r.binaries.is_empty());
     }
 
     #[test]

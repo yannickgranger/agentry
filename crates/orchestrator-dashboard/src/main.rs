@@ -33,8 +33,9 @@ use axum::{Json, Router};
 use futures::Stream;
 use orchestrator_runtime::{redis_io, Config};
 use orchestrator_types::{
-    brief::EscalationMode, role::McpServer, AgentRole, Brief, MessageEdge, PermitScope, Project,
-    ProjectSlug, RoleName, StandingOrders, SubstrateClass, TeamName, TeamTopology, ToolAllowlist,
+    brief::EscalationMode, role::McpServer, AgentRole, Brief, MessageEdge, PackageManager,
+    PermitScope, Project, ProjectSlug, RoleName, StandingOrders, SubstrateClass, TeamName,
+    TeamTopology, ToolAllowlist,
 };
 use redis::aio::ConnectionManager;
 use redis::streams::{StreamReadOptions, StreamReadReply};
@@ -676,23 +677,29 @@ async fn roles_list(State(app): State<AppState>) -> Result<Html<String>, AppErro
 }
 
 async fn role_new_form() -> Html<String> {
-    let body = r#"<h2 class="text-lg font-semibold text-slate-200 mb-4">New role</h2>
+    let body = r##"<h2 class="text-lg font-semibold text-slate-200 mb-4">New role</h2>
 <form method="POST" action="/roles" class="space-y-4">
   <div><label class="block text-sm text-slate-400 mb-1">name <span class="text-xs text-slate-600">(lowercase, hyphens)</span></label>
     <input name="name" required pattern="[a-z0-9-]+" class="w-full bg-slate-900 border border-slate-700 rounded px-3 py-2 text-slate-100"></div>
   <div><label class="block text-sm text-slate-400 mb-1">model <span class="text-xs text-slate-600">(optional)</span></label>
     <input name="model" placeholder="claude-opus-4-7 / grok-4 / gemini-2-flash" class="w-full bg-slate-900 border border-slate-700 rounded px-3 py-2 text-slate-100"></div>
-  <div><label class="block text-sm text-slate-400 mb-1">image <span class="text-xs text-slate-600">(fully qualified)</span></label>
-    <input name="image" required placeholder="localhost/agentry/echo-agent:v1" class="w-full bg-slate-900 border border-slate-700 rounded px-3 py-2 font-mono text-sm text-slate-100"></div>
+  <div><label class="block text-sm text-slate-400 mb-1">base image <span class="text-xs text-slate-600">(stock public image; spawner installs binaries + execs entrypoint)</span></label>
+    <input name="image" required placeholder="docker.io/library/alpine:3.21" class="w-full bg-slate-900 border border-slate-700 rounded px-3 py-2 font-mono text-sm text-slate-100"></div>
   <div><label class="block text-sm text-slate-400 mb-1">substrate</label>
     <select name="substrate_class" class="bg-slate-900 border border-slate-700 rounded px-3 py-2 text-slate-100">
       <option value="podman" selected>podman</option><option value="docker">docker</option>
       <option value="lxc">lxc</option><option value="ssh">ssh</option><option value="vm">vm</option>
     </select></div>
+  <div><label class="block text-sm text-slate-400 mb-1">package manager <span class="text-xs text-slate-600">(alpine:apk | debian:apt)</span></label>
+    <select name="package_manager" required class="bg-slate-900 border border-slate-700 rounded px-3 py-2 text-slate-100">
+      <option value="apk" selected>apk (alpine)</option><option value="apt">apt (debian/ubuntu)</option>
+    </select></div>
+  <div><label class="block text-sm text-slate-400 mb-1">entrypoint script <span class="text-xs text-slate-600">(bash; reads startup JSON on stdin, emits NDJSON events on stdout)</span></label>
+    <textarea name="entrypoint_script" rows="10" required placeholder="#!/usr/bin/env bash&#10;set -euo pipefail&#10;cat > /dev/null&#10;printf '{&quot;at&quot;:&quot;%s&quot;,&quot;type&quot;:&quot;done&quot;,&quot;verdict&quot;:&quot;shipped&quot;}\n' &quot;$(date -Iseconds)&quot;" class="w-full bg-slate-900 border border-slate-700 rounded px-3 py-2 font-mono text-xs text-slate-100"></textarea></div>
   <div><label class="block text-sm text-slate-400 mb-1">system prompt <span class="text-xs text-slate-600">(optional, or @file://path)</span></label>
     <textarea name="system_prompt" rows="4" class="w-full bg-slate-900 border border-slate-700 rounded px-3 py-2 text-sm text-slate-100"></textarea></div>
-  <div><label class="block text-sm text-slate-400 mb-1">binaries <span class="text-xs text-slate-600">(CSV)</span></label>
-    <input name="binaries_csv" placeholder="rustc,cargo,sccache" class="w-full bg-slate-900 border border-slate-700 rounded px-3 py-2 font-mono text-sm text-slate-100"></div>
+  <div><label class="block text-sm text-slate-400 mb-1">binaries <span class="text-xs text-slate-600">(CSV; extras on top of baseline bash/coreutils/jq/ca-certificates)</span></label>
+    <input name="binaries_csv" placeholder="git,curl" class="w-full bg-slate-900 border border-slate-700 rounded px-3 py-2 font-mono text-sm text-slate-100"></div>
   <div><label class="block text-sm text-slate-400 mb-1">tool allowlist <span class="text-xs text-slate-600">(CSV)</span></label>
     <input name="tool_allowlist_csv" placeholder="read,edit,bash:cargo" class="w-full bg-slate-900 border border-slate-700 rounded px-3 py-2 font-mono text-sm text-slate-100"></div>
   <div><label class="block text-sm text-slate-400 mb-1">permit scope <span class="text-xs text-slate-600">(one per line)</span></label>
@@ -704,7 +711,7 @@ async fn role_new_form() -> Html<String> {
   <div><label class="block text-sm text-slate-400 mb-1">bind mounts <span class="text-xs text-slate-600">(one per line: <code>source:target[:ro]</code>)</span></label>
     <textarea name="mounts_lines" rows="3" placeholder="/var/home/yg/.local/bin/claude:/usr/local/bin/claude:ro&#10;/var/home/yg/.claude/.credentials.json:/root/.claude/.credentials.json:ro" class="w-full bg-slate-900 border border-slate-700 rounded px-3 py-2 font-mono text-sm text-slate-100"></textarea></div>
   <button type="submit" class="px-4 py-2 rounded bg-indigo-700 hover:bg-indigo-600 text-white">save (auto v=next)</button>
-</form>"#;
+</form>"##;
     Html(page("agentry — new role", body))
 }
 
@@ -714,6 +721,8 @@ struct RoleForm {
     model: Option<String>,
     image: String,
     substrate_class: String,
+    package_manager: String,
+    entrypoint_script: String,
     system_prompt: Option<String>,
     binaries_csv: String,
     tool_allowlist_csv: String,
@@ -756,6 +765,13 @@ async fn role_create(
     let substrate_class: SubstrateClass =
         serde_json::from_value(Value::String(f.substrate_class.clone()))
             .map_err(|e| anyhow::anyhow!("invalid substrate_class: {e}"))?;
+    let package_manager: PackageManager =
+        serde_json::from_value(Value::String(f.package_manager.clone()))
+            .map_err(|e| anyhow::anyhow!("invalid package_manager: {e}"))?;
+
+    if f.entrypoint_script.trim().is_empty() {
+        return Err(anyhow::anyhow!("entrypoint_script is required").into());
+    }
 
     let mcp_servers: Vec<McpServer> = if f.mcp_servers_json.trim().is_empty() {
         Vec::new()
@@ -778,12 +794,8 @@ async fn role_create(
         system_prompt,
         image: f.image,
         substrate_class,
-        // Dashboard-created roles default to the legacy path (image supplies its
-        // own ENTRYPOINT). Inline-script roles are seeded programmatically for
-        // now; adding entrypoint_script + package_manager to the form is a
-        // follow-up.
-        package_manager: Default::default(),
-        entrypoint_script: None,
+        package_manager,
+        entrypoint_script: f.entrypoint_script,
         binaries: split_csv(&f.binaries_csv),
         mcp_servers,
         tool_allowlist: ToolAllowlist(split_csv(&f.tool_allowlist_csv)),

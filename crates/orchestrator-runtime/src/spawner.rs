@@ -1,4 +1,4 @@
-//! Spawner — abstract container lifecycle; Podman adapter for M0.
+//! Spawner — abstract container lifecycle; Podman adapter.
 //!
 //! The Spawner:
 //!   1. Accepts a Brief + AgentRole + WorkPermit.
@@ -7,7 +7,8 @@
 //!   4. Tails stdout as NDJSON `Event`s, mirroring each to the brief's trace stream.
 //!   5. On `Done`, appends a Verdict and tears down the container.
 //!
-//! For M0: only Podman is implemented. Other substrates come later.
+//! Only Podman is implemented today; other substrates (Docker, LXC, SSH, VM)
+//! will land as sibling adapters implementing the same `Spawner` trait.
 
 use crate::{permit as permit_mod, redis_io, Error, Result};
 use async_trait::async_trait;
@@ -79,7 +80,7 @@ pub trait Spawner: Send + Sync {
     ) -> Result<AgentOutcome>;
 }
 
-/// Podman spawner (M0).
+/// Podman spawner.
 pub struct PodmanSpawner;
 
 impl PodmanSpawner {
@@ -180,20 +181,15 @@ impl Spawner for PodmanSpawner {
             cmd.arg("-v").arg(spec);
         }
 
-        // If the role ships an inline entrypoint script, pass it as an env var
+        // Deliver the inline entrypoint script via the AGENTRY_SCRIPT env var
         // and override the image command with a bootstrap that installs
         // `binaries` via the declared package manager and execs the script.
-        // This replaces the need for per-agent Containerfiles.
-        if let Some(script) = &role.entrypoint_script {
-            cmd.arg("--env").arg(format!("AGENTRY_SCRIPT={script}"));
-            cmd.arg(&role.image);
-            cmd.arg("sh")
-                .arg("-c")
-                .arg(bootstrap_command(role.package_manager, &role.binaries));
-        } else {
-            // Legacy path: image provides its own ENTRYPOINT.
-            cmd.arg(&role.image);
-        }
+        cmd.arg("--env")
+            .arg(format!("AGENTRY_SCRIPT={}", role.entrypoint_script));
+        cmd.arg(&role.image);
+        cmd.arg("sh")
+            .arg("-c")
+            .arg(bootstrap_command(role.package_manager, &role.binaries));
 
         cmd.stdin(Stdio::piped());
         cmd.stdout(Stdio::piped());
@@ -269,7 +265,7 @@ impl Spawner for PodmanSpawner {
             }
         }
 
-        // Capture stderr (diagnostic only — not mirrored to trace for M0).
+        // Capture stderr (diagnostic only — not mirrored to trace).
         if let Some(mut stderr) = child.stderr.take() {
             let mut buf = Vec::new();
             use tokio::io::AsyncReadExt;
@@ -344,8 +340,7 @@ async fn append_audit(
 ///
 /// Installs a baseline (`bash ca-certificates coreutils jq`) plus role-specific
 /// `binaries` via the declared `package_manager`, then execs the script
-/// delivered via the `AGENTRY_SCRIPT` env var. When `package_manager` is
-/// `None`, the install phase is a no-op and the script runs directly.
+/// delivered via the `AGENTRY_SCRIPT` env var.
 fn bootstrap_command(pm: PackageManager, extra_binaries: &[String]) -> String {
     const BASELINE: &[&str] = &["bash", "ca-certificates", "coreutils", "jq"];
     let all: Vec<&str> = BASELINE
@@ -359,17 +354,12 @@ fn bootstrap_command(pm: PackageManager, extra_binaries: &[String]) -> String {
         PackageManager::Apt => format!(
             "apt-get update -qq >/dev/null && apt-get install -y --no-install-recommends {pkgs} >/dev/null"
         ),
-        PackageManager::None => ":".to_string(),
     };
     // $AGENTRY_SCRIPT is passed as an env var by the spawner. `bash -c` runs
     // it as a script; the script's own `cat` still reads the startup JSON
     // bundle from stdin (not affected by the outer bootstrap).
     format!("set -e\n{install}\nexec bash -c \"$AGENTRY_SCRIPT\"")
 }
-
-// Silence unused imports in M0 (full use comes in later milestones).
-#[allow(dead_code)]
-fn _used(_: EventKind, _: BriefId) {}
 
 #[cfg(test)]
 mod tests {
@@ -398,15 +388,6 @@ mod tests {
         let s = bootstrap_command(PackageManager::Apt, &[]);
         assert!(s.contains("apt-get update"));
         assert!(s.contains("apt-get install -y --no-install-recommends"));
-        assert!(s.contains("exec bash -c \"$AGENTRY_SCRIPT\""));
-    }
-
-    #[test]
-    fn bootstrap_none_skips_install() {
-        let s = bootstrap_command(PackageManager::None, &[]);
-        assert!(!s.contains("apk"));
-        assert!(!s.contains("apt-get"));
-        assert!(s.contains(":\n"));
         assert!(s.contains("exec bash -c \"$AGENTRY_SCRIPT\""));
     }
 }

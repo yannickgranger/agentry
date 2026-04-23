@@ -1,6 +1,6 @@
 //! orchestrator — the CLI.
 //! `orchestrator submit <brief-file>` — submit a brief.
-//! `orchestrator seed` — seed the registry (M0: echo role + team).
+//! `orchestrator seed` — seed the registry (roles + teams).
 //! `orchestrator verdicts` — list last N verdicts.
 //! `orchestrator abort --all` — abort all running briefs.
 
@@ -23,7 +23,7 @@ enum Cmd {
         /// Path to a JSON Brief file.
         file: PathBuf,
     },
-    /// Seed the registry with M0 defaults (echo-agent role + echo-team).
+    /// Seed the registry with the default roles and team topologies.
     Seed,
     /// List the last N verdicts.
     Verdicts {
