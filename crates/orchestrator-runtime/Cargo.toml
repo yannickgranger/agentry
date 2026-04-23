@@ -27,6 +27,9 @@ async-trait.workspace = true
 chrono.workspace = true
 uuid.workspace = true
 clap.workspace = true
+ed25519-dalek.workspace = true
+rand_core.workspace = true
+hex.workspace = true
 
 [lints]
 workspace = true

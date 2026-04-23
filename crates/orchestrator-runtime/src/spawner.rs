@@ -9,12 +9,14 @@
 //!
 //! For M0: only Podman is implemented. Other substrates come later.
 
-use crate::{Error, Result, redis_io};
+use crate::{Error, Result, permit as permit_mod, redis_io};
 use async_trait::async_trait;
+use ed25519_dalek::VerifyingKey;
 use orchestrator_types::{
     AgentRole, Brief, BriefId, Event, EventKind, Verdict, VerdictKind, WorkPermit,
 };
 use redis::aio::ConnectionManager;
+use redis::AsyncCommands;
 use serde::Serialize;
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -38,12 +40,14 @@ pub struct AgentHandle {
 /// The spawner abstraction.
 #[async_trait]
 pub trait Spawner: Send + Sync {
-    /// Run the agent fully: spawn, pipe stdin, tail stdout to trace, write verdict, tear down.
+    /// Run the agent fully: spawn, pipe stdin, tail stdout to trace, enforce
+    /// permit on tool-call events, write verdict, tear down.
     async fn run_agent(
         &self,
         brief: &Brief,
         role: &AgentRole,
         permit: &WorkPermit,
+        verifying_key: &VerifyingKey,
         conn: &mut ConnectionManager,
     ) -> Result<(AgentHandle, Verdict)>;
 }
@@ -75,8 +79,12 @@ impl Spawner for PodmanSpawner {
         brief: &Brief,
         role: &AgentRole,
         permit: &WorkPermit,
+        verifying_key: &VerifyingKey,
         conn: &mut ConnectionManager,
     ) -> Result<(AgentHandle, Verdict)> {
+        // Defence in depth: verify the permit we're about to hand out.
+        permit_mod::verify(permit, verifying_key)?;
+
         let agent_id = &permit.agent_id;
         let name = Self::container_name(agent_id);
 
@@ -130,12 +138,34 @@ impl Spawner for PodmanSpawner {
         let mut reader = BufReader::new(stdout).lines();
 
         let mut terminal: Option<Event> = None;
+        let mut permit_violation: Option<String> = None;
         while let Some(line) = reader.next_line().await? {
             if line.is_empty() {
                 continue;
             }
             match serde_json::from_str::<Event>(&line) {
                 Ok(ev) => {
+                    // Enforce permit on tool calls: any call outside the
+                    // allowlist kills the container immediately.
+                    if let EventKind::ToolCall { call } = &ev.kind {
+                        append_audit(conn, &brief.id, agent_id, &call.tool, &call.args).await.ok();
+                        if !permit_mod::tool_allowed(permit, &call.tool) {
+                            tracing::warn!(
+                                brief = %brief.id,
+                                agent = %agent_id,
+                                tool = %call.tool,
+                                "permit violation — killing container"
+                            );
+                            permit_violation = Some(call.tool.clone());
+                            redis_io::append_trace(conn, &brief.id, agent_id, &ev).await?;
+                            // Best-effort container stop.
+                            let _ = tokio::process::Command::new("podman")
+                                .args(["stop", "-t", "1", &name])
+                                .output()
+                                .await;
+                            break;
+                        }
+                    }
                     redis_io::append_trace(conn, &brief.id, agent_id, &ev).await?;
                     if ev.is_terminal() {
                         terminal = Some(ev);
@@ -160,19 +190,19 @@ impl Spawner for PodmanSpawner {
 
         let status = child.wait().await?;
 
-        let verdict_kind = match terminal.as_ref().and_then(Event::verdict) {
-            Some(v) => VerdictKind::from(v),
-            None => {
-                tracing::warn!(brief=%brief.id, exit=?status.code(), "no done event");
-                VerdictKind::Failed
+        let (verdict_kind, reason) = if let Some(tool) = permit_violation.clone() {
+            (
+                VerdictKind::PermitViolation,
+                Some(format!("unauthorized tool call: {tool}")),
+            )
+        } else {
+            match terminal.as_ref().and_then(Event::verdict) {
+                Some(v) => (VerdictKind::from(v), None),
+                None => (
+                    VerdictKind::Failed,
+                    Some(format!("agent exited without done event (code={:?})", status.code())),
+                ),
             }
-        };
-
-        let reason = match &verdict_kind {
-            VerdictKind::Failed if terminal.is_none() => {
-                Some(format!("agent exited without done event (code={:?})", status.code()))
-            }
-            _ => None,
         };
 
         let verdict = Verdict::new(brief.id.clone(), verdict_kind);
@@ -197,6 +227,32 @@ mod tests {
         let n = PodmanSpawner::container_name("agt_abcd");
         assert_eq!(n, "agentry-agt_abcd");
     }
+}
+
+/// Append a tool-call entry to the brief's audit stream (independent from the trace).
+/// Audit is tamper-evident (append-only) and contains what was asked for, regardless
+/// of whether the broker allowed it. Used by dashboards + post-hoc review.
+async fn append_audit(
+    conn: &mut ConnectionManager,
+    brief: &BriefId,
+    agent_id: &str,
+    tool: &str,
+    args: &serde_json::Value,
+) -> Result<()> {
+    let stream = format!("agentry:brief:{}:audit", brief.0);
+    let args_str = serde_json::to_string(args)?;
+    let _: String = conn
+        .xadd(
+            &stream,
+            "*",
+            &[
+                ("agent", agent_id),
+                ("tool", tool),
+                ("args", args_str.as_str()),
+            ],
+        )
+        .await?;
+    Ok(())
 }
 
 // Silence unused imports in M0 (full use comes in later milestones).

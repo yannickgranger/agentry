@@ -9,6 +9,7 @@
 
 pub mod daemon;
 pub mod errors;
+pub mod permit;
 pub mod redis_io;
 pub mod seed;
 pub mod spawner;

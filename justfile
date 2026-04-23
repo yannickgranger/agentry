@@ -31,6 +31,10 @@ fix:
 build-echo:
     cd containers/echo-agent && podman build -t agentry/echo-agent:v1 -f Containerfile .
 
+# Build naughty-agent container image (M3)
+build-naughty:
+    cd containers/naughty-agent && podman build -t agentry/naughty-agent:v1 -f Containerfile .
+
 # Start dev infra (orchestratord + dashboard as user processes, podman for agents)
 dev-up: build build-echo
     #!/usr/bin/env bash
@@ -81,6 +85,21 @@ verify-M0:
     echo "Brief submitted. Waiting for verdict..."
     sleep 5
     redis-cli -h 192.168.1.152 -p 6379 -a RedisRationalized2026 --no-auth-warning XREVRANGE agentry:verdicts + - COUNT 1
+
+# Verify M3: naughty agent attempts an unauthorized tool call; broker kills it.
+verify-M3:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    ./target/release/orchestrator submit examples/verify-M3.json
+    echo "Brief submitted. Waiting for broker to kill the naughty agent..."
+    sleep 6
+    echo "--- verdict (expect kind=permit_violation) ---"
+    redis-cli -h 192.168.1.152 -p 6379 -a RedisRationalized2026 --no-auth-warning XREVRANGE agentry:verdicts + - COUNT 1
+    echo "--- audit stream (should record the unauthorized attempt) ---"
+    redis-cli -h 192.168.1.152 -p 6379 -a RedisRationalized2026 --no-auth-warning XRANGE agentry:brief:brf_verify_m3:audit - +
+    echo ""
+    redis-cli -h 192.168.1.152 -p 6379 -a RedisRationalized2026 --no-auth-warning XREVRANGE agentry:verdicts + - COUNT 1 \
+        | grep -q '"kind":"permit_violation"' && echo "M3 verify PASS" || (echo "M3 verify FAIL — expected permit_violation"; exit 1)
 
 # Verify M2: create a role + team via dashboard forms, run a brief on them.
 verify-M2:

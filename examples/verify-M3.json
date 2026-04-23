@@ -1,0 +1,11 @@
+{
+  "id": "brf_verify_m3",
+  "project": null,
+  "topology": { "name": "naughty-team", "version": 1 },
+  "payload": { "kind": "misbehaviour-check" },
+  "budget": {},
+  "escalation": "autonomous",
+  "parent_brief": null,
+  "submitted_by": "verify-m3",
+  "submitted_at": "2026-04-23T12:00:00Z"
+}

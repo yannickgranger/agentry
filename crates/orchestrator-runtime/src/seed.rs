@@ -8,7 +8,7 @@ use orchestrator_types::{
     ToolAllowlist,
 };
 
-/// Seed the M0 registry.
+/// Seed the M0/M3 registry.
 pub async fn seed_m0() -> Result<()> {
     let mut conn = redis_io::connect().await?;
 
@@ -25,7 +25,7 @@ pub async fn seed_m0() -> Result<()> {
         permit_scope: PermitScope(vec!["net:deny:*".into()]),
     };
 
-    let team = TeamTopology {
+    let echo_team = TeamTopology {
         name: TeamName("echo-team".into()),
         version: 1,
         roles: vec![echo.name.clone()],
@@ -34,9 +34,38 @@ pub async fn seed_m0() -> Result<()> {
         max_retries: 0,
     };
 
-    redis_io::save_role(&mut conn, &echo).await?;
-    redis_io::save_team(&mut conn, &team).await?;
+    // M3: naughty agent — allowlist is `[read]`; the container will emit a
+    // `write` tool_call which the broker must block. Verify expects a
+    // permit_violation verdict.
+    let naughty = AgentRole {
+        name: RoleName("naughty-agent".into()),
+        version: 1,
+        model: None,
+        system_prompt: None,
+        image: "localhost/agentry/naughty-agent:v1".into(),
+        substrate_class: SubstrateClass::Podman,
+        binaries: vec![],
+        mcp_servers: vec![],
+        tool_allowlist: ToolAllowlist(vec!["read".into()]),
+        permit_scope: PermitScope(vec!["net:deny:*".into()]),
+    };
 
-    tracing::info!("seeded: role echo-agent v1, team echo-team v1");
+    let naughty_team = TeamTopology {
+        name: TeamName("naughty-team".into()),
+        version: 1,
+        roles: vec![naughty.name.clone()],
+        message_graph: Vec::<MessageEdge>::new(),
+        terminal_role: naughty.name.clone(),
+        max_retries: 0,
+    };
+
+    redis_io::save_role(&mut conn, &echo).await?;
+    redis_io::save_team(&mut conn, &echo_team).await?;
+    redis_io::save_role(&mut conn, &naughty).await?;
+    redis_io::save_team(&mut conn, &naughty_team).await?;
+
+    tracing::info!(
+        "seeded: roles [echo-agent v1, naughty-agent v1], teams [echo-team v1, naughty-team v1]"
+    );
     Ok(())
 }

@@ -6,3 +6,6 @@ target/
 .env
 .vscode/
 .idea/
+# Signing key — never commit.
+signing.key
+*.key

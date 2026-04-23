@@ -1,21 +1,29 @@
 # Next Concrete Action
 
-**Status:** **M0 + M1 + M2 GREEN** as of 2026-04-23. Next: M3 — permit broker (AEGIS signing + tool-call enforcement).
+**Status:** **M0 + M1 + M2 + M3 GREEN** as of 2026-04-23. Next: M4 — inter-role message routing (two-role teams communicate via agency-bus-style inbox/outbox streams).
 
 ## Done
 
 ### M0 — runtime + podman spawner + echo-agent
-- Commit: `24f7e4f`
-- Verdict: `agentry:verdicts` stream-id `1776957867711-0` for `brf_verify_m0`
+Commit: `24f7e4f`. Verdict `shipped` for `brf_verify_m0` on `agentry:verdicts`.
 
-### M1 — dashboard with SSE
-- Commit: `eb51c08`
-- Verified: `curl /` contains brf_verify_m1; `curl -N /sse/verdicts` captured live verdict event.
+### M1 — dashboard + SSE
+Commit: `eb51c08`. `curl /` shows brf; `/sse/verdicts` emits live.
 
-### M2 — typed registry editor (Role/Team/Project forms)
-- Commit: see `git log` for the M2 commit
-- Verified: `just verify-M2` creates `printer` role + `printer-team` via dashboard POST, submits brief, verdict=shipped.
-- Also verified: POST /projects → saves project record with full standing_orders.
+### M2 — typed registry editor
+Commit: `2753ecf`. POST /roles, /teams, /projects all save typed records with auto version bump.
+
+### M3 — permit broker (AEGIS signing + tool-call enforcement)
+- ed25519 signing via `ed25519-dalek`. Key at `~/.config/agentry/signing.key` (0600). Generate: `orchestrator key-gen`.
+- `sign(&mut permit, &signing_key)`, `verify(&permit, &verifying_key)`, `tool_allowed(&permit, tool)`.
+- Daemon loads key at startup; `mint_permit` signs before handing off.
+- Spawner verifies permit on entry; intercepts `Event::ToolCall` on stdout.
+- Every tool call is appended to `agentry:brief:{id}:audit` (always, allowed or not).
+- Unauthorized tool → container killed (`podman stop`), verdict `permit_violation`.
+- Verified with a `naughty-agent` container whose allowlist is `[read]` but attempts `write`:
+  - verdict on Redis: `{"brief":"brf_verify_m3","kind":"permit_violation","reason":"unauthorized tool call: write"}`
+  - audit stream recorded the `write` attempt with `args={"path":"/etc/shadow"}`
+- M0 regression: still green after signing pipeline.
 
 ### Replay any milestone
 
@@ -24,54 +32,55 @@ export AGENTRY_REDIS_URL='redis://:RedisRationalized2026@192.168.1.152:6379'
 export AGENTRY_DASHBOARD_PORT=7800
 cd /var/mnt/workspaces/agentry
 cargo build --release --workspace
-podman image exists localhost/agentry/echo-agent:v1 || (cd containers/echo-agent && podman build -t agentry/echo-agent:v1 -f Containerfile .)
+
+# One-time key gen (M3 onwards; skip if ~/.config/agentry/signing.key already exists)
+./target/release/orchestrator key-gen --force
+
+# Container images
+podman image exists localhost/agentry/echo-agent:v1    || (cd containers/echo-agent    && podman build -t agentry/echo-agent:v1    -f Containerfile .)
+podman image exists localhost/agentry/naughty-agent:v1 || (cd containers/naughty-agent && podman build -t agentry/naughty-agent:v1 -f Containerfile .)
+
 ./target/release/orchestrator seed
-ps -eo pid,comm | awk '$2 ~ /^orchestrator/ {print $1}' | xargs -r kill -9   # defensive: one daemon
+
+ps -eo pid,comm | awk '$2 ~ /^orchestrator/ {print $1}' | xargs -r kill -9   # defensive
 nohup ./target/release/orchestratord         > /tmp/agentry-orchestratord.log 2>&1 &
 nohup ./target/release/orchestrator-dashboard > /tmp/agentry-dashboard.log 2>&1 &
 sleep 1
-just verify-M0   # or verify-M1 / verify-M2
+just verify-M0   # or verify-M1 / verify-M2 / verify-M3
 ```
 
-## M3 — Permit broker (next up)
+## M4 — inter-role message routing (next up)
 
-Goal: AEGIS-style ed25519 signing + runtime tool-call enforcement. A role with `allowlist:[read]` that attempts `write` gets killed.
+Goal: a `speaker → listener` team where the speaker's output lands in the listener's inbox. Trace shows ordered events from both roles.
 
 ### Subtasks
 
-1. **Salvage agency-aegis** from `~/workspaces/agency-orchestrator/crates/agency-aegis/`:
-   - Identify the minimum set: signing key management, Permit sign/verify, audit trail append.
-   - Copy into `orchestrator-runtime/src/permit/` module. Adjust to our `WorkPermit` shape (already structurally compatible per `orchestrator-types::permit`).
-2. **Key management:**
-   - `orchestrator key-gen` CLI subcommand → writes `~/.config/agentry/signing.key` (600).
-   - Runtime reads key at startup; fails loudly if absent.
-3. **Permit signing:**
-   - `mint_permit()` in `daemon.rs` now signs the canonical JSON and sets `signature`.
-   - Verify-on-use: the broker checks signature before permitting tool calls.
-4. **Tool-call enforcement:**
-   - In `spawner.rs`: when an `Event::ToolCall` arrives on stdout, the broker:
-     - Checks tool ∈ allowlist → if not, kill container + append `permit_violation` verdict.
-     - Appends the call to `agentry:brief:{id}:audit` stream.
-   - `permit_violation` becomes a new VerdictKind path.
-5. **Echo-agent upgrade (mis-behaving role):**
-   - A second agent image `localhost/agentry/naughty-agent:v1` that emits an illegal tool_call event before emitting done → verify the broker kills it.
-6. **examples/verify-M3.json** + `just verify-M3`:
-   - Submit brief to team with a role whose allowlist is `[read]` and agent attempts `write`.
-   - Expect verdict=`permit_violation` on Redis, dashboard shows red banner.
+1. **Agent I/O contract v2** (orchestrator-types::event):
+   - The existing `EventKind::Message { to, payload }` on stdout already marks an outbox message.
+   - Container runner, on each `Message { to, payload }`, publishes to `agentry:agent:{<to-agent-id>}:inbox` (and mirrors to trace).
+   - Need: a way to map `to: <role-name>` → the actual sibling's agent_id in the same brief. Introduce a per-brief role-agent-id table (in-memory in the daemon or Redis hash `agentry:brief:{id}:agents`).
+2. **Spawner upgrade:** before spawning each role, resolve outgoing edges from `team.message_graph` and register the agent_id → outbox-stream mapping.
+3. **Agent entrypoint:** role containers now receive `AGENTRY_INBOX_STREAM` env var; agents can tail the stream on their own schedule. For M4, keep agents simple: shell scripts that read `AGENTRY_STARTUP` (stdin) and optionally read one inbox line.
+4. **Two-role example:**
+   - `speaker` role: emits `Message { to: "listener", payload: {msg:"hi"} }` + `done shipped`.
+   - `listener` role: reads inbox for one line, emits an `event` with the received payload, then `done shipped`.
+5. **Team:** `speaker → listener` message graph, terminal `listener`.
+6. **Daemon change:** sequential spawn, but when spawning role N, the daemon has the agent_id of role N-1 in hand. When role N-1's `Message { to: N }` arrives, route to role N's inbox.
+7. **verify-M4.json** + `just verify-M4` — assert both trace events appear and verdict is `shipped`.
 
 ### Budget
 
-~200 LOC new + agency-aegis salvage (copy ≤1,000 LOC depending on trim).
+~150 LOC new. Ceiling per drift rules.
 
 ### Invariants to preserve
 
-- Old M0/M1/M2 verifications must still pass.
-- Runtime rejects unsigned permits (after M3 goes green, M0/M1/M2 verify recipes need to ensure `mint_permit` signs).
-- Keys on disk: `~/.config/agentry/signing.key` — committed to `.gitignore`, never pushed.
+- Sequential role execution (parallel = later milestone; adds complexity).
+- Permit broker still enforces allowlists; `message` tool is implicit (not listed in allowlist as a distinct tool).
+- Old M0–M3 verifications must still pass.
 
 ## If this session ends mid-task
 
-- `git status` → commit as `wip(m3): <file>:<line> <what>`.
+- `git status` → commit as `wip(m4): <file>:<line> <what>`.
 - Update this `TODO.md`.
 - `mcp__memory__set key="project:agentry:resume" value=<updated state>`.
-- Replay recipe above.
+- Run replay recipe above.

@@ -5,17 +5,34 @@
 //!   - Spawn → run → verdict → next.
 //!   - Message routing between roles: M4+.
 
-use crate::{Error, Result, redis_io, spawner::{PodmanSpawner, Spawner}};
+use crate::{
+    Error, Result, permit as permit_mod, redis_io,
+    spawner::{PodmanSpawner, Spawner},
+};
+use ed25519_dalek::{SigningKey, VerifyingKey};
 use orchestrator_types::{
     AgentRole, Brief, BriefId, PermitScope, RoleName, ToolAllowlist, Verdict, VerdictKind,
     VersionedRef, WorkPermit, now,
 };
 use redis::aio::ConnectionManager;
+use std::sync::Arc;
 
 /// Run the daemon loop forever.
 pub async fn run() -> Result<()> {
     let mut conn = redis_io::connect().await?;
     tracing::info!("connected to Redis");
+
+    // Load signing key. Fail loudly if missing.
+    let key_path = permit_mod::key_path();
+    if !key_path.exists() {
+        return Err(Error::Config(format!(
+            "signing key not found at {}. Run `orchestrator key-gen` first.",
+            key_path.display()
+        )));
+    }
+    let signing_key = Arc::new(permit_mod::load_signing_key(&key_path)?);
+    let verifying_key = Arc::new(signing_key.verifying_key());
+    tracing::info!(key = %key_path.display(), "signing key loaded");
 
     let spawner = PodmanSpawner::new();
     let mut last_id = "$".to_string(); // only new briefs
@@ -25,7 +42,9 @@ pub async fn run() -> Result<()> {
             Ok(Some((sid, brief))) => {
                 last_id = sid;
                 tracing::info!(brief = %brief.id, "received brief");
-                if let Err(e) = handle_brief(&mut conn, &spawner, &brief).await {
+                if let Err(e) =
+                    handle_brief(&mut conn, &spawner, &brief, &signing_key, &verifying_key).await
+                {
                     tracing::error!(brief = %brief.id, error = %e, "brief handling failed");
                     let v = Verdict::new(brief.id.clone(), VerdictKind::Failed)
                         .with_reason(format!("handler error: {e}"));
@@ -48,6 +67,8 @@ async fn handle_brief(
     conn: &mut ConnectionManager,
     spawner: &impl Spawner,
     brief: &Brief,
+    signing_key: &SigningKey,
+    verifying_key: &VerifyingKey,
 ) -> Result<()> {
     let team = redis_io::fetch_team(conn, &brief.topology).await?;
 
@@ -60,8 +81,11 @@ async fn handle_brief(
 
     for role_name in &team.roles {
         let role = fetch_role_any_version(conn, role_name).await?;
-        let permit = mint_permit(brief, &role)?;
-        let (_handle, verdict) = spawner.run_agent(brief, &role, &permit, conn).await?;
+        let mut permit = mint_permit(brief, &role)?;
+        permit_mod::sign(&mut permit, signing_key)?;
+        let (_handle, verdict) = spawner
+            .run_agent(brief, &role, &permit, verifying_key, conn)
+            .await?;
         redis_io::append_verdict(conn, &verdict).await?;
         tracing::info!(
             brief = %brief.id,

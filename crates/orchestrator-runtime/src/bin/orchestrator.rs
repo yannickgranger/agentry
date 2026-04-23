@@ -5,7 +5,7 @@
 //! `orchestrator abort --all` — abort all running briefs.
 
 use clap::{Parser, Subcommand};
-use orchestrator_runtime::{Result, redis_io, seed};
+use orchestrator_runtime::{Result, permit, redis_io, seed};
 use orchestrator_types::Brief;
 use std::path::PathBuf;
 
@@ -34,6 +34,12 @@ enum Cmd {
     Abort {
         #[arg(long)]
         all: bool,
+    },
+    /// Generate an ed25519 signing key for permits (M3).
+    KeyGen {
+        /// Overwrite if the key already exists.
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -75,6 +81,21 @@ async fn main() -> Result<()> {
                     println!("{}", b);
                 }
             }
+        }
+        Cmd::KeyGen { force } => {
+            let path = permit::key_path();
+            if path.exists() && !force {
+                eprintln!(
+                    "refusing to overwrite existing key at {} (use --force)",
+                    path.display()
+                );
+                std::process::exit(2);
+            }
+            permit::generate_and_save(&path)?;
+            println!(
+                "{{\"generated\":true,\"path\":\"{}\"}}",
+                path.display()
+            );
         }
         Cmd::Abort { all } => {
             if all {
