@@ -635,6 +635,8 @@ async fn role_new_form() -> Html<String> {
     <textarea name="mcp_servers_json" rows="3" placeholder='[{"name":"ra-query","image":"ghcr.io/yg/ra-query:v0.1"}]' class="w-full bg-slate-900 border border-slate-700 rounded px-3 py-2 font-mono text-sm text-slate-100"></textarea></div>
   <div><label class="block text-sm text-slate-400 mb-1">passthru env <span class="text-xs text-slate-600">(CSV of env-var names read from orchestratord env, e.g. XAI_API_KEY)</span></label>
     <input name="passthru_env_csv" placeholder="XAI_API_KEY,GEMINI_API_KEY" class="w-full bg-slate-900 border border-slate-700 rounded px-3 py-2 font-mono text-sm text-slate-100"></div>
+  <div><label class="block text-sm text-slate-400 mb-1">bind mounts <span class="text-xs text-slate-600">(one per line: <code>source:target[:ro]</code>)</span></label>
+    <textarea name="mounts_lines" rows="3" placeholder="/var/home/yg/.local/bin/claude:/usr/local/bin/claude:ro&#10;/var/home/yg/.claude/.credentials.json:/root/.claude/.credentials.json:ro" class="w-full bg-slate-900 border border-slate-700 rounded px-3 py-2 font-mono text-sm text-slate-100"></textarea></div>
   <button type="submit" class="px-4 py-2 rounded bg-indigo-700 hover:bg-indigo-600 text-white">save (auto v=next)</button>
 </form>"#;
     Html(page("agentry — new role", body))
@@ -653,6 +655,32 @@ struct RoleForm {
     mcp_servers_json: String,
     #[serde(default)]
     passthru_env_csv: String,
+    #[serde(default)]
+    mounts_lines: String,
+}
+
+/// Parse `source:target[:ro]` lines into `Mount` records.
+fn parse_mounts(s: &str) -> Vec<orchestrator_types::Mount> {
+    s.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .filter_map(|l| {
+            let parts: Vec<&str> = l.split(':').collect();
+            match parts.as_slice() {
+                [src, tgt] => Some(orchestrator_types::Mount {
+                    source: (*src).into(),
+                    target: (*tgt).into(),
+                    readonly: false,
+                }),
+                [src, tgt, "ro"] => Some(orchestrator_types::Mount {
+                    source: (*src).into(),
+                    target: (*tgt).into(),
+                    readonly: true,
+                }),
+                _ => None,
+            }
+        })
+        .collect()
 }
 
 async fn role_create(
@@ -690,6 +718,7 @@ async fn role_create(
         tool_allowlist: ToolAllowlist(split_csv(&f.tool_allowlist_csv)),
         permit_scope: PermitScope(split_lines(&f.permit_scope_lines)),
         passthru_env: split_csv(&f.passthru_env_csv),
+        mounts: parse_mounts(&f.mounts_lines),
     };
     {
         let mut c = app.redis.lock().await;

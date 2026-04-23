@@ -161,6 +161,21 @@ impl Spawner for PodmanSpawner {
                 }
             }
         }
+        // Bind mounts: `-v source:target[:ro]`. When mounts are declared,
+        // disable SELinux label translation — otherwise rootless podman on
+        // Fedora/Silverblue can't read host-owned files (EACCES). `:z`/`:Z`
+        // mount flags would relabel the SOURCE on the host, which is worse.
+        if !role.mounts.is_empty() {
+            cmd.arg("--security-opt").arg("label=disable");
+        }
+        for m in &role.mounts {
+            let spec = if m.readonly {
+                format!("{}:{}:ro", m.source, m.target)
+            } else {
+                format!("{}:{}", m.source, m.target)
+            };
+            cmd.arg("-v").arg(spec);
+        }
         cmd.arg(&role.image);
 
         cmd.stdin(Stdio::piped());

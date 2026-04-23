@@ -63,6 +63,20 @@ pub struct McpServer {
     pub binary: Option<String>,
 }
 
+/// A host→container bind mount, optionally read-only. Used by Claude-Max
+/// agents to bring in the `claude` binary and `~/.claude/.credentials.json`
+/// without baking them into an image.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Mount {
+    /// Absolute host path.
+    pub source: String,
+    /// Absolute container path.
+    pub target: String,
+    /// If `true`, the mount is read-only (`:ro`). Defaults to `false`.
+    #[serde(default)]
+    pub readonly: bool,
+}
+
 /// Permission scopes — narrowed further at spawn time by brief/team overrides.
 /// Each entry is a symbolic scope string: `fs:read:/workspace/**`, `net:deny:*`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -103,6 +117,10 @@ pub struct AgentRole {
     /// spawn time. Missing vars are silently skipped (broker logs a warning).
     #[serde(default)]
     pub passthru_env: Vec<String>,
+    /// Host→container bind mounts. Used by Claude-Max agents to bring in the
+    /// `claude` binary and credentials file without baking them into an image.
+    #[serde(default)]
+    pub mounts: Vec<Mount>,
 }
 
 #[cfg(test)]
@@ -131,6 +149,7 @@ mod tests {
                 "net:deny:*".into(),
             ]),
             passthru_env: vec![],
+            mounts: vec![],
         };
         let s = serde_json::to_string_pretty(&r).expect("ser");
         let back: AgentRole = serde_json::from_str(&s).expect("de");

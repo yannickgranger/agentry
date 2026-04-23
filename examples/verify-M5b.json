@@ -1,0 +1,11 @@
+{
+  "id": "brf_verify_m5b",
+  "project": null,
+  "topology": { "name": "claude-echo-team", "version": 1 },
+  "payload": { "prompt": "Reply with exactly one word: pong" },
+  "budget": {},
+  "escalation": "autonomous",
+  "parent_brief": null,
+  "submitted_by": "verify-m5b",
+  "submitted_at": "2026-04-23T12:00:00Z"
+}

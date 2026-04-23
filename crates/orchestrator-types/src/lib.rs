@@ -18,7 +18,7 @@ pub use brief::{Brief, BriefId, Budget, EscalationMode, Payload};
 pub use event::{Event, EventKind, ToolCall, Verdict as EventVerdict};
 pub use permit::{PermitScope, ToolAllowlist, WorkPermit};
 pub use project::{Project, ProjectSlug, StandingOrders};
-pub use role::{AgentRole, RoleName, SubstrateClass};
+pub use role::{AgentRole, Mount, RoleName, SubstrateClass};
 pub use team::{MessageEdge, PermitOverrides, TeamName, TeamTopology};
 pub use verdict::{Verdict, VerdictKind};
 

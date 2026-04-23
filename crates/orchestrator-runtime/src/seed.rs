@@ -4,7 +4,7 @@
 
 use crate::{Result, redis_io};
 use orchestrator_types::{
-    AgentRole, MessageEdge, PermitScope, RoleName, SubstrateClass, TeamName, TeamTopology,
+    AgentRole, MessageEdge, Mount, PermitScope, RoleName, SubstrateClass, TeamName, TeamTopology,
     ToolAllowlist,
 };
 
@@ -24,6 +24,7 @@ pub async fn seed_m0() -> Result<()> {
         tool_allowlist: ToolAllowlist(vec![]),
         permit_scope: PermitScope(vec!["net:deny:*".into()]),
         passthru_env: vec![],
+        mounts: vec![],
     };
 
     let echo_team = TeamTopology {
@@ -50,6 +51,7 @@ pub async fn seed_m0() -> Result<()> {
         tool_allowlist: ToolAllowlist(vec!["read".into()]),
         permit_scope: PermitScope(vec!["net:deny:*".into()]),
         passthru_env: vec![],
+        mounts: vec![],
     };
 
     let naughty_team = TeamTopology {
@@ -79,6 +81,7 @@ pub async fn seed_m0() -> Result<()> {
         tool_allowlist: ToolAllowlist(vec![]),
         permit_scope: PermitScope(vec!["net:deny:*".into()]),
         passthru_env: vec![],
+        mounts: vec![],
     };
     let listener = AgentRole {
         name: RoleName("listener-agent".into()),
@@ -92,6 +95,7 @@ pub async fn seed_m0() -> Result<()> {
         tool_allowlist: ToolAllowlist(vec![]),
         permit_scope: PermitScope(vec!["net:deny:*".into()]),
         passthru_env: vec![],
+        mounts: vec![],
     };
     let speaker_listener_team = TeamTopology {
         name: TeamName("speaker-listener-team".into()),
@@ -123,6 +127,7 @@ pub async fn seed_m0() -> Result<()> {
         tool_allowlist: ToolAllowlist(vec![]),
         permit_scope: PermitScope(vec!["net:allow:api.x.ai".into()]),
         passthru_env: vec!["XAI_API_KEY".into()],
+        mounts: vec![],
     };
     let grok_team = TeamTopology {
         name: TeamName("grok-echo-team".into()),
@@ -136,8 +141,55 @@ pub async fn seed_m0() -> Result<()> {
     redis_io::save_role(&mut conn, &grok_echo).await?;
     redis_io::save_team(&mut conn, &grok_team).await?;
 
+    // M5b: claude-echo — Claude Max via host `claude` CLI.
+    // Paths are computed from HOME at seed-time so different machines can reuse the same seed binary.
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/var/home/yg".into());
+    let claude_echo = AgentRole {
+        name: RoleName("claude-echo".into()),
+        version: 1,
+        model: Some("claude-max".into()),
+        system_prompt: None,
+        image: "localhost/agentry/claude-agent:v1".into(),
+        substrate_class: SubstrateClass::Podman,
+        binaries: vec![],
+        mcp_servers: vec![],
+        tool_allowlist: ToolAllowlist(vec![]),
+        permit_scope: PermitScope(vec![
+            "net:allow:api.anthropic.com".into(), // claude CLI does call this, authed via OAuth — NOT via API key
+        ]),
+        passthru_env: vec![],
+        mounts: vec![
+            Mount {
+                source: format!("{home}/.local/bin/claude"),
+                target: "/usr/local/bin/claude".into(),
+                readonly: true,
+            },
+            Mount {
+                source: format!("{home}/.claude/.credentials.json"),
+                target: "/root/.claude/.credentials.json".into(),
+                readonly: true,
+            },
+            Mount {
+                source: format!("{home}/.claude/settings.json"),
+                target: "/root/.claude/settings.json".into(),
+                readonly: true,
+            },
+        ],
+    };
+    let claude_team = TeamTopology {
+        name: TeamName("claude-echo-team".into()),
+        version: 1,
+        roles: vec![claude_echo.name.clone()],
+        message_graph: vec![],
+        terminal_role: claude_echo.name.clone(),
+        max_retries: 0,
+    };
+
+    redis_io::save_role(&mut conn, &claude_echo).await?;
+    redis_io::save_team(&mut conn, &claude_team).await?;
+
     tracing::info!(
-        "seeded: roles [echo-agent, naughty-agent, speaker-agent, listener-agent, grok-echo] v1, teams [echo-team, naughty-team, speaker-listener-team, grok-echo-team] v1"
+        "seeded: roles [echo, naughty, speaker, listener, grok-echo, claude-echo] v1, teams [echo, naughty, speaker-listener, grok-echo, claude-echo] v1"
     );
     Ok(())
 }

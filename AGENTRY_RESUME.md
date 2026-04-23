@@ -125,7 +125,12 @@ Any future Claude session picking this up MUST:
 
 **DO NOT** invent new primitives, add a new crate, or re-open deferred features. If tempted, stop and re-read drift rules above.
 
-## Known limitations (M0 / M1 / M2 / M3 / M4 / M5a)
+## Known limitations (M0 / M1 / M2 / M3 / M4 / M5a / M5b)
+
+- **SELinux + bind mounts:** rootless podman on Fedora/Silverblue requires `--security-opt label=disable` to read host-owned files. Spawner auto-adds it whenever `role.mounts` is non-empty. Don't use `:z`/`:Z` — they relabel the host path.
+- **Claude Max via bind-mounted binary + `~/.claude/.credentials.json`.** `settings.json` is also mounted read-only. Container's `HOME` is `/root`; `~/.claude` maps from the host.
+
+## OLD Known limitations (M0 / M1 / M2 / M3 / M4 / M5a)
 
 - **Single-daemon only.** `orchestratord` uses `XREAD BLOCK $` — no consumer groups. Two daemons will both consume a brief → double-processing. Production uses a single systemd user unit; this is fine until M4+. Dodge: `pkill -f orchestratord` before `orchestratord`.
 - **Permit signing is active from M3.** Run `orchestrator key-gen` once; key lives at `~/.config/agentry/signing.key` (0600). Without the key, `orchestratord` refuses to start.

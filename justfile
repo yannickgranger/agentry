@@ -44,6 +44,10 @@ build-m4:
 build-m5a:
     cd containers/grok-agent && podman build -t agentry/grok-agent:v1 -f Containerfile .
 
+# Build M5b claude-agent image (no Anthropic API — Claude Max subscription only).
+build-m5b:
+    cd containers/claude-agent && podman build -t agentry/claude-agent:v1 -f Containerfile .
+
 # Start dev infra (orchestratord + dashboard as user processes, podman for agents)
 dev-up: build build-echo
     #!/usr/bin/env bash
@@ -94,6 +98,22 @@ verify-M0:
     echo "Brief submitted. Waiting for verdict..."
     sleep 5
     redis-cli -h 192.168.1.152 -p 6379 -a RedisRationalized2026 --no-auth-warning XREVRANGE agentry:verdicts + - COUNT 1
+
+# Verify M5b: Claude Max via the host `claude` CLI — no Anthropic API spend.
+# Requires: host claude binary + ~/.claude/.credentials.json present (OAuth login done).
+verify-M5b:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    ./target/release/orchestrator submit examples/verify-M5b.json
+    echo "Brief submitted. Waiting for Claude Max reply (can take ~10s)..."
+    sleep 15
+    echo "--- verdict (expect kind=shipped) ---"
+    redis-cli -h 192.168.1.152 -p 6379 -a RedisRationalized2026 --no-auth-warning XREVRANGE agentry:verdicts + - COUNT 1
+    echo "--- trace ---"
+    redis-cli -h 192.168.1.152 -p 6379 -a RedisRationalized2026 --no-auth-warning XRANGE agentry:brief:brf_verify_m5b:trace - +
+    echo "--- reply must contain 'pong' ---"
+    redis-cli -h 192.168.1.152 -p 6379 -a RedisRationalized2026 --no-auth-warning XRANGE agentry:brief:brf_verify_m5b:trace - + \
+        | grep -qi 'reply":"pong' && echo "M5b verify PASS" || (echo "M5b verify FAIL"; exit 1)
 
 # Verify M5a: call xAI Grok from inside a container; emit a reply event.
 # Requires XAI_API_KEY in orchestratord's env at startup.
