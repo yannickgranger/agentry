@@ -125,6 +125,13 @@ Any future Claude session picking this up MUST:
 
 **DO NOT** invent new primitives, add a new crate, or re-open deferred features. If tempted, stop and re-read drift rules above.
 
+## Known limitations (M0 / M1)
+
+- **Single-daemon only.** `orchestratord` uses `XREAD BLOCK $` — no consumer groups. Two daemons will both consume a brief → double-processing. Production uses a single systemd user unit; this is fine until M4+. Dodge: `pkill -f orchestratord` before `orchestratord`.
+- **No permit enforcement at runtime yet.** M3 lands signing + tool-call interception; M0/M1 permits are minted but never rejected.
+- **No inter-role message routing.** Teams with multiple roles in M0/M1 run roles sequentially but don't forward messages (outbox/inbox streams unused). M4 wires this.
+- **Dashboard is read-only.** Registry editor lands in M2.
+
 ## Open questions (frozen until user returns)
 
 The following design points have user-confirmed answers; do not re-open:

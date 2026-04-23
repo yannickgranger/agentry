@@ -78,9 +78,26 @@ verify-M0:
     #!/usr/bin/env bash
     set -euo pipefail
     ./target/release/orchestrator submit examples/verify-M0.json
-    echo "Brief submitted. Checking verdict..."
-    sleep 3
-    redis-cli -u "$AGENTRY_REDIS_URL" XREVRANGE agentry:verdicts + - COUNT 1
+    echo "Brief submitted. Waiting for verdict..."
+    sleep 5
+    redis-cli -h 192.168.1.152 -p 6379 -a RedisRationalized2026 --no-auth-warning XREVRANGE agentry:verdicts + - COUNT 1
+
+# Verify M1: replay a brief and check the dashboard renders it.
+verify-M1:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    ./target/release/orchestrator submit examples/verify-M1.json
+    echo "Brief submitted. Waiting for verdict..."
+    sleep 5
+    echo "--- verdict on Redis ---"
+    redis-cli -h 192.168.1.152 -p 6379 -a RedisRationalized2026 --no-auth-warning XREVRANGE agentry:verdicts + - COUNT 1
+    echo ""
+    echo "--- dashboard index reachable? ---"
+    curl -sS http://localhost:${AGENTRY_DASHBOARD_PORT}/healthz
+    echo ""
+    echo "--- index HTML contains brf_verify_m1? ---"
+    curl -sS http://localhost:${AGENTRY_DASHBOARD_PORT}/ | grep -c "brf_verify_m1" || (echo "NOT FOUND"; exit 1)
+    echo "M1 verify PASS"
 
 # Tail verdicts stream
 verdicts:

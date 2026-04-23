@@ -1,0 +1,11 @@
+{
+  "id": "brf_verify_m1",
+  "project": null,
+  "topology": { "name": "echo-team", "version": 1 },
+  "payload": { "kind": "echo", "msg": "hello from M1" },
+  "budget": {},
+  "escalation": "autonomous",
+  "parent_brief": null,
+  "submitted_by": "verify-m1",
+  "submitted_at": "2026-04-23T12:00:00Z"
+}
