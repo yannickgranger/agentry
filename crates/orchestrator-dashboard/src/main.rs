@@ -778,6 +778,12 @@ async fn role_create(
         system_prompt,
         image: f.image,
         substrate_class,
+        // Dashboard-created roles default to the legacy path (image supplies its
+        // own ENTRYPOINT). Inline-script roles are seeded programmatically for
+        // now; adding entrypoint_script + package_manager to the form is a
+        // follow-up.
+        package_manager: Default::default(),
+        entrypoint_script: None,
         binaries: split_csv(&f.binaries_csv),
         mcp_servers,
         tool_allowlist: ToolAllowlist(split_csv(&f.tool_allowlist_csv)),

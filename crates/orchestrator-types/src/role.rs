@@ -34,6 +34,22 @@ pub enum SubstrateClass {
     Vm,
 }
 
+/// Which package manager the spawner uses to install `binaries` at spawn time.
+/// Picked explicitly per role; no heuristic from image name. `None` disables
+/// install entirely (used when the base image already contains everything
+/// the entrypoint needs).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PackageManager {
+    /// No install at spawn — script runs directly. Default.
+    #[default]
+    None,
+    /// Alpine — `apk add --no-cache <binaries>`.
+    Apk,
+    /// Debian/Ubuntu — `apt-get update && apt-get install -y <binaries>`.
+    Apt,
+}
+
 /// What tools the agent is permitted to call. Names are stable symbolic ids;
 /// the container runner maps them to actual binaries / MCP methods.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -89,12 +105,27 @@ pub struct AgentRole {
     pub model: Option<String>,
     /// System prompt (inline). Can reference a file as `@file://path` — resolver elsewhere.
     pub system_prompt: Option<String>,
-    /// Container image to spawn (fully qualified): `agentry/echo-agent:v1`.
+    /// Container image to spawn. Either a stock public image
+    /// (`alpine:3.21`, `debian:bookworm-slim`) with an `entrypoint_script`
+    /// provisioned at spawn, or a pre-built image embedding its own entrypoint
+    /// (legacy path — left supported for roles that genuinely need baking).
     pub image: String,
     /// Substrate to spawn on.
     #[serde(default)]
     pub substrate_class: SubstrateClass,
-    /// Extra binaries to install in the container at spawn.
+    /// Package manager to use when installing `binaries` at spawn. `None`
+    /// skips install (base image has everything).
+    #[serde(default)]
+    pub package_manager: PackageManager,
+    /// Inline entrypoint script (bash). When set, spawner delivers it to the
+    /// container via the `AGENTRY_SCRIPT` env var, installs `binaries` via
+    /// `package_manager`, then execs it. When `None`, spawner falls back to
+    /// the image's baked ENTRYPOINT (legacy path).
+    #[serde(default)]
+    pub entrypoint_script: Option<String>,
+    /// Package names to install at spawn via `package_manager`. The spawner
+    /// always adds a baseline (`bash ca-certificates coreutils jq`); this
+    /// list is role-specific extras (e.g. `["git", "curl"]`).
     #[serde(default)]
     pub binaries: Vec<String>,
     /// MCP servers to mount.
@@ -129,9 +160,11 @@ mod tests {
             version: 3,
             model: Some("claude-opus-4-7".into()),
             system_prompt: Some("You are a Rust coder. Follow the contract.".into()),
-            image: "agentry/coder-rust:v3".into(),
+            image: "alpine:3.21".into(),
             substrate_class: SubstrateClass::Podman,
-            binaries: vec!["cargo".into(), "rustfmt".into()],
+            package_manager: PackageManager::Apk,
+            entrypoint_script: Some("#!/usr/bin/env bash\necho hello\n".into()),
+            binaries: vec!["git".into(), "curl".into()],
             mcp_servers: vec![McpServer {
                 name: "ra-query".into(),
                 image: Some("ghcr.io/yg/ra-query:v0.1".into()),
@@ -154,6 +187,28 @@ mod tests {
     #[test]
     fn default_substrate_is_podman() {
         assert_eq!(SubstrateClass::default(), SubstrateClass::Podman);
+    }
+
+    #[test]
+    fn default_package_manager_is_none() {
+        assert_eq!(PackageManager::default(), PackageManager::None);
+    }
+
+    #[test]
+    fn role_without_entrypoint_script_deserializes() {
+        // Backward-compat: old role JSON without entrypoint_script / package_manager
+        // fields must still deserialize cleanly, defaulting to None / PackageManager::None.
+        let json = r#"{
+            "name": "legacy-agent",
+            "version": 1,
+            "model": null,
+            "system_prompt": null,
+            "image": "agentry/legacy-agent:v1"
+        }"#;
+        let r: AgentRole = serde_json::from_str(json).expect("de");
+        assert!(r.entrypoint_script.is_none());
+        assert_eq!(r.package_manager, PackageManager::None);
+        assert!(r.binaries.is_empty());
     }
 
     #[test]

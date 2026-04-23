@@ -13,7 +13,7 @@ use crate::{permit as permit_mod, redis_io, Error, Result};
 use async_trait::async_trait;
 use ed25519_dalek::VerifyingKey;
 use orchestrator_types::{
-    AgentRole, Brief, BriefId, Event, EventKind, Verdict, VerdictKind, WorkPermit,
+    AgentRole, Brief, BriefId, Event, EventKind, PackageManager, Verdict, VerdictKind, WorkPermit,
 };
 use redis::aio::ConnectionManager;
 use redis::AsyncCommands;
@@ -136,7 +136,10 @@ impl Spawner for PodmanSpawner {
         cmd.arg("run")
             .arg("--rm")
             .arg("-i")
-            .arg("--pull=never")
+            // Stock public base images (alpine:3.21, debian:bookworm-slim) are
+            // pulled once and cached. `missing` downloads only when absent;
+            // subsequent spawns reuse the cached layer.
+            .arg("--pull=missing")
             .arg("--name")
             .arg(&name)
             .arg("--label")
@@ -176,7 +179,21 @@ impl Spawner for PodmanSpawner {
             };
             cmd.arg("-v").arg(spec);
         }
-        cmd.arg(&role.image);
+
+        // If the role ships an inline entrypoint script, pass it as an env var
+        // and override the image command with a bootstrap that installs
+        // `binaries` via the declared package manager and execs the script.
+        // This replaces the need for per-agent Containerfiles.
+        if let Some(script) = &role.entrypoint_script {
+            cmd.arg("--env").arg(format!("AGENTRY_SCRIPT={script}"));
+            cmd.arg(&role.image);
+            cmd.arg("sh")
+                .arg("-c")
+                .arg(bootstrap_command(role.package_manager, &role.binaries));
+        } else {
+            // Legacy path: image provides its own ENTRYPOINT.
+            cmd.arg(&role.image);
+        }
 
         cmd.stdin(Stdio::piped());
         cmd.stdout(Stdio::piped());
@@ -323,6 +340,33 @@ async fn append_audit(
     Ok(())
 }
 
+/// Build the `sh -c` argument that the container runs as its command.
+///
+/// Installs a baseline (`bash ca-certificates coreutils jq`) plus role-specific
+/// `binaries` via the declared `package_manager`, then execs the script
+/// delivered via the `AGENTRY_SCRIPT` env var. When `package_manager` is
+/// `None`, the install phase is a no-op and the script runs directly.
+fn bootstrap_command(pm: PackageManager, extra_binaries: &[String]) -> String {
+    const BASELINE: &[&str] = &["bash", "ca-certificates", "coreutils", "jq"];
+    let all: Vec<&str> = BASELINE
+        .iter()
+        .copied()
+        .chain(extra_binaries.iter().map(String::as_str))
+        .collect();
+    let pkgs = all.join(" ");
+    let install = match pm {
+        PackageManager::Apk => format!("apk add --no-cache {pkgs} >/dev/null"),
+        PackageManager::Apt => format!(
+            "apt-get update -qq >/dev/null && apt-get install -y --no-install-recommends {pkgs} >/dev/null"
+        ),
+        PackageManager::None => ":".to_string(),
+    };
+    // $AGENTRY_SCRIPT is passed as an env var by the spawner. `bash -c` runs
+    // it as a script; the script's own `cat` still reads the startup JSON
+    // bundle from stdin (not affected by the outer bootstrap).
+    format!("set -e\n{install}\nexec bash -c \"$AGENTRY_SCRIPT\"")
+}
+
 // Silence unused imports in M0 (full use comes in later milestones).
 #[allow(dead_code)]
 fn _used(_: EventKind, _: BriefId) {}
@@ -335,5 +379,34 @@ mod tests {
     fn container_name_format() {
         let n = PodmanSpawner::container_name("agt_abcd");
         assert_eq!(n, "agentry-agt_abcd");
+    }
+
+    #[test]
+    fn bootstrap_apk_installs_baseline_plus_extras() {
+        let s = bootstrap_command(PackageManager::Apk, &["git".into(), "curl".into()]);
+        assert!(s.contains("apk add --no-cache"));
+        assert!(s.contains("bash"));
+        assert!(s.contains("coreutils"));
+        assert!(s.contains("jq"));
+        assert!(s.contains("git"));
+        assert!(s.contains("curl"));
+        assert!(s.contains("exec bash -c \"$AGENTRY_SCRIPT\""));
+    }
+
+    #[test]
+    fn bootstrap_apt_uses_apt_get() {
+        let s = bootstrap_command(PackageManager::Apt, &[]);
+        assert!(s.contains("apt-get update"));
+        assert!(s.contains("apt-get install -y --no-install-recommends"));
+        assert!(s.contains("exec bash -c \"$AGENTRY_SCRIPT\""));
+    }
+
+    #[test]
+    fn bootstrap_none_skips_install() {
+        let s = bootstrap_command(PackageManager::None, &[]);
+        assert!(!s.contains("apk"));
+        assert!(!s.contains("apt-get"));
+        assert!(s.contains(":\n"));
+        assert!(s.contains("exec bash -c \"$AGENTRY_SCRIPT\""));
     }
 }
