@@ -82,6 +82,43 @@ verify-M0:
     sleep 5
     redis-cli -h 192.168.1.152 -p 6379 -a RedisRationalized2026 --no-auth-warning XREVRANGE agentry:verdicts + - COUNT 1
 
+# Verify M2: create a role + team via dashboard forms, run a brief on them.
+verify-M2:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # 1. Create "printer" role via POST /roles (dashboard must be running).
+    curl -sS -X POST "http://localhost:${AGENTRY_DASHBOARD_PORT}/roles" \
+        --data-urlencode "name=printer" \
+        --data-urlencode "model=" \
+        --data-urlencode "image=localhost/agentry/echo-agent:v1" \
+        --data-urlencode "substrate_class=podman" \
+        --data-urlencode "system_prompt=" \
+        --data-urlencode "binaries_csv=" \
+        --data-urlencode "tool_allowlist_csv=" \
+        --data-urlencode "permit_scope_lines=net:deny:*" \
+        --data-urlencode "mcp_servers_json=" \
+        -o /dev/null -w "POST /roles -> HTTP %{http_code} (expect 303)\n"
+    # 2. Create "printer-team" referencing the printer role.
+    curl -sS -X POST "http://localhost:${AGENTRY_DASHBOARD_PORT}/teams" \
+        --data-urlencode "name=printer-team" \
+        --data-urlencode "roles_csv=printer" \
+        --data-urlencode "graph_lines=" \
+        --data-urlencode "terminal_role=printer" \
+        --data-urlencode "max_retries=0" \
+        -o /dev/null -w "POST /teams -> HTTP %{http_code} (expect 303)\n"
+    # 3. Confirm records visible on dashboard listing pages.
+    echo "--- /roles contains 'printer'? ---"
+    curl -sS "http://localhost:${AGENTRY_DASHBOARD_PORT}/roles" | grep -c ">printer<" || (echo "NOT FOUND"; exit 1)
+    echo "--- /teams contains 'printer-team'? ---"
+    curl -sS "http://localhost:${AGENTRY_DASHBOARD_PORT}/teams" | grep -c ">printer-team<" || (echo "NOT FOUND"; exit 1)
+    # 4. Submit the M2 brief (team: printer-team).
+    ./target/release/orchestrator submit examples/verify-M2.json
+    echo "Brief submitted. Waiting for verdict..."
+    sleep 5
+    echo "--- verdict ---"
+    redis-cli -h 192.168.1.152 -p 6379 -a RedisRationalized2026 --no-auth-warning XREVRANGE agentry:verdicts + - COUNT 1
+    echo "M2 verify PASS"
+
 # Verify M1: replay a brief and check the dashboard renders it.
 verify-M1:
     #!/usr/bin/env bash

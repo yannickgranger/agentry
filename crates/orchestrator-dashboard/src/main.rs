@@ -1,7 +1,7 @@
 //! orchestrator-dashboard — live view over Redis state.
 //!
-//! Single-file dashboard (M1): Axum + SSE + hand-rolled HTML + Tailwind CDN.
-//! Read-only; no writes (the registry editor lands in M2).
+//! Single-file dashboard (M1+M2): Axum + SSE + hand-rolled HTML + Tailwind CDN.
+//! M2 adds typed registry editor: list + create for AgentRole, TeamTopology, Project.
 //!
 //! Routes:
 //!   GET /                           index (recent verdicts + active briefs)
@@ -9,23 +9,38 @@
 //!   GET /sse/verdicts               SSE stream of new verdicts
 //!   GET /sse/brief/:id/trace        SSE stream of brief's trace events
 //!   GET /healthz                    liveness
+//!   GET /roles                      list roles
+//!   GET /roles/new                  create-role form
+//!   POST /roles                     submit role (serde-validated, auto-version)
+//!   GET /teams                      list teams
+//!   GET /teams/new                  create-team form
+//!   POST /teams                     submit team
+//!   GET /projects                   list projects
+//!   GET /projects/new               create-project form
+//!   POST /projects                  submit project
 //!
 //! The SSE handlers tail Redis streams; the HTML bootstraps the latest entries
 //! and the EventSource live-appends as new entries arrive.
 
 #![forbid(unsafe_code)]
 
-use axum::extract::{Path, State};
+use axum::extract::{Form, Path, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
-use axum::response::{Html, IntoResponse, Response};
-use axum::routing::get;
+use axum::response::{Html, IntoResponse, Redirect, Response};
+use axum::routing::{get, post};
 use axum::Router;
 use futures::Stream;
 use orchestrator_runtime::redis_io;
+use orchestrator_types::{
+    AgentRole, MessageEdge, PermitScope, Project, ProjectSlug, RoleName, StandingOrders,
+    SubstrateClass, TeamName, TeamTopology, ToolAllowlist, brief::EscalationMode,
+    role::McpServer,
+};
 use redis::aio::ConnectionManager;
 use redis::streams::{StreamReadOptions, StreamReadReply};
 use redis::AsyncCommands;
+use serde::Deserialize;
 use serde_json::Value;
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -68,6 +83,16 @@ async fn main() -> anyhow::Result<()> {
         .route("/sse/verdicts", get(sse_verdicts))
         .route("/sse/brief/{id}/trace", get(sse_brief_trace))
         .route("/healthz", get(healthz))
+        // M2 registry editor
+        .route("/roles", get(roles_list))
+        .route("/roles/new", get(role_new_form))
+        .route("/roles", post(role_create))
+        .route("/teams", get(teams_list))
+        .route("/teams/new", get(team_new_form))
+        .route("/teams", post(team_create))
+        .route("/projects", get(projects_list))
+        .route("/projects/new", get(project_new_form))
+        .route("/projects", post(project_create))
         .with_state(state);
 
     let addr: SocketAddr = ([0, 0, 0, 0], port).into();
@@ -452,6 +477,473 @@ fn redis_value_to_str(v: &redis::Value) -> Option<String> {
     }
 }
 
+// ---------- M2 registry editor ----------
+
+/// Find the next version for a given kind+name by scanning Redis keys.
+/// Returns 1 for a brand-new record; max_existing+1 otherwise.
+async fn next_version(
+    conn: &mut ConnectionManager,
+    kind: &str,
+    name: &str,
+) -> anyhow::Result<u32> {
+    let pattern = format!("agentry:{kind}:{name}:v*");
+    let mut max_v: u32 = 0;
+    let mut cursor: u64 = 0;
+    loop {
+        let (next, keys): (u64, Vec<String>) = redis::cmd("SCAN")
+            .arg(cursor)
+            .arg("MATCH")
+            .arg(&pattern)
+            .arg("COUNT")
+            .arg(100)
+            .query_async(conn)
+            .await?;
+        for k in keys {
+            if let Some(v_str) = k.rsplit(":v").next() {
+                if let Ok(v) = v_str.parse::<u32>() {
+                    if v > max_v {
+                        max_v = v;
+                    }
+                }
+            }
+        }
+        if next == 0 {
+            break;
+        }
+        cursor = next;
+    }
+    Ok(max_v + 1)
+}
+
+/// SCAN-fetch all keys matching a pattern (kind), return the record JSONs.
+async fn list_records(
+    conn: &mut ConnectionManager,
+    kind: &str,
+) -> anyhow::Result<Vec<(String, Value)>> {
+    let pattern = format!("agentry:{kind}:*");
+    let mut cursor: u64 = 0;
+    let mut keys: Vec<String> = Vec::new();
+    loop {
+        let (next, batch): (u64, Vec<String>) = redis::cmd("SCAN")
+            .arg(cursor)
+            .arg("MATCH")
+            .arg(&pattern)
+            .arg("COUNT")
+            .arg(200)
+            .query_async(conn)
+            .await?;
+        keys.extend(batch);
+        if next == 0 {
+            break;
+        }
+        cursor = next;
+    }
+    keys.sort();
+    let mut out = Vec::with_capacity(keys.len());
+    for k in keys {
+        let raw: Option<String> = conn.get(&k).await?;
+        if let Some(s) = raw {
+            if let Ok(v) = serde_json::from_str::<Value>(&s) {
+                out.push((k, v));
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn split_csv(s: &str) -> Vec<String> {
+    s.split(',')
+        .map(str::trim)
+        .filter(|x| !x.is_empty())
+        .map(String::from)
+        .collect()
+}
+
+fn split_lines(s: &str) -> Vec<String> {
+    s.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(String::from)
+        .collect()
+}
+
+// ---------- Roles ----------
+
+async fn roles_list(State(app): State<AppState>) -> Result<Html<String>, AppError> {
+    let items = {
+        let mut c = app.redis.lock().await;
+        list_records(&mut c, "role").await?
+    };
+    let mut rows = String::new();
+    for (key, v) in &items {
+        let name = v.get("name").and_then(Value::as_str).unwrap_or("?");
+        let version = v.get("version").and_then(Value::as_u64).unwrap_or(0);
+        let model = v.get("model").and_then(Value::as_str).unwrap_or("");
+        let image = v.get("image").and_then(Value::as_str).unwrap_or("");
+        rows.push_str(&format!(
+            r#"<tr class="border-b border-slate-800">
+<td class="py-2 font-mono text-sm text-slate-200">{name}</td>
+<td class="py-2 font-mono text-xs text-slate-400">v{version}</td>
+<td class="py-2 text-sm text-slate-300">{model}</td>
+<td class="py-2 text-xs text-slate-400 font-mono">{image}</td>
+<td class="py-2 text-xs text-slate-600 font-mono">{key}</td>
+</tr>"#
+        ));
+    }
+    if rows.is_empty() {
+        rows = r#"<tr><td colspan="5" class="py-4 text-slate-500 italic text-sm">No roles yet.</td></tr>"#.into();
+    }
+    Ok(Html(page(
+        "agentry — roles",
+        &format!(
+            r#"<div class="flex items-center mb-4">
+<h2 class="text-lg font-semibold text-slate-200">Roles</h2>
+<a href="/roles/new" class="ml-auto px-3 py-1 rounded bg-indigo-700 hover:bg-indigo-600 text-white text-sm">+ new role</a>
+</div>
+<table class="w-full">
+<thead><tr class="text-slate-500 text-xs uppercase tracking-wider border-b border-slate-700">
+<th class="text-left py-2">name</th><th class="text-left py-2">version</th>
+<th class="text-left py-2">model</th><th class="text-left py-2">image</th><th class="text-left py-2">redis key</th></tr></thead>
+<tbody>{rows}</tbody></table>"#
+        ),
+    )))
+}
+
+async fn role_new_form() -> Html<String> {
+    let body = r#"<h2 class="text-lg font-semibold text-slate-200 mb-4">New role</h2>
+<form method="POST" action="/roles" class="space-y-4">
+  <div><label class="block text-sm text-slate-400 mb-1">name <span class="text-xs text-slate-600">(lowercase, hyphens)</span></label>
+    <input name="name" required pattern="[a-z0-9-]+" class="w-full bg-slate-900 border border-slate-700 rounded px-3 py-2 text-slate-100"></div>
+  <div><label class="block text-sm text-slate-400 mb-1">model <span class="text-xs text-slate-600">(optional)</span></label>
+    <input name="model" placeholder="claude-opus-4-7 / grok-4 / gemini-2-flash" class="w-full bg-slate-900 border border-slate-700 rounded px-3 py-2 text-slate-100"></div>
+  <div><label class="block text-sm text-slate-400 mb-1">image <span class="text-xs text-slate-600">(fully qualified)</span></label>
+    <input name="image" required placeholder="localhost/agentry/echo-agent:v1" class="w-full bg-slate-900 border border-slate-700 rounded px-3 py-2 font-mono text-sm text-slate-100"></div>
+  <div><label class="block text-sm text-slate-400 mb-1">substrate</label>
+    <select name="substrate_class" class="bg-slate-900 border border-slate-700 rounded px-3 py-2 text-slate-100">
+      <option value="podman" selected>podman</option><option value="docker">docker</option>
+      <option value="lxc">lxc</option><option value="ssh">ssh</option><option value="vm">vm</option>
+    </select></div>
+  <div><label class="block text-sm text-slate-400 mb-1">system prompt <span class="text-xs text-slate-600">(optional, or @file://path)</span></label>
+    <textarea name="system_prompt" rows="4" class="w-full bg-slate-900 border border-slate-700 rounded px-3 py-2 text-sm text-slate-100"></textarea></div>
+  <div><label class="block text-sm text-slate-400 mb-1">binaries <span class="text-xs text-slate-600">(CSV)</span></label>
+    <input name="binaries_csv" placeholder="rustc,cargo,sccache" class="w-full bg-slate-900 border border-slate-700 rounded px-3 py-2 font-mono text-sm text-slate-100"></div>
+  <div><label class="block text-sm text-slate-400 mb-1">tool allowlist <span class="text-xs text-slate-600">(CSV)</span></label>
+    <input name="tool_allowlist_csv" placeholder="read,edit,bash:cargo" class="w-full bg-slate-900 border border-slate-700 rounded px-3 py-2 font-mono text-sm text-slate-100"></div>
+  <div><label class="block text-sm text-slate-400 mb-1">permit scope <span class="text-xs text-slate-600">(one per line)</span></label>
+    <textarea name="permit_scope_lines" rows="3" placeholder="fs:read:/workspace/**&#10;fs:write:/workspace/**&#10;net:deny:*" class="w-full bg-slate-900 border border-slate-700 rounded px-3 py-2 font-mono text-sm text-slate-100"></textarea></div>
+  <div><label class="block text-sm text-slate-400 mb-1">mcp servers <span class="text-xs text-slate-600">(JSON array, optional)</span></label>
+    <textarea name="mcp_servers_json" rows="3" placeholder='[{"name":"ra-query","image":"ghcr.io/yg/ra-query:v0.1"}]' class="w-full bg-slate-900 border border-slate-700 rounded px-3 py-2 font-mono text-sm text-slate-100"></textarea></div>
+  <button type="submit" class="px-4 py-2 rounded bg-indigo-700 hover:bg-indigo-600 text-white">save (auto v=next)</button>
+</form>"#;
+    Html(page("agentry — new role", body))
+}
+
+#[derive(Deserialize)]
+struct RoleForm {
+    name: String,
+    model: Option<String>,
+    image: String,
+    substrate_class: String,
+    system_prompt: Option<String>,
+    binaries_csv: String,
+    tool_allowlist_csv: String,
+    permit_scope_lines: String,
+    mcp_servers_json: String,
+}
+
+async fn role_create(
+    State(app): State<AppState>,
+    Form(f): Form<RoleForm>,
+) -> Result<Redirect, AppError> {
+    let substrate_class: SubstrateClass = serde_json::from_value(Value::String(
+        f.substrate_class.clone(),
+    ))
+    .map_err(|e| anyhow::anyhow!("invalid substrate_class: {e}"))?;
+
+    let mcp_servers: Vec<McpServer> = if f.mcp_servers_json.trim().is_empty() {
+        Vec::new()
+    } else {
+        serde_json::from_str(&f.mcp_servers_json)
+            .map_err(|e| anyhow::anyhow!("mcp_servers_json: {e}"))?
+    };
+
+    let model = f.model.filter(|s| !s.trim().is_empty());
+    let system_prompt = f.system_prompt.filter(|s| !s.trim().is_empty());
+
+    let version = {
+        let mut c = app.redis.lock().await;
+        next_version(&mut c, "role", &f.name).await?
+    };
+    let role = AgentRole {
+        name: RoleName(f.name.clone()),
+        version,
+        model,
+        system_prompt,
+        image: f.image,
+        substrate_class,
+        binaries: split_csv(&f.binaries_csv),
+        mcp_servers,
+        tool_allowlist: ToolAllowlist(split_csv(&f.tool_allowlist_csv)),
+        permit_scope: PermitScope(split_lines(&f.permit_scope_lines)),
+    };
+    {
+        let mut c = app.redis.lock().await;
+        redis_io::save_role(&mut c, &role).await?;
+    }
+    Ok(Redirect::to("/roles"))
+}
+
+// ---------- Teams ----------
+
+async fn teams_list(State(app): State<AppState>) -> Result<Html<String>, AppError> {
+    let items = {
+        let mut c = app.redis.lock().await;
+        list_records(&mut c, "team").await?
+    };
+    let mut rows = String::new();
+    for (key, v) in &items {
+        let name = v.get("name").and_then(Value::as_str).unwrap_or("?");
+        let version = v.get("version").and_then(Value::as_u64).unwrap_or(0);
+        let roles = v
+            .get("roles")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", "))
+            .unwrap_or_default();
+        let terminal = v.get("terminal_role").and_then(Value::as_str).unwrap_or("");
+        rows.push_str(&format!(
+            r#"<tr class="border-b border-slate-800">
+<td class="py-2 font-mono text-sm text-slate-200">{name}</td>
+<td class="py-2 font-mono text-xs text-slate-400">v{version}</td>
+<td class="py-2 text-sm text-slate-300">{roles}</td>
+<td class="py-2 text-xs font-mono text-slate-400">{terminal}</td>
+<td class="py-2 text-xs text-slate-600 font-mono">{key}</td>
+</tr>"#
+        ));
+    }
+    if rows.is_empty() {
+        rows = r#"<tr><td colspan="5" class="py-4 text-slate-500 italic text-sm">No teams yet.</td></tr>"#.into();
+    }
+    Ok(Html(page(
+        "agentry — teams",
+        &format!(
+            r#"<div class="flex items-center mb-4">
+<h2 class="text-lg font-semibold text-slate-200">Teams</h2>
+<a href="/teams/new" class="ml-auto px-3 py-1 rounded bg-indigo-700 hover:bg-indigo-600 text-white text-sm">+ new team</a>
+</div>
+<table class="w-full">
+<thead><tr class="text-slate-500 text-xs uppercase tracking-wider border-b border-slate-700">
+<th class="text-left py-2">name</th><th class="text-left py-2">version</th>
+<th class="text-left py-2">roles</th><th class="text-left py-2">terminal</th><th class="text-left py-2">redis key</th></tr></thead>
+<tbody>{rows}</tbody></table>"#
+        ),
+    )))
+}
+
+async fn team_new_form() -> Html<String> {
+    let body = r#"<h2 class="text-lg font-semibold text-slate-200 mb-4">New team</h2>
+<form method="POST" action="/teams" class="space-y-4">
+  <div><label class="block text-sm text-slate-400 mb-1">name</label>
+    <input name="name" required pattern="[a-z0-9-]+" class="w-full bg-slate-900 border border-slate-700 rounded px-3 py-2 text-slate-100"></div>
+  <div><label class="block text-sm text-slate-400 mb-1">roles <span class="text-xs text-slate-600">(CSV, in order)</span></label>
+    <input name="roles_csv" required placeholder="archaeologist,prescriber,coder-rust,reviewer,shipper" class="w-full bg-slate-900 border border-slate-700 rounded px-3 py-2 font-mono text-sm text-slate-100"></div>
+  <div><label class="block text-sm text-slate-400 mb-1">message graph <span class="text-xs text-slate-600">(one per line: <code>from -> to</code> or <code>from -> to :overrides_key</code>)</span></label>
+    <textarea name="graph_lines" rows="6" placeholder="archaeologist -> prescriber&#10;prescriber -> coder-rust :permit_overrides&#10;coder-rust -> reviewer&#10;reviewer -> shipper" class="w-full bg-slate-900 border border-slate-700 rounded px-3 py-2 font-mono text-sm text-slate-100"></textarea></div>
+  <div><label class="block text-sm text-slate-400 mb-1">terminal role</label>
+    <input name="terminal_role" required placeholder="shipper" class="w-full bg-slate-900 border border-slate-700 rounded px-3 py-2 font-mono text-sm text-slate-100"></div>
+  <div><label class="block text-sm text-slate-400 mb-1">max retries</label>
+    <input name="max_retries" type="number" min="0" value="0" class="w-24 bg-slate-900 border border-slate-700 rounded px-3 py-2 text-slate-100"></div>
+  <button type="submit" class="px-4 py-2 rounded bg-indigo-700 hover:bg-indigo-600 text-white">save (auto v=next)</button>
+</form>"#;
+    Html(page("agentry — new team", body))
+}
+
+#[derive(Deserialize)]
+struct TeamForm {
+    name: String,
+    roles_csv: String,
+    graph_lines: String,
+    terminal_role: String,
+    max_retries: u32,
+}
+
+fn parse_edge(line: &str) -> Option<MessageEdge> {
+    // Format: "from -> to" or "from -> to :overrides_key"
+    let (edge_part, overrides) = match line.split_once(':') {
+        Some((e, rest)) => (e.trim(), Some(rest.trim().to_string())),
+        None => (line.trim(), None),
+    };
+    let (from, to) = edge_part.split_once("->")?;
+    Some(MessageEdge {
+        from: RoleName(from.trim().to_string()),
+        to: RoleName(to.trim().to_string()),
+        permit_overrides_from: overrides,
+    })
+}
+
+async fn team_create(
+    State(app): State<AppState>,
+    Form(f): Form<TeamForm>,
+) -> Result<Redirect, AppError> {
+    let roles: Vec<RoleName> = split_csv(&f.roles_csv).into_iter().map(RoleName).collect();
+    if roles.is_empty() {
+        return Err(AppError(anyhow::anyhow!("team must have at least one role")));
+    }
+    let edges: Vec<MessageEdge> = split_lines(&f.graph_lines)
+        .iter()
+        .filter_map(|l| parse_edge(l))
+        .collect();
+
+    let version = {
+        let mut c = app.redis.lock().await;
+        next_version(&mut c, "team", &f.name).await?
+    };
+    let team = TeamTopology {
+        name: TeamName(f.name.clone()),
+        version,
+        roles,
+        message_graph: edges,
+        terminal_role: RoleName(f.terminal_role),
+        max_retries: f.max_retries,
+    };
+    {
+        let mut c = app.redis.lock().await;
+        redis_io::save_team(&mut c, &team).await?;
+    }
+    Ok(Redirect::to("/teams"))
+}
+
+// ---------- Projects ----------
+
+async fn projects_list(State(app): State<AppState>) -> Result<Html<String>, AppError> {
+    let items = {
+        let mut c = app.redis.lock().await;
+        list_records(&mut c, "project").await?
+    };
+    let mut rows = String::new();
+    for (key, v) in &items {
+        let slug = v.get("slug").and_then(Value::as_str).unwrap_or("?");
+        let name = v.get("name").and_then(Value::as_str).unwrap_or("");
+        let default_topo = v
+            .get("default_topology")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        rows.push_str(&format!(
+            r#"<tr class="border-b border-slate-800">
+<td class="py-2 font-mono text-sm text-slate-200">{slug}</td>
+<td class="py-2 text-sm text-slate-300">{name}</td>
+<td class="py-2 text-xs font-mono text-slate-400">{default_topo}</td>
+<td class="py-2 text-xs text-slate-600 font-mono">{key}</td>
+</tr>"#
+        ));
+    }
+    if rows.is_empty() {
+        rows = r#"<tr><td colspan="4" class="py-4 text-slate-500 italic text-sm">No projects yet.</td></tr>"#.into();
+    }
+    Ok(Html(page(
+        "agentry — projects",
+        &format!(
+            r#"<div class="flex items-center mb-4">
+<h2 class="text-lg font-semibold text-slate-200">Projects</h2>
+<a href="/projects/new" class="ml-auto px-3 py-1 rounded bg-indigo-700 hover:bg-indigo-600 text-white text-sm">+ new project</a>
+</div>
+<table class="w-full">
+<thead><tr class="text-slate-500 text-xs uppercase tracking-wider border-b border-slate-700">
+<th class="text-left py-2">slug</th><th class="text-left py-2">name</th>
+<th class="text-left py-2">default topology</th><th class="text-left py-2">redis key</th></tr></thead>
+<tbody>{rows}</tbody></table>"#
+        ),
+    )))
+}
+
+async fn project_new_form() -> Html<String> {
+    let body = r#"<h2 class="text-lg font-semibold text-slate-200 mb-4">New project</h2>
+<form method="POST" action="/projects" class="space-y-4">
+  <div><label class="block text-sm text-slate-400 mb-1">slug <span class="text-xs text-slate-600">(lowercase)</span></label>
+    <input name="slug" required pattern="[a-z0-9-]+" class="w-full bg-slate-900 border border-slate-700 rounded px-3 py-2 font-mono text-sm text-slate-100"></div>
+  <div><label class="block text-sm text-slate-400 mb-1">display name</label>
+    <input name="name" required class="w-full bg-slate-900 border border-slate-700 rounded px-3 py-2 text-slate-100"></div>
+  <div><label class="block text-sm text-slate-400 mb-1">forges <span class="text-xs text-slate-600">(one per line: forge-slug:owner/repo)</span></label>
+    <textarea name="forges_lines" rows="2" required placeholder="agency:yg/qbot-core" class="w-full bg-slate-900 border border-slate-700 rounded px-3 py-2 font-mono text-sm text-slate-100"></textarea></div>
+  <div class="grid grid-cols-2 gap-4">
+    <div><label class="block text-sm text-slate-400 mb-1">default topology</label>
+      <input name="default_topology" placeholder="qbot-issue-team" class="w-full bg-slate-900 border border-slate-700 rounded px-3 py-2 font-mono text-sm text-slate-100"></div>
+    <div><label class="block text-sm text-slate-400 mb-1">steward topology</label>
+      <input name="steward_topology" placeholder="qbot-steward" class="w-full bg-slate-900 border border-slate-700 rounded px-3 py-2 font-mono text-sm text-slate-100"></div>
+  </div>
+  <h3 class="text-sm font-semibold text-slate-300 mt-6">Standing orders</h3>
+  <div class="grid grid-cols-3 gap-4">
+    <div><label class="block text-sm text-slate-400 mb-1">tokens/day</label>
+      <input name="tokens_daily" type="number" min="0" class="w-full bg-slate-900 border border-slate-700 rounded px-3 py-2 text-slate-100"></div>
+    <div><label class="block text-sm text-slate-400 mb-1">usd/day</label>
+      <input name="usd_daily" type="number" step="0.01" min="0" class="w-full bg-slate-900 border border-slate-700 rounded px-3 py-2 text-slate-100"></div>
+    <div><label class="block text-sm text-slate-400 mb-1">default escalation</label>
+      <select name="default_escalation" class="w-full bg-slate-900 border border-slate-700 rounded px-3 py-2 text-slate-100">
+        <option value="supervised" selected>supervised</option>
+        <option value="autonomous">autonomous</option>
+        <option value="manual">manual</option>
+      </select></div>
+  </div>
+  <div><label class="block text-sm text-slate-400 mb-1">priorities <span class="text-xs text-slate-600">(one per line)</span></label>
+    <textarea name="priorities_lines" rows="3" class="w-full bg-slate-900 border border-slate-700 rounded px-3 py-2 text-sm text-slate-100"></textarea></div>
+  <div><label class="block text-sm text-slate-400 mb-1">forbidden <span class="text-xs text-slate-600">(one per line)</span></label>
+    <textarea name="forbidden_lines" rows="3" placeholder="git:force-push:main" class="w-full bg-slate-900 border border-slate-700 rounded px-3 py-2 font-mono text-sm text-slate-100"></textarea></div>
+  <button type="submit" class="px-4 py-2 rounded bg-indigo-700 hover:bg-indigo-600 text-white">save</button>
+</form>"#;
+    Html(page("agentry — new project", body))
+}
+
+#[derive(Deserialize)]
+struct ProjectForm {
+    slug: String,
+    name: String,
+    forges_lines: String,
+    default_topology: String,
+    steward_topology: String,
+    tokens_daily: Option<u64>,
+    usd_daily: Option<f64>,
+    default_escalation: String,
+    priorities_lines: String,
+    forbidden_lines: String,
+}
+
+async fn project_create(
+    State(app): State<AppState>,
+    Form(f): Form<ProjectForm>,
+) -> Result<Redirect, AppError> {
+    let default_escalation: EscalationMode = serde_json::from_value(Value::String(
+        f.default_escalation.clone(),
+    ))
+    .map_err(|e| anyhow::anyhow!("invalid default_escalation: {e}"))?;
+
+    let project = Project {
+        slug: ProjectSlug(f.slug.clone()),
+        name: f.name,
+        forges: split_lines(&f.forges_lines),
+        default_topology: match f.default_topology.trim() {
+            "" => None,
+            s => Some(TeamName(s.to_string())),
+        },
+        steward_topology: match f.steward_topology.trim() {
+            "" => None,
+            s => Some(TeamName(s.to_string())),
+        },
+        standing_orders: StandingOrders {
+            tokens_daily: f.tokens_daily,
+            usd_daily: f.usd_daily,
+            default_escalation,
+            priorities: split_lines(&f.priorities_lines),
+            forbidden: split_lines(&f.forbidden_lines),
+        },
+    };
+    let key = format!("agentry:project:{}", project.slug.0);
+    let body = serde_json::to_string(&project)?;
+    {
+        let mut c = app.redis.lock().await;
+        let _: () = c.set(&key, body).await?;
+    }
+    Ok(Redirect::to("/projects"))
+}
+
 // ---------- shell page ----------
 
 fn page(title: &str, body_html: &str) -> String {
@@ -465,12 +957,17 @@ fn page(title: &str, body_html: &str) -> String {
   <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="bg-slate-950 text-slate-200 font-sans min-h-screen">
-  <header class="max-w-4xl mx-auto p-6 border-b border-slate-800 flex items-center">
+  <header class="max-w-5xl mx-auto p-6 border-b border-slate-800 flex items-center gap-6">
     <a href="/" class="text-xl font-semibold text-slate-100">agentry</a>
-    <span class="ml-3 text-slate-500 text-sm">ephemeral agent orchestrator</span>
-    <span class="ml-auto text-slate-500 text-xs">M1 · read-only</span>
+    <nav class="flex gap-4 text-sm text-slate-400">
+      <a href="/" class="hover:text-slate-200">briefs</a>
+      <a href="/roles" class="hover:text-slate-200">roles</a>
+      <a href="/teams" class="hover:text-slate-200">teams</a>
+      <a href="/projects" class="hover:text-slate-200">projects</a>
+    </nav>
+    <span class="ml-auto text-slate-500 text-xs">M2</span>
   </header>
-  <main class="max-w-4xl mx-auto p-6">
+  <main class="max-w-5xl mx-auto p-6">
     {body_html}
   </main>
 </body>

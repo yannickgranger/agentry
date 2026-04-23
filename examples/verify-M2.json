@@ -1,0 +1,11 @@
+{
+  "id": "brf_verify_m2",
+  "project": null,
+  "topology": { "name": "printer-team", "version": 1 },
+  "payload": { "kind": "echo", "msg": "hello from M2 (role created via dashboard form)" },
+  "budget": {},
+  "escalation": "autonomous",
+  "parent_brief": null,
+  "submitted_by": "verify-m2",
+  "submitted_at": "2026-04-23T12:00:00Z"
+}
