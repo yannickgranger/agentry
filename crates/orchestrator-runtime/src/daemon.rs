@@ -7,7 +7,7 @@
 
 use crate::{
     Error, Result, permit as permit_mod, redis_io,
-    spawner::{PodmanSpawner, Spawner},
+    spawner::{PodmanSpawner, RoutedMessage, Spawner, TeamContext},
 };
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use orchestrator_types::{
@@ -79,21 +79,37 @@ async fn handle_brief(
         )));
     }
 
+    // Accumulated outbox from all upstream roles; sliced per role on dispatch.
+    let mut all_messages: Vec<RoutedMessage> = Vec::new();
+
     for role_name in &team.roles {
         let role = fetch_role_any_version(conn, role_name).await?;
         let mut permit = mint_permit(brief, &role)?;
         permit_mod::sign(&mut permit, signing_key)?;
-        let (_handle, verdict) = spawner
-            .run_agent(brief, &role, &permit, verifying_key, conn)
+
+        // Messages addressed to this role from any prior step.
+        let team_ctx = TeamContext {
+            messages: all_messages
+                .iter()
+                .filter(|m| m.to == role.name.0)
+                .cloned()
+                .collect(),
+        };
+
+        let outcome = spawner
+            .run_agent(brief, &role, &permit, verifying_key, &team_ctx, conn)
             .await?;
-        redis_io::append_verdict(conn, &verdict).await?;
+        redis_io::append_verdict(conn, &outcome.verdict).await?;
         tracing::info!(
             brief = %brief.id,
             role = %role_name,
-            verdict = ?verdict.kind,
+            verdict = ?outcome.verdict.kind,
+            outbox_len = outcome.outbox.len(),
             "role completed"
         );
-        if !matches!(verdict.kind, VerdictKind::Shipped) {
+        all_messages.extend(outcome.outbox);
+
+        if !matches!(outcome.verdict.kind, VerdictKind::Shipped) {
             // On non-shipped verdict, stop the team run.
             return Ok(());
         }

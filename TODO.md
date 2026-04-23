@@ -1,86 +1,70 @@
 # Next Concrete Action
 
-**Status:** **M0 + M1 + M2 + M3 GREEN** as of 2026-04-23. Next: M4 — inter-role message routing (two-role teams communicate via agency-bus-style inbox/outbox streams).
+**Status:** **M0 + M1 + M2 + M3 + M4 GREEN** as of 2026-04-23. Next: M5 — real LLM agent inside a container (first Claude/Grok/Gemini role).
 
 ## Done
 
-### M0 — runtime + podman spawner + echo-agent
-Commit: `24f7e4f`. Verdict `shipped` for `brf_verify_m0` on `agentry:verdicts`.
+| # | Scope | Commit | Proof |
+|---|-------|--------|-------|
+| M0 | runtime + podman spawner + echo | `24f7e4f` | verdict shipped for brf_verify_m0 |
+| M1 | dashboard + SSE | `eb51c08` | /sse/verdicts emits live events |
+| M2 | registry editor (forms) | `2753ecf` | POST /roles → role saved → brief → shipped |
+| M3 | permit broker (signing + enforcement) | `95dc1cb` | naughty-agent blocked → permit_violation |
+| M4 | inter-role message routing | see `git log` | speaker → listener; listener received message |
 
-### M1 — dashboard + SSE
-Commit: `eb51c08`. `curl /` shows brf; `/sse/verdicts` emits live.
-
-### M2 — typed registry editor
-Commit: `2753ecf`. POST /roles, /teams, /projects all save typed records with auto version bump.
-
-### M3 — permit broker (AEGIS signing + tool-call enforcement)
-- ed25519 signing via `ed25519-dalek`. Key at `~/.config/agentry/signing.key` (0600). Generate: `orchestrator key-gen`.
-- `sign(&mut permit, &signing_key)`, `verify(&permit, &verifying_key)`, `tool_allowed(&permit, tool)`.
-- Daemon loads key at startup; `mint_permit` signs before handing off.
-- Spawner verifies permit on entry; intercepts `Event::ToolCall` on stdout.
-- Every tool call is appended to `agentry:brief:{id}:audit` (always, allowed or not).
-- Unauthorized tool → container killed (`podman stop`), verdict `permit_violation`.
-- Verified with a `naughty-agent` container whose allowlist is `[read]` but attempts `write`:
-  - verdict on Redis: `{"brief":"brf_verify_m3","kind":"permit_violation","reason":"unauthorized tool call: write"}`
-  - audit stream recorded the `write` attempt with `args={"path":"/etc/shadow"}`
-- M0 regression: still green after signing pipeline.
-
-### Replay any milestone
+### Replay (order matters: M0 → M1 → M2 → M3 → M4)
 
 ```bash
 export AGENTRY_REDIS_URL='redis://:RedisRationalized2026@192.168.1.152:6379'
 export AGENTRY_DASHBOARD_PORT=7800
 cd /var/mnt/workspaces/agentry
 cargo build --release --workspace
-
-# One-time key gen (M3 onwards; skip if ~/.config/agentry/signing.key already exists)
-./target/release/orchestrator key-gen --force
-
-# Container images
-podman image exists localhost/agentry/echo-agent:v1    || (cd containers/echo-agent    && podman build -t agentry/echo-agent:v1    -f Containerfile .)
-podman image exists localhost/agentry/naughty-agent:v1 || (cd containers/naughty-agent && podman build -t agentry/naughty-agent:v1 -f Containerfile .)
-
+./target/release/orchestrator key-gen --force    # M3
+for img in echo naughty speaker listener; do
+  podman image exists localhost/agentry/${img}-agent:v1 \
+    || (cd containers/${img}-agent && podman build -t agentry/${img}-agent:v1 -f Containerfile .)
+done
+cd /var/mnt/workspaces/agentry
 ./target/release/orchestrator seed
-
-ps -eo pid,comm | awk '$2 ~ /^orchestrator/ {print $1}' | xargs -r kill -9   # defensive
+ps -eo pid,comm | awk '$2 ~ /^orchestrator/ {print $1}' | xargs -r kill -9
 nohup ./target/release/orchestratord         > /tmp/agentry-orchestratord.log 2>&1 &
 nohup ./target/release/orchestrator-dashboard > /tmp/agentry-dashboard.log 2>&1 &
 sleep 1
-just verify-M0   # or verify-M1 / verify-M2 / verify-M3
+for m in 0 1 2 3 4; do just verify-M$m; done
 ```
 
-## M4 — inter-role message routing (next up)
+## M5 — real LLM agent inside a container
 
-Goal: a `speaker → listener` team where the speaker's output lands in the listener's inbox. Trace shows ordered events from both roles.
+Goal: a role whose container runs a real LLM (Claude API preferred, Grok/Gemini acceptable) against a prompt derived from the brief payload. Emits events with the model's output. Respects permit allowlist for any tool calls the model wants to make.
 
-### Subtasks
+### Approach (simplest viable first — don't over-engineer)
 
-1. **Agent I/O contract v2** (orchestrator-types::event):
-   - The existing `EventKind::Message { to, payload }` on stdout already marks an outbox message.
-   - Container runner, on each `Message { to, payload }`, publishes to `agentry:agent:{<to-agent-id>}:inbox` (and mirrors to trace).
-   - Need: a way to map `to: <role-name>` → the actual sibling's agent_id in the same brief. Introduce a per-brief role-agent-id table (in-memory in the daemon or Redis hash `agentry:brief:{id}:agents`).
-2. **Spawner upgrade:** before spawning each role, resolve outgoing edges from `team.message_graph` and register the agent_id → outbox-stream mapping.
-3. **Agent entrypoint:** role containers now receive `AGENTRY_INBOX_STREAM` env var; agents can tail the stream on their own schedule. For M4, keep agents simple: shell scripts that read `AGENTRY_STARTUP` (stdin) and optionally read one inbox line.
-4. **Two-role example:**
-   - `speaker` role: emits `Message { to: "listener", payload: {msg:"hi"} }` + `done shipped`.
-   - `listener` role: reads inbox for one line, emits an `event` with the received payload, then `done shipped`.
-5. **Team:** `speaker → listener` message graph, terminal `listener`.
-6. **Daemon change:** sequential spawn, but when spawning role N, the daemon has the agent_id of role N-1 in hand. When role N-1's `Message { to: N }` arrives, route to role N's inbox.
-7. **verify-M4.json** + `just verify-M4` — assert both trace events appear and verdict is `shipped`.
+1. **Container image:** `agentry/llm-agent:v1` — alpine + `python3` + `py3-pip` + `anthropic` (or `grok-python`/`google-genai`).
+2. **Entrypoint:** `entrypoint.py` — reads stdin JSON bundle, pulls API key from env (passed by spawner via `--env ANTHROPIC_API_KEY=...`), calls the model with `brief.payload.prompt`, emits one `event` per streamed chunk (or one at the end if not streaming), then `done`.
+3. **Spawner change:** pass any env vars from an orchestrator-side list-of-secrets (e.g. `AGENTRY_PASSTHRU_ENV=ANTHROPIC_API_KEY,OPENAI_API_KEY`) into the container with `--env KEY=value`.
+4. **Key handling:** orchestratord reads keys from the environment at startup; the key NEVER lives in a file in the repo; `.gitignore` already covers `.env`.
+5. **A role "llm-echo" seeded**: image `llm-agent:v1`, allowlist `[]` (no tools — pure completion), prompt from brief.
+6. **verify-M5.json** submits `{payload:{prompt:"Say hello in 5 words"}}`; expect `verdict=shipped` + trace contains a model-output event.
 
 ### Budget
 
-~150 LOC new. Ceiling per drift rules.
+~150 LOC new Rust (env passthrough in spawner) + ~50 LOC Python (entrypoint) + container.
 
 ### Invariants to preserve
 
-- Sequential role execution (parallel = later milestone; adds complexity).
-- Permit broker still enforces allowlists; `message` tool is implicit (not listed in allowlist as a distinct tool).
-- Old M0–M3 verifications must still pass.
+- Keys never committed. `entrypoint.py` never writes keys to stdout.
+- Old verifies still pass.
+- The model agent respects permit allowlist — if it tries a tool call, broker blocks (M3 mechanism).
+- One single inference per brief for the first pass; streaming + long-context + tool-use are separate milestones.
+
+### If Anthropic's API is down or the key is missing
+
+- The brief should verdict=`failed` with reason. Don't hang.
+- Timeout: container wall-time capped by podman `--timeout 60s`.
 
 ## If this session ends mid-task
 
-- `git status` → commit as `wip(m4): <file>:<line> <what>`.
+- `git status` → commit as `wip(m5): ...`.
 - Update this `TODO.md`.
-- `mcp__memory__set key="project:agentry:resume" value=<updated state>`.
-- Run replay recipe above.
+- Update Redis key `project:agentry:resume` with current focus.
+- Run replay block to validate nothing regressed.

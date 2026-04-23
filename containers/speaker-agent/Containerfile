@@ -1,0 +1,6 @@
+# speaker-agent — emits a Message event addressed to a downstream role.
+FROM alpine:3.21
+RUN apk add --no-cache coreutils bash
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+ENTRYPOINT ["/entrypoint.sh"]

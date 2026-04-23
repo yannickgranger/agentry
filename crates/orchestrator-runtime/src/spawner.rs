@@ -28,6 +28,24 @@ pub struct AgentStartup<'a> {
     pub brief: &'a Brief,
     pub role: &'a AgentRole,
     pub permit: &'a WorkPermit,
+    /// Messages routed to this role from upstream roles in the same team.
+    /// Populated from the team's message_graph + accumulated Message events.
+    pub team_context: &'a TeamContext,
+}
+
+/// Per-brief, per-role context delivered on stdin. Accumulates in the daemon
+/// as upstream roles emit `Message` events.
+#[derive(Clone, Debug, Default, Serialize, serde::Deserialize)]
+pub struct TeamContext {
+    pub messages: Vec<RoutedMessage>,
+}
+
+#[derive(Clone, Debug, Serialize, serde::Deserialize)]
+pub struct RoutedMessage {
+    pub from: String,
+    pub to: String,
+    pub payload: serde_json::Value,
+    pub at: chrono::DateTime<chrono::Utc>,
 }
 
 /// Handle returned by the spawner; used for teardown.
@@ -38,18 +56,27 @@ pub struct AgentHandle {
 }
 
 /// The spawner abstraction.
+/// Outcome of running one role.
+pub struct AgentOutcome {
+    pub handle: AgentHandle,
+    pub verdict: Verdict,
+    /// Messages the agent emitted; the daemon routes these to downstream roles.
+    pub outbox: Vec<RoutedMessage>,
+}
+
 #[async_trait]
 pub trait Spawner: Send + Sync {
     /// Run the agent fully: spawn, pipe stdin, tail stdout to trace, enforce
-    /// permit on tool-call events, write verdict, tear down.
+    /// permit on tool-call events, route messages, write verdict, tear down.
     async fn run_agent(
         &self,
         brief: &Brief,
         role: &AgentRole,
         permit: &WorkPermit,
         verifying_key: &VerifyingKey,
+        team_context: &TeamContext,
         conn: &mut ConnectionManager,
-    ) -> Result<(AgentHandle, Verdict)>;
+    ) -> Result<AgentOutcome>;
 }
 
 /// Podman spawner (M0).
@@ -80,8 +107,9 @@ impl Spawner for PodmanSpawner {
         role: &AgentRole,
         permit: &WorkPermit,
         verifying_key: &VerifyingKey,
+        team_context: &TeamContext,
         conn: &mut ConnectionManager,
-    ) -> Result<(AgentHandle, Verdict)> {
+    ) -> Result<AgentOutcome> {
         // Defence in depth: verify the permit we're about to hand out.
         permit_mod::verify(permit, verifying_key)?;
 
@@ -92,6 +120,7 @@ impl Spawner for PodmanSpawner {
             brief,
             role,
             permit,
+            team_context,
         };
         let startup_json = serde_json::to_string(&startup)?;
 
@@ -139,6 +168,7 @@ impl Spawner for PodmanSpawner {
 
         let mut terminal: Option<Event> = None;
         let mut permit_violation: Option<String> = None;
+        let mut outbox: Vec<RoutedMessage> = Vec::new();
         while let Some(line) = reader.next_line().await? {
             if line.is_empty() {
                 continue;
@@ -165,6 +195,15 @@ impl Spawner for PodmanSpawner {
                                 .await;
                             break;
                         }
+                    }
+                    // Collect outbox messages for downstream routing.
+                    if let EventKind::Message { to, payload } = &ev.kind {
+                        outbox.push(RoutedMessage {
+                            from: role.name.0.clone(),
+                            to: to.clone(),
+                            payload: payload.clone(),
+                            at: ev.at,
+                        });
                     }
                     redis_io::append_trace(conn, &brief.id, agent_id, &ev).await?;
                     if ev.is_terminal() {
@@ -208,13 +247,14 @@ impl Spawner for PodmanSpawner {
         let verdict = Verdict::new(brief.id.clone(), verdict_kind);
         let verdict = if let Some(r) = reason { verdict.with_reason(r) } else { verdict };
 
-        Ok((
-            AgentHandle {
+        Ok(AgentOutcome {
+            handle: AgentHandle {
                 agent_id: agent_id.clone(),
                 container_name: name,
             },
             verdict,
-        ))
+            outbox,
+        })
     }
 }
 

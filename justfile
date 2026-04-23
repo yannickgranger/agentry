@@ -35,6 +35,11 @@ build-echo:
 build-naughty:
     cd containers/naughty-agent && podman build -t agentry/naughty-agent:v1 -f Containerfile .
 
+# Build M4 speaker + listener images
+build-m4:
+    cd containers/speaker-agent && podman build -t agentry/speaker-agent:v1 -f Containerfile .
+    cd containers/listener-agent && podman build -t agentry/listener-agent:v1 -f Containerfile .
+
 # Start dev infra (orchestratord + dashboard as user processes, podman for agents)
 dev-up: build build-echo
     #!/usr/bin/env bash
@@ -85,6 +90,21 @@ verify-M0:
     echo "Brief submitted. Waiting for verdict..."
     sleep 5
     redis-cli -h 192.168.1.152 -p 6379 -a RedisRationalized2026 --no-auth-warning XREVRANGE agentry:verdicts + - COUNT 1
+
+# Verify M4: speaker emits a Message; listener receives it via team_context.
+verify-M4:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    ./target/release/orchestrator submit examples/verify-M4.json
+    echo "Brief submitted. Waiting for team to complete..."
+    sleep 8
+    echo "--- verdict (expect kind=shipped) ---"
+    redis-cli -h 192.168.1.152 -p 6379 -a RedisRationalized2026 --no-auth-warning XREVRANGE agentry:verdicts + - COUNT 1
+    echo "--- trace events ---"
+    redis-cli -h 192.168.1.152 -p 6379 -a RedisRationalized2026 --no-auth-warning XRANGE agentry:brief:brf_verify_m4:trace - +
+    echo "--- listener must have a 'received_from=speaker-agent' event ---"
+    redis-cli -h 192.168.1.152 -p 6379 -a RedisRationalized2026 --no-auth-warning XRANGE agentry:brief:brf_verify_m4:trace - + \
+        | grep -q 'received_from":"speaker-agent' && echo "M4 verify PASS" || (echo "M4 verify FAIL"; exit 1)
 
 # Verify M3: naughty agent attempts an unauthorized tool call; broker kills it.
 verify-M3:

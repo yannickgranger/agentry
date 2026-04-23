@@ -125,11 +125,11 @@ Any future Claude session picking this up MUST:
 
 **DO NOT** invent new primitives, add a new crate, or re-open deferred features. If tempted, stop and re-read drift rules above.
 
-## Known limitations (M0 / M1 / M2 / M3)
+## Known limitations (M0 / M1 / M2 / M3 / M4)
 
 - **Single-daemon only.** `orchestratord` uses `XREAD BLOCK $` — no consumer groups. Two daemons will both consume a brief → double-processing. Production uses a single systemd user unit; this is fine until M4+. Dodge: `pkill -f orchestratord` before `orchestratord`.
 - **Permit signing is active from M3.** Run `orchestrator key-gen` once; key lives at `~/.config/agentry/signing.key` (0600). Without the key, `orchestratord` refuses to start.
-- **No inter-role message routing.** Teams with multiple roles run roles sequentially but don't forward messages (outbox/inbox streams unused). M4 wires this.
+- **Message routing is sequential only.** M4 ships role-A → role-B hand-off via accumulated `team_context.messages` in the next role's startup bundle. Roles run one-at-a-time; parallel team execution is M10+.
 - **Registry editor is create-only.** M2 ships list + new + POST for Role/Team/Project. Edit (PUT/PATCH) + delete land when the need surfaces; until then version-bump on every save is the history trail.
 - **No CSRF / auth on the dashboard.** Single-user LAN dev tool. Shipping to any shared network is a separate M10+ concern.
 - **303 redirect + curl quirk:** curl by default does NOT downgrade POST → GET on a 303 (contrary to RFC 7231). Every form POST from curl must NOT use `-L`; browser clients follow the PRG pattern correctly.
