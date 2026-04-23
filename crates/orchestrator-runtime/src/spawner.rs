@@ -144,8 +144,24 @@ impl Spawner for PodmanSpawner {
             .arg("--label")
             .arg(format!("agentry.role={}", role.name))
             .arg("--label")
-            .arg(format!("agentry.agent={agent_id}"))
-            .arg(&role.image);
+            .arg(format!("agentry.agent={agent_id}"));
+        // Pass through declared env vars from orchestratord's own env.
+        // Missing vars are logged and skipped — role doesn't get what it wanted.
+        for var_name in &role.passthru_env {
+            match std::env::var(var_name) {
+                Ok(val) => {
+                    cmd.arg("--env").arg(format!("{var_name}={val}"));
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        role = %role.name,
+                        env = %var_name,
+                        "passthru env not set in orchestratord; skipped"
+                    );
+                }
+            }
+        }
+        cmd.arg(&role.image);
 
         cmd.stdin(Stdio::piped());
         cmd.stdout(Stdio::piped());

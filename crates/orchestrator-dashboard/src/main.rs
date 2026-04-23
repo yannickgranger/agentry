@@ -633,6 +633,8 @@ async fn role_new_form() -> Html<String> {
     <textarea name="permit_scope_lines" rows="3" placeholder="fs:read:/workspace/**&#10;fs:write:/workspace/**&#10;net:deny:*" class="w-full bg-slate-900 border border-slate-700 rounded px-3 py-2 font-mono text-sm text-slate-100"></textarea></div>
   <div><label class="block text-sm text-slate-400 mb-1">mcp servers <span class="text-xs text-slate-600">(JSON array, optional)</span></label>
     <textarea name="mcp_servers_json" rows="3" placeholder='[{"name":"ra-query","image":"ghcr.io/yg/ra-query:v0.1"}]' class="w-full bg-slate-900 border border-slate-700 rounded px-3 py-2 font-mono text-sm text-slate-100"></textarea></div>
+  <div><label class="block text-sm text-slate-400 mb-1">passthru env <span class="text-xs text-slate-600">(CSV of env-var names read from orchestratord env, e.g. XAI_API_KEY)</span></label>
+    <input name="passthru_env_csv" placeholder="XAI_API_KEY,GEMINI_API_KEY" class="w-full bg-slate-900 border border-slate-700 rounded px-3 py-2 font-mono text-sm text-slate-100"></div>
   <button type="submit" class="px-4 py-2 rounded bg-indigo-700 hover:bg-indigo-600 text-white">save (auto v=next)</button>
 </form>"#;
     Html(page("agentry — new role", body))
@@ -649,6 +651,8 @@ struct RoleForm {
     tool_allowlist_csv: String,
     permit_scope_lines: String,
     mcp_servers_json: String,
+    #[serde(default)]
+    passthru_env_csv: String,
 }
 
 async fn role_create(
@@ -685,6 +689,7 @@ async fn role_create(
         mcp_servers,
         tool_allowlist: ToolAllowlist(split_csv(&f.tool_allowlist_csv)),
         permit_scope: PermitScope(split_lines(&f.permit_scope_lines)),
+        passthru_env: split_csv(&f.passthru_env_csv),
     };
     {
         let mut c = app.redis.lock().await;

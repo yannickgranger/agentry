@@ -40,6 +40,10 @@ build-m4:
     cd containers/speaker-agent && podman build -t agentry/speaker-agent:v1 -f Containerfile .
     cd containers/listener-agent && podman build -t agentry/listener-agent:v1 -f Containerfile .
 
+# Build M5a grok image
+build-m5a:
+    cd containers/grok-agent && podman build -t agentry/grok-agent:v1 -f Containerfile .
+
 # Start dev infra (orchestratord + dashboard as user processes, podman for agents)
 dev-up: build build-echo
     #!/usr/bin/env bash
@@ -90,6 +94,22 @@ verify-M0:
     echo "Brief submitted. Waiting for verdict..."
     sleep 5
     redis-cli -h 192.168.1.152 -p 6379 -a RedisRationalized2026 --no-auth-warning XREVRANGE agentry:verdicts + - COUNT 1
+
+# Verify M5a: call xAI Grok from inside a container; emit a reply event.
+# Requires XAI_API_KEY in orchestratord's env at startup.
+verify-M5a:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    ./target/release/orchestrator submit examples/verify-M5a.json
+    echo "Brief submitted. Waiting for Grok reply..."
+    sleep 10
+    echo "--- verdict (expect kind=shipped) ---"
+    redis-cli -h 192.168.1.152 -p 6379 -a RedisRationalized2026 --no-auth-warning XREVRANGE agentry:verdicts + - COUNT 1
+    echo "--- trace ---"
+    redis-cli -h 192.168.1.152 -p 6379 -a RedisRationalized2026 --no-auth-warning XRANGE agentry:brief:brf_verify_m5a:trace - +
+    echo "--- reply must contain 'pong' ---"
+    redis-cli -h 192.168.1.152 -p 6379 -a RedisRationalized2026 --no-auth-warning XRANGE agentry:brief:brf_verify_m5a:trace - + \
+        | grep -qi '"reply":"pong' && echo "M5a verify PASS" || (echo "M5a verify FAIL"; exit 1)
 
 # Verify M4: speaker emits a Message; listener receives it via team_context.
 verify-M4:

@@ -97,6 +97,12 @@ pub struct AgentRole {
     /// Base permit scope — narrowed further per brief.
     #[serde(default)]
     pub permit_scope: PermitScope,
+    /// Environment-variable names to pass through from orchestratord's env
+    /// to the spawned container (e.g. `["XAI_API_KEY"]`). Values are NEVER
+    /// stored in the role; the orchestrator reads them from its own env at
+    /// spawn time. Missing vars are silently skipped (broker logs a warning).
+    #[serde(default)]
+    pub passthru_env: Vec<String>,
 }
 
 #[cfg(test)]
@@ -124,6 +130,7 @@ mod tests {
                 "fs:write:/workspace/**".into(),
                 "net:deny:*".into(),
             ]),
+            passthru_env: vec![],
         };
         let s = serde_json::to_string_pretty(&r).expect("ser");
         let back: AgentRole = serde_json::from_str(&s).expect("de");
