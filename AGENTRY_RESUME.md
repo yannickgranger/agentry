@@ -134,9 +134,12 @@ Any future Claude session picking this up MUST:
 - **No CSRF / auth on the dashboard.** Single-user LAN dev tool. Shipping to any shared network is a separate M10+ concern.
 - **303 redirect + curl quirk:** curl by default does NOT downgrade POST → GET on a 303 (contrary to RFC 7231). Every form POST from curl must NOT use `-L`; browser clients follow the PRG pattern correctly.
 
-## Open questions (frozen until user returns)
+## Frozen rules (do not re-open)
 
-The following design points have user-confirmed answers; do not re-open:
+### Terminal rules
+- **Claude is Claude Max subscription only — NEVER the per-token Anthropic API.** Any Claude agent subprocesses the host's `claude` CLI. No `ANTHROPIC_API_KEY`, no `anthropic` SDK, no HTTP to api.anthropic.com. Grok and Gemini APIs are fine (cheap/fast models). See `~/.claude/projects/-var-mnt-workspaces-agency-orchestrator/memory/feedback_claude_max_only.md`.
+
+### Design points
 - Front-door = any client (app/CLI/IDE) writing to `agentry:briefs`. Not an agentry agent.
 - Dashboard = Axum + htmx + Alpine + Tailwind CDN. No SPA. Leptos islands reserved for a future drag-drop graph editor.
 - Registry storage = Redis + typed dashboard forms. No YAML files.
