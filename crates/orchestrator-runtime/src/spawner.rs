@@ -230,6 +230,34 @@ impl Spawner for PodmanSpawner {
                 format!("{}:{}", ws.host_path.display(), wm.container_path)
             };
             cmd.arg("-v").arg(spec);
+
+            // If the workspace is a git worktree, its `.git` is a FILE
+            // containing a `gitdir:` pointer to `<root>/.clones/.../worktrees/<name>/`.
+            // That host-absolute path must resolve INSIDE the container too,
+            // or every git operation fails with `fatal: not a git repository`
+            // and `set -euo pipefail` kills the script at the first git call.
+            // Bind-mount the `.clones/` root at its own host path so the
+            // pointer resolves. Read-write because git writes worktree admin
+            // files (HEAD, logs/HEAD) on every commit. Contents are public
+            // forge objects — no secrets live in the bare clone's config.
+            let dotgit = ws.host_path.join(".git");
+            if tokio::fs::metadata(&dotgit)
+                .await
+                .map(|m| m.is_file())
+                .unwrap_or(false)
+            {
+                let clones_root = crate::workspace::BriefWorkspace::root().join(".clones");
+                if clones_root.exists() {
+                    let spec = format!("{}:{}", clones_root.display(), clones_root.display());
+                    cmd.arg("-v").arg(spec);
+                    tracing::debug!(
+                        brief = %brief.id,
+                        role = %role.name,
+                        clones = %clones_root.display(),
+                        "bind-mounted bare-clone root for worktree"
+                    );
+                }
+            }
         }
 
         // Deliver the inline entrypoint script via the AGENTRY_SCRIPT env var
