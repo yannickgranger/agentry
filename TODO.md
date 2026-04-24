@@ -1,33 +1,24 @@
-# Next Concrete Action
+# Next
 
-**Status:** **M0 → M8 ALL GREEN.** Eleven verifies pass end-to-end on real infra + local podman Redis.
+**State of develop**: bootstrap infrastructure for self-hosting in place — per-brief workspace (`BriefWorkspace`), wall-clock timeout from `permit.max_wall_seconds`, `agentry-net` podman network with dedicated `agentry-sccache-redis`. `AgentRole` carries optional `workspace_mount` + `sccache` flag. Permit broker + signed `WorkPermit` + tool-call audit + message-graph routing + chain triggers + cron + webhook intake all land.
 
-Next: **M9 — first real qbot-core issue closed end-to-end** (the "we are up and running" gate from the original roadmap).
+**Next one PR** (issue #8 on `yg/agentry`): the dogfood team `agentry-self-host-v0` — `coder-claude-agentry → reviewer-mechanical-agentry → shipper-agentry`, strict sequential, `max_retries=0`. After this PR merges, agentry is the only way to modify agentry. No more Claude-authored direct commits; all further changes flow as briefs dispatched into this team. No break-glass exception.
 
-## HARD RULES (re-read every session)
+## Open issues on the forge
 
-> **Redis: LOCAL podman only** (`127.0.0.1:6380`). Never LXC 401 (.152) or 522 (.189).
-> **Claude: Max subscription only** (host `claude` CLI + bind-mounted creds). Never Anthropic API.
-> **Cheap APIs OK:** Grok (xAI), Gemini (Google). Per-role `passthru_env`.
-> **PR-opening token** (`GITEA_TOKEN`) is per-role via `passthru_env`. Never broad-cast.
+| # | Title | Track |
+|---|-------|-------|
+| [#8](https://agency.lab:3000/yg/agentry/issues/8) | dogfood team — coder + mechanical reviewer + shipper + v0 topology | **bootstrap — last Claude-authored PR, cutoff trigger** |
+| [#9](https://agency.lab:3000/yg/agentry/issues/9) | ci-watcher + auto-merge on CI-green | self-host — dispatched as brief |
+| [#10](https://agency.lab:3000/yg/agentry/issues/10) | bare-clone + git-worktree (replaces minimal workspace) | self-host |
+| [#11](https://agency.lab:3000/yg/agentry/issues/11) | `ReworkNeeded` verdict + `ReviewFinding` + coder↔reviewer loop | self-host |
+| [#12](https://agency.lab:3000/yg/agentry/issues/12) | `reviewer-claude-agentry` — LLM reviewer alongside mechanical | self-host |
+| [#13](https://agency.lab:3000/yg/agentry/issues/13) | DAG scheduler + concurrent brief execution | self-host |
+| [#14](https://agency.lab:3000/yg/agentry/issues/14) | first cfdb ban rule — no `.unwrap()` in non-test prod | self-host |
 
-## Done — all 8 roadmap milestones + figment + prod-Redis fix
+Bodies on each issue carry verb-targeted transformation lists (`CREATE`/`UPDATE`/`DELETE`/`REPLACE`/`MOVE` + `crate`/`file`/`line`) and real-infra acceptance criteria. The last six become brief payloads after #8 lands.
 
-| # | Scope | Commit | Proof |
-|---|-------|--------|-------|
-| M0 | runtime + podman + echo | `24f7e4f` | verdict shipped |
-| M1 | dashboard + SSE | `eb51c08` | /sse/verdicts live |
-| M2 | registry editor (forms) | `2753ecf` | POST /roles /teams /projects |
-| M3 | permit broker | `95dc1cb` | permit_violation on unauthorized tool |
-| M4 | inter-role message routing | `366b1b9` | speaker → listener |
-| M5a | cheap-API LLM (xAI Grok) | `38852b8` | grok-4-fast returned pong |
-| M5b | Claude Max via host CLI | `06a922e` | claude -p returned pong, zero API spend |
-| M6 + prod-Redis fix | permit_overrides narrow scope + local podman Redis | `89bc95f` | fs:write scope denied; 29 keys wiped from .152 |
-| figment | typed config (defaults + TOML + env overlay) | `bf3a81b` | 30 tests incl. anti-prod-Redis pin |
-| M7 | shipper opens real PR on toy repo | `a72fe71` | PR #1 on yg/agentry-toy |
-| M8 | triggers (cron + webhook + chain) | see `git log` | chain A→B both shipped; webhook 401-unauth and 200-submit |
-
-## Replay (in order)
+## Replay (current shape)
 
 ```bash
 cd /var/mnt/workspaces/agentry
@@ -37,76 +28,55 @@ export AGENTRY_REDIS__URL="redis://:${AGENTRY_REDIS_PASSWORD}@127.0.0.1:6380"
 export AGENTRY_DASHBOARD__PORT=7800
 export AGENTRY_WEBHOOK__SECRET=$(openssl rand -hex 16)
 export GITEA_TOKEN=$(keepassxc-cli show -sa Password --no-password -k ~/agent-zero/key/claude.key ~/agent-zero/claude.kdbx "gitea/agency.lab")
-export XAI_API_KEY=$(keepassxc-cli show -sa Password --no-password -k ~/agent-zero/key/claude.key ~/agent-zero/claude.kdbx "services/xai-grok")
 
+# Infra.
+just dev-redis-up
+just agentry-net-up
+
+# Build + seed.
 cargo build --release --workspace
 ./target/release/orchestrator key-gen --force || true
-just dev-redis-up
-# Agent containers are no longer pre-built: each role ships an inline
-# entrypoint_script and binaries list; the spawner installs packages on a
-# stock alpine:3.21 / debian:bookworm-slim base at spawn time. Podman pulls
-# those images on first use.
 ./target/release/orchestrator seed
 
-ps -eo pid,comm | awk '$2 ~ /^orchestrator/ {print $1}' | xargs -r kill -9
+# Daemons.
+pkill -9 -f '/target/release/orchestratord' || true
 nohup ./target/release/orchestratord         > /tmp/agentry-orchestratord.log 2>&1 &
+disown
 nohup ./target/release/orchestrator-dashboard > /tmp/agentry-dashboard.log 2>&1 &
-sleep 1
+disown
 
-for m in 0 1 2 3 4 5a 5b 6 7; do just verify-M$m; done
-just verify-M8-chain
-just verify-M8-webhook
+# Regression smoke (the three probe teams).
+./target/release/orchestrator submit examples/verify-M0.json            # echo-team → shipped
+./target/release/orchestrator submit examples/verify-M3.json            # naughty-team → permit_violation
+# Workspace + timeout probes run from seed-based teams:
+#   workspace-probe-team  — verifies bind-mount lifecycle
+#   timeout-probe-team    — verifies wall-clock enforcement
+#   sccache-probe-team    — verifies agentry-net + sccache-redis round-trip
+
+redis-cli -p 6380 -a "$AGENTRY_REDIS_PASSWORD" --no-auth-warning XREVRANGE agentry:verdicts + - COUNT 5
 ```
 
-## M9 — first real qbot-core issue end-to-end
+## Arch gate
 
-This is the north-star "we are up and running" gate.
+Every PR runs both:
 
-### Prerequisites (resolve with user before building)
+```bash
+scripts/arch-check.sh
+# → graph-specs check --specs specs/concepts/ --code crates/     (0 violations required)
+# → cfdb extract --workspace . --db .cfdb/db-local --keyspace agentry
+# → cfdb violations (one .cypher per file in .cfdb/queries/; currently empty by design)
+```
 
-1. **Which qbot-core issue?** Target should be:
-   - Small, well-specced (typo fix, one clippy warning, one test rename).
-   - Touches ≤3 files.
-   - Has clear acceptance (`cargo clippy` clean, `cargo test` green).
-2. **Which coder model?**
-   - **Claude Max** via M5b substrate (`claude-echo` role template) — free under subscription.
-   - **Grok Code Fast** via M5a substrate — cheap but untested on real Rust.
-   - Lean: start with Claude Max; it's what the user already trusts.
-3. **Team topology for qbot-core work.** Proposal:
-   ```
-   archaeologist -> prescriber -> coder-claude -> reviewer -> shipper
-   ```
-   - `archaeologist`: read-only, uses grep/find on a cloned worktree. Produces facts.
-   - `prescriber`: read-only, synthesizes REUSE/CREATE decisions + `permit_overrides.fs_write` to scope coder.
-   - `coder-claude`: Claude Max in container, writes files within narrowed scope, runs `cargo check`.
-   - `reviewer`: reads diff, runs full `cargo test`, emits `approve` or `reject`.
-   - `shipper`: M7 shipper retargeted at `yg/qbot-core`, opens PR.
-4. **Do we merge automatically?** Lean: NO for M9. Shipper opens PR; human merges. Auto-merge is a separate scope.
-
-### Architectural work needed (not just config)
-
-- **Cloned worktree per team.** Each agent needs the qbot-core checkout. Options:
-  a) One worktree shared via bind mount (unsafe — parallel writes, which isn't a concern since roles are sequential, but still cross-context contamination).
-  b) Each agent clones its own. Wasteful but clean.
-  c) First role clones; subsequent roles bind-mount the same directory.
-  Lean: (c) — clone once in `archaeologist`, bind-mount through team.
-  Needs: a way to mark a role as "persists its workspace" + a way for downstream roles to inherit it. This is a NEW CONCEPT. Deferring to explicit design discussion before coding.
-- **Real quality signal.** `cargo check`/`cargo test` from a container takes minutes for qbot-core. Need resource allocation + timeout (podman `--timeout`), separate from the brief-level budget.
-- **MCP server for forge ops inside coder-claude.** Claude needs to read file history / blame / diff. Lean: mount `mcp-forge` into coder-claude's container (M5b-like pattern + mounts field already exists).
-
-### Alternatives to M9
-
-If M9 feels too ambitious as the next step, three intermediate milestones that are each individually valuable:
-
-- **M8.5 — parallel spawning** in one team. Currently all roles run sequentially. For real teams this is fine for linear pipelines but limits council patterns (archaeologist + spec-guardian + cfdb-auditor running in parallel). ~150 LOC.
-- **M8.6 — persistent workspace inheritance.** A role declares `workspace: persist`; downstream roles declare `workspace: inherit`, and the spawner bind-mounts the upstream container's workspace as read-only into the downstream. ~100 LOC.
-- **M8.7 — glob matching for fs scope.** Currently M6 does literal-path matching. For real work we need `fs:write:/workspace/src/**` style globs. Add `globset` crate. ~50 LOC.
-
-Recommend building at least M8.6 before M9 — qbot-core work really needs persistent workspace across roles.
+Adding, renaming, or removing a top-level `pub struct/enum/trait/type` without updating `specs/concepts/` in the same PR is a CI failure. Ban rules land one-per-PR with their own justification and zero existing violations.
 
 ## If this session ends mid-task
 
-- `git status` → commit as `wip(m9): ...`.
-- Update this TODO.
-- `mcp__memory__set key="project:agentry:resume"`.
-- Replay block above before new work.
+- `git status` → `fix: ...` or `feat: ...` commit (no `wip:`).
+- `mcp__memory__save_state namespace='a0-session:<date>-<topic>'` with a structured handoff.
+- Next session: `mcp__memory__load_state` + check PR merge states on the forge + read this file.
+
+## History (summarised)
+
+Prior to the current state, the project landed in a 2-hour burst of M0-M8 theater milestones on a dead feature branch, all demonstrating shell scripts emitting what their own verify greps expected. That work was reframed: specs + cfdb gate installed (PR #4), per-agent Containerfiles consolidated into inline scripts + `package_manager` + `entrypoint_script` (PRs #2 then #15), infra for real self-hosting added (PRs #18 = recovered #16 + #17).
+
+The milestone-number narrative does not return. Every future change is a verb-targeted brief against a specced codebase.
