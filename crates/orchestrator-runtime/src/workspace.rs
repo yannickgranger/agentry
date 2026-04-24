@@ -126,6 +126,27 @@ pub async fn ensure_bare_clone(repo_url: &str, root: &Path) -> Result<PathBuf> {
                 String::from_utf8_lossy(&out.stderr)
             )));
         }
+        // `git clone --bare` in modern git does NOT add a fetch refspec.
+        // Without it, subsequent `git fetch --prune` updates only FETCH_HEAD —
+        // local refs/heads/* stay frozen, and every brief's
+        // `git worktree add -b auto/X <path> develop` forks from stale develop.
+        // Set the standard refspec explicitly so fetches keep refs fresh.
+        let out = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(&bare)
+            .arg("config")
+            .arg("--add")
+            .arg("remote.origin.fetch")
+            .arg("+refs/heads/*:refs/heads/*")
+            .output()
+            .await
+            .map_err(|e| Error::Config(format!("git config remote.origin.fetch: {e}")))?;
+        if !out.status.success() {
+            return Err(Error::Config(format!(
+                "git config --add remote.origin.fetch failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            )));
+        }
     }
 
     Ok(bare)
@@ -416,6 +437,51 @@ mod tests {
         assert!(
             bare_dir.join("HEAD").exists(),
             "destroy nuked the bare clone (must survive)"
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_bare_clone_sets_fetch_refspec() {
+        let seed = tempfile::tempdir().expect("seed tmpdir");
+        // Minimal upstream: a bare repo we can clone from via file:// URL.
+        let seed_repo = seed.path().join("upstream.git");
+        tokio::process::Command::new("git")
+            .arg("init")
+            .arg("--bare")
+            .arg(&seed_repo)
+            .output()
+            .await
+            .expect("git init --bare upstream");
+
+        let root = tempfile::tempdir().expect("root tmpdir");
+        let url = format!("file://{}", seed_repo.display());
+        let bare = ensure_bare_clone(&url, root.path())
+            .await
+            .expect("ensure_bare_clone");
+
+        // Read the refspec via `git config --get-all`. Must contain the
+        // standard `+refs/heads/*:refs/heads/*` entry, otherwise `git fetch`
+        // will not refresh local refs.
+        let out = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(&bare)
+            .arg("config")
+            .arg("--get-all")
+            .arg("remote.origin.fetch")
+            .output()
+            .await
+            .expect("git config --get-all");
+        assert!(
+            out.status.success(),
+            "git config --get-all failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let refspecs = String::from_utf8(out.stdout).expect("utf8");
+        assert!(
+            refspecs
+                .lines()
+                .any(|l| l.trim() == "+refs/heads/*:refs/heads/*"),
+            "expected +refs/heads/*:refs/heads/* in remote.origin.fetch, got: {refspecs:?}"
         );
     }
 }
