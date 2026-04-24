@@ -53,6 +53,12 @@ allowlist, baseline permit scope, env passthrough list, mounts, optional
 workspace mount, and a `sccache` flag that wires the container to the
 shared sccache-redis compile cache over the `agentry-net` podman network.
 
+The role also carries `extra_bootstrap`: extra shell commands executed as
+part of the container's bootstrap sequence, one per entry, appended AFTER
+the package-manager install and BEFORE the role's entrypoint script.
+Typical use: `rustup component add rustfmt clippy` for rust-based roles.
+Empty means no extras.
+
 ## TeamName
 
 Identifier for a team topology. Lowercase + hyphens, unique within the

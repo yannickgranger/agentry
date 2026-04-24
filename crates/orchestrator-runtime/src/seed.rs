@@ -593,6 +593,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         tool_allowlist: ToolAllowlist(vec![]),
         permit_scope: PermitScope(vec!["net:deny:*".into()]),
         passthru_env: vec![],
+        extra_bootstrap: vec![],
         mounts: vec![],
         workspace_mount: None,
         sccache: false,
@@ -621,6 +622,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         tool_allowlist: ToolAllowlist(vec!["read".into()]),
         permit_scope: PermitScope(vec!["net:deny:*".into()]),
         passthru_env: vec![],
+        extra_bootstrap: vec![],
         mounts: vec![],
         workspace_mount: None,
         sccache: false,
@@ -649,6 +651,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         tool_allowlist: ToolAllowlist(vec![]),
         permit_scope: PermitScope(vec!["net:deny:*".into()]),
         passthru_env: vec![],
+        extra_bootstrap: vec![],
         mounts: vec![],
         workspace_mount: None,
         sccache: false,
@@ -667,6 +670,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         tool_allowlist: ToolAllowlist(vec![]),
         permit_scope: PermitScope(vec!["net:deny:*".into()]),
         passthru_env: vec![],
+        extra_bootstrap: vec![],
         mounts: vec![],
         workspace_mount: None,
         sccache: false,
@@ -699,6 +703,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         tool_allowlist: ToolAllowlist(vec![]),
         permit_scope: PermitScope(vec!["net:allow:api.x.ai".into()]),
         passthru_env: vec!["XAI_API_KEY".into()],
+        extra_bootstrap: vec![],
         mounts: vec![],
         workspace_mount: None,
         sccache: false,
@@ -732,6 +737,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
             "net:allow:api.anthropic.com".into(), // claude CLI authed via OAuth, NOT API key
         ]),
         passthru_env: vec![],
+        extra_bootstrap: vec![],
         mounts: vec![
             Mount {
                 source: format!("{home}/.local/bin/claude"),
@@ -776,6 +782,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         tool_allowlist: ToolAllowlist(vec![]),
         permit_scope: PermitScope(vec!["net:deny:*".into()]),
         passthru_env: vec![],
+        extra_bootstrap: vec![],
         mounts: vec![],
         workspace_mount: None,
         sccache: false,
@@ -799,6 +806,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
             "net:deny:*".into(),
         ]),
         passthru_env: vec![],
+        extra_bootstrap: vec![],
         mounts: vec![],
         workspace_mount: None,
         sccache: false,
@@ -834,6 +842,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
             "forge:write:yg/agentry-toy".into(), // symbolic (no runtime enforcement yet)
         ]),
         passthru_env: vec!["GITEA_TOKEN".into()],
+        extra_bootstrap: vec![],
         mounts: vec![],
         workspace_mount: None,
         sccache: false,
@@ -865,6 +874,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
             "fs:write:/workspace/**".into(),
         ]),
         passthru_env: vec![],
+        extra_bootstrap: vec![],
         mounts: vec![],
         workspace_mount: Some(WorkspaceMount {
             container_path: "/workspace".into(),
@@ -898,6 +908,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         tool_allowlist: ToolAllowlist(vec![]),
         permit_scope: PermitScope(vec!["net:allow:agentry-sccache-redis".into()]),
         passthru_env: vec![],
+        extra_bootstrap: vec![],
         mounts: vec![],
         workspace_mount: None,
         sccache: true,
@@ -926,6 +937,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         tool_allowlist: ToolAllowlist(vec![]),
         permit_scope: PermitScope(vec!["net:deny:*".into()]),
         passthru_env: vec![],
+        extra_bootstrap: vec![],
         mounts: vec![],
         workspace_mount: None,
         sccache: false,
@@ -966,6 +978,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
             "net:allow:agency.lab".into(),
         ]),
         passthru_env: vec!["GITEA_TOKEN".into()],
+        extra_bootstrap: vec!["rustup component add rustfmt clippy".into()],
         mounts: vec![
             Mount {
                 source: format!("{home}/.local/bin/claude"),
@@ -1008,6 +1021,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         tool_allowlist: ToolAllowlist(vec![]),
         permit_scope: PermitScope(vec!["fs:read:/workspace/**".into()]),
         passthru_env: vec![],
+        extra_bootstrap: vec!["rustup component add rustfmt clippy".into()],
         mounts: vec![],
         workspace_mount: Some(WorkspaceMount {
             container_path: "/workspace".into(),
@@ -1035,6 +1049,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
             "forge:write:yg/*".into(),
         ]),
         passthru_env: vec!["GITEA_TOKEN".into()],
+        extra_bootstrap: vec![],
         mounts: vec![],
         // Shipper writes to /workspace/repo/.git during `git push` (reflog,
         // FETCH_HEAD), so the workspace mount must be writable.

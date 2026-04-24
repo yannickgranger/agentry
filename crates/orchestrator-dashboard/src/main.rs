@@ -848,6 +848,7 @@ async fn role_create(
         tool_allowlist: ToolAllowlist(split_csv(&f.tool_allowlist_csv)),
         permit_scope: PermitScope(split_lines(&f.permit_scope_lines)),
         passthru_env: split_csv(&f.passthru_env_csv),
+        extra_bootstrap: vec![],
         mounts: parse_mounts(&f.mounts_lines),
         // Dashboard form doesn't surface workspace_mount yet; dashboard-
         // created roles default to no workspace. Future issue extends the
