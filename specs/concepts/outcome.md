@@ -9,8 +9,15 @@ a brief*. A `Verdict` here is the final record the daemon writes to
 ## VerdictKind
 
 The closed set of possible team outcomes: shipped, failed, escalated,
-permit-violation. The dashboard and the chain-trigger logic switch on this
-kind; external consumers treat it as the brief's published result.
+permit-violation, budget-exceeded, aborted, rejected, rework-needed. The
+dashboard and the chain-trigger logic switch on this kind; external
+consumers treat it as the brief's published result.
+
+The verdict *kind* is a role-level primitive: every role emits one
+verdict. The daemon composes per-role verdicts into a team-level
+outcome; a team of three roles where the middle role emits
+`ReworkNeeded` and the coder then emits `Shipped` on rework still
+resolves the team as `Shipped` from the outside view.
 
 ## Verdict
 

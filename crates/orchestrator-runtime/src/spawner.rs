@@ -273,6 +273,7 @@ impl Spawner for PodmanSpawner {
             let mut terminal: Option<Event> = None;
             let mut permit_violation: Option<String> = None;
             let mut outbox: Vec<RoutedMessage> = Vec::new();
+            let mut findings: Vec<orchestrator_types::ReviewFinding> = Vec::new();
             while let Some(line) = reader.next_line().await? {
                 if line.is_empty() {
                     continue;
@@ -314,6 +315,10 @@ impl Spawner for PodmanSpawner {
                                 at: ev.at,
                             });
                         }
+                        // Accumulate findings for attachment to ReworkNeeded verdict.
+                        if let EventKind::Finding { finding } = &ev.kind {
+                            findings.push(finding.clone());
+                        }
                         redis_io::append_trace(conn, &brief.id, agent_id, &ev).await?;
                         if ev.is_terminal() {
                             terminal = Some(ev);
@@ -325,16 +330,22 @@ impl Spawner for PodmanSpawner {
                     }
                 }
             }
-            Ok::<(Option<Event>, Option<String>, Vec<RoutedMessage>), Error>((
-                terminal,
-                permit_violation,
-                outbox,
-            ))
+            Ok::<
+                (
+                    Option<Event>,
+                    Option<String>,
+                    Vec<RoutedMessage>,
+                    Vec<orchestrator_types::ReviewFinding>,
+                ),
+                Error,
+            >((terminal, permit_violation, outbox, findings))
         };
 
-        let (timed_out, terminal, permit_violation, outbox) = match permit.max_wall_seconds {
+        let (timed_out, terminal, permit_violation, outbox, findings) = match permit
+            .max_wall_seconds
+        {
             Some(secs) => match tokio::time::timeout(Duration::from_secs(secs), read_fut).await {
-                Ok(Ok((t, pv, ob))) => (false, t, pv, ob),
+                Ok(Ok((t, pv, ob, fi))) => (false, t, pv, ob, fi),
                 Ok(Err(e)) => return Err(e),
                 Err(_elapsed) => {
                     tracing::warn!(
@@ -347,12 +358,12 @@ impl Spawner for PodmanSpawner {
                         .args(["stop", "-t", "1", &name])
                         .output()
                         .await;
-                    (true, None, None, Vec::new())
+                    (true, None, None, Vec::new(), Vec::new())
                 }
             },
             None => {
-                let (t, pv, ob) = read_fut.await?;
-                (false, t, pv, ob)
+                let (t, pv, ob, fi) = read_fut.await?;
+                (false, t, pv, ob, fi)
             }
         };
 
@@ -374,6 +385,7 @@ impl Spawner for PodmanSpawner {
             permit_violation.as_deref(),
             terminal.as_ref().and_then(Event::verdict),
             status.code(),
+            findings,
         );
 
         Ok(AgentOutcome {
@@ -390,12 +402,19 @@ impl Spawner for PodmanSpawner {
 /// Build the team-level `Verdict` from the spawner's observed outcomes.
 /// Pure function so the verdict-selection logic is unit-testable without
 /// spawning a container.
+///
+/// `accumulated_findings` are `EventKind::Finding` payloads emitted by the
+/// agent during its run. They are only attached to the output when
+/// `terminal_event == Some(ReworkNeeded)`; otherwise they're dropped (the
+/// agent declared a different terminal outcome and the findings are
+/// informational trace data only).
 fn compute_verdict(
     brief_id: &BriefId,
     timed_out: bool,
     permit_violation: Option<&str>,
     terminal_event: Option<orchestrator_types::EventVerdict>,
     exit_code: Option<i32>,
+    accumulated_findings: Vec<orchestrator_types::ReviewFinding>,
 ) -> Verdict {
     let (kind, reason) = if timed_out {
         (
@@ -406,6 +425,12 @@ fn compute_verdict(
         (VerdictKind::PermitViolation, Some(r.to_string()))
     } else {
         match terminal_event {
+            Some(orchestrator_types::EventVerdict::ReworkNeeded) => (
+                VerdictKind::ReworkNeeded {
+                    findings: accumulated_findings,
+                },
+                None,
+            ),
             Some(v) => (VerdictKind::from(v), None),
             None => (
                 VerdictKind::Failed,
@@ -523,6 +548,7 @@ mod tests {
             Some("tried to write denied path"),
             Some(EventVerdict::Shipped),
             Some(137),
+            Vec::new(),
         );
         assert!(matches!(v.kind, VerdictKind::Failed));
         assert_eq!(v.reason.as_deref(), Some("wall-clock budget exceeded"));
@@ -536,6 +562,7 @@ mod tests {
             Some("unauthorized tool call: write"),
             None,
             None,
+            Vec::new(),
         );
         assert!(matches!(v.kind, VerdictKind::PermitViolation));
         assert_eq!(v.reason.as_deref(), Some("unauthorized tool call: write"));
@@ -543,9 +570,45 @@ mod tests {
 
     #[test]
     fn verdict_from_terminal_event() {
-        let v = compute_verdict(&bid(), false, None, Some(EventVerdict::Shipped), Some(0));
+        let v = compute_verdict(
+            &bid(),
+            false,
+            None,
+            Some(EventVerdict::Shipped),
+            Some(0),
+            Vec::new(),
+        );
         assert!(matches!(v.kind, VerdictKind::Shipped));
         assert!(v.reason.is_none());
+    }
+
+    #[test]
+    fn verdict_rework_needed_attaches_accumulated_findings() {
+        use orchestrator_types::{FindingOrigin, ReviewFinding, Severity};
+        let findings = vec![ReviewFinding {
+            file: None,
+            line: None,
+            severity: Severity::Blocker,
+            origin: FindingOrigin::Mechanical {
+                tool: "clippy".into(),
+                rule: None,
+            },
+            category: "acceptance".into(),
+            message: "stderr blob".into(),
+            suggested_fix: None,
+        }];
+        let v = compute_verdict(
+            &bid(),
+            false,
+            None,
+            Some(EventVerdict::ReworkNeeded),
+            Some(0),
+            findings.clone(),
+        );
+        match v.kind {
+            VerdictKind::ReworkNeeded { findings: got } => assert_eq!(got, findings),
+            other => panic!("expected ReworkNeeded, got {other:?}"),
+        }
     }
 
     fn sample_role(sccache: bool, binaries: Vec<&str>) -> AgentRole {
@@ -596,7 +659,7 @@ mod tests {
     #[test]
     fn verdict_failed_without_done_event() {
         // Container exited but never emitted `done` — Failed with exit code in reason.
-        let v = compute_verdict(&bid(), false, None, None, Some(1));
+        let v = compute_verdict(&bid(), false, None, None, Some(1), Vec::new());
         assert!(matches!(v.kind, VerdictKind::Failed));
         let reason = v.reason.expect("reason required");
         assert!(reason.contains("agent exited without done event"));

@@ -92,8 +92,14 @@ async fn handle_brief(
     // Track the last non-shipped verdict kind so teardown can decide whether
     // to destroy the workspace (Shipped) or retain it (anything else).
     let mut team_shipped = true;
+    // Per-brief rework budget: bounded by `team.max_retries`. When exhausted,
+    // the next rework request turns into a `Failed` team verdict.
+    let mut reworks_used: u32 = 0;
 
-    for role_name in &team.roles {
+    // Index-based loop: rework rewinds the index to an upstream role.
+    let mut role_idx = 0usize;
+    while role_idx < team.roles.len() {
+        let role_name = &team.roles[role_idx];
         let role = fetch_role_any_version(conn, role_name).await?;
 
         if role.workspace_mount.is_some() && workspace.is_none() {
@@ -119,7 +125,10 @@ async fn handle_brief(
         }
         permit_mod::sign(&mut permit, signing_key)?;
 
-        // Messages addressed to this role from any prior step.
+        // Messages addressed to this role from any prior step. On rework, the
+        // rework RoutedMessage inserted by the downstream consumer is already
+        // in `all_messages` — filter-by-`to` picks it up alongside original
+        // inputs.
         let team_ctx = TeamContext {
             messages: all_messages
                 .iter()
@@ -182,9 +191,72 @@ async fn handle_brief(
         }
         all_messages.extend(outcome.outbox);
 
-        if !matches!(outcome.verdict.kind, VerdictKind::Shipped) {
-            team_shipped = false;
-            break;
+        match &outcome.verdict.kind {
+            VerdictKind::Shipped => {
+                role_idx += 1;
+            }
+            VerdictKind::ReworkNeeded { findings } => {
+                // Resolve the single upstream role via `message_graph`. v0
+                // assumes a linear pipeline (one incoming edge per role). If
+                // the producer has no upstream (it IS the coder), or if the
+                // retry budget is exhausted, fail the team.
+                let upstream = team.incoming(&role.name).first().map(|e| e.from.clone());
+                match upstream {
+                    Some(up) if reworks_used < team.max_retries => {
+                        let up_idx = team.roles.iter().position(|r| r == &up).ok_or_else(|| {
+                            Error::Config(format!(
+                                "team {} message_graph names upstream {} not in roles list",
+                                team.name.0, up.0
+                            ))
+                        })?;
+                        // Inject findings as a RoutedMessage from the producer
+                        // to the upstream worker. The upstream role picks them
+                        // up on its next run via TeamContext.messages.
+                        all_messages.push(RoutedMessage {
+                            from: role.name.0.clone(),
+                            to: up.0.clone(),
+                            payload: serde_json::json!({ "findings": findings }),
+                            at: orchestrator_types::now(),
+                        });
+                        reworks_used += 1;
+                        tracing::info!(
+                            brief = %brief.id,
+                            from = %role_name,
+                            to = %up,
+                            findings_count = findings.len(),
+                            reworks_used,
+                            max_retries = team.max_retries,
+                            "rework requested — rewinding to upstream role"
+                        );
+                        role_idx = up_idx;
+                    }
+                    Some(up) => {
+                        tracing::warn!(
+                            brief = %brief.id,
+                            role = %role_name,
+                            upstream = %up,
+                            reworks_used,
+                            max_retries = team.max_retries,
+                            "rework requested but retry budget exhausted"
+                        );
+                        team_shipped = false;
+                        break;
+                    }
+                    None => {
+                        tracing::warn!(
+                            brief = %brief.id,
+                            role = %role_name,
+                            "rework requested but role has no upstream — treating as failed"
+                        );
+                        team_shipped = false;
+                        break;
+                    }
+                }
+            }
+            _ => {
+                team_shipped = false;
+                break;
+            }
         }
     }
 

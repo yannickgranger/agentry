@@ -10,6 +10,7 @@ pub mod brief;
 pub mod event;
 pub mod permit;
 pub mod project;
+pub mod review;
 pub mod role;
 pub mod team;
 pub mod verdict;
@@ -18,6 +19,7 @@ pub use brief::{Brief, BriefId, Budget, EscalationMode, Payload};
 pub use event::{Event, EventKind, EventVerdict, ToolCall};
 pub use permit::{PermitScope, ToolAllowlist, WorkPermit};
 pub use project::{Project, ProjectSlug, StandingOrders};
+pub use review::{FindingOrigin, ReviewFinding, Severity};
 pub use role::{AgentRole, Mount, PackageManager, RoleName, SubstrateClass, WorkspaceMount};
 pub use team::{MessageEdge, PermitOverrides, TeamName, TeamTopology};
 
