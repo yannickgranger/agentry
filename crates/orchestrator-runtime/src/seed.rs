@@ -501,7 +501,7 @@ cd /workspace
 
 # Diff against develop. The coder produces commits on top of origin/develop;
 # we review what was ADDED, not the whole file set.
-if ! git diff "origin/${base_branch}..HEAD" > /tmp/diff.patch 2>/tmp/diff.err; then
+if ! git diff "${base_branch}..HEAD" > /tmp/diff.patch 2>/tmp/diff.err; then
     err=$(tail -20 /tmp/diff.err)
     emit_event "$(jq -nc --arg err "$err" '{error:"git diff failed",detail:$err}')"
     emit_done "failed"; exit 0
