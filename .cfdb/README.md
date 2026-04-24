@@ -24,15 +24,18 @@ PR.
 
 ## Ban rules
 
-`queries/*.cypher` is the ban-rule directory. **Currently empty by
-design.** Rules are added one at a time, each in its own PR with its own
-justification and its own set of existing violations fixed first. No
-baseline file, no ratchet, no allowlist — violation counts start at
-zero for every declared rule.
+`queries/*.cypher` is the ban-rule directory. Rules are added one at a
+time, each in its own PR with its own justification and its own set of
+existing violations fixed first. No baseline file, no ratchet, no
+allowlist — violation counts start at zero for every declared rule.
 
 Rule additions live on a separate track from the workflow wiring: CI
 iterates `.cypher` files and treats any matching row as a failure.
 Adding a new file is the gate that turns on its enforcement.
+
+- **`arch-ban-unwrap-in-prod.cypher`** — bans `.unwrap()` in prod
+  code. Production paths must propagate errors via `?` or attach
+  context via `.expect("…")`. Test-gated scopes are exempt.
 
 ## Facts, not enforcement (today)
 
