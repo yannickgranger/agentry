@@ -23,8 +23,9 @@ use orchestrator_types::{
 // ---------------------------------------------------------------------------
 
 /// Bash helpers injected at the top of scripts that build structured events
-/// via jq. Defines `emit_event <payload-json>`, `emit_done <verdict>`, and
-/// `emit_finding <severity> <tool> <category> <message>` (mechanical origin).
+/// via jq. Defines `emit_event <payload-json>`, `emit_done <verdict>`,
+/// `emit_finding <severity> <tool> <category> <message>` (mechanical origin),
+/// and `emit_message <to> <payload-json>`.
 const BASH_PRELUDE: &str = r#"emit_event() {
     jq -nc --arg at "$(date -Iseconds)" --argjson payload "$1" \
         '{at:$at, type:"event", payload:$payload}'
@@ -43,6 +44,11 @@ emit_finding() {
             file:null, line:null,
             category:$cat, message:$msg, suggested_fix:null
         }}'
+}
+emit_message() {
+    # args: to (role name), payload (JSON)
+    jq -nc --arg at "$(date -Iseconds)" --arg to "$1" --argjson payload "$2" \
+        '{at:$at, type:"message", to:$to, payload:$payload}'
 }
 "#;
 
@@ -511,7 +517,106 @@ if [ -z "$pr_url" ] || [ "$pr_url" = "null" ]; then
 fi
 
 emit_event "$(jq -nc --arg u "$pr_url" --argjson n "$pr_number" '{msg:"PR opened",url:$u,number:$n}')"
+
+head_sha=$(git rev-parse HEAD)
+emit_message "ci-watcher-agentry" "$(jq -nc \
+    --argjson n "$pr_number" --arg u "$pr_url" --arg s "$head_sha" \
+    '{pr_number:$n, pr_url:$u, head_sha:$s}')"
+
 emit_done "shipped"
+"##;
+
+/// Ci-watcher role for the `agentry-self-host-v0` team. Reads the shipper's
+/// Message payload from `TeamContext.messages` (pr_number + head_sha), polls
+/// the forge's commit-status endpoint every 15s, merges the PR on CI green,
+/// emits Failed with CI context on CI red.
+const CI_WATCHER_AGENTRY_SCRIPT: &str = r##"#!/usr/bin/env bash
+set -euo pipefail
+bundle="$(cat)"
+
+target_repo=$(jq -r '.brief.payload.target_repo // "yg/agentry"' <<<"$bundle")
+forge_host=$(jq -r '.brief.payload.forge_host // "agency.lab:3000"' <<<"$bundle")
+owner="${target_repo%%/*}"
+repo_name="${target_repo##*/}"
+
+# Pull pr_number + head_sha from the shipper's routed message. message_graph
+# puts the shipper's payload in TeamContext.messages where from=shipper-agentry.
+msg=$(jq -c '[.team_context.messages[] | select(.from=="shipper-agentry")] | last // empty' <<<"$bundle")
+if [ -z "$msg" ] || [ "$msg" = "null" ]; then
+    emit_event '{"error":"no shipper-agentry message in team_context — cannot locate PR to watch"}'
+    emit_done "failed"; exit 0
+fi
+
+pr_number=$(jq -r '.payload.pr_number' <<<"$msg")
+head_sha=$(jq -r '.payload.head_sha' <<<"$msg")
+pr_url=$(jq -r '.payload.pr_url' <<<"$msg")
+
+if [ -z "$pr_number" ] || [ "$pr_number" = "null" ] || [ -z "$head_sha" ] || [ "$head_sha" = "null" ]; then
+    emit_event "$(jq -nc --arg m "$msg" '{error:"shipper message missing pr_number or head_sha",detail:$m}')"
+    emit_done "failed"; exit 0
+fi
+
+emit_event "$(jq -nc --argjson n "$pr_number" --arg s "$head_sha" --arg u "$pr_url" \
+    '{msg:"ci-watcher starting",pr_number:$n,head_sha:$s,pr_url:$u}')"
+
+if [ -z "${GITEA_TOKEN:-}" ]; then
+    emit_event '{"error":"GITEA_TOKEN not in env"}'
+    emit_done "failed"; exit 0
+fi
+
+# Poll the combined status. Max 120 iterations × 15s = 30 min. The daemon's
+# wall-clock budget from permit.max_wall_seconds is the authoritative cap;
+# this loop gives up earlier only if the budget is small.
+max_polls=120
+status_url="https://${forge_host}/api/v1/repos/${owner}/${repo_name}/commits/${head_sha}/status"
+for i in $(seq 1 "$max_polls"); do
+    resp=$(curl -sS -k -H "Authorization: token ${GITEA_TOKEN}" "$status_url" 2>/tmp/ci.err) || {
+        err=$(tail -5 /tmp/ci.err)
+        emit_event "$(jq -nc --arg err "$err" '{error:"status GET failed",detail:$err}')"
+        sleep 15; continue
+    }
+    state=$(jq -r '.state // "unknown"' <<<"$resp")
+    emit_event "$(jq -nc --arg s "$state" --argjson i "$i" \
+        '{msg:"polling CI",state:$s,iteration:$i}')"
+    case "$state" in
+        success)
+            merge_body='{"Do":"merge"}'
+            merge_resp=$(curl -sS -k -X POST \
+                "https://${forge_host}/api/v1/repos/${owner}/${repo_name}/pulls/${pr_number}/merge" \
+                -H "Authorization: token ${GITEA_TOKEN}" \
+                -H "Content-Type: application/json" \
+                -d "$merge_body" \
+                -o /tmp/merge.body -w '%{http_code}')
+            if [ "$merge_resp" = "200" ] || [ "$merge_resp" = "204" ]; then
+                emit_event "$(jq -nc --argjson n "$pr_number" --arg u "$pr_url" \
+                    '{msg:"merged",pr_number:$n,pr_url:$u}')"
+                emit_done "shipped"; exit 0
+            else
+                detail=$(cat /tmp/merge.body 2>/dev/null || echo "")
+                emit_event "$(jq -nc --arg code "$merge_resp" --arg d "$detail" \
+                    '{error:"merge API call failed",http_code:$code,detail:$d}')"
+                emit_done "failed"; exit 0
+            fi
+            ;;
+        failure|error)
+            # Pull the first failing context for reason.
+            ctx=$(jq -r '[.statuses[]? | select(.state=="failure" or .state=="error") | .context] | .[0] // "(no context)"' <<<"$resp")
+            emit_event "$(jq -nc --arg s "$state" --arg ctx "$ctx" \
+                '{error:"CI red",state:$s,failing_context:$ctx}')"
+            emit_done "failed"; exit 0
+            ;;
+        pending|unknown|"")
+            sleep 15
+            ;;
+        *)
+            emit_event "$(jq -nc --arg s "$state" '{error:"unexpected CI state",state:$s}')"
+            emit_done "failed"; exit 0
+            ;;
+    esac
+done
+
+emit_event '{"error":"CI poll exhausted 30min without success — giving up"}'
+emit_done "failed"
 "##;
 
 const SHIPPER_SCRIPT: &str = r#"#!/usr/bin/env bash
@@ -1015,7 +1120,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
     // Coder clones, calls claude, runs acceptance, commits locally.
     // Reviewer re-runs acceptance in isolation on the coder's workspace.
     // Shipper pushes the branch and opens a PR on the forge.
-    // No rework loop, no ci-watcher — v0 ships as the minimum self-host team.
+    // Ci-watcher polls forge CI on the PR's head sha and merges on green.
     let home = std::env::var("HOME").unwrap_or_else(|_| "/var/home/yg".into());
     let coder_claude_agentry = AgentRole {
         name: RoleName("coder-claude-agentry".into()),
@@ -1126,6 +1231,32 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         }),
         sccache: false,
     };
+    let ci_watcher_agentry = AgentRole {
+        name: RoleName("ci-watcher-agentry".into()),
+        version: 1,
+        model: None,
+        system_prompt: None,
+        image: ALPINE.into(),
+        substrate_class: SubstrateClass::Podman,
+        package_manager: PackageManager::Apk,
+        entrypoint_script: format!("{BASH_PRELUDE}{CI_WATCHER_AGENTRY_SCRIPT}"),
+        exitpoint_script: None,
+        binaries: vec!["curl".into(), "ca-certificates".into()],
+        mcp_servers: vec![],
+        tool_allowlist: ToolAllowlist(vec![]),
+        permit_scope: PermitScope(vec![
+            "net:allow:agency.lab".into(),
+            "forge:write:yg/agentry".into(),
+        ]),
+        passthru_env: vec!["GITEA_TOKEN".into()],
+        extra_bootstrap: vec![],
+        mounts: vec![],
+        // ci-watcher doesn't need the repo — all inputs come via the
+        // shipper's routed Message payload. Skipping workspace_mount means
+        // this role doesn't extend workspace lifetime beyond shipper.
+        workspace_mount: None,
+        sccache: false,
+    };
     let agentry_self_host_v0 = TeamTopology {
         name: TeamName("agentry-self-host-v0".into()),
         version: 1,
@@ -1133,6 +1264,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
             coder_claude_agentry.name.clone(),
             reviewer_mechanical_agentry.name.clone(),
             shipper_agentry.name.clone(),
+            ci_watcher_agentry.name.clone(),
         ],
         // Rework loop enabled — max_retries=2 gives the coder two chances to
         // fix findings emitted by the reviewer before the team resolves Failed.
@@ -1147,8 +1279,13 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
                 to: shipper_agentry.name.clone(),
                 permit_overrides_from: None,
             },
+            MessageEdge {
+                from: shipper_agentry.name.clone(),
+                to: ci_watcher_agentry.name.clone(),
+                permit_overrides_from: None,
+            },
         ],
-        terminal_role: shipper_agentry.name.clone(),
+        terminal_role: ci_watcher_agentry.name.clone(),
         max_retries: 2,
     };
 
@@ -1178,10 +1315,11 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
     redis_io::save_role(&mut conn, &coder_claude_agentry).await?;
     redis_io::save_role(&mut conn, &reviewer_mechanical_agentry).await?;
     redis_io::save_role(&mut conn, &shipper_agentry).await?;
+    redis_io::save_role(&mut conn, &ci_watcher_agentry).await?;
     redis_io::save_team(&mut conn, &agentry_self_host_v0).await?;
 
     tracing::info!(
-        "seeded: roles [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker, listener, grok-echo, claude-echo, synthesizer, narrowed-coder, shipper, coder-claude-agentry, reviewer-mechanical-agentry, shipper-agentry] (inline entrypoint scripts); teams [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker-listener, grok-echo, claude-echo, narrowed-team, shipper-solo-team, agentry-self-host-v0]"
+        "seeded: roles [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker, listener, grok-echo, claude-echo, synthesizer, narrowed-coder, shipper, coder-claude-agentry, reviewer-mechanical-agentry, shipper-agentry, ci-watcher-agentry] (inline entrypoint scripts); teams [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker-listener, grok-echo, claude-echo, narrowed-team, shipper-solo-team, agentry-self-host-v0]"
     );
     Ok(())
 }

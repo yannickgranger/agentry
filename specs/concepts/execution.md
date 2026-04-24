@@ -4,7 +4,12 @@ The bounded context that owns *running work*. The daemon reads briefs off
 the queue, resolves their team topology, mints and signs permits, dispatches
 each role through a `Spawner`, accumulates messages between roles, and
 records outcomes. Execution is the customer of `briefing` + `registry` +
-`permits`; it is the supplier of `outcome`.
+`permits`; it is the supplier of `outcome`. When the team's terminal role is
+a ci-watcher (as in `agentry-self-host-v0`), the daemon keeps the workspace
+alive through the ci-watcher run — though ci-watcher itself does not bind
+the workspace, the shipper's preceding push may still be referenced by the
+running ci-watcher process. Workspace teardown happens only after the
+terminal role's verdict lands.
 
 ## AgentStartup
 
@@ -31,7 +36,10 @@ this role from upstream roles in the same team.
 
 One inter-role message: sender role name, target role name, payload JSON,
 timestamp. Accumulated by the daemon as upstream roles ship and filtered
-into each downstream role's `TeamContext` at dispatch time.
+into each downstream role's `TeamContext` at dispatch time. The ci-watcher
+in `agentry-self-host-v0` reads its inputs (`pr_number`, `pr_url`,
+`head_sha`) entirely from `TeamContext.messages`; the shipper emits a
+Message addressed to the ci-watcher immediately before `emit_done "shipped"`.
 
 ## AgentHandle
 
