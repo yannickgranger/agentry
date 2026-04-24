@@ -806,6 +806,7 @@ async fn role_create(
         // created roles default to no workspace. Future issue extends the
         // form when a dashboard-author wants a workspace-using role.
         workspace_mount: None,
+        sccache: false,
     };
     {
         let mut c = app.redis.lock().await;

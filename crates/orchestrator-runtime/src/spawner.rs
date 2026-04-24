@@ -157,6 +157,12 @@ impl Spawner for PodmanSpawner {
             // pulled once and cached. `missing` downloads only when absent;
             // subsequent spawns reuse the cached layer.
             .arg("--pull=missing")
+            // Every agentry-spawned container joins the shared `agentry-net`
+            // network so roles can reach the sccache-redis (and future
+            // per-brief services) by container name. The network is created
+            // out-of-band via `just agentry-net-up` — the spawn fails loudly
+            // if it doesn't exist.
+            .arg("--network=agentry-net")
             .arg("--name")
             .arg(&name)
             .arg("--label")
@@ -165,6 +171,16 @@ impl Spawner for PodmanSpawner {
             .arg(format!("agentry.role={}", role.name))
             .arg("--label")
             .arg(format!("agentry.agent={agent_id}"));
+        // sccache wiring — when declared, route all Rust compilations through
+        // the shared sccache-redis. The `sccache` binary is auto-added to the
+        // install list below (not the role's responsibility). Endpoint uses
+        // the podman-network DNS name, not the host port.
+        if role.sccache {
+            cmd.arg("--env").arg("RUSTC_WRAPPER=sccache");
+            cmd.arg("--env")
+                .arg("SCCACHE_REDIS_ENDPOINT=redis://agentry-sccache-redis:6379");
+            cmd.arg("--env").arg("SCCACHE_REDIS_KEY_PREFIX=agentry");
+        }
         // Pass through declared env vars from orchestratord's own env.
         // Missing vars are logged and skipped — role doesn't get what it wanted.
         for var_name in &role.passthru_env {
@@ -222,9 +238,10 @@ impl Spawner for PodmanSpawner {
         cmd.arg("--env")
             .arg(format!("AGENTRY_SCRIPT={}", role.entrypoint_script));
         cmd.arg(&role.image);
+        let effective_binaries = effective_binaries(role);
         cmd.arg("sh")
             .arg("-c")
-            .arg(bootstrap_command(role.package_manager, &role.binaries));
+            .arg(bootstrap_command(role.package_manager, &effective_binaries));
 
         cmd.stdin(Stdio::piped());
         cmd.stdout(Stdio::piped());
@@ -435,6 +452,17 @@ async fn append_audit(
 /// Installs a baseline (`bash ca-certificates coreutils jq`) plus role-specific
 /// `binaries` via the declared `package_manager`, then execs the script
 /// delivered via the `AGENTRY_SCRIPT` env var.
+/// Merge the role's declared `binaries` with any implicit extras derived
+/// from other role fields. Today: `sccache=true` adds the `sccache` package
+/// to the install list so it can run as `RUSTC_WRAPPER`.
+fn effective_binaries(role: &AgentRole) -> Vec<String> {
+    let mut out = role.binaries.clone();
+    if role.sccache && !out.iter().any(|b| b == "sccache") {
+        out.push("sccache".into());
+    }
+    out
+}
+
 fn bootstrap_command(pm: PackageManager, extra_binaries: &[String]) -> String {
     const BASELINE: &[&str] = &["bash", "ca-certificates", "coreutils", "jq"];
     let all: Vec<&str> = BASELINE
@@ -504,6 +532,50 @@ mod tests {
         let v = compute_verdict(&bid(), false, None, Some(EventVerdict::Shipped), Some(0));
         assert!(matches!(v.kind, VerdictKind::Shipped));
         assert!(v.reason.is_none());
+    }
+
+    fn sample_role(sccache: bool, binaries: Vec<&str>) -> AgentRole {
+        AgentRole {
+            name: orchestrator_types::RoleName("probe".into()),
+            version: 1,
+            model: None,
+            system_prompt: None,
+            image: "alpine:3.21".into(),
+            substrate_class: orchestrator_types::SubstrateClass::Podman,
+            package_manager: PackageManager::Apk,
+            entrypoint_script: "#!/usr/bin/env bash\nexit 0\n".into(),
+            binaries: binaries.into_iter().map(String::from).collect(),
+            mcp_servers: vec![],
+            tool_allowlist: orchestrator_types::ToolAllowlist::default(),
+            permit_scope: orchestrator_types::PermitScope::default(),
+            passthru_env: vec![],
+            mounts: vec![],
+            workspace_mount: None,
+            sccache,
+        }
+    }
+
+    #[test]
+    fn effective_binaries_adds_sccache_when_enabled() {
+        let r = sample_role(true, vec!["git", "curl"]);
+        let eff = effective_binaries(&r);
+        assert!(eff.iter().any(|b| b == "sccache"));
+        assert_eq!(eff.len(), 3);
+    }
+
+    #[test]
+    fn effective_binaries_no_sccache_when_disabled() {
+        let r = sample_role(false, vec!["git"]);
+        let eff = effective_binaries(&r);
+        assert!(!eff.iter().any(|b| b == "sccache"));
+        assert_eq!(eff.len(), 1);
+    }
+
+    #[test]
+    fn effective_binaries_no_duplicate_when_role_already_has_sccache() {
+        let r = sample_role(true, vec!["sccache"]);
+        let eff = effective_binaries(&r);
+        assert_eq!(eff.iter().filter(|b| b.as_str() == "sccache").count(), 1);
     }
 
     #[test]

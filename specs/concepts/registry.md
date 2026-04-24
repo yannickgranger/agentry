@@ -49,8 +49,9 @@ that later roles in the same brief also see.
 The full specification of one kind of agent container: name, version, model
 hint, system prompt, base image, substrate class, package manager, inline
 entrypoint script, extra binaries to install, MCP servers, baseline tool
-allowlist, baseline permit scope, env passthrough list, mounts, and
-optional workspace mount.
+allowlist, baseline permit scope, env passthrough list, mounts, optional
+workspace mount, and a `sccache` flag that wires the container to the
+shared sccache-redis compile cache over the `agentry-net` podman network.
 
 ## TeamName
 
