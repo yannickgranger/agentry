@@ -386,7 +386,7 @@ emit_event '{"msg":"cargo fmt --all clean"}'
 # (binary absent), skip and let the reviewer catch anything hygiene would have.
 if command -v quality-hygiene >/dev/null 2>&1; then
     emit_event '{"msg":"running quality-hygiene --fix"}'
-    if ! quality-hygiene --fix --workspace /workspace --base "origin/${base_branch}" >/tmp/qh.out 2>/tmp/qh.err; then
+    if ! quality-hygiene --fix --workspace /workspace --base "${base_branch}" >/tmp/qh.out 2>/tmp/qh.err; then
         err=$(tail -100 /tmp/qh.err)
         emit_event "$(jq -nc --arg err "$err" '{error:"quality-hygiene --fix failed",detail:$err}')"
         emit_finding "blocker" "quality-hygiene" "hygiene" "$err"
@@ -441,7 +441,7 @@ cd /workspace
 emit_event '{"msg":"reviewer starting"}'
 
 # Diff summary. base_branch is on `origin/<base_branch>`.
-diff_stat=$(git diff --stat "origin/${base_branch}"..HEAD 2>&1 | tail -1 || true)
+diff_stat=$(git diff --stat "${base_branch}"..HEAD 2>&1 | tail -1 || true)
 emit_event "$(jq -nc --arg d "$diff_stat" '{msg:"diff",summary:$d}')"
 
 # Workspace is read-only for this role — redirect Cargo's target/ to /tmp.
