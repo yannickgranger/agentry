@@ -63,7 +63,14 @@ The concrete spawner backed by rootless Podman. Assembles the `podman run`
 command (env passthrough, bind mounts, inline script bootstrap), pipes the
 startup bundle to stdin, reads NDJSON events from stdout, enforces the
 permit's `ToolAllowlist` and `PermitScope` on every `ToolCall` event,
-accumulates the outbox, builds a verdict.
+accumulates the outbox, builds a verdict. When a role declares
+`exitpoint_script`, the `PodmanSpawner` bootstrap chains it after the
+entrypoint: `bash -c $AGENTRY_SCRIPT && exec bash -c $AGENTRY_EXITPOINT`.
+The entrypoint's early-error paths short-circuit via `exit 0` after
+emitting `done`; the exitpoint runs regardless (its output is safely
+discarded post-terminal) unless the entrypoint exits non-zero. This
+gives every role a substrate-agnostic place for post-worker gates
+without forking the script surface.
 
 ## Error
 

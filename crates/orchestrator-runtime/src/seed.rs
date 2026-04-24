@@ -317,6 +317,15 @@ cd /workspace/repo
 branch="auto/${brief_id}"
 git checkout -b "$branch" 2>&1 >/dev/null
 
+cat > /tmp/brief_vars.sh <<'VARS_EOF'
+#!/bin/bash
+VARS_EOF
+printf 'export brief_id=%q\n' "$brief_id"        >> /tmp/brief_vars.sh
+printf 'export base_branch=%q\n' "$base_branch"  >> /tmp/brief_vars.sh
+printf 'export issue_title=%q\n' "$issue_title"  >> /tmp/brief_vars.sh
+printf 'export acceptance=%q\n' "$acceptance"    >> /tmp/brief_vars.sh
+printf 'export branch=%q\n' "$branch"            >> /tmp/brief_vars.sh
+
 cat > /tmp/prompt.txt <<PROMPT
 You are the coder role inside the agentry autonomous team, operating in the
 container-local working directory /workspace/repo. The repo is cloned at
@@ -352,21 +361,43 @@ reply=$(HOME=/root claude -p "$(cat /tmp/prompt.txt)" 2>&1) || {
 }
 
 emit_event "$(jq -nc --arg len "${#reply}" '{msg:"claude reply received",bytes:$len}')"
+"##;
 
-# Re-run acceptance ourselves as a self-check before handing off.
+const CODER_CLAUDE_AGENTRY_EXITPOINT: &str = r##"#!/usr/bin/env bash
+set -euo pipefail
+. /tmp/brief_vars.sh
 cd /workspace/repo
+
+# quality-hygiene — role-local hygiene gate. If the binary was installed by
+# extra_bootstrap, run --fix so the commit is clean. If the install failed
+# (binary absent), skip and let the reviewer catch anything hygiene would have.
+if command -v quality-hygiene >/dev/null 2>&1; then
+    emit_event '{"msg":"running quality-hygiene --fix"}'
+    if ! quality-hygiene --fix --workspace /workspace/repo --base "origin/${base_branch}" >/tmp/qh.out 2>/tmp/qh.err; then
+        err=$(tail -100 /tmp/qh.err)
+        emit_event "$(jq -nc --arg err "$err" '{error:"quality-hygiene --fix failed",detail:$err}')"
+        emit_finding "blocker" "quality-hygiene" "hygiene" "$err"
+        emit_done "failed"; exit 0
+    fi
+    emit_event '{"msg":"quality-hygiene --fix clean"}'
+else
+    emit_event '{"msg":"quality-hygiene not installed, skipping role-local gate"}'
+fi
+
+# Acceptance self-check — same command the reviewer will run.
 if eval "$acceptance" >/tmp/acc.out 2>/tmp/acc.err; then
     emit_event '{"msg":"acceptance passed (self-check)"}'
 else
     err=$(tail -50 /tmp/acc.err)
     emit_event "$(jq -nc --arg err "$err" '{error:"acceptance failed (self-check)",detail:$err}')"
+    emit_finding "blocker" "cargo" "acceptance" "$err"
     emit_done "failed"; exit 0
 fi
 
-# Stage + commit whatever claude changed.
+# Stage + commit whatever claude (and quality-hygiene --fix) changed.
 git add -A
 if git diff --cached --quiet; then
-    emit_event '{"error":"claude produced no changes"}'
+    emit_event '{"error":"no changes produced"}'
     emit_done "failed"; exit 0
 fi
 git commit -m "auto(${brief_id}): ${issue_title}" > /dev/null
@@ -605,6 +636,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         substrate_class: SubstrateClass::Podman,
         package_manager: PackageManager::Apk,
         entrypoint_script: ECHO_SCRIPT.into(),
+        exitpoint_script: None,
         binaries: vec![],
         mcp_servers: vec![],
         tool_allowlist: ToolAllowlist(vec![]),
@@ -634,6 +666,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         substrate_class: SubstrateClass::Podman,
         package_manager: PackageManager::Apk,
         entrypoint_script: NAUGHTY_SCRIPT.into(),
+        exitpoint_script: None,
         binaries: vec![],
         mcp_servers: vec![],
         tool_allowlist: ToolAllowlist(vec!["read".into()]),
@@ -663,6 +696,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         substrate_class: SubstrateClass::Podman,
         package_manager: PackageManager::Apk,
         entrypoint_script: SPEAKER_SCRIPT.into(),
+        exitpoint_script: None,
         binaries: vec![],
         mcp_servers: vec![],
         tool_allowlist: ToolAllowlist(vec![]),
@@ -682,6 +716,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         substrate_class: SubstrateClass::Podman,
         package_manager: PackageManager::Apk,
         entrypoint_script: LISTENER_SCRIPT.into(),
+        exitpoint_script: None,
         binaries: vec![],
         mcp_servers: vec![],
         tool_allowlist: ToolAllowlist(vec![]),
@@ -715,6 +750,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         substrate_class: SubstrateClass::Podman,
         package_manager: PackageManager::Apk,
         entrypoint_script: format!("{BASH_PRELUDE}{GROK_SCRIPT}"),
+        exitpoint_script: None,
         binaries: vec!["curl".into()],
         mcp_servers: vec![],
         tool_allowlist: ToolAllowlist(vec![]),
@@ -747,6 +783,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         substrate_class: SubstrateClass::Podman,
         package_manager: PackageManager::Apt,
         entrypoint_script: format!("{BASH_PRELUDE}{CLAUDE_SCRIPT}"),
+        exitpoint_script: None,
         binaries: vec![],
         mcp_servers: vec![],
         tool_allowlist: ToolAllowlist(vec![]),
@@ -794,6 +831,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         substrate_class: SubstrateClass::Podman,
         package_manager: PackageManager::Apk,
         entrypoint_script: SYNTHESIZER_SCRIPT.into(),
+        exitpoint_script: None,
         binaries: vec![],
         mcp_servers: vec![],
         tool_allowlist: ToolAllowlist(vec![]),
@@ -813,6 +851,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         substrate_class: SubstrateClass::Podman,
         package_manager: PackageManager::Apk,
         entrypoint_script: NARROWED_CODER_SCRIPT.into(),
+        exitpoint_script: None,
         binaries: vec![],
         mcp_servers: vec![],
         // Broad base — will be narrowed by synthesizer's Message.
@@ -851,6 +890,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         substrate_class: SubstrateClass::Podman,
         package_manager: PackageManager::Apk,
         entrypoint_script: format!("{BASH_PRELUDE}{SHIPPER_SCRIPT}"),
+        exitpoint_script: None,
         binaries: vec!["git".into(), "curl".into()],
         mcp_servers: vec![],
         tool_allowlist: ToolAllowlist(vec![]),
@@ -883,6 +923,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         substrate_class: SubstrateClass::Podman,
         package_manager: PackageManager::Apk,
         entrypoint_script: WORKSPACE_PROBE_SCRIPT.into(),
+        exitpoint_script: None,
         binaries: vec![],
         mcp_servers: vec![],
         tool_allowlist: ToolAllowlist(vec![]),
@@ -918,6 +959,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         substrate_class: SubstrateClass::Podman,
         package_manager: PackageManager::Apk,
         entrypoint_script: SCCACHE_PROBE_SCRIPT.into(),
+        exitpoint_script: None,
         // Alpine ships rust/cargo in its community repo; sccache is added
         // automatically by `effective_binaries` when `sccache=true`.
         binaries: vec!["rust".into(), "cargo".into()],
@@ -949,6 +991,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         substrate_class: SubstrateClass::Podman,
         package_manager: PackageManager::Apk,
         entrypoint_script: TIMEOUT_PROBE_SCRIPT.into(),
+        exitpoint_script: None,
         binaries: vec![],
         mcp_servers: vec![],
         tool_allowlist: ToolAllowlist(vec![]),
@@ -985,6 +1028,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         substrate_class: SubstrateClass::Podman,
         package_manager: PackageManager::Apt,
         entrypoint_script: format!("{BASH_PRELUDE}{CODER_CLAUDE_AGENTRY_SCRIPT}"),
+        exitpoint_script: Some(format!("{BASH_PRELUDE}{CODER_CLAUDE_AGENTRY_EXITPOINT}")),
         binaries: vec!["git".into(), "curl".into(), "ca-certificates".into()],
         mcp_servers: vec![],
         tool_allowlist: ToolAllowlist(vec![]),
@@ -995,7 +1039,11 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
             "net:allow:agency.lab".into(),
         ]),
         passthru_env: vec!["GITEA_TOKEN".into()],
-        extra_bootstrap: vec!["rustup component add rustfmt clippy".into()],
+        extra_bootstrap: vec![
+            "rustup component add rustfmt clippy".into(),
+            "git config --global http.sslVerify false".into(),
+            "CARGO_NET_GIT_FETCH_WITH_CLI=true cargo install --git https://oauth2:${GITEA_TOKEN}@agency.lab:3000/yg/quality-architecture.git --bin quality-hygiene --root /usr/local --locked --quiet || true".into(),
+        ],
         mounts: vec![
             Mount {
                 source: format!("{home}/.local/bin/claude"),
@@ -1033,6 +1081,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         substrate_class: SubstrateClass::Podman,
         package_manager: PackageManager::Apt,
         entrypoint_script: format!("{BASH_PRELUDE}{REVIEWER_MECHANICAL_AGENTRY_SCRIPT}"),
+        exitpoint_script: None,
         binaries: vec!["git".into(), "ca-certificates".into()],
         mcp_servers: vec![],
         tool_allowlist: ToolAllowlist(vec![]),
@@ -1058,6 +1107,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         substrate_class: SubstrateClass::Podman,
         package_manager: PackageManager::Apk,
         entrypoint_script: format!("{BASH_PRELUDE}{SHIPPER_AGENTRY_SCRIPT}"),
+        exitpoint_script: None,
         binaries: vec!["git".into(), "curl".into(), "ca-certificates".into()],
         mcp_servers: vec![],
         tool_allowlist: ToolAllowlist(vec![]),
@@ -1084,9 +1134,8 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
             reviewer_mechanical_agentry.name.clone(),
             shipper_agentry.name.clone(),
         ],
-        // Strict sequential pipeline. No rework edge — if the reviewer fails,
-        // the team fails and the human retries with a new brief. Rework loop
-        // lands in issue #11.
+        // Rework loop enabled — max_retries=2 gives the coder two chances to
+        // fix findings emitted by the reviewer before the team resolves Failed.
         message_graph: vec![
             MessageEdge {
                 from: coder_claude_agentry.name.clone(),
@@ -1100,7 +1149,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
             },
         ],
         terminal_role: shipper_agentry.name.clone(),
-        max_retries: 0,
+        max_retries: 2,
     };
 
     // ---- persist everything ----

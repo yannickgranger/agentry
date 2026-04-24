@@ -127,6 +127,15 @@ pub struct AgentRole {
     /// `package_manager`, then execs it. Required — every role ships its
     /// own script.
     pub entrypoint_script: String,
+    /// Optional post-worker script. When set, the spawner exports it as
+    /// `AGENTRY_EXITPOINT` and the container's bootstrap execs it ONLY if
+    /// the entrypoint returned 0. Used for role-local gates (e.g.
+    /// `quality-hygiene --fix`) that run AFTER the worker (claude -p,
+    /// cargo test) and BEFORE the terminal verdict event. Findings emitted
+    /// from the exitpoint accumulate into the role's Verdict. `None` means
+    /// the entrypoint is solely responsible for emitting `done`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exitpoint_script: Option<String>,
     /// Package names to install at spawn via `package_manager`. The spawner
     /// always adds a baseline (`bash ca-certificates coreutils jq`); this
     /// list is role-specific extras (e.g. `["git", "curl"]`).
@@ -188,6 +197,7 @@ mod tests {
             substrate_class: SubstrateClass::Podman,
             package_manager: PackageManager::Apk,
             entrypoint_script: "#!/usr/bin/env bash\necho hello\n".into(),
+            exitpoint_script: None,
             binaries: vec!["git".into(), "curl".into()],
             mcp_servers: vec![McpServer {
                 name: "ra-query".into(),
@@ -225,6 +235,7 @@ mod tests {
             substrate_class: SubstrateClass::Podman,
             package_manager: PackageManager::Apt,
             entrypoint_script: "#!/usr/bin/env bash\nexit 0\n".into(),
+            exitpoint_script: None,
             binaries: vec![],
             mcp_servers: vec![],
             tool_allowlist: ToolAllowlist::default(),
@@ -242,6 +253,37 @@ mod tests {
         assert_eq!(
             back.extra_bootstrap[0],
             "rustup component add rustfmt clippy"
+        );
+    }
+
+    #[test]
+    fn agent_role_roundtrips_with_exitpoint() {
+        let r = AgentRole {
+            name: RoleName("coder-rust".into()),
+            version: 1,
+            model: None,
+            system_prompt: None,
+            image: "docker.io/library/rust:1.93".into(),
+            substrate_class: SubstrateClass::Podman,
+            package_manager: PackageManager::Apt,
+            entrypoint_script: "#!/usr/bin/env bash\nexit 0\n".into(),
+            exitpoint_script: Some("#!/usr/bin/env bash\nemit_done shipped\n".into()),
+            binaries: vec![],
+            mcp_servers: vec![],
+            tool_allowlist: ToolAllowlist::default(),
+            permit_scope: PermitScope::default(),
+            passthru_env: vec![],
+            mounts: vec![],
+            workspace_mount: None,
+            sccache: false,
+            extra_bootstrap: vec![],
+        };
+        let s = serde_json::to_string(&r).expect("ser");
+        let back: AgentRole = serde_json::from_str(&s).expect("de");
+        assert_eq!(r, back);
+        assert_eq!(
+            back.exitpoint_script.as_deref(),
+            Some("#!/usr/bin/env bash\nemit_done shipped\n")
         );
     }
 

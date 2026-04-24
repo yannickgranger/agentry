@@ -237,12 +237,16 @@ impl Spawner for PodmanSpawner {
         // `binaries` via the declared package manager and execs the script.
         cmd.arg("--env")
             .arg(format!("AGENTRY_SCRIPT={}", role.entrypoint_script));
+        if let Some(ep) = &role.exitpoint_script {
+            cmd.arg("--env").arg(format!("AGENTRY_EXITPOINT={ep}"));
+        }
         cmd.arg(&role.image);
         let effective_binaries = effective_binaries(role);
         cmd.arg("sh").arg("-c").arg(bootstrap_command(
             role.package_manager,
             &effective_binaries,
             &role.extra_bootstrap,
+            role.exitpoint_script.is_some(),
         ));
 
         cmd.stdin(Stdio::piped());
@@ -494,6 +498,7 @@ fn bootstrap_command(
     pm: PackageManager,
     extra_binaries: &[String],
     extra_bootstrap: &[String],
+    has_exitpoint: bool,
 ) -> String {
     const BASELINE: &[&str] = &["bash", "ca-certificates", "coreutils", "jq"];
     let all: Vec<&str> = BASELINE
@@ -518,7 +523,15 @@ fn bootstrap_command(
     // $AGENTRY_SCRIPT is passed as an env var by the spawner. `bash -c` runs
     // it as a script; the script's own `cat` still reads the startup JSON
     // bundle from stdin (not affected by the outer bootstrap).
-    script.push_str("exec bash -c \"$AGENTRY_SCRIPT\"");
+    if has_exitpoint {
+        script.push_str("bash -c \"$AGENTRY_SCRIPT\"; _rc=$?\n");
+        script.push_str("if [ \"$_rc\" -eq 0 ] && [ -n \"${AGENTRY_EXITPOINT:-}\" ]; then\n");
+        script.push_str("    exec bash -c \"$AGENTRY_EXITPOINT\"\n");
+        script.push_str("fi\n");
+        script.push_str("exit \"$_rc\"");
+    } else {
+        script.push_str("exec bash -c \"$AGENTRY_SCRIPT\"");
+    }
     script
 }
 
@@ -621,6 +634,7 @@ mod tests {
             substrate_class: orchestrator_types::SubstrateClass::Podman,
             package_manager: PackageManager::Apk,
             entrypoint_script: "#!/usr/bin/env bash\nexit 0\n".into(),
+            exitpoint_script: None,
             binaries: binaries.into_iter().map(String::from).collect(),
             mcp_servers: vec![],
             tool_allowlist: orchestrator_types::ToolAllowlist::default(),
@@ -668,7 +682,12 @@ mod tests {
 
     #[test]
     fn bootstrap_apk_installs_baseline_plus_extras() {
-        let s = bootstrap_command(PackageManager::Apk, &["git".into(), "curl".into()], &[]);
+        let s = bootstrap_command(
+            PackageManager::Apk,
+            &["git".into(), "curl".into()],
+            &[],
+            false,
+        );
         assert!(s.contains("apk add --no-cache"));
         assert!(s.contains("bash"));
         assert!(s.contains("coreutils"));
@@ -680,7 +699,7 @@ mod tests {
 
     #[test]
     fn bootstrap_apt_uses_apt_get() {
-        let s = bootstrap_command(PackageManager::Apt, &[], &[]);
+        let s = bootstrap_command(PackageManager::Apt, &[], &[], false);
         assert!(s.contains("apt-get update"));
         assert!(s.contains("apt-get install -y --no-install-recommends"));
         assert!(s.contains("exec bash -c \"$AGENTRY_SCRIPT\""));
@@ -695,6 +714,7 @@ mod tests {
                 "rustup component add rustfmt".into(),
                 "rustup component add clippy".into(),
             ],
+            false,
         );
         assert!(s.contains("rustup component add rustfmt"));
         assert!(s.contains("rustup component add clippy"));
@@ -711,5 +731,13 @@ mod tests {
         assert!(install_idx < rustfmt_idx);
         assert!(rustfmt_idx < clippy_idx);
         assert!(clippy_idx < exec_idx);
+    }
+
+    #[test]
+    fn bootstrap_runs_exitpoint_when_flag_set() {
+        let s = bootstrap_command(PackageManager::Apt, &[], &[], true);
+        assert!(s.contains("AGENTRY_EXITPOINT"));
+        assert!(s.contains("exec bash -c \"$AGENTRY_EXITPOINT\""));
+        assert!(!s.contains("exec bash -c \"$AGENTRY_SCRIPT\""));
     }
 }
