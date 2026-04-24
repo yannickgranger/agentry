@@ -843,6 +843,7 @@ async fn role_create(
         substrate_class,
         package_manager,
         entrypoint_script: f.entrypoint_script,
+        exitpoint_script: None,
         binaries: split_csv(&f.binaries_csv),
         mcp_servers,
         tool_allowlist: ToolAllowlist(split_csv(&f.tool_allowlist_csv)),

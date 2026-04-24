@@ -57,7 +57,12 @@ The role also carries `extra_bootstrap`: extra shell commands executed as
 part of the container's bootstrap sequence, one per entry, appended AFTER
 the package-manager install and BEFORE the role's entrypoint script.
 Typical use: `rustup component add rustfmt clippy` for rust-based roles.
-Empty means no extras.
+Empty means no extras. The role may also carry `exitpoint_script`: an
+optional bash program the spawner runs AFTER the entrypoint exits 0,
+BEFORE the terminal verdict. Used for role-local gates that augment the
+entrypoint's work (e.g. a coder running `quality-hygiene --fix` before
+emitting `shipped`). `None` means the entrypoint is solely responsible
+for the terminal event.
 
 ## TeamName
 
