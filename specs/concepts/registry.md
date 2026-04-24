@@ -64,6 +64,13 @@ entrypoint's work (e.g. a coder running `quality-hygiene --fix` before
 emitting `shipped`). `None` means the entrypoint is solely responsible
 for the terminal event.
 
+Roles may pair up as sibling reviewers. The `agentry-self-host-v0` team
+runs two reviewers in sequence: `reviewer-mechanical-agentry` (cargo
+fmt/clippy/test — machine truth) and `reviewer-claude-agentry` (LLM
+review — naming, design, clarity, invariants). Both treat the coder as
+their rework-target upstream via `MessageEdge`. A Blocker from either
+reviewer rewinds to the coder, bounded by `team.max_retries`.
+
 ## TeamName
 
 Identifier for a team topology. Lowercase + hyphens, unique within the
