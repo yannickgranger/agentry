@@ -12,6 +12,16 @@ The JSON bundle written to the spawned container's stdin: brief, role,
 permit, team context. Published Language between `execution` and the agent's
 entrypoint script.
 
+## BriefWorkspace
+
+The per-brief host scratch directory. Allocated by the daemon on the first
+role in the team that declares a `WorkspaceMount`, shared across all
+subsequent roles in the same brief, torn down on team-level `Shipped` and
+retained on any other terminal state for audit. Gives roles a place to
+clone, edit, and commit that survives across role boundaries. Minimal
+shape today — a host dir bind-mounted at the declared container path;
+bare-clone + `git worktree` semantics come later.
+
 ## TeamContext
 
 Per-role, per-brief context handed to the container: messages routed to
@@ -36,10 +46,16 @@ outbox (messages the role emitted that may feed downstream roles).
 
 ## Spawner
 
-The abstract container-lifecycle trait. One method: take a brief, role,
-permit, verifying key, team context, and a Redis connection; run the agent
-to completion; return an outcome. Substrate-specific implementations
-specialise this.
+The abstract container-lifecycle trait. One method: take a `RunAgentCtx`
+bundle and a Redis connection; run the agent to completion; return an
+outcome. Substrate-specific implementations specialise this.
+
+## RunAgentCtx
+
+Borrowed bundle of inputs to `Spawner::run_agent` — brief, role, permit,
+verifying key, team context, optional brief workspace. Keeps the trait
+method signature narrow (two arguments) regardless of how many inputs the
+implementation needs to see.
 
 ## PodmanSpawner
 

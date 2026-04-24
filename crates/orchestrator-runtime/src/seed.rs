@@ -9,7 +9,7 @@
 use crate::{redis_io, Config, Result};
 use orchestrator_types::{
     AgentRole, MessageEdge, Mount, PackageManager, PermitScope, RoleName, SubstrateClass, TeamName,
-    TeamTopology, ToolAllowlist,
+    TeamTopology, ToolAllowlist, WorkspaceMount,
 };
 
 // ---------------------------------------------------------------------------
@@ -178,6 +178,20 @@ printf '{"at":"%s","type":"event","payload":{"msg":"NOT BLOCKED — regression i
 printf '{"at":"%s","type":"done","verdict":"shipped"}\n' "$(date -Iseconds)"
 "#;
 
+/// Probe role used by agentry's own workspace tests. Writes and reads a file
+/// under the brief's workspace mount so integration tests can assert that
+/// the host dir is live during the run and gone after teardown.
+const WORKSPACE_PROBE_SCRIPT: &str = r#"#!/usr/bin/env bash
+set -euo pipefail
+cat > /dev/null
+printf '{"at":"%s","type":"event","payload":{"msg":"workspace-probe starting"}}\n' "$(date -Iseconds)"
+touch /workspace/hello
+echo "content from workspace-probe" > /workspace/hello
+body=$(cat /workspace/hello)
+printf '{"at":"%s","type":"event","payload":{"msg":"wrote and read","body":"%s"}}\n' "$(date -Iseconds)" "$body"
+printf '{"at":"%s","type":"done","verdict":"shipped"}\n' "$(date -Iseconds)"
+"#;
+
 const SHIPPER_SCRIPT: &str = r#"#!/usr/bin/env bash
 # Reads {repo, branch, file, content, commit_msg, pr_title, pr_body, base,
 # forge_host} from brief.payload. Clones forge repo with GITEA_TOKEN,
@@ -287,6 +301,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         permit_scope: PermitScope(vec!["net:deny:*".into()]),
         passthru_env: vec![],
         mounts: vec![],
+        workspace_mount: None,
     };
     let echo_team = TeamTopology {
         name: TeamName("echo-team".into()),
@@ -313,6 +328,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         permit_scope: PermitScope(vec!["net:deny:*".into()]),
         passthru_env: vec![],
         mounts: vec![],
+        workspace_mount: None,
     };
     let naughty_team = TeamTopology {
         name: TeamName("naughty-team".into()),
@@ -339,6 +355,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         permit_scope: PermitScope(vec!["net:deny:*".into()]),
         passthru_env: vec![],
         mounts: vec![],
+        workspace_mount: None,
     };
     let listener = AgentRole {
         name: RoleName("listener-agent".into()),
@@ -355,6 +372,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         permit_scope: PermitScope(vec!["net:deny:*".into()]),
         passthru_env: vec![],
         mounts: vec![],
+        workspace_mount: None,
     };
     let speaker_listener_team = TeamTopology {
         name: TeamName("speaker-listener-team".into()),
@@ -385,6 +403,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         permit_scope: PermitScope(vec!["net:allow:api.x.ai".into()]),
         passthru_env: vec!["XAI_API_KEY".into()],
         mounts: vec![],
+        workspace_mount: None,
     };
     let grok_team = TeamTopology {
         name: TeamName("grok-echo-team".into()),
@@ -432,6 +451,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
                 readonly: true,
             },
         ],
+        workspace_mount: None,
     };
     let claude_team = TeamTopology {
         name: TeamName("claude-echo-team".into()),
@@ -458,6 +478,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         permit_scope: PermitScope(vec!["net:deny:*".into()]),
         passthru_env: vec![],
         mounts: vec![],
+        workspace_mount: None,
     };
     let narrowed_coder = AgentRole {
         name: RoleName("narrowed-coder".into()),
@@ -479,6 +500,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         ]),
         passthru_env: vec![],
         mounts: vec![],
+        workspace_mount: None,
     };
     let narrowed_team = TeamTopology {
         name: TeamName("narrowed-team".into()),
@@ -512,6 +534,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         ]),
         passthru_env: vec!["GITEA_TOKEN".into()],
         mounts: vec![],
+        workspace_mount: None,
     };
     let shipper_team = TeamTopology {
         name: TeamName("shipper-solo-team".into()),
@@ -522,9 +545,44 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         max_retries: 0,
     };
 
+    // ---- workspace-probe (for workspace regression tests) ----
+    let workspace_probe = AgentRole {
+        name: RoleName("workspace-probe".into()),
+        version: 1,
+        model: None,
+        system_prompt: None,
+        image: ALPINE.into(),
+        substrate_class: SubstrateClass::Podman,
+        package_manager: PackageManager::Apk,
+        entrypoint_script: WORKSPACE_PROBE_SCRIPT.into(),
+        binaries: vec![],
+        mcp_servers: vec![],
+        tool_allowlist: ToolAllowlist(vec![]),
+        permit_scope: PermitScope(vec![
+            "fs:read:/workspace/**".into(),
+            "fs:write:/workspace/**".into(),
+        ]),
+        passthru_env: vec![],
+        mounts: vec![],
+        workspace_mount: Some(WorkspaceMount {
+            container_path: "/workspace".into(),
+            readonly: false,
+        }),
+    };
+    let workspace_probe_team = TeamTopology {
+        name: TeamName("workspace-probe-team".into()),
+        version: 1,
+        roles: vec![workspace_probe.name.clone()],
+        message_graph: Vec::<MessageEdge>::new(),
+        terminal_role: workspace_probe.name.clone(),
+        max_retries: 0,
+    };
+
     // ---- persist everything ----
     redis_io::save_role(&mut conn, &echo).await?;
     redis_io::save_team(&mut conn, &echo_team).await?;
+    redis_io::save_role(&mut conn, &workspace_probe).await?;
+    redis_io::save_team(&mut conn, &workspace_probe_team).await?;
     redis_io::save_role(&mut conn, &naughty).await?;
     redis_io::save_team(&mut conn, &naughty_team).await?;
     redis_io::save_role(&mut conn, &speaker).await?;
@@ -541,7 +599,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
     redis_io::save_team(&mut conn, &shipper_team).await?;
 
     tracing::info!(
-        "seeded: roles [echo, naughty, speaker, listener, grok-echo, claude-echo, synthesizer, narrowed-coder, shipper] (inline entrypoint scripts); teams [echo, naughty, speaker-listener, grok-echo, claude-echo, narrowed-team, shipper-solo-team]"
+        "seeded: roles [echo, workspace-probe, naughty, speaker, listener, grok-echo, claude-echo, synthesizer, narrowed-coder, shipper] (inline entrypoint scripts); teams [echo, workspace-probe, naughty, speaker-listener, grok-echo, claude-echo, narrowed-team, shipper-solo-team]"
     );
     Ok(())
 }
