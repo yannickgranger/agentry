@@ -8,7 +8,8 @@
 
 use crate::{
     permit as permit_mod, redis_io,
-    spawner::{PodmanSpawner, RoutedMessage, Spawner, TeamContext},
+    spawner::{PodmanSpawner, RoutedMessage, RunAgentCtx, Spawner, TeamContext},
+    workspace::{self, BriefWorkspace},
     Error, Result,
 };
 use ed25519_dalek::{SigningKey, VerifyingKey};
@@ -85,9 +86,25 @@ async fn handle_brief(
     // Populated by scanning upstream outbox messages against team.message_graph edges
     // that declare `permit_overrides_from`.
     let mut overrides_for: HashMap<String, PermitOverrides> = HashMap::new();
+    // Lazily allocated on first role that declares a `workspace_mount`; shared
+    // across subsequent roles so they see each other's changes.
+    let mut workspace: Option<BriefWorkspace> = None;
+    // Track the last non-shipped verdict kind so teardown can decide whether
+    // to destroy the workspace (Shipped) or retain it (anything else).
+    let mut team_shipped = true;
 
     for role_name in &team.roles {
         let role = fetch_role_any_version(conn, role_name).await?;
+
+        if role.workspace_mount.is_some() && workspace.is_none() {
+            let ws = workspace::allocate(&brief.id).await?;
+            tracing::info!(
+                brief = %brief.id,
+                path = %ws.host_path.display(),
+                "allocated brief workspace"
+            );
+            workspace = Some(ws);
+        }
 
         // Mint + narrow + sign.
         let mut permit = mint_permit(brief, &role)?;
@@ -112,7 +129,17 @@ async fn handle_brief(
         };
 
         let outcome = spawner
-            .run_agent(brief, &role, &permit, verifying_key, &team_ctx, conn)
+            .run_agent(
+                RunAgentCtx {
+                    brief,
+                    role: &role,
+                    permit: &permit,
+                    verifying_key,
+                    team_context: &team_ctx,
+                    workspace: workspace.as_ref(),
+                },
+                conn,
+            )
             .await?;
         redis_io::append_verdict(conn, &outcome.verdict).await?;
         tracing::info!(
@@ -156,8 +183,41 @@ async fn handle_brief(
         all_messages.extend(outcome.outbox);
 
         if !matches!(outcome.verdict.kind, VerdictKind::Shipped) {
-            return Ok(());
+            team_shipped = false;
+            break;
         }
+    }
+
+    // Workspace teardown: destroy on full-team Shipped, retain on any other
+    // terminal state so the failing workspace can be inspected. Retention
+    // is cleaned up by a future `orchestrator prune` (not built here).
+    if let Some(ws) = workspace.take() {
+        if team_shipped {
+            if let Err(e) = workspace::destroy(&ws).await {
+                tracing::warn!(
+                    brief = %brief.id,
+                    path = %ws.host_path.display(),
+                    error = %e,
+                    "workspace destroy failed"
+                );
+            } else {
+                tracing::info!(
+                    brief = %brief.id,
+                    path = %ws.host_path.display(),
+                    "workspace destroyed (team shipped)"
+                );
+            }
+        } else {
+            tracing::info!(
+                brief = %brief.id,
+                path = %ws.host_path.display(),
+                "workspace retained for audit (team did not ship)"
+            );
+        }
+    }
+
+    if !team_shipped {
+        return Ok(());
     }
 
     // Chain trigger: if every role shipped AND the brief's payload names a

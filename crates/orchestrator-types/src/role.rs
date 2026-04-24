@@ -83,6 +83,18 @@ pub struct Mount {
     pub readonly: bool,
 }
 
+/// Declaration that a role wants the brief's workspace bind-mounted into its
+/// container. The host path is allocated by the daemon at brief dispatch; the
+/// role only names the container-side mount point.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceMount {
+    /// Absolute container path where the brief's workspace appears, e.g. `/workspace`.
+    pub container_path: String,
+    /// If `true`, the mount is read-only (`:ro`). Defaults to `false`.
+    #[serde(default)]
+    pub readonly: bool,
+}
+
 /// Permission scopes — narrowed further at spawn time by brief/team overrides.
 /// Each entry is a symbolic scope string: `fs:read:/workspace/**`, `net:deny:*`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -139,6 +151,12 @@ pub struct AgentRole {
     /// `claude` binary and credentials file without baking them into an image.
     #[serde(default)]
     pub mounts: Vec<Mount>,
+    /// Whether this role needs the brief's per-brief workspace mounted.
+    /// When `Some`, the daemon allocates a host dir per brief and bind-mounts
+    /// it at the declared container path. `None` means the role runs without
+    /// a brief workspace (echo/naughty/speaker/listener etc.).
+    #[serde(default)]
+    pub workspace_mount: Option<WorkspaceMount>,
 }
 
 #[cfg(test)]
@@ -170,10 +188,31 @@ mod tests {
             ]),
             passthru_env: vec![],
             mounts: vec![],
+            workspace_mount: Some(WorkspaceMount {
+                container_path: "/workspace".into(),
+                readonly: false,
+            }),
         };
         let s = serde_json::to_string_pretty(&r).expect("ser");
         let back: AgentRole = serde_json::from_str(&s).expect("de");
         assert_eq!(r, back);
+    }
+
+    #[test]
+    fn workspace_mount_defaults_to_none() {
+        // Old role JSON without the field must still deserialize — critical
+        // for already-seeded roles (echo/naughty/speaker/etc.).
+        let json = r##"{
+            "name": "legacy",
+            "version": 1,
+            "model": null,
+            "system_prompt": null,
+            "image": "alpine:3.21",
+            "package_manager": "apk",
+            "entrypoint_script": "#!/usr/bin/env bash\nexit 0\n"
+        }"##;
+        let r: AgentRole = serde_json::from_str(json).expect("de");
+        assert!(r.workspace_mount.is_none());
     }
 
     #[test]

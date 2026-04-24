@@ -18,7 +18,7 @@ pub use brief::{Brief, BriefId, Budget, EscalationMode, Payload};
 pub use event::{Event, EventKind, EventVerdict, ToolCall};
 pub use permit::{PermitScope, ToolAllowlist, WorkPermit};
 pub use project::{Project, ProjectSlug, StandingOrders};
-pub use role::{AgentRole, Mount, PackageManager, RoleName, SubstrateClass};
+pub use role::{AgentRole, Mount, PackageManager, RoleName, SubstrateClass, WorkspaceMount};
 pub use team::{MessageEdge, PermitOverrides, TeamName, TeamTopology};
 
 /// Apply a `PermitOverrides` payload to an already-minted permit, in place.

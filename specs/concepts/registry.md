@@ -34,12 +34,23 @@ A host→container bind mount on a role. Optionally read-only. Used by
 Claude-Max roles to bring the `claude` binary and credentials into the
 container without baking them into an image.
 
+## WorkspaceMount
+
+A role's declaration that it wants the brief's workspace bind-mounted into
+its container. Names only the container-side path (e.g. `/workspace`) and
+a read-only flag; the host path is chosen by the daemon at brief dispatch
+from the allocated `BriefWorkspace`. A role without a `WorkspaceMount`
+runs with no brief-scoped scratch space (echo / naughty / speaker etc.);
+a coder-style role with one can clone, edit, and commit a working tree
+that later roles in the same brief also see.
+
 ## AgentRole
 
 The full specification of one kind of agent container: name, version, model
 hint, system prompt, base image, substrate class, package manager, inline
 entrypoint script, extra binaries to install, MCP servers, baseline tool
-allowlist, baseline permit scope, env passthrough list, and mounts.
+allowlist, baseline permit scope, env passthrough list, mounts, and
+optional workspace mount.
 
 ## TeamName
 

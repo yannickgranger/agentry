@@ -802,6 +802,10 @@ async fn role_create(
         permit_scope: PermitScope(split_lines(&f.permit_scope_lines)),
         passthru_env: split_csv(&f.passthru_env_csv),
         mounts: parse_mounts(&f.mounts_lines),
+        // Dashboard form doesn't surface workspace_mount yet; dashboard-
+        // created roles default to no workspace. Future issue extends the
+        // form when a dashboard-author wants a workspace-using role.
+        workspace_mount: None,
     };
     {
         let mut c = app.redis.lock().await;

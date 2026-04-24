@@ -10,7 +10,7 @@
 //! Only Podman is implemented today; other substrates (Docker, LXC, SSH, VM)
 //! will land as sibling adapters implementing the same `Spawner` trait.
 
-use crate::{permit as permit_mod, redis_io, Error, Result};
+use crate::{permit as permit_mod, redis_io, workspace::BriefWorkspace, Error, Result};
 use async_trait::async_trait;
 use ed25519_dalek::VerifyingKey;
 use orchestrator_types::{
@@ -65,17 +65,28 @@ pub struct AgentOutcome {
     pub outbox: Vec<RoutedMessage>,
 }
 
+/// Borrowed bundle of inputs to `Spawner::run_agent`, so the trait method
+/// keeps a two-arg shape (context + connection). Construct at the daemon,
+/// destructure at the spawner.
+pub struct RunAgentCtx<'a> {
+    pub brief: &'a Brief,
+    pub role: &'a AgentRole,
+    pub permit: &'a WorkPermit,
+    pub verifying_key: &'a VerifyingKey,
+    pub team_context: &'a TeamContext,
+    /// Per-brief workspace. Bind-mounted into the container when
+    /// `role.workspace_mount.is_some()`. `None` is valid for briefs whose
+    /// team has no workspace-using roles.
+    pub workspace: Option<&'a BriefWorkspace>,
+}
+
 #[async_trait]
 pub trait Spawner: Send + Sync {
     /// Run the agent fully: spawn, pipe stdin, tail stdout to trace, enforce
     /// permit on tool-call events, route messages, write verdict, tear down.
     async fn run_agent(
         &self,
-        brief: &Brief,
-        role: &AgentRole,
-        permit: &WorkPermit,
-        verifying_key: &VerifyingKey,
-        team_context: &TeamContext,
+        ctx: RunAgentCtx<'_>,
         conn: &mut ConnectionManager,
     ) -> Result<AgentOutcome>;
 }
@@ -104,13 +115,17 @@ impl Default for PodmanSpawner {
 impl Spawner for PodmanSpawner {
     async fn run_agent(
         &self,
-        brief: &Brief,
-        role: &AgentRole,
-        permit: &WorkPermit,
-        verifying_key: &VerifyingKey,
-        team_context: &TeamContext,
+        ctx: RunAgentCtx<'_>,
         conn: &mut ConnectionManager,
     ) -> Result<AgentOutcome> {
+        let RunAgentCtx {
+            brief,
+            role,
+            permit,
+            verifying_key,
+            team_context,
+            workspace,
+        } = ctx;
         // Defence in depth: verify the permit we're about to hand out.
         permit_mod::verify(permit, verifying_key)?;
 
@@ -169,7 +184,8 @@ impl Spawner for PodmanSpawner {
         // disable SELinux label translation — otherwise rootless podman on
         // Fedora/Silverblue can't read host-owned files (EACCES). `:z`/`:Z`
         // mount flags would relabel the SOURCE on the host, which is worse.
-        if !role.mounts.is_empty() {
+        let role_wants_workspace = role.workspace_mount.is_some();
+        if !role.mounts.is_empty() || role_wants_workspace {
             cmd.arg("--security-opt").arg("label=disable");
         }
         for m in &role.mounts {
@@ -177,6 +193,24 @@ impl Spawner for PodmanSpawner {
                 format!("{}:{}:ro", m.source, m.target)
             } else {
                 format!("{}:{}", m.source, m.target)
+            };
+            cmd.arg("-v").arg(spec);
+        }
+        // Workspace mount: when the role declares a `workspace_mount`, bind
+        // the brief's host workspace at the declared container path. If the
+        // role wants one but the daemon didn't allocate (configuration bug),
+        // fail fast rather than silently running without the workspace.
+        if let Some(wm) = &role.workspace_mount {
+            let ws = workspace.ok_or_else(|| {
+                Error::Config(format!(
+                    "role '{}' declares workspace_mount but no workspace was allocated for brief {}",
+                    role.name, brief.id
+                ))
+            })?;
+            let spec = if wm.readonly {
+                format!("{}:{}:ro", ws.host_path.display(), wm.container_path)
+            } else {
+                format!("{}:{}", ws.host_path.display(), wm.container_path)
             };
             cmd.arg("-v").arg(spec);
         }
