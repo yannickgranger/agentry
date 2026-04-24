@@ -192,6 +192,18 @@ printf '{"at":"%s","type":"event","payload":{"msg":"wrote and read","body":"%s"}
 printf '{"at":"%s","type":"done","verdict":"shipped"}\n' "$(date -Iseconds)"
 "#;
 
+/// Probe role used by agentry's own wall-clock-timeout tests. Sleeps long
+/// enough that the spawner's `permit.max_wall_seconds` guard must fire. If
+/// the probe ever reaches its `done shipped` line, the budget enforcement
+/// regressed.
+const TIMEOUT_PROBE_SCRIPT: &str = r#"#!/usr/bin/env bash
+set -euo pipefail
+cat > /dev/null
+printf '{"at":"%s","type":"event","payload":{"msg":"timeout-probe sleeping; spawner should kill me"}}\n' "$(date -Iseconds)"
+sleep 300
+printf '{"at":"%s","type":"done","verdict":"shipped"}\n' "$(date -Iseconds)"
+"#;
+
 const SHIPPER_SCRIPT: &str = r#"#!/usr/bin/env bash
 # Reads {repo, branch, file, content, commit_msg, pr_title, pr_body, base,
 # forge_host} from brief.payload. Clones forge repo with GITEA_TOKEN,
@@ -578,11 +590,40 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         max_retries: 0,
     };
 
+    // ---- timeout-probe (for wall-clock-timeout regression tests) ----
+    let timeout_probe = AgentRole {
+        name: RoleName("timeout-probe".into()),
+        version: 1,
+        model: None,
+        system_prompt: None,
+        image: ALPINE.into(),
+        substrate_class: SubstrateClass::Podman,
+        package_manager: PackageManager::Apk,
+        entrypoint_script: TIMEOUT_PROBE_SCRIPT.into(),
+        binaries: vec![],
+        mcp_servers: vec![],
+        tool_allowlist: ToolAllowlist(vec![]),
+        permit_scope: PermitScope(vec!["net:deny:*".into()]),
+        passthru_env: vec![],
+        mounts: vec![],
+        workspace_mount: None,
+    };
+    let timeout_probe_team = TeamTopology {
+        name: TeamName("timeout-probe-team".into()),
+        version: 1,
+        roles: vec![timeout_probe.name.clone()],
+        message_graph: Vec::<MessageEdge>::new(),
+        terminal_role: timeout_probe.name.clone(),
+        max_retries: 0,
+    };
+
     // ---- persist everything ----
     redis_io::save_role(&mut conn, &echo).await?;
     redis_io::save_team(&mut conn, &echo_team).await?;
     redis_io::save_role(&mut conn, &workspace_probe).await?;
     redis_io::save_team(&mut conn, &workspace_probe_team).await?;
+    redis_io::save_role(&mut conn, &timeout_probe).await?;
+    redis_io::save_team(&mut conn, &timeout_probe_team).await?;
     redis_io::save_role(&mut conn, &naughty).await?;
     redis_io::save_team(&mut conn, &naughty_team).await?;
     redis_io::save_role(&mut conn, &speaker).await?;
@@ -599,7 +640,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
     redis_io::save_team(&mut conn, &shipper_team).await?;
 
     tracing::info!(
-        "seeded: roles [echo, workspace-probe, naughty, speaker, listener, grok-echo, claude-echo, synthesizer, narrowed-coder, shipper] (inline entrypoint scripts); teams [echo, workspace-probe, naughty, speaker-listener, grok-echo, claude-echo, narrowed-team, shipper-solo-team]"
+        "seeded: roles [echo, workspace-probe, timeout-probe, naughty, speaker, listener, grok-echo, claude-echo, synthesizer, narrowed-coder, shipper] (inline entrypoint scripts); teams [echo, workspace-probe, timeout-probe, naughty, speaker-listener, grok-echo, claude-echo, narrowed-team, shipper-solo-team]"
     );
     Ok(())
 }

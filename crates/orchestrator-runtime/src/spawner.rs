@@ -20,6 +20,7 @@ use redis::aio::ConnectionManager;
 use redis::AsyncCommands;
 use serde::Serialize;
 use std::process::Stdio;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 
@@ -244,60 +245,97 @@ impl Spawner for PodmanSpawner {
             .ok_or_else(|| Error::Spawn("no stdout".into()))?;
         let mut reader = BufReader::new(stdout).lines();
 
-        let mut terminal: Option<Event> = None;
-        let mut permit_violation: Option<String> = None;
-        let mut outbox: Vec<RoutedMessage> = Vec::new();
-        while let Some(line) = reader.next_line().await? {
-            if line.is_empty() {
-                continue;
-            }
-            match serde_json::from_str::<Event>(&line) {
-                Ok(ev) => {
-                    // Enforce permit on tool calls: any call outside the allowlist
-                    // OR outside the narrowed fs scope kills the container.
-                    if let EventKind::ToolCall { call } = &ev.kind {
-                        append_audit(conn, &brief.id, agent_id, &call.tool, &call.args)
-                            .await
-                            .ok();
-                        if let Err(reason) =
-                            orchestrator_types::check_tool_call(permit, &call.tool, &call.args)
-                        {
-                            tracing::warn!(
-                                brief = %brief.id,
-                                agent = %agent_id,
-                                tool = %call.tool,
-                                reason = %reason,
-                                "permit violation — killing container"
-                            );
-                            permit_violation = Some(reason);
-                            redis_io::append_trace(conn, &brief.id, agent_id, &ev).await?;
-                            let _ = tokio::process::Command::new("podman")
-                                .args(["stop", "-t", "1", &name])
-                                .output()
-                                .await;
+        // The read loop is wrapped in `tokio::time::timeout(permit.max_wall_seconds)`
+        // so a hung agent (network stall, runaway script) cannot stall the daemon.
+        // The inner future owns `reader` and mutably borrows `conn`; on elapsed
+        // the future is dropped, releasing both, and we `podman stop` the
+        // container by name to unblock `child.wait()` below.
+        let read_fut = async {
+            let mut terminal: Option<Event> = None;
+            let mut permit_violation: Option<String> = None;
+            let mut outbox: Vec<RoutedMessage> = Vec::new();
+            while let Some(line) = reader.next_line().await? {
+                if line.is_empty() {
+                    continue;
+                }
+                match serde_json::from_str::<Event>(&line) {
+                    Ok(ev) => {
+                        // Enforce permit on tool calls: any call outside the
+                        // allowlist OR outside the narrowed fs scope kills the
+                        // container.
+                        if let EventKind::ToolCall { call } = &ev.kind {
+                            append_audit(conn, &brief.id, agent_id, &call.tool, &call.args)
+                                .await
+                                .ok();
+                            if let Err(reason) =
+                                orchestrator_types::check_tool_call(permit, &call.tool, &call.args)
+                            {
+                                tracing::warn!(
+                                    brief = %brief.id,
+                                    agent = %agent_id,
+                                    tool = %call.tool,
+                                    reason = %reason,
+                                    "permit violation — killing container"
+                                );
+                                permit_violation = Some(reason);
+                                redis_io::append_trace(conn, &brief.id, agent_id, &ev).await?;
+                                let _ = tokio::process::Command::new("podman")
+                                    .args(["stop", "-t", "1", &name])
+                                    .output()
+                                    .await;
+                                break;
+                            }
+                        }
+                        // Collect outbox messages for downstream routing.
+                        if let EventKind::Message { to, payload } = &ev.kind {
+                            outbox.push(RoutedMessage {
+                                from: role.name.0.clone(),
+                                to: to.clone(),
+                                payload: payload.clone(),
+                                at: ev.at,
+                            });
+                        }
+                        redis_io::append_trace(conn, &brief.id, agent_id, &ev).await?;
+                        if ev.is_terminal() {
+                            terminal = Some(ev);
                             break;
                         }
                     }
-                    // Collect outbox messages for downstream routing.
-                    if let EventKind::Message { to, payload } = &ev.kind {
-                        outbox.push(RoutedMessage {
-                            from: role.name.0.clone(),
-                            to: to.clone(),
-                            payload: payload.clone(),
-                            at: ev.at,
-                        });
+                    Err(err) => {
+                        tracing::warn!(line=%line, error=%err, "skipped malformed event");
                     }
-                    redis_io::append_trace(conn, &brief.id, agent_id, &ev).await?;
-                    if ev.is_terminal() {
-                        terminal = Some(ev);
-                        break;
-                    }
-                }
-                Err(err) => {
-                    tracing::warn!(line=%line, error=%err, "skipped malformed event");
                 }
             }
-        }
+            Ok::<(Option<Event>, Option<String>, Vec<RoutedMessage>), Error>((
+                terminal,
+                permit_violation,
+                outbox,
+            ))
+        };
+
+        let (timed_out, terminal, permit_violation, outbox) = match permit.max_wall_seconds {
+            Some(secs) => match tokio::time::timeout(Duration::from_secs(secs), read_fut).await {
+                Ok(Ok((t, pv, ob))) => (false, t, pv, ob),
+                Ok(Err(e)) => return Err(e),
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        brief = %brief.id,
+                        agent = %agent_id,
+                        seconds = secs,
+                        "wall-clock budget exceeded — stopping container"
+                    );
+                    let _ = tokio::process::Command::new("podman")
+                        .args(["stop", "-t", "1", &name])
+                        .output()
+                        .await;
+                    (true, None, None, Vec::new())
+                }
+            },
+            None => {
+                let (t, pv, ob) = read_fut.await?;
+                (false, t, pv, ob)
+            }
+        };
 
         // Capture stderr (diagnostic only — not mirrored to trace).
         if let Some(mut stderr) = child.stderr.take() {
@@ -311,27 +349,13 @@ impl Spawner for PodmanSpawner {
 
         let status = child.wait().await?;
 
-        let (verdict_kind, reason) = if let Some(r) = permit_violation.clone() {
-            (VerdictKind::PermitViolation, Some(r))
-        } else {
-            match terminal.as_ref().and_then(Event::verdict) {
-                Some(v) => (VerdictKind::from(v), None),
-                None => (
-                    VerdictKind::Failed,
-                    Some(format!(
-                        "agent exited without done event (code={:?})",
-                        status.code()
-                    )),
-                ),
-            }
-        };
-
-        let verdict = Verdict::new(brief.id.clone(), verdict_kind);
-        let verdict = if let Some(r) = reason {
-            verdict.with_reason(r)
-        } else {
-            verdict
-        };
+        let verdict = compute_verdict(
+            &brief.id,
+            timed_out,
+            permit_violation.as_deref(),
+            terminal.as_ref().and_then(Event::verdict),
+            status.code(),
+        );
 
         Ok(AgentOutcome {
             handle: AgentHandle {
@@ -341,6 +365,42 @@ impl Spawner for PodmanSpawner {
             verdict,
             outbox,
         })
+    }
+}
+
+/// Build the team-level `Verdict` from the spawner's observed outcomes.
+/// Pure function so the verdict-selection logic is unit-testable without
+/// spawning a container.
+fn compute_verdict(
+    brief_id: &BriefId,
+    timed_out: bool,
+    permit_violation: Option<&str>,
+    terminal_event: Option<orchestrator_types::EventVerdict>,
+    exit_code: Option<i32>,
+) -> Verdict {
+    let (kind, reason) = if timed_out {
+        (
+            VerdictKind::Failed,
+            Some("wall-clock budget exceeded".to_string()),
+        )
+    } else if let Some(r) = permit_violation {
+        (VerdictKind::PermitViolation, Some(r.to_string()))
+    } else {
+        match terminal_event {
+            Some(v) => (VerdictKind::from(v), None),
+            None => (
+                VerdictKind::Failed,
+                Some(format!(
+                    "agent exited without done event (code={exit_code:?})"
+                )),
+            ),
+        }
+    };
+    let v = Verdict::new(brief_id.clone(), kind);
+    if let Some(r) = reason {
+        v.with_reason(r)
+    } else {
+        v
     }
 }
 
@@ -398,11 +458,62 @@ fn bootstrap_command(pm: PackageManager, extra_binaries: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use orchestrator_types::EventVerdict;
+
+    fn bid() -> BriefId {
+        BriefId("brf_test".into())
+    }
 
     #[test]
     fn container_name_format() {
         let n = PodmanSpawner::container_name("agt_abcd");
         assert_eq!(n, "agentry-agt_abcd");
+    }
+
+    #[test]
+    fn verdict_timeout_beats_everything() {
+        // Even if a permit_violation or terminal event were observed, a
+        // timeout signal must dominate — timeouts indicate the agent did not
+        // complete within budget, which trumps any partial signal.
+        let v = compute_verdict(
+            &bid(),
+            true,
+            Some("tried to write denied path"),
+            Some(EventVerdict::Shipped),
+            Some(137),
+        );
+        assert!(matches!(v.kind, VerdictKind::Failed));
+        assert_eq!(v.reason.as_deref(), Some("wall-clock budget exceeded"));
+    }
+
+    #[test]
+    fn verdict_permit_violation_when_no_timeout() {
+        let v = compute_verdict(
+            &bid(),
+            false,
+            Some("unauthorized tool call: write"),
+            None,
+            None,
+        );
+        assert!(matches!(v.kind, VerdictKind::PermitViolation));
+        assert_eq!(v.reason.as_deref(), Some("unauthorized tool call: write"));
+    }
+
+    #[test]
+    fn verdict_from_terminal_event() {
+        let v = compute_verdict(&bid(), false, None, Some(EventVerdict::Shipped), Some(0));
+        assert!(matches!(v.kind, VerdictKind::Shipped));
+        assert!(v.reason.is_none());
+    }
+
+    #[test]
+    fn verdict_failed_without_done_event() {
+        // Container exited but never emitted `done` — Failed with exit code in reason.
+        let v = compute_verdict(&bid(), false, None, None, Some(1));
+        assert!(matches!(v.kind, VerdictKind::Failed));
+        let reason = v.reason.expect("reason required");
+        assert!(reason.contains("agent exited without done event"));
+        assert!(reason.contains("1"), "exit code surfaced: {reason}");
     }
 
     #[test]
