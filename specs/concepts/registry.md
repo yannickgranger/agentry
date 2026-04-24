@@ -65,11 +65,13 @@ emitting `shipped`). `None` means the entrypoint is solely responsible
 for the terminal event.
 
 Roles may pair up as sibling reviewers. The `agentry-self-host-v0` team
-runs two reviewers in sequence: `reviewer-mechanical-agentry` (cargo
-fmt/clippy/test — machine truth) and `reviewer-claude-agentry` (LLM
-review — naming, design, clarity, invariants). Both treat the coder as
-their rework-target upstream via `MessageEdge`. A Blocker from either
-reviewer rewinds to the coder, bounded by `team.max_retries`.
+has two reviewers as siblings in `message_graph` (both list the coder as
+their rework-target upstream via `MessageEdge`): `reviewer-mechanical-agentry`
+(cargo fmt/clippy/test — machine truth) and `reviewer-claude-agentry` (LLM
+review — naming, design, clarity, invariants). The current scheduler
+executes them sequentially (mechanical first, then claude); the DAG
+scheduler in issue #13 will enable parallel execution. A Blocker from
+either reviewer rewinds to the coder, bounded by `team.max_retries`.
 
 ## TeamName
 

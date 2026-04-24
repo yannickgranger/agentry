@@ -480,7 +480,9 @@ fi
 /// LLM reviewer role for the `agentry-self-host-v0` team. Reads the diff
 /// produced by the coder, prompts claude -p for a JSON array of findings,
 /// emits each as a Finding event, and resolves rework_needed if any Blocker
-/// is present. Runs sequentially after the mechanical reviewer.
+/// is present. Currently executed after the mechanical reviewer by the
+/// sequential scheduler; message_graph is parallel-capable (issue #13
+/// will enable parallel execution).
 const REVIEWER_CLAUDE_AGENTRY_SCRIPT: &str = r##"#!/usr/bin/env bash
 set -euo pipefail
 bundle="$(cat)"
