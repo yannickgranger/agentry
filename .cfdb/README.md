@@ -41,3 +41,16 @@ resulting fact graph as a CI artifact. This is the x-ray always running,
 even before any ban rule is declared. It proves the extractor stays
 healthy against agentry's growing code and gives future rules a warm
 target.
+
+## Enforced ban rules
+
+Each `.cypher` file under `.cfdb/queries/` defines a Cypher rule that
+must return 0 rows against the workspace. `scripts/arch-check.sh`
+iterates the directory and fails if any rule fires. New rules are
+added one per PR; the PR that adds the rule must also fix every
+violation so the rule lands at 0 and stays there (no baselines, no
+ratchets, no allowlists).
+
+- **`arch-ban-unwrap-in-prod.cypher`** — bans `.unwrap()` in prod
+  code. Production paths must propagate errors via `?` or attach
+  context via `.expect("…")`. Test-gated scopes are exempt.
