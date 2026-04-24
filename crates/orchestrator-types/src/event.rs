@@ -7,10 +7,12 @@
 use crate::{now, Ts};
 use serde::{Deserialize, Serialize};
 
-/// Verdict emitted by an agent at the end of its run.
+/// Verdict emitted by an agent at the end of its run. Distinct from the
+/// team-level `crate::verdict::Verdict` — this one travels on the stdout
+/// NDJSON wire, the team-level one is persisted as the brief's outcome.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum Verdict {
+pub enum EventVerdict {
     Shipped,
     Failed,
     Escalated,
@@ -40,7 +42,7 @@ pub enum EventKind {
     /// Human-readable log line.
     Log { level: String, msg: String },
     /// Agent is done; terminal.
-    Done { verdict: Verdict },
+    Done { verdict: EventVerdict },
 }
 
 /// A stamped event.
@@ -63,7 +65,7 @@ impl Event {
     }
 
     #[must_use]
-    pub fn verdict(&self) -> Option<Verdict> {
+    pub fn verdict(&self) -> Option<EventVerdict> {
         match &self.kind {
             EventKind::Done { verdict } => Some(*verdict),
             _ => None,
@@ -90,10 +92,10 @@ mod tests {
     #[test]
     fn done_event_is_terminal() {
         let e = Event::new(EventKind::Done {
-            verdict: Verdict::Shipped,
+            verdict: EventVerdict::Shipped,
         });
         assert!(e.is_terminal());
-        assert_eq!(e.verdict(), Some(Verdict::Shipped));
+        assert_eq!(e.verdict(), Some(EventVerdict::Shipped));
     }
 
     #[test]
@@ -125,6 +127,6 @@ mod tests {
     fn done_line_parses() {
         let line = r#"{"at":"2026-04-23T10:00:01Z","type":"done","verdict":"shipped"}"#;
         let e: Event = serde_json::from_str(line).expect("parse");
-        assert_eq!(e.verdict(), Some(Verdict::Shipped));
+        assert_eq!(e.verdict(), Some(EventVerdict::Shipped));
     }
 }

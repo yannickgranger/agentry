@@ -3,7 +3,7 @@
 //! Appended to `agentry:verdicts` stream. Drives the dashboard's verdict-history
 //! view and satisfies the "no verdict, no close" drift rule.
 
-use crate::{brief::BriefId, event::Verdict as EventVerdict, now, Ts};
+use crate::{brief::BriefId, event::EventVerdict, now, Ts};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
