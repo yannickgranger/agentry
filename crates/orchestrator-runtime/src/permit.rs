@@ -43,6 +43,19 @@ pub fn generate_and_save(path: &Path) -> Result<()> {
 /// Load a signing key from disk (hex-encoded 32 bytes).
 pub fn load_signing_key(path: &Path) -> Result<SigningKey> {
     let hex_str = std::fs::read_to_string(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path)?.permissions().mode() & 0o777;
+        if mode != 0o600 {
+            return Err(Error::Config(format!(
+                "signing key {} has mode {:o}, expected 600; remediation: chmod 600 {}",
+                path.display(),
+                mode,
+                path.display()
+            )));
+        }
+    }
     let bytes = hex::decode(hex_str.trim())
         .map_err(|e| Error::Config(format!("signing key hex decode: {e}")))?;
     let arr: [u8; 32] = bytes
@@ -142,5 +155,26 @@ mod tests {
         let p = sample_permit();
         assert!(tool_allowed(&p, "read"));
         assert!(!tool_allowed(&p, "write"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_signing_key_rejects_insecure_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("signing.key");
+        std::fs::write(&path, "0".repeat(64)).expect("write key");
+        let mut perms = std::fs::metadata(&path).expect("metadata").permissions();
+        perms.set_mode(0o644);
+        std::fs::set_permissions(&path, perms).expect("set_permissions");
+
+        let err = load_signing_key(&path).expect_err("insecure mode should fail load");
+        let msg = err.to_string();
+        assert!(
+            matches!(&err, Error::Config(_)),
+            "expected Error::Config(_), got: {err:?}"
+        );
+        assert!(msg.contains("mode"), "'mode' not in error: {msg}");
+        assert!(msg.contains("chmod 600"), "'chmod 600' not in error: {msg}");
     }
 }
