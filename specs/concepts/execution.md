@@ -65,21 +65,6 @@ startup bundle to stdin, reads NDJSON events from stdout, enforces the
 permit's `ToolAllowlist` and `PermitScope` on every `ToolCall` event,
 accumulates the outbox, builds a verdict.
 
-## Reviewer vs CI responsibility
-
-The `reviewer-mechanical-agentry` role runs the per-brief acceptance
-command in an isolated `CARGO_TARGET_DIR`. Acceptance SHOULD be limited
-to: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D
-warnings`, `cargo test --workspace`, and any tests that do not require
-the cfdb or graph-specs binaries. `scripts/arch-check.sh` is a CI-only
-gate — cfdb and graph-specs are cargo-installable but too slow to
-provision per-brief, and CI on the forge has them pre-warmed in its
-runner image.
-
-Reviewer latency matters more than reviewer coverage. CI is the second
-line of defence; if a brief lands an arch-check regression, the brief's
-PR fails CI before merge.
-
 ## Error
 
 The runtime's error type. Covers spawn failures, Redis IO failures, permit

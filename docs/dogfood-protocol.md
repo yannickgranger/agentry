@@ -40,6 +40,28 @@ Human reviews + merges the produced PR.
 - **shipper-agentry** — `git push -u origin HEAD:<branch>`,
   `POST /api/v1/repos/.../pulls`. Emits `Shipped` with the PR URL.
 
+### Reviewer vs CI responsibility
+
+The `reviewer-mechanical-agentry` role runs the per-brief acceptance
+command in an isolated `CARGO_TARGET_DIR`. Acceptance SHOULD be limited
+to fast, deterministic, per-workspace checks — `cargo fmt --check`,
+`cargo clippy --workspace --all-targets -- -D warnings`, `cargo test
+--workspace`.
+
+`scripts/arch-check.sh` is a **CI-only** gate. `cfdb` and `graph-specs`
+are *insight tools* used by the main session to author briefs
+(`/discover`, `/prescribe`, `specs/concepts/*` drafts) — they inform
+architecture decisions before a brief is dispatched. They never belong
+in a per-brief container: containers are short-lived and single-purpose,
+paying the install cost per brief is wrong, and the tools' role is
+analysis rather than enforcement.
+
+CI on the forge has `cfdb` + `graph-specs` pre-warmed. If a brief lands
+an arch-check regression, the brief's PR fails CI before merge — that's
+the second line of defence.
+
+Reviewer latency matters more than reviewer coverage.
+
 Issues #9–#13 upgrade this team: #9 auto-merges on CI green, #10 uses
 bare-clone + git-worktree, #11 adds the rework loop, #12 adds an LLM
 reviewer, #13 makes the scheduler a DAG with concurrent briefs.
