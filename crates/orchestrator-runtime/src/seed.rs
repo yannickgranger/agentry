@@ -374,6 +374,18 @@ set -euo pipefail
 . /tmp/brief_vars.sh
 cd /workspace/repo
 
+# Baseline fmt — always run, no install dependency. rustfmt ships with
+# rustup and is already provisioned via extra_bootstrap. Protects against
+# quality-hygiene being absent (its `cargo install` is best-effort).
+emit_event '{"msg":"running cargo fmt --all (baseline)"}'
+if ! cargo fmt --all 2>/tmp/fmt.err; then
+    err=$(tail -50 /tmp/fmt.err)
+    emit_event "$(jq -nc --arg err "$err" '{error:"cargo fmt --all failed",detail:$err}')"
+    emit_finding "blocker" "cargo-fmt" "fmt" "$err"
+    emit_done "failed"; exit 0
+fi
+emit_event '{"msg":"cargo fmt --all clean"}'
+
 # quality-hygiene — role-local hygiene gate. If the binary was installed by
 # extra_bootstrap, run --fix so the commit is clean. If the install failed
 # (binary absent), skip and let the reviewer catch anything hygiene would have.
