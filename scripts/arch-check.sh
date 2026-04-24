@@ -24,7 +24,7 @@ if compgen -G ".cfdb/queries/*.cypher" > /dev/null; then
     fail=0
     for rule in .cfdb/queries/*.cypher; do
         printf '  rule: %s ... ' "$(basename "$rule")"
-        if cfdb violations --db "$DB_DIR" --keyspace agentry --rule "$rule" 2>&1 | grep -q "^0 violations"; then
+        if cfdb violations --db "$DB_DIR" --keyspace agentry --rule "$rule" 2>&1 | grep -q "^violations: 0 "; then
             echo "ok"
         else
             echo "FAIL"
