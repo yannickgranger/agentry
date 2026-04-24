@@ -263,6 +263,209 @@ sleep 300
 printf '{"at":"%s","type":"done","verdict":"shipped"}\n' "$(date -Iseconds)"
 "#;
 
+/// Coder role for the `agentry-self-host-v0` team. Clones the target repo
+/// into the per-brief workspace, creates `auto/<brief_id>`, calls `claude -p`
+/// with a verb-structured prompt built from the brief payload, runs the
+/// acceptance command, and commits locally. Does NOT push — the shipper
+/// does that after the reviewer approves.
+const CODER_CLAUDE_AGENTRY_SCRIPT: &str = r##"#!/usr/bin/env bash
+set -euo pipefail
+bundle="$(cat)"
+
+brief_id=$(jq -r '.brief.id' <<<"$bundle")
+target_repo=$(jq -r '.brief.payload.target_repo // "yg/agentry"' <<<"$bundle")
+base_branch=$(jq -r '.brief.payload.base_branch // "develop"' <<<"$bundle")
+issue_title=$(jq -r '.brief.payload.issue_title // ""' <<<"$bundle")
+issue_body=$(jq -r '.brief.payload.issue_body // ""' <<<"$bundle")
+acceptance=$(jq -r '.brief.payload.acceptance // "true"' <<<"$bundle")
+forge_host=$(jq -r '.brief.payload.forge_host // "agency.lab:3000"' <<<"$bundle")
+
+if [ -z "${GITEA_TOKEN:-}" ]; then
+    emit_event '{"error":"GITEA_TOKEN not in env"}'
+    emit_done "failed"; exit 0
+fi
+
+mkdir -p /root/.claude
+export HOME=/root
+
+cd /workspace
+git config --global user.email "coder-claude-agentry@agentry.lab"
+git config --global user.name "coder-claude-agentry"
+git config --global http.sslVerify false
+
+clone_url="https://oauth2:${GITEA_TOKEN}@${forge_host}/${target_repo}.git"
+
+emit_event "$(jq -nc --arg r "$target_repo" --arg b "$base_branch" '{msg:"cloning target repo",repo:$r,base:$b}')"
+git clone --depth=10 --branch "$base_branch" "$clone_url" repo 2>/tmp/clone.err || {
+    emit_event "$(jq -nc --arg e "$(tail -10 /tmp/clone.err)" '{error:"clone failed",detail:$e}')"
+    emit_done "failed"; exit 0
+}
+cd /workspace/repo
+
+branch="auto/${brief_id}"
+git checkout -b "$branch" 2>&1 >/dev/null
+
+cat > /tmp/prompt.txt <<PROMPT
+You are the coder role inside the agentry autonomous team, operating in the
+container-local working directory /workspace/repo. The repo is cloned at
+branch "$base_branch"; you are on a fresh branch "$branch".
+
+Your task is described in verb-structured form below. Follow it literally:
+each verb (CREATE / UPDATE / REPLACE / DELETE / MOVE) names a transformation
+on a specific file:line target. Do NOT invent additional changes.
+
+Task title: $issue_title
+
+Task body:
+$issue_body
+
+Constraints:
+- Operate only inside /workspace/repo. Never touch files outside it.
+- When you are done editing, the acceptance command below must pass. You
+  may run it yourself to check. The orchestrator will re-run it before
+  accepting the diff:
+    $acceptance
+- Do not commit or push. The orchestrator handles commit and push on your
+  behalf after you exit.
+
+When the transformations are complete and the acceptance passes, simply
+report success and exit.
+PROMPT
+
+emit_event "$(jq -nc --arg len "$(wc -c < /tmp/prompt.txt)" '{msg:"calling claude -p",prompt_bytes:$len}')"
+
+reply=$(HOME=/root claude -p "$(cat /tmp/prompt.txt)" 2>&1) || {
+    emit_event "$(jq -nc --arg err "$reply" '{error:"claude -p failed",detail:$err}')"
+    emit_done "failed"; exit 0
+}
+
+emit_event "$(jq -nc --arg len "${#reply}" '{msg:"claude reply received",bytes:$len}')"
+
+# Re-run acceptance ourselves as a self-check before handing off.
+cd /workspace/repo
+if eval "$acceptance" >/tmp/acc.out 2>/tmp/acc.err; then
+    emit_event '{"msg":"acceptance passed (self-check)"}'
+else
+    err=$(tail -50 /tmp/acc.err)
+    emit_event "$(jq -nc --arg err "$err" '{error:"acceptance failed (self-check)",detail:$err}')"
+    emit_done "failed"; exit 0
+fi
+
+# Stage + commit whatever claude changed.
+git add -A
+if git diff --cached --quiet; then
+    emit_event '{"error":"claude produced no changes"}'
+    emit_done "failed"; exit 0
+fi
+git commit -m "auto(${brief_id}): ${issue_title}" > /dev/null
+sha=$(git rev-parse HEAD)
+emit_event "$(jq -nc --arg br "$branch" --arg s "$sha" '{msg:"committed",branch:$br,sha:$s}')"
+
+emit_done "shipped"
+"##;
+
+/// Mechanical reviewer role. Reads the coder's workspace read-only,
+/// re-runs the acceptance command in an isolated build dir (`CARGO_TARGET_DIR=/tmp/review-target`),
+/// emits `shipped` on success and `failed` on any non-zero exit with the
+/// tail of stderr/stdout in the reason payload.
+const REVIEWER_MECHANICAL_AGENTRY_SCRIPT: &str = r##"#!/usr/bin/env bash
+set -euo pipefail
+bundle="$(cat)"
+
+base_branch=$(jq -r '.brief.payload.base_branch // "develop"' <<<"$bundle")
+acceptance=$(jq -r '.brief.payload.acceptance // "cargo test --workspace"' <<<"$bundle")
+
+if [ ! -d /workspace/repo ]; then
+    emit_event '{"error":"workspace/repo missing — coder did not produce it"}'
+    emit_done "failed"; exit 0
+fi
+
+cd /workspace/repo
+
+emit_event '{"msg":"reviewer starting"}'
+
+# Diff summary. base_branch is on `origin/<base_branch>`.
+diff_stat=$(git diff --stat "origin/${base_branch}"..HEAD 2>&1 | tail -1 || true)
+emit_event "$(jq -nc --arg d "$diff_stat" '{msg:"diff",summary:$d}')"
+
+# Workspace is read-only for this role — redirect Cargo's target/ to /tmp.
+export CARGO_TARGET_DIR=/tmp/review-target
+mkdir -p "$CARGO_TARGET_DIR"
+
+emit_event "$(jq -nc --arg a "$acceptance" '{msg:"running acceptance (isolated)",cmd:$a}')"
+if eval "$acceptance" >/tmp/rev.out 2>/tmp/rev.err; then
+    emit_event '{"msg":"acceptance passed"}'
+    emit_done "shipped"
+else
+    err=$(tail -50 /tmp/rev.err)
+    out=$(tail -20 /tmp/rev.out)
+    emit_event "$(jq -nc --arg err "$err" --arg out "$out" '{error:"acceptance failed",stderr:$err,stdout:$out}')"
+    emit_done "failed"
+fi
+"##;
+
+/// Shipper role for the `agentry-self-host-v0` team. Pushes the branch
+/// already committed in the brief's workspace (by the coder) and opens a
+/// PR on the forge. Emits the PR URL and number in its terminal event.
+const SHIPPER_AGENTRY_SCRIPT: &str = r##"#!/usr/bin/env bash
+set -euo pipefail
+bundle="$(cat)"
+
+brief_id=$(jq -r '.brief.id' <<<"$bundle")
+target_repo=$(jq -r '.brief.payload.target_repo // "yg/agentry"' <<<"$bundle")
+base_branch=$(jq -r '.brief.payload.base_branch // "develop"' <<<"$bundle")
+pr_title=$(jq -r '.brief.payload.pr_title // ("auto(" + .brief.id + ")")' <<<"$bundle")
+pr_body=$(jq -r '.brief.payload.pr_body // "Agentry-produced PR. See brief trace stream."' <<<"$bundle")
+forge_host=$(jq -r '.brief.payload.forge_host // "agency.lab:3000"' <<<"$bundle")
+branch="auto/${brief_id}"
+
+if [ -z "${GITEA_TOKEN:-}" ]; then
+    emit_event '{"error":"GITEA_TOKEN not in env"}'
+    emit_done "failed"; exit 0
+fi
+
+if [ ! -d /workspace/repo ]; then
+    emit_event '{"error":"workspace/repo missing — coder did not produce it"}'
+    emit_done "failed"; exit 0
+fi
+
+cd /workspace/repo
+git config http.sslVerify false
+git config user.email "shipper-agentry@agentry.lab"
+git config user.name "shipper-agentry"
+
+# Rewrite origin with the token so we can push.
+git remote set-url origin "https://oauth2:${GITEA_TOKEN}@${forge_host}/${target_repo}.git"
+
+emit_event "$(jq -nc --arg b "$branch" '{msg:"pushing branch",branch:$b}')"
+if ! git push -u origin "$branch" 2>/tmp/push.err; then
+    err=$(tail -20 /tmp/push.err)
+    emit_event "$(jq -nc --arg err "$err" '{error:"git push failed",detail:$err}')"
+    emit_done "failed"; exit 0
+fi
+
+owner="${target_repo%%/*}"
+repo_name="${target_repo##*/}"
+emit_event "$(jq -nc --arg r "$target_repo" --arg b "$branch" '{msg:"opening PR",repo:$r,head:$b}')"
+
+pr_body_json=$(jq -n --arg t "$pr_title" --arg b "$pr_body" --arg h "$branch" --arg base "$base_branch" \
+    '{title:$t,body:$b,head:$h,base:$base}')
+pr_resp=$(curl -sS -k -X POST "https://${forge_host}/api/v1/repos/${owner}/${repo_name}/pulls" \
+    -H "Authorization: token ${GITEA_TOKEN}" \
+    -H "Content-Type: application/json" \
+    -d "$pr_body_json")
+
+pr_url=$(jq -r '.html_url // ""' <<<"$pr_resp")
+pr_number=$(jq -r '.number // 0' <<<"$pr_resp")
+if [ -z "$pr_url" ] || [ "$pr_url" = "null" ]; then
+    emit_event "$(jq -nc --arg err "$pr_resp" '{error:"PR API call failed",detail:$err}')"
+    emit_done "failed"; exit 0
+fi
+
+emit_event "$(jq -nc --arg u "$pr_url" --argjson n "$pr_number" '{msg:"PR opened",url:$u,number:$n}')"
+emit_done "shipped"
+"##;
+
 const SHIPPER_SCRIPT: &str = r#"#!/usr/bin/env bash
 # Reads {repo, branch, file, content, commit_msg, pr_title, pr_body, base,
 # forge_host} from brief.payload. Clones forge repo with GITEA_TOKEN,
@@ -717,6 +920,138 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         max_retries: 0,
     };
 
+    // ---- agentry-self-host-v0 team (cutoff trigger) ----
+    // Coder clones, calls claude, runs acceptance, commits locally.
+    // Reviewer re-runs acceptance in isolation on the coder's workspace.
+    // Shipper pushes the branch and opens a PR on the forge.
+    // No rework loop, no ci-watcher — v0 ships as the minimum self-host team.
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/var/home/yg".into());
+    let coder_claude_agentry = AgentRole {
+        name: RoleName("coder-claude-agentry".into()),
+        version: 1,
+        model: Some("claude-max".into()),
+        system_prompt: None,
+        // rust:1.93 already has cargo + rustc. Apt installs the git client
+        // + ca-certificates; claude CLI is bind-mounted from the host.
+        image: "docker.io/library/rust:1.93".into(),
+        substrate_class: SubstrateClass::Podman,
+        package_manager: PackageManager::Apt,
+        entrypoint_script: format!("{BASH_PRELUDE}{CODER_CLAUDE_AGENTRY_SCRIPT}"),
+        binaries: vec!["git".into(), "curl".into(), "ca-certificates".into()],
+        mcp_servers: vec![],
+        tool_allowlist: ToolAllowlist(vec![]),
+        permit_scope: PermitScope(vec![
+            "fs:read:/workspace/**".into(),
+            "fs:write:/workspace/**".into(),
+            "net:allow:api.anthropic.com".into(),
+            "net:allow:agency.lab".into(),
+        ]),
+        passthru_env: vec!["GITEA_TOKEN".into()],
+        mounts: vec![
+            Mount {
+                source: format!("{home}/.local/bin/claude"),
+                target: "/usr/local/bin/claude".into(),
+                readonly: true,
+            },
+            Mount {
+                source: format!("{home}/.claude/.credentials.json"),
+                target: "/root/.claude/.credentials.json".into(),
+                readonly: true,
+            },
+            Mount {
+                source: format!("{home}/.claude/settings.json"),
+                target: "/root/.claude/settings.json".into(),
+                readonly: true,
+            },
+        ],
+        workspace_mount: Some(WorkspaceMount {
+            container_path: "/workspace".into(),
+            readonly: false,
+        }),
+        // sccache disabled for v0 — rust:1.93 is debian-based; sccache is not
+        // in apt/bookworm. Issue #9/#10 or a follow-up brief will add a
+        // static binary download here. Without sccache, each brief does a
+        // cold compile of the target repo (~60–90s for agentry itself).
+        sccache: false,
+    };
+    let reviewer_mechanical_agentry = AgentRole {
+        name: RoleName("reviewer-mechanical-agentry".into()),
+        version: 1,
+        model: None,
+        system_prompt: None,
+        // Same toolchain as coder — deterministic re-run.
+        image: "docker.io/library/rust:1.93".into(),
+        substrate_class: SubstrateClass::Podman,
+        package_manager: PackageManager::Apt,
+        entrypoint_script: format!("{BASH_PRELUDE}{REVIEWER_MECHANICAL_AGENTRY_SCRIPT}"),
+        binaries: vec!["git".into(), "ca-certificates".into()],
+        mcp_servers: vec![],
+        tool_allowlist: ToolAllowlist(vec![]),
+        permit_scope: PermitScope(vec!["fs:read:/workspace/**".into()]),
+        passthru_env: vec![],
+        mounts: vec![],
+        workspace_mount: Some(WorkspaceMount {
+            container_path: "/workspace".into(),
+            // Reviewer is mechanical and independent — it does not mutate
+            // the workspace. CARGO_TARGET_DIR is redirected to /tmp inside
+            // the container so a read-only mount is sufficient.
+            readonly: true,
+        }),
+        sccache: false,
+    };
+    let shipper_agentry = AgentRole {
+        name: RoleName("shipper-agentry".into()),
+        version: 1,
+        model: None,
+        system_prompt: None,
+        image: ALPINE.into(),
+        substrate_class: SubstrateClass::Podman,
+        package_manager: PackageManager::Apk,
+        entrypoint_script: format!("{BASH_PRELUDE}{SHIPPER_AGENTRY_SCRIPT}"),
+        binaries: vec!["git".into(), "curl".into(), "ca-certificates".into()],
+        mcp_servers: vec![],
+        tool_allowlist: ToolAllowlist(vec![]),
+        permit_scope: PermitScope(vec![
+            "net:allow:agency.lab".into(),
+            "forge:write:yg/*".into(),
+        ]),
+        passthru_env: vec!["GITEA_TOKEN".into()],
+        mounts: vec![],
+        // Shipper writes to /workspace/repo/.git during `git push` (reflog,
+        // FETCH_HEAD), so the workspace mount must be writable.
+        workspace_mount: Some(WorkspaceMount {
+            container_path: "/workspace".into(),
+            readonly: false,
+        }),
+        sccache: false,
+    };
+    let agentry_self_host_v0 = TeamTopology {
+        name: TeamName("agentry-self-host-v0".into()),
+        version: 1,
+        roles: vec![
+            coder_claude_agentry.name.clone(),
+            reviewer_mechanical_agentry.name.clone(),
+            shipper_agentry.name.clone(),
+        ],
+        // Strict sequential pipeline. No rework edge — if the reviewer fails,
+        // the team fails and the human retries with a new brief. Rework loop
+        // lands in issue #11.
+        message_graph: vec![
+            MessageEdge {
+                from: coder_claude_agentry.name.clone(),
+                to: reviewer_mechanical_agentry.name.clone(),
+                permit_overrides_from: None,
+            },
+            MessageEdge {
+                from: reviewer_mechanical_agentry.name.clone(),
+                to: shipper_agentry.name.clone(),
+                permit_overrides_from: None,
+            },
+        ],
+        terminal_role: shipper_agentry.name.clone(),
+        max_retries: 0,
+    };
+
     // ---- persist everything ----
     redis_io::save_role(&mut conn, &echo).await?;
     redis_io::save_team(&mut conn, &echo_team).await?;
@@ -740,9 +1075,13 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
     redis_io::save_team(&mut conn, &narrowed_team).await?;
     redis_io::save_role(&mut conn, &shipper).await?;
     redis_io::save_team(&mut conn, &shipper_team).await?;
+    redis_io::save_role(&mut conn, &coder_claude_agentry).await?;
+    redis_io::save_role(&mut conn, &reviewer_mechanical_agentry).await?;
+    redis_io::save_role(&mut conn, &shipper_agentry).await?;
+    redis_io::save_team(&mut conn, &agentry_self_host_v0).await?;
 
     tracing::info!(
-        "seeded: roles [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker, listener, grok-echo, claude-echo, synthesizer, narrowed-coder, shipper] (inline entrypoint scripts); teams [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker-listener, grok-echo, claude-echo, narrowed-team, shipper-solo-team]"
+        "seeded: roles [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker, listener, grok-echo, claude-echo, synthesizer, narrowed-coder, shipper, coder-claude-agentry, reviewer-mechanical-agentry, shipper-agentry] (inline entrypoint scripts); teams [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker-listener, grok-echo, claude-echo, narrowed-team, shipper-solo-team, agentry-self-host-v0]"
     );
     Ok(())
 }
