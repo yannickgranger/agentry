@@ -40,36 +40,6 @@ fix:
     cargo fmt
     cargo clippy --workspace --fix --allow-dirty --allow-staged
 
-# Build echo-agent container image (M0)
-build-echo:
-    cd containers/echo-agent && podman build -t agentry/echo-agent:v1 -f Containerfile .
-
-# Build naughty-agent container image (M3)
-build-naughty:
-    cd containers/naughty-agent && podman build -t agentry/naughty-agent:v1 -f Containerfile .
-
-# Build M4 speaker + listener images
-build-m4:
-    cd containers/speaker-agent && podman build -t agentry/speaker-agent:v1 -f Containerfile .
-    cd containers/listener-agent && podman build -t agentry/listener-agent:v1 -f Containerfile .
-
-# Build M5a grok image
-build-m5a:
-    cd containers/grok-agent && podman build -t agentry/grok-agent:v1 -f Containerfile .
-
-# Build M5b claude-agent image (no Anthropic API — Claude Max subscription only).
-build-m5b:
-    cd containers/claude-agent && podman build -t agentry/claude-agent:v1 -f Containerfile .
-
-# Build M6 synthesizer + narrowed-coder images.
-build-m6:
-    cd containers/synthesizer-agent  && podman build -t agentry/synthesizer-agent:v1  -f Containerfile .
-    cd containers/narrowed-coder-agent && podman build -t agentry/narrowed-coder-agent:v1 -f Containerfile .
-
-# Build M7 shipper image.
-build-m7:
-    cd containers/shipper-agent && podman build -t agentry/shipper-agent:v1 -f Containerfile .
-
 # Start local dev Redis container on :6380. Idempotent.
 dev-redis-up:
     #!/usr/bin/env bash
@@ -142,7 +112,7 @@ agentry-net-down:
     -podman network rm -f agentry-net
 
 # Start dev infra (orchestratord + dashboard as user processes, podman for agents)
-dev-up: dev-redis-up build build-echo
+dev-up: dev-redis-up build
     #!/usr/bin/env bash
     set -euo pipefail
     # Ensure Redis is reachable
