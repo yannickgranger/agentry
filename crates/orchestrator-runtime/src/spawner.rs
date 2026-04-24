@@ -239,9 +239,11 @@ impl Spawner for PodmanSpawner {
             .arg(format!("AGENTRY_SCRIPT={}", role.entrypoint_script));
         cmd.arg(&role.image);
         let effective_binaries = effective_binaries(role);
-        cmd.arg("sh")
-            .arg("-c")
-            .arg(bootstrap_command(role.package_manager, &effective_binaries));
+        cmd.arg("sh").arg("-c").arg(bootstrap_command(
+            role.package_manager,
+            &effective_binaries,
+            &role.extra_bootstrap,
+        ));
 
         cmd.stdin(Stdio::piped());
         cmd.stdout(Stdio::piped());
@@ -463,7 +465,11 @@ fn effective_binaries(role: &AgentRole) -> Vec<String> {
     out
 }
 
-fn bootstrap_command(pm: PackageManager, extra_binaries: &[String]) -> String {
+fn bootstrap_command(
+    pm: PackageManager,
+    extra_binaries: &[String],
+    extra_bootstrap: &[String],
+) -> String {
     const BASELINE: &[&str] = &["bash", "ca-certificates", "coreutils", "jq"];
     let all: Vec<&str> = BASELINE
         .iter()
@@ -477,10 +483,18 @@ fn bootstrap_command(pm: PackageManager, extra_binaries: &[String]) -> String {
             "apt-get update -qq >/dev/null && apt-get install -y --no-install-recommends {pkgs} >/dev/null"
         ),
     };
+    let mut script = String::from("set -e\n");
+    script.push_str(&install);
+    script.push('\n');
+    for cmd in extra_bootstrap {
+        script.push_str(cmd);
+        script.push('\n');
+    }
     // $AGENTRY_SCRIPT is passed as an env var by the spawner. `bash -c` runs
     // it as a script; the script's own `cat` still reads the startup JSON
     // bundle from stdin (not affected by the outer bootstrap).
-    format!("set -e\n{install}\nexec bash -c \"$AGENTRY_SCRIPT\"")
+    script.push_str("exec bash -c \"$AGENTRY_SCRIPT\"");
+    script
 }
 
 #[cfg(test)]
@@ -552,6 +566,7 @@ mod tests {
             mounts: vec![],
             workspace_mount: None,
             sccache,
+            extra_bootstrap: vec![],
         }
     }
 
@@ -590,7 +605,7 @@ mod tests {
 
     #[test]
     fn bootstrap_apk_installs_baseline_plus_extras() {
-        let s = bootstrap_command(PackageManager::Apk, &["git".into(), "curl".into()]);
+        let s = bootstrap_command(PackageManager::Apk, &["git".into(), "curl".into()], &[]);
         assert!(s.contains("apk add --no-cache"));
         assert!(s.contains("bash"));
         assert!(s.contains("coreutils"));
@@ -602,9 +617,36 @@ mod tests {
 
     #[test]
     fn bootstrap_apt_uses_apt_get() {
-        let s = bootstrap_command(PackageManager::Apt, &[]);
+        let s = bootstrap_command(PackageManager::Apt, &[], &[]);
         assert!(s.contains("apt-get update"));
         assert!(s.contains("apt-get install -y --no-install-recommends"));
         assert!(s.contains("exec bash -c \"$AGENTRY_SCRIPT\""));
+    }
+
+    #[test]
+    fn bootstrap_includes_extra_commands() {
+        let s = bootstrap_command(
+            PackageManager::Apt,
+            &[],
+            &[
+                "rustup component add rustfmt".into(),
+                "rustup component add clippy".into(),
+            ],
+        );
+        assert!(s.contains("rustup component add rustfmt"));
+        assert!(s.contains("rustup component add clippy"));
+        let install_idx = s.find("apt-get install").expect("install line present");
+        let rustfmt_idx = s
+            .find("rustup component add rustfmt")
+            .expect("rustfmt line present");
+        let clippy_idx = s
+            .find("rustup component add clippy")
+            .expect("clippy line present");
+        let exec_idx = s
+            .find("exec bash -c \"$AGENTRY_SCRIPT\"")
+            .expect("exec line present");
+        assert!(install_idx < rustfmt_idx);
+        assert!(rustfmt_idx < clippy_idx);
+        assert!(clippy_idx < exec_idx);
     }
 }

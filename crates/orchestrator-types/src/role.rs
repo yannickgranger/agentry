@@ -164,6 +164,13 @@ pub struct AgentRole {
     /// network. Roles that never compile Rust leave this `false` (default).
     #[serde(default)]
     pub sccache: bool,
+    /// Extra shell commands executed as part of the container's bootstrap
+    /// sequence, one per entry, appended AFTER the package-manager install
+    /// and BEFORE the role's entrypoint script. Typical use:
+    /// `rustup component add rustfmt clippy` for rust-based roles. Empty =
+    /// no extras.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_bootstrap: Vec<String>,
 }
 
 #[cfg(test)]
@@ -200,10 +207,39 @@ mod tests {
                 readonly: false,
             }),
             sccache: true,
+            extra_bootstrap: vec![],
         };
         let s = serde_json::to_string_pretty(&r).expect("ser");
         let back: AgentRole = serde_json::from_str(&s).expect("de");
         assert_eq!(r, back);
+    }
+
+    #[test]
+    fn agent_role_roundtrips_with_extra_bootstrap() {
+        let r = AgentRole {
+            name: RoleName("coder-rust".into()),
+            version: 1,
+            model: None,
+            system_prompt: None,
+            image: "docker.io/library/rust:1.93".into(),
+            substrate_class: SubstrateClass::Podman,
+            package_manager: PackageManager::Apt,
+            entrypoint_script: "#!/usr/bin/env bash\nexit 0\n".into(),
+            binaries: vec![],
+            mcp_servers: vec![],
+            tool_allowlist: ToolAllowlist::default(),
+            permit_scope: PermitScope::default(),
+            passthru_env: vec![],
+            mounts: vec![],
+            workspace_mount: None,
+            sccache: false,
+            extra_bootstrap: vec!["rustup component add rustfmt clippy".into()],
+        };
+        let s = serde_json::to_string(&r).expect("ser");
+        let back: AgentRole = serde_json::from_str(&s).expect("de");
+        assert_eq!(r, back);
+        assert_eq!(back.extra_bootstrap.len(), 1);
+        assert_eq!(back.extra_bootstrap[0], "rustup component add rustfmt clippy");
     }
 
     #[test]
