@@ -239,7 +239,10 @@ mod tests {
         let back: AgentRole = serde_json::from_str(&s).expect("de");
         assert_eq!(r, back);
         assert_eq!(back.extra_bootstrap.len(), 1);
-        assert_eq!(back.extra_bootstrap[0], "rustup component add rustfmt clippy");
+        assert_eq!(
+            back.extra_bootstrap[0],
+            "rustup component add rustfmt clippy"
+        );
     }
 
     #[test]
