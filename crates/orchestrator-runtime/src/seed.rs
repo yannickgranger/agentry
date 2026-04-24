@@ -192,6 +192,77 @@ printf '{"at":"%s","type":"event","payload":{"msg":"wrote and read","body":"%s"}
 printf '{"at":"%s","type":"done","verdict":"shipped"}\n' "$(date -Iseconds)"
 "#;
 
+/// Probe role used by agentry's own sccache-wiring tests. Installs a small
+/// rust toolchain via apk, compiles a trivial program twice under
+/// `sccache rustc`, and asserts the second compile hits the shared
+/// sccache-redis cache. Proves the `--network=agentry-net` flag reaches the
+/// cache container by name and the `sccache=true` env vars are honoured.
+const SCCACHE_PROBE_SCRIPT: &str = r#"#!/usr/bin/env bash
+set -euo pipefail
+cat > /dev/null
+
+emit_event() {
+    jq -nc --arg at "$(date -Iseconds)" --argjson p "$1" '{at:$at,type:"event",payload:$p}'
+}
+emit_done() {
+    jq -nc --arg at "$(date -Iseconds)" --arg v "$1" '{at:$at,type:"done",verdict:$v}'
+}
+
+emit_event "$(jq -nc --arg wrap "$RUSTC_WRAPPER" --arg ep "$SCCACHE_REDIS_ENDPOINT" '{msg:"sccache-probe starting",RUSTC_WRAPPER:$wrap,SCCACHE_REDIS_ENDPOINT:$ep}')"
+
+# Explicitly start the sccache server so stats persist across compile calls.
+# Without this, each `sccache rustc` call spins up a transient server and
+# the stats don't accumulate.
+sccache --start-server 2>&1 | head -3 > /tmp/sccache-start.log || true
+sleep 1
+
+echo 'pub fn hello() -> i32 { 42 }' > /tmp/hello.rs
+mkdir -p /tmp/out1 /tmp/out2
+
+# Compile twice with identical inputs, different --out-dir. sccache's rust
+# parser rejects `-o <file>` invocations (Non-cacheable reason "-o") so we
+# use `--out-dir` + `--emit=metadata` — same shape cargo emits. First call
+# populates the cache across the agentry-net hop; second reads it back. A
+# cache hit proves the container→agentry-sccache-redis round-trip works.
+sccache rustc --edition=2021 --crate-name=hello --crate-type=rlib --emit=metadata --out-dir=/tmp/out1 /tmp/hello.rs 2>/tmp/c1.err
+sccache rustc --edition=2021 --crate-name=hello --crate-type=rlib --emit=metadata --out-dir=/tmp/out2 /tmp/hello.rs 2>/tmp/c2.err
+
+sccache_version=$(sccache --version 2>&1 | head -1)
+stats_text=$(sccache --show-stats 2>&1 | head -40)
+
+# Use text output — json formats vary across sccache versions. The cache-hit
+# count lives on a "Cache hits  N" line.
+hits=$(echo "$stats_text" | awk 'tolower($0) ~ /^cache hits/ && $NF ~ /^[0-9]+$/ {print $NF; exit}')
+misses=$(echo "$stats_text" | awk 'tolower($0) ~ /^cache misses/ && $NF ~ /^[0-9]+$/ {print $NF; exit}')
+hits=${hits:-0}
+misses=${misses:-0}
+
+emit_event "$(jq -nc --arg v "$sccache_version" --argjson h "$hits" --argjson m "$misses" --arg s "$stats_text" '{msg:"sccache stats",version:$v,hits:$h,misses:$m,raw:$s}')"
+
+if [ "$hits" -ge 1 ] || [ "$misses" -ge 1 ]; then
+    # Cache was actually consulted (miss on first compile OK; second should hit).
+    emit_done "shipped"
+else
+    c1_tail=$(tail -3 /tmp/c1.err 2>/dev/null || echo "")
+    c2_tail=$(tail -3 /tmp/c2.err 2>/dev/null || echo "")
+    start_log=$(cat /tmp/sccache-start.log 2>/dev/null || echo "")
+    emit_event "$(jq -nc --argjson h "$hits" --argjson m "$misses" --arg c1 "$c1_tail" --arg c2 "$c2_tail" --arg s "$start_log" '{error:"sccache recorded no activity",hits:$h,misses:$m,compile1_stderr:$c1,compile2_stderr:$c2,server_start:$s}')"
+    emit_done "failed"
+fi
+"#;
+
+/// Probe role used by agentry's own wall-clock-timeout tests. Sleeps long
+/// enough that the spawner's `permit.max_wall_seconds` guard must fire. If
+/// the probe ever reaches its `done shipped` line, the budget enforcement
+/// regressed.
+const TIMEOUT_PROBE_SCRIPT: &str = r#"#!/usr/bin/env bash
+set -euo pipefail
+cat > /dev/null
+printf '{"at":"%s","type":"event","payload":{"msg":"timeout-probe sleeping; spawner should kill me"}}\n' "$(date -Iseconds)"
+sleep 300
+printf '{"at":"%s","type":"done","verdict":"shipped"}\n' "$(date -Iseconds)"
+"#;
+
 const SHIPPER_SCRIPT: &str = r#"#!/usr/bin/env bash
 # Reads {repo, branch, file, content, commit_msg, pr_title, pr_body, base,
 # forge_host} from brief.payload. Clones forge repo with GITEA_TOKEN,
@@ -302,6 +373,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         passthru_env: vec![],
         mounts: vec![],
         workspace_mount: None,
+        sccache: false,
     };
     let echo_team = TeamTopology {
         name: TeamName("echo-team".into()),
@@ -329,6 +401,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         passthru_env: vec![],
         mounts: vec![],
         workspace_mount: None,
+        sccache: false,
     };
     let naughty_team = TeamTopology {
         name: TeamName("naughty-team".into()),
@@ -356,6 +429,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         passthru_env: vec![],
         mounts: vec![],
         workspace_mount: None,
+        sccache: false,
     };
     let listener = AgentRole {
         name: RoleName("listener-agent".into()),
@@ -373,6 +447,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         passthru_env: vec![],
         mounts: vec![],
         workspace_mount: None,
+        sccache: false,
     };
     let speaker_listener_team = TeamTopology {
         name: TeamName("speaker-listener-team".into()),
@@ -404,6 +479,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         passthru_env: vec!["XAI_API_KEY".into()],
         mounts: vec![],
         workspace_mount: None,
+        sccache: false,
     };
     let grok_team = TeamTopology {
         name: TeamName("grok-echo-team".into()),
@@ -452,6 +528,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
             },
         ],
         workspace_mount: None,
+        sccache: false,
     };
     let claude_team = TeamTopology {
         name: TeamName("claude-echo-team".into()),
@@ -479,6 +556,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         passthru_env: vec![],
         mounts: vec![],
         workspace_mount: None,
+        sccache: false,
     };
     let narrowed_coder = AgentRole {
         name: RoleName("narrowed-coder".into()),
@@ -501,6 +579,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         passthru_env: vec![],
         mounts: vec![],
         workspace_mount: None,
+        sccache: false,
     };
     let narrowed_team = TeamTopology {
         name: TeamName("narrowed-team".into()),
@@ -535,6 +614,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         passthru_env: vec!["GITEA_TOKEN".into()],
         mounts: vec![],
         workspace_mount: None,
+        sccache: false,
     };
     let shipper_team = TeamTopology {
         name: TeamName("shipper-solo-team".into()),
@@ -568,6 +648,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
             container_path: "/workspace".into(),
             readonly: false,
         }),
+        sccache: false,
     };
     let workspace_probe_team = TeamTopology {
         name: TeamName("workspace-probe-team".into()),
@@ -578,11 +659,73 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         max_retries: 0,
     };
 
+    // ---- sccache-probe (for sccache-wiring regression tests) ----
+    let sccache_probe = AgentRole {
+        name: RoleName("sccache-probe".into()),
+        version: 1,
+        model: None,
+        system_prompt: None,
+        image: ALPINE.into(),
+        substrate_class: SubstrateClass::Podman,
+        package_manager: PackageManager::Apk,
+        entrypoint_script: SCCACHE_PROBE_SCRIPT.into(),
+        // Alpine ships rust/cargo in its community repo; sccache is added
+        // automatically by `effective_binaries` when `sccache=true`.
+        binaries: vec!["rust".into(), "cargo".into()],
+        mcp_servers: vec![],
+        tool_allowlist: ToolAllowlist(vec![]),
+        permit_scope: PermitScope(vec!["net:allow:agentry-sccache-redis".into()]),
+        passthru_env: vec![],
+        mounts: vec![],
+        workspace_mount: None,
+        sccache: true,
+    };
+    let sccache_probe_team = TeamTopology {
+        name: TeamName("sccache-probe-team".into()),
+        version: 1,
+        roles: vec![sccache_probe.name.clone()],
+        message_graph: Vec::<MessageEdge>::new(),
+        terminal_role: sccache_probe.name.clone(),
+        max_retries: 0,
+    };
+
+    // ---- timeout-probe (for wall-clock-timeout regression tests) ----
+    let timeout_probe = AgentRole {
+        name: RoleName("timeout-probe".into()),
+        version: 1,
+        model: None,
+        system_prompt: None,
+        image: ALPINE.into(),
+        substrate_class: SubstrateClass::Podman,
+        package_manager: PackageManager::Apk,
+        entrypoint_script: TIMEOUT_PROBE_SCRIPT.into(),
+        binaries: vec![],
+        mcp_servers: vec![],
+        tool_allowlist: ToolAllowlist(vec![]),
+        permit_scope: PermitScope(vec!["net:deny:*".into()]),
+        passthru_env: vec![],
+        mounts: vec![],
+        workspace_mount: None,
+        sccache: false,
+    };
+    let timeout_probe_team = TeamTopology {
+        name: TeamName("timeout-probe-team".into()),
+        version: 1,
+        roles: vec![timeout_probe.name.clone()],
+        message_graph: Vec::<MessageEdge>::new(),
+        terminal_role: timeout_probe.name.clone(),
+        max_retries: 0,
+    };
+
     // ---- persist everything ----
     redis_io::save_role(&mut conn, &echo).await?;
     redis_io::save_team(&mut conn, &echo_team).await?;
     redis_io::save_role(&mut conn, &workspace_probe).await?;
     redis_io::save_team(&mut conn, &workspace_probe_team).await?;
+    redis_io::save_role(&mut conn, &sccache_probe).await?;
+    redis_io::save_team(&mut conn, &sccache_probe_team).await?;
+    redis_io::save_role(&mut conn, &timeout_probe).await?;
+    redis_io::save_team(&mut conn, &timeout_probe_team).await?;
     redis_io::save_role(&mut conn, &naughty).await?;
     redis_io::save_team(&mut conn, &naughty_team).await?;
     redis_io::save_role(&mut conn, &speaker).await?;
@@ -599,7 +742,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
     redis_io::save_team(&mut conn, &shipper_team).await?;
 
     tracing::info!(
-        "seeded: roles [echo, workspace-probe, naughty, speaker, listener, grok-echo, claude-echo, synthesizer, narrowed-coder, shipper] (inline entrypoint scripts); teams [echo, workspace-probe, naughty, speaker-listener, grok-echo, claude-echo, narrowed-team, shipper-solo-team]"
+        "seeded: roles [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker, listener, grok-echo, claude-echo, synthesizer, narrowed-coder, shipper] (inline entrypoint scripts); teams [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker-listener, grok-echo, claude-echo, narrowed-team, shipper-solo-team]"
     );
     Ok(())
 }

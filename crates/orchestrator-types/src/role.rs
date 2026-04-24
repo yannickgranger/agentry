@@ -157,6 +157,13 @@ pub struct AgentRole {
     /// a brief workspace (echo/naughty/speaker/listener etc.).
     #[serde(default)]
     pub workspace_mount: Option<WorkspaceMount>,
+    /// Wire the container to the agentry-scoped sccache-redis cache. The
+    /// spawner auto-installs `sccache` via `package_manager`, sets
+    /// `RUSTC_WRAPPER`, and points `SCCACHE_REDIS_ENDPOINT` at
+    /// `redis://agentry-sccache-redis:6379` on the `agentry-net` podman
+    /// network. Roles that never compile Rust leave this `false` (default).
+    #[serde(default)]
+    pub sccache: bool,
 }
 
 #[cfg(test)]
@@ -192,6 +199,7 @@ mod tests {
                 container_path: "/workspace".into(),
                 readonly: false,
             }),
+            sccache: true,
         };
         let s = serde_json::to_string_pretty(&r).expect("ser");
         let back: AgentRole = serde_json::from_str(&s).expect("de");

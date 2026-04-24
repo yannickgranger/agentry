@@ -101,6 +101,46 @@ dev-redis-down:
     -podman stop agentry-dev-redis
     -podman rm agentry-dev-redis
 
+# Create the podman network every agentry-spawned container joins, and bring
+# up a dedicated `agentry-sccache-redis` container attached to it so roles
+# with `sccache=true` can reach the compile cache by DNS name. Orchestratord
+# itself runs on the host and reaches agentry-dev-redis via the existing
+# 127.0.0.1:6380 port mapping — it doesn't need agentry-net. Idempotent.
+agentry-net-up:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if ! podman network exists agentry-net; then
+        podman network create agentry-net > /dev/null
+        echo "created podman network agentry-net"
+    else
+        echo "agentry-net already exists"
+    fi
+    # agentry-scoped sccache backend. Kept separate from any other `sccache-redis`
+    # container so we don't touch cross-team state. No host port mapping — only
+    # reachable from containers on agentry-net.
+    if podman container exists agentry-sccache-redis; then
+        podman start agentry-sccache-redis > /dev/null 2>&1 || true
+        echo "agentry-sccache-redis already exists; (re)started"
+    else
+        podman volume inspect agentry-sccache-data >/dev/null 2>&1 || podman volume create agentry-sccache-data > /dev/null
+        podman run -d \
+            --name agentry-sccache-redis \
+            --network agentry-net \
+            -v agentry-sccache-data:/data \
+            docker.io/library/redis:7-alpine \
+            redis-server --maxmemory 2gb --maxmemory-policy allkeys-lru --appendonly no > /dev/null
+        echo "created agentry-sccache-redis on agentry-net"
+    fi
+    sleep 1
+    # Smoke test: reach the cache by DNS name from an ephemeral container on agentry-net.
+    podman run --rm --network agentry-net docker.io/library/redis:7-alpine \
+        redis-cli -h agentry-sccache-redis -p 6379 ping
+
+agentry-net-down:
+    -podman stop agentry-sccache-redis
+    -podman rm agentry-sccache-redis
+    -podman network rm -f agentry-net
+
 # Start dev infra (orchestratord + dashboard as user processes, podman for agents)
 dev-up: dev-redis-up build build-echo
     #!/usr/bin/env bash
