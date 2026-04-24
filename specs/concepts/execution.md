@@ -23,9 +23,18 @@ The per-brief host scratch directory. Allocated by the daemon on the first
 role in the team that declares a `WorkspaceMount`, shared across all
 subsequent roles in the same brief, torn down on team-level `Shipped` and
 retained on any other terminal state for audit. Gives roles a place to
-clone, edit, and commit that survives across role boundaries. Minimal
-shape today — a host dir bind-mounted at the declared container path;
-bare-clone + `git worktree` semantics come later.
+clone, edit, and commit that survives across role boundaries.
+
+When the brief's project (or payload) names a `repo_url` + `base_branch`,
+the daemon allocates the workspace as a **git worktree** off a shared
+bare clone at `<root>/.clones/<org>/<repo>/`, checked out on branch
+`auto/<brief_id>`. Subsequent briefs against the same repo reuse the bare
+clone, fetching only what is new. The worktree is removed on team-level
+`Shipped`; the bare clone survives.
+
+When no repo is named (probe roles: echo, naughty, speaker, etc.), the
+workspace falls back to a plain empty scratch dir — preserving the legacy
+semantics for teams that don't need git.
 
 ## TeamContext
 

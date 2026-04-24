@@ -103,10 +103,21 @@ async fn handle_brief(
         let role = fetch_role_any_version(conn, role_name).await?;
 
         if role.workspace_mount.is_some() && workspace.is_none() {
-            let ws = workspace::allocate(&brief.id).await?;
+            // Resolve project-level repo info. Priority: (1) brief.project's
+            // repo_url + base_branch if loaded; (2) brief.payload.target_repo
+            // + base_branch (legacy path). If neither path yields both
+            // values, fall through as `None` — the workspace becomes an
+            // empty scratch dir (probe semantics).
+            let repo = resolve_repo_for_brief(brief, conn).await?;
+            let ws = workspace::allocate(
+                &brief.id,
+                repo.as_ref().map(|(u, b)| (u.as_str(), b.as_str())),
+            )
+            .await?;
             tracing::info!(
                 brief = %brief.id,
                 path = %ws.host_path.display(),
+                worktree = repo.is_some(),
                 "allocated brief workspace"
             );
             workspace = Some(ws);
@@ -359,6 +370,71 @@ fn mint_permit(brief: &Brief, role: &AgentRole) -> Result<WorkPermit> {
         issued_at: now(),
         signature: None,
     })
+}
+
+/// Resolve the `(repo_url, base_branch)` tuple for this brief's workspace.
+///
+/// Priority:
+/// 1. `brief.project` (when present) → fetch the Project record; use its
+///    `repo_url` + `base_branch` if both are set.
+/// 2. `brief.payload.target_repo` + `brief.payload.base_branch` (legacy
+///    path) → construct a token-bearing forge URL using `GITEA_TOKEN`. The
+///    token is needed only for the FIRST `git clone --bare`; subsequent
+///    fetches+worktree-adds against the bare clone don't carry auth.
+///
+/// Returns `Ok(None)` if neither path yields a usable pair — in which case
+/// the workspace falls back to an empty scratch dir (probe semantics).
+async fn resolve_repo_for_brief(
+    brief: &Brief,
+    conn: &mut ConnectionManager,
+) -> Result<Option<(String, String)>> {
+    if let Some(slug) = brief.project.as_deref() {
+        match redis_io::fetch_project(conn, slug).await {
+            Ok(project) => {
+                if let (Some(url), Some(branch)) = (project.repo_url, project.base_branch) {
+                    return Ok(Some((url, branch)));
+                }
+            }
+            Err(Error::NotFound { .. }) => {
+                // Project not found in Redis; fall through to payload path.
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    let target_repo = brief
+        .payload
+        .get("target_repo")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let base_branch = brief
+        .payload
+        .get("base_branch")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let forge_host = brief
+        .payload
+        .get("forge_host")
+        .and_then(|v| v.as_str())
+        .unwrap_or("agency.lab:3000")
+        .to_string();
+
+    if let (Some(repo), Some(branch)) = (target_repo, base_branch) {
+        let url = forge_url(&repo, &forge_host)?;
+        return Ok(Some((url, branch)));
+    }
+
+    Ok(None)
+}
+
+/// Build a token-bearing forge URL for the FIRST bare clone. Subsequent
+/// worktree operations against the bare clone do not need to carry auth.
+fn forge_url(target_repo: &str, forge_host: &str) -> Result<String> {
+    let token = std::env::var("GITEA_TOKEN")
+        .map_err(|_| Error::Config("GITEA_TOKEN not in daemon env".into()))?;
+    Ok(format!(
+        "https://oauth2:{token}@{forge_host}/{target_repo}.git"
+    ))
 }
 
 #[allow(dead_code)]

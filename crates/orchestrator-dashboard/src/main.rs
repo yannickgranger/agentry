@@ -1111,6 +1111,8 @@ async fn project_create(
             priorities: split_lines(&f.priorities_lines),
             forbidden: split_lines(&f.forbidden_lines),
         },
+        repo_url: None,
+        base_branch: None,
     };
     let key = format!("agentry:project:{}", project.slug.0);
     let body = serde_json::to_string(&project)?;
