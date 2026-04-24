@@ -25,6 +25,7 @@ use orchestrator_types::{
 /// Bash helpers injected at the top of scripts that build structured events
 /// via jq. Defines `emit_event <payload-json>`, `emit_done <verdict>`,
 /// `emit_finding <severity> <tool> <category> <message>` (mechanical origin),
+/// `emit_finding_model <severity> <agent-id> <category> <message>` (LLM origin),
 /// and `emit_message <to> <payload-json>`.
 const BASH_PRELUDE: &str = r#"emit_event() {
     jq -nc --arg at "$(date -Iseconds)" --argjson payload "$1" \
@@ -49,6 +50,17 @@ emit_message() {
     # args: to (role name), payload (JSON)
     jq -nc --arg at "$(date -Iseconds)" --arg to "$1" --argjson payload "$2" \
         '{at:$at, type:"message", to:$to, payload:$payload}'
+}
+emit_finding_model() {
+    # args: severity (blocker|warn), reviewer_agent_id, category, message
+    jq -nc --arg at "$(date -Iseconds)" \
+        --arg sev "$1" --arg aid "$2" --arg cat "$3" --arg msg "$4" \
+        '{at:$at, type:"finding", finding:{
+            severity:$sev,
+            origin:{kind:"model", reviewer_agent_id:$aid},
+            file:null, line:null,
+            category:$cat, message:$msg, suggested_fix:null
+        }}'
 }
 "#;
 
@@ -462,6 +474,127 @@ else
     combined=$(printf '%s\n---stdout---\n%s' "$err" "$out" | head -c 2000)
     emit_finding "blocker" "cargo" "acceptance" "$combined"
     emit_done "rework_needed"
+fi
+"##;
+
+/// LLM reviewer role for the `agentry-self-host-v0` team. Reads the diff
+/// produced by the coder, prompts claude -p for a JSON array of findings,
+/// emits each as a Finding event, and resolves rework_needed if any Blocker
+/// is present. Runs sequentially after the mechanical reviewer.
+const REVIEWER_CLAUDE_AGENTRY_SCRIPT: &str = r##"#!/usr/bin/env bash
+set -euo pipefail
+bundle="$(cat)"
+
+base_branch=$(jq -r '.brief.payload.base_branch // "develop"' <<<"$bundle")
+issue_title=$(jq -r '.brief.payload.issue_title // ""' <<<"$bundle")
+issue_body=$(jq -r '.brief.payload.issue_body // ""' <<<"$bundle")
+agent_id=$(jq -r '.permit.agent_id' <<<"$bundle")
+
+if [ ! -d /workspace/.git ] && [ ! -f /workspace/.git ]; then
+    emit_event '{"error":"workspace is not a git repo — coder did not produce it"}'
+    emit_done "failed"; exit 0
+fi
+
+mkdir -p /root/.claude
+export HOME=/root
+cd /workspace
+
+# Diff against develop. The coder produces commits on top of origin/develop;
+# we review what was ADDED, not the whole file set.
+if ! git diff "origin/${base_branch}..HEAD" > /tmp/diff.patch 2>/tmp/diff.err; then
+    err=$(tail -20 /tmp/diff.err)
+    emit_event "$(jq -nc --arg err "$err" '{error:"git diff failed",detail:$err}')"
+    emit_done "failed"; exit 0
+fi
+
+diff_bytes=$(wc -c < /tmp/diff.patch)
+if [ "$diff_bytes" -eq 0 ]; then
+    emit_event '{"error":"empty diff — coder produced no changes"}'
+    emit_done "failed"; exit 0
+fi
+
+emit_event "$(jq -nc --argjson b "$diff_bytes" '{msg:"reviewing diff",diff_bytes:$b}')"
+
+# Review prompt. The output format is strict so downstream parsing is
+# deterministic. Any prose (fences, explanations) breaks the jq parse and
+# the script resolves the role as Failed — signaling prompt drift.
+cat > /tmp/rev_prompt.txt <<PROMPT
+You are a senior code reviewer for the agentry project — a Rust workspace
+that orchestrates short-lived agent containers. Review the following diff
+produced against branch "${base_branch}" in response to this task:
+
+TITLE: ${issue_title}
+
+BODY (first 2000 chars):
+$(printf '%s' "$issue_body" | head -c 2000)
+
+--- DIFF ---
+$(cat /tmp/diff.patch)
+--- END DIFF ---
+
+Output EXACTLY a JSON array of findings — nothing else. No markdown fences,
+no prose, no preamble, no explanation. Each element:
+
+{
+  "severity": "blocker" | "warn",
+  "category": "design" | "naming" | "clarity" | "invariant" | "other",
+  "message": "one-sentence human-readable description (max 200 chars)"
+}
+
+Guidance:
+- \`blocker\` = ships-broken, security-risk, invariant-violation, wrong abstraction.
+- \`warn\` = minor cleanup, non-load-bearing style.
+- If the diff is acceptable as-is, output exactly: []
+- Maximum 6 findings. Prefer a single Blocker over many Warns.
+- Do not comment on fmt/clippy/test — those are mechanical-reviewer scope.
+
+Your response, right now, starting with [ and ending with ]:
+PROMPT
+
+response=$(HOME=/root claude -p "$(cat /tmp/rev_prompt.txt)" 2>&1) || {
+    emit_event "$(jq -nc --arg err "$response" '{error:"claude -p failed",detail:$err}')"
+    emit_done "failed"; exit 0
+}
+
+# Tolerate (and strip) leading/trailing fences if claude adds them despite
+# the instruction — common drift pattern.
+cleaned=$(printf '%s' "$response" | sed -e 's/^```json$//' -e 's/^```$//' -e '/^$/d' | tr -d '\r')
+# Find first [ and last ] — slice.
+start=$(printf '%s' "$cleaned" | grep -b -m1 '\[' | head -1 | cut -d: -f1)
+end=$(printf '%s' "$cleaned" | grep -bo '\]' | tail -1 | cut -d: -f1)
+if [ -z "$start" ] || [ -z "$end" ]; then
+    emit_event "$(jq -nc --arg r "$(printf '%s' "$cleaned" | head -c 300)" '{error:"claude response missing JSON array brackets",head:$r}')"
+    emit_done "failed"; exit 0
+fi
+payload=$(printf '%s' "$cleaned" | tail -c +$((start+1)) | head -c $((end-start+1)))
+
+if ! printf '%s' "$payload" | jq -e 'type == "array"' >/dev/null 2>&1; then
+    emit_event "$(jq -nc --arg r "$(printf '%s' "$payload" | head -c 300)" '{error:"claude response not a JSON array",head:$r}')"
+    emit_done "failed"; exit 0
+fi
+
+count=$(printf '%s' "$payload" | jq 'length')
+emit_event "$(jq -nc --argjson n "$count" '{msg:"claude review parsed",findings_count:$n}')"
+
+# Emit each finding as a Finding event. A file marker captures whether any
+# Blocker was seen, since a while-read piped subshell can't set outer vars.
+rm -f /tmp/has_blocker.marker
+printf '%s' "$payload" | jq -c '.[]' | while read -r finding; do
+    severity=$(jq -r '.severity // "warn"' <<<"$finding")
+    category=$(jq -r '.category // "other"' <<<"$finding")
+    message=$(jq -r '.message // ""' <<<"$finding")
+    emit_finding_model "$severity" "$agent_id" "$category" "$message"
+    if [ "$severity" = "blocker" ]; then
+        touch /tmp/has_blocker.marker
+    fi
+done
+
+if [ -f /tmp/has_blocker.marker ]; then
+    emit_event '{"msg":"blockers present — requesting rework"}'
+    emit_done "rework_needed"
+else
+    emit_event '{"msg":"no blockers — claude-reviewer passes"}'
+    emit_done "shipped"
 fi
 "##;
 
@@ -1215,6 +1348,51 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         }),
         sccache: false,
     };
+    let reviewer_claude_agentry = AgentRole {
+        name: RoleName("reviewer-claude-agentry".into()),
+        version: 1,
+        model: Some("claude-max".into()),
+        system_prompt: None,
+        image: "docker.io/library/debian:bookworm-slim".into(),
+        substrate_class: SubstrateClass::Podman,
+        package_manager: PackageManager::Apt,
+        entrypoint_script: format!("{BASH_PRELUDE}{REVIEWER_CLAUDE_AGENTRY_SCRIPT}"),
+        exitpoint_script: None,
+        // git for diff; no rust toolchain — LLM reviewer does no compilation.
+        binaries: vec!["git".into(), "ca-certificates".into()],
+        mcp_servers: vec![],
+        tool_allowlist: ToolAllowlist(vec![]),
+        permit_scope: PermitScope(vec![
+            "fs:read:/workspace/**".into(),
+            "net:allow:api.anthropic.com".into(),
+            "net:allow:agency.lab".into(), // for git fetch origin/<base_branch>
+        ]),
+        passthru_env: vec![],
+        extra_bootstrap: vec![],
+        mounts: vec![
+            Mount {
+                source: format!("{home}/.local/bin/claude"),
+                target: "/usr/local/bin/claude".into(),
+                readonly: true,
+            },
+            Mount {
+                source: format!("{home}/.claude/.credentials.json"),
+                target: "/root/.claude/.credentials.json".into(),
+                readonly: true,
+            },
+            Mount {
+                source: claude_settings_path.clone(),
+                target: "/root/.claude/settings.json".into(),
+                readonly: true,
+            },
+        ],
+        // Read-only workspace — LLM reviewer does not mutate the coder's tree.
+        workspace_mount: Some(WorkspaceMount {
+            container_path: "/workspace".into(),
+            readonly: true,
+        }),
+        sccache: false,
+    };
     let shipper_agentry = AgentRole {
         name: RoleName("shipper-agentry".into()),
         version: 1,
@@ -1275,22 +1453,38 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         roles: vec![
             coder_claude_agentry.name.clone(),
             reviewer_mechanical_agentry.name.clone(),
+            reviewer_claude_agentry.name.clone(),
             shipper_agentry.name.clone(),
             ci_watcher_agentry.name.clone(),
         ],
         // Rework loop enabled — max_retries=2 gives the coder two chances to
         // fix findings emitted by the reviewer before the team resolves Failed.
         message_graph: vec![
+            // Both reviewers treat coder as their rework-target upstream.
             MessageEdge {
                 from: coder_claude_agentry.name.clone(),
                 to: reviewer_mechanical_agentry.name.clone(),
                 permit_overrides_from: None,
             },
             MessageEdge {
+                from: coder_claude_agentry.name.clone(),
+                to: reviewer_claude_agentry.name.clone(),
+                permit_overrides_from: None,
+            },
+            // Mechanical reviewer signals shipper only for sequential flow; no
+            // data payload carried on this edge.
+            MessageEdge {
                 from: reviewer_mechanical_agentry.name.clone(),
                 to: shipper_agentry.name.clone(),
                 permit_overrides_from: None,
             },
+            // Claude reviewer also signals shipper.
+            MessageEdge {
+                from: reviewer_claude_agentry.name.clone(),
+                to: shipper_agentry.name.clone(),
+                permit_overrides_from: None,
+            },
+            // Shipper routes head_sha + pr_number to ci-watcher via Message event.
             MessageEdge {
                 from: shipper_agentry.name.clone(),
                 to: ci_watcher_agentry.name.clone(),
@@ -1326,12 +1520,13 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
     redis_io::save_team(&mut conn, &shipper_team).await?;
     redis_io::save_role(&mut conn, &coder_claude_agentry).await?;
     redis_io::save_role(&mut conn, &reviewer_mechanical_agentry).await?;
+    redis_io::save_role(&mut conn, &reviewer_claude_agentry).await?;
     redis_io::save_role(&mut conn, &shipper_agentry).await?;
     redis_io::save_role(&mut conn, &ci_watcher_agentry).await?;
     redis_io::save_team(&mut conn, &agentry_self_host_v0).await?;
 
     tracing::info!(
-        "seeded: roles [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker, listener, grok-echo, claude-echo, synthesizer, narrowed-coder, shipper, coder-claude-agentry, reviewer-mechanical-agentry, shipper-agentry, ci-watcher-agentry] (inline entrypoint scripts); teams [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker-listener, grok-echo, claude-echo, narrowed-team, shipper-solo-team, agentry-self-host-v0]"
+        "seeded: roles [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker, listener, grok-echo, claude-echo, synthesizer, narrowed-coder, shipper, coder-claude-agentry, reviewer-mechanical-agentry, shipper-agentry, ci-watcher-agentry, reviewer-claude-agentry] (inline entrypoint scripts); teams [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker-listener, grok-echo, claude-echo, narrowed-team, shipper-solo-team, agentry-self-host-v0]"
     );
     Ok(())
 }
