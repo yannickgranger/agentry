@@ -2,7 +2,8 @@
 
 use crate::{Error, Result};
 use orchestrator_types::{
-    AgentRole, Brief, BriefId, Event, RoleName, TeamName, TeamTopology, Verdict, VersionedRef,
+    AgentRole, Brief, BriefId, Event, Project, RoleName, TeamName, TeamTopology, Verdict,
+    VersionedRef,
 };
 use redis::aio::ConnectionManager;
 use redis::AsyncCommands;
@@ -66,6 +67,18 @@ pub async fn fetch_role(
     let raw: Option<String> = conn.get(&key).await?;
     let raw = raw.ok_or_else(|| Error::NotFound {
         kind: "role",
+        key: key.clone(),
+    })?;
+    Ok(serde_json::from_str(&raw)?)
+}
+
+/// Fetch a project record by slug. Project records are keyed
+/// `agentry:project:<slug>` and are not versioned.
+pub async fn fetch_project(conn: &mut ConnectionManager, slug: &str) -> Result<Project> {
+    let key = format!("agentry:project:{slug}");
+    let raw: Option<String> = conn.get(&key).await?;
+    let raw = raw.ok_or_else(|| Error::NotFound {
+        kind: "project",
         key: key.clone(),
     })?;
     Ok(serde_json::from_str(&raw)?)

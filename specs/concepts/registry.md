@@ -103,3 +103,10 @@ dispatch time.
 The full project record: slug, display name, standing orders, creation
 timestamp. Briefs may optionally name a project; when they do, the team's
 roles receive the project's standing orders as part of their startup bundle.
+
+A project may optionally carry `repo_url` + `base_branch`. When both are
+set, briefs dispatched under this project get their workspace allocated as
+a git worktree off a shared bare clone of `repo_url`, tracking
+`base_branch`. Briefs without a project fall back to reading `target_repo`
++ `base_branch` from `brief.payload` — this is the transitional path until
+every brief carries a project.

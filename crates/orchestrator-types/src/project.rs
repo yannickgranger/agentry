@@ -51,6 +51,16 @@ pub struct Project {
     pub steward_topology: Option<TeamName>,
     #[serde(default)]
     pub standing_orders: StandingOrders,
+    /// Optional forge URL for the project's primary repo. When set, briefs
+    /// naming this project get their workspace allocated as a `git worktree`
+    /// off a shared bare clone at `<workspace-root>/.clones/<org>/<repo>/`.
+    /// Example: `https://oauth2:${GITEA_TOKEN}@agency.lab:3000/yg/agentry.git`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_url: Option<String>,
+    /// Optional base branch. When set together with `repo_url`, this is the
+    /// ref the bare clone tracks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_branch: Option<String>,
 }
 
 #[cfg(test)]
@@ -72,6 +82,25 @@ mod tests {
                 priorities: vec!["close RFC-023".into()],
                 forbidden: vec!["git:force-push:main".into()],
             },
+            repo_url: None,
+            base_branch: None,
+        };
+        let s = serde_json::to_string(&p).expect("ser");
+        let back: Project = serde_json::from_str(&s).expect("de");
+        assert_eq!(p, back);
+    }
+
+    #[test]
+    fn project_roundtrips_with_repo_url() {
+        let p = Project {
+            slug: ProjectSlug("agentry".into()),
+            name: "agentry".into(),
+            forges: vec!["agency:yg/agentry".into()],
+            default_topology: Some(TeamName("agentry-self-host-v0".into())),
+            steward_topology: None,
+            standing_orders: StandingOrders::default(),
+            repo_url: Some("https://agency.lab:3000/yg/agentry.git".into()),
+            base_branch: Some("develop".into()),
         };
         let s = serde_json::to_string(&p).expect("ser");
         let back: Project = serde_json::from_str(&s).expect("de");

@@ -281,11 +281,13 @@ sleep 300
 printf '{"at":"%s","type":"done","verdict":"shipped"}\n' "$(date -Iseconds)"
 "#;
 
-/// Coder role for the `agentry-self-host-v0` team. Clones the target repo
-/// into the per-brief workspace, creates `auto/<brief_id>`, calls `claude -p`
-/// with a verb-structured prompt built from the brief payload, runs the
-/// acceptance command, and commits locally. Does NOT push — the shipper
-/// does that after the reviewer approves.
+/// Coder role for the `agentry-self-host-v0` team. The workspace arrives
+/// pre-cloned (as a `git worktree` off a shared bare clone) at `/workspace`
+/// with branch `auto/<brief_id>` already checked out — the daemon's
+/// `workspace::allocate` did the work. The coder calls `claude -p` with a
+/// verb-structured prompt built from the brief payload, runs the acceptance
+/// command, and commits locally. Does NOT push — the shipper does that
+/// after the reviewer approves.
 const CODER_CLAUDE_AGENTRY_SCRIPT: &str = r##"#!/usr/bin/env bash
 set -euo pipefail
 bundle="$(cat)"
@@ -311,17 +313,10 @@ git config --global user.email "coder-claude-agentry@agentry.lab"
 git config --global user.name "coder-claude-agentry"
 git config --global http.sslVerify false
 
-clone_url="https://oauth2:${GITEA_TOKEN}@${forge_host}/${target_repo}.git"
-
-emit_event "$(jq -nc --arg r "$target_repo" --arg b "$base_branch" '{msg:"cloning target repo",repo:$r,base:$b}')"
-git clone --depth=10 --branch "$base_branch" "$clone_url" repo 2>/tmp/clone.err || {
-    emit_event "$(jq -nc --arg e "$(tail -10 /tmp/clone.err)" '{error:"clone failed",detail:$e}')"
-    emit_done "failed"; exit 0
-}
-cd /workspace/repo
-
 branch="auto/${brief_id}"
-git checkout -b "$branch" 2>&1 >/dev/null
+# Workspace is a git worktree allocated by the daemon; it is already on
+# branch auto/${brief_id}, forked from origin/${base_branch}.
+emit_event "$(jq -nc --arg b "$branch" '{msg:"workspace worktree ready",branch:$b}')"
 
 cat > /tmp/brief_vars.sh <<'VARS_EOF'
 #!/bin/bash
@@ -334,7 +329,7 @@ printf 'export branch=%q\n' "$branch"            >> /tmp/brief_vars.sh
 
 cat > /tmp/prompt.txt <<PROMPT
 You are the coder role inside the agentry autonomous team, operating in the
-container-local working directory /workspace/repo. The repo is cloned at
+container-local working directory /workspace. The repo is cloned at
 branch "$base_branch"; you are on a fresh branch "$branch".
 
 Your task is described in verb-structured form below. Follow it literally:
@@ -347,7 +342,7 @@ Task body:
 $issue_body
 
 Constraints:
-- Operate only inside /workspace/repo. Never touch files outside it.
+- Operate only inside /workspace. Never touch files outside it.
 - When you are done editing, the acceptance command below must pass. You
   may run it yourself to check. The orchestrator will re-run it before
   accepting the diff:
@@ -372,7 +367,7 @@ emit_event "$(jq -nc --arg len "${#reply}" '{msg:"claude reply received",bytes:$
 const CODER_CLAUDE_AGENTRY_EXITPOINT: &str = r##"#!/usr/bin/env bash
 set -euo pipefail
 . /tmp/brief_vars.sh
-cd /workspace/repo
+cd /workspace
 
 # Baseline fmt — always run, no install dependency. rustfmt ships with
 # rustup and is already provisioned via extra_bootstrap. Protects against
@@ -391,7 +386,7 @@ emit_event '{"msg":"cargo fmt --all clean"}'
 # (binary absent), skip and let the reviewer catch anything hygiene would have.
 if command -v quality-hygiene >/dev/null 2>&1; then
     emit_event '{"msg":"running quality-hygiene --fix"}'
-    if ! quality-hygiene --fix --workspace /workspace/repo --base "origin/${base_branch}" >/tmp/qh.out 2>/tmp/qh.err; then
+    if ! quality-hygiene --fix --workspace /workspace --base "origin/${base_branch}" >/tmp/qh.out 2>/tmp/qh.err; then
         err=$(tail -100 /tmp/qh.err)
         emit_event "$(jq -nc --arg err "$err" '{error:"quality-hygiene --fix failed",detail:$err}')"
         emit_finding "blocker" "quality-hygiene" "hygiene" "$err"
@@ -436,12 +431,12 @@ bundle="$(cat)"
 base_branch=$(jq -r '.brief.payload.base_branch // "develop"' <<<"$bundle")
 acceptance=$(jq -r '.brief.payload.acceptance // "cargo test --workspace"' <<<"$bundle")
 
-if [ ! -d /workspace/repo ]; then
-    emit_event '{"error":"workspace/repo missing — coder did not produce it"}'
+if [ ! -d /workspace/.git ] && [ ! -f /workspace/.git ]; then
+    emit_event '{"error":"workspace missing — coder did not produce it"}'
     emit_done "failed"; exit 0
 fi
 
-cd /workspace/repo
+cd /workspace
 
 emit_event '{"msg":"reviewer starting"}'
 
@@ -490,21 +485,26 @@ if [ -z "${GITEA_TOKEN:-}" ]; then
     emit_done "failed"; exit 0
 fi
 
-if [ ! -d /workspace/repo ]; then
-    emit_event '{"error":"workspace/repo missing — coder did not produce it"}'
+if [ ! -d /workspace/.git ] && [ ! -f /workspace/.git ]; then
+    emit_event '{"error":"workspace missing — coder did not produce it"}'
     emit_done "failed"; exit 0
 fi
 
-cd /workspace/repo
+cd /workspace
 git config http.sslVerify false
 git config user.email "shipper-agentry@agentry.lab"
 git config user.name "shipper-agentry"
 
-# Rewrite origin with the token so we can push.
-git remote set-url origin "https://oauth2:${GITEA_TOKEN}@${forge_host}/${target_repo}.git"
-
+# DO NOT `git remote set-url` to a token-bearing URL: this is a worktree
+# off a shared bare clone, and `set-url` would write the token into the
+# bare clone's config — visible to every other brief that reuses this
+# bare. Instead, pass the Authorization header on this single push only,
+# via `-c http.extraheader`. Security-clean: the header is in the
+# command's argv, not on disk.
 emit_event "$(jq -nc --arg b "$branch" '{msg:"pushing branch",branch:$b}')"
-if ! git push -u origin "$branch" 2>/tmp/push.err; then
+if ! git -c http.sslVerify=false \
+        -c http.extraheader="Authorization: token ${GITEA_TOKEN}" \
+        push -u origin "$branch" 2>/tmp/push.err; then
     err=$(tail -20 /tmp/push.err)
     emit_event "$(jq -nc --arg err "$err" '{error:"git push failed",detail:$err}')"
     emit_done "failed"; exit 0
@@ -1235,7 +1235,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         passthru_env: vec!["GITEA_TOKEN".into()],
         extra_bootstrap: vec![],
         mounts: vec![],
-        // Shipper writes to /workspace/repo/.git during `git push` (reflog,
+        // Shipper writes to /workspace/.git during `git push` (reflog,
         // FETCH_HEAD), so the workspace mount must be writable.
         workspace_mount: Some(WorkspaceMount {
             container_path: "/workspace".into(),
