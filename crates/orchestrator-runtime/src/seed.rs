@@ -336,6 +336,7 @@ VARS_EOF
 printf 'export brief_id=%q\n' "$brief_id"        >> /tmp/brief_vars.sh
 printf 'export base_branch=%q\n' "$base_branch"  >> /tmp/brief_vars.sh
 printf 'export issue_title=%q\n' "$issue_title"  >> /tmp/brief_vars.sh
+printf 'export issue_body=%q\n' "$issue_body"    >> /tmp/brief_vars.sh
 printf 'export acceptance=%q\n' "$acceptance"    >> /tmp/brief_vars.sh
 printf 'export branch=%q\n' "$branch"            >> /tmp/brief_vars.sh
 
@@ -425,6 +426,66 @@ if git diff --cached --quiet; then
     emit_event '{"error":"no changes produced"}'
     emit_done "failed"; exit 0
 fi
+
+# Self-review — LLM checks verb-completeness before commit.
+# Skips silently if issue body has no verb syntax (legacy free-form briefs).
+# On malformed claude output, warns and falls through to commit — this is
+# a cheap pre-filter, not a hard gate; reviewer-claude is the backstop.
+if printf '%s' "$issue_body" | grep -qE '^(### [0-9]+\. |CREATE |UPDATE |REPLACE |DELETE |MOVE )'; then
+    emit_event '{"msg":"running self-review (verb completeness)"}'
+    git diff --cached > /tmp/staged.patch
+    cat > /tmp/self_rev.txt <<PROMPT
+You are a self-review check for the agentry project. Below is the TASK
+BODY (with explicit verbs — CREATE/UPDATE/REPLACE/DELETE/MOVE) and the
+STAGED DIFF you are about to commit.
+
+TASK BODY:
+$(printf '%s' "$issue_body" | head -c 3000)
+
+STAGED DIFF:
+$(cat /tmp/staged.patch)
+
+For each verb declared in the task body, check whether it has been applied
+in the diff at the named location. Output EXACTLY a JSON object — no
+markdown fences, no prose:
+
+{
+  "all_applied": true,
+  "unapplied": []
+}
+
+If any verb is missing, set all_applied:false and list each missing verb
+as a short description (max 200 chars each, max 6 entries).
+
+Your response, right now, starting with { and ending with }:
+PROMPT
+    sr=$(HOME=/root claude -p "$(cat /tmp/self_rev.txt)" 2>&1) || {
+        emit_event "$(jq -nc --arg err "$(printf '%s' "$sr" | head -c 300)" '{warn:"self-review claude call failed; proceeding",detail:$err}')"
+        sr='{"all_applied":true,"unapplied":[]}'
+    }
+    cleaned=$(printf '%s' "$sr" | sed -e 's/^```json$//' -e 's/^```$//' -e '/^$/d' | tr -d '\r')
+    start=$(printf '%s' "$cleaned" | grep -b -m1 '{' | head -1 | cut -d: -f1)
+    end=$(printf '%s' "$cleaned" | grep -bo '}' | tail -1 | cut -d: -f1)
+    if [ -n "$start" ] && [ -n "$end" ]; then
+        payload=$(printf '%s' "$cleaned" | tail -c +$((start+1)) | head -c $((end-start+1)))
+        if printf '%s' "$payload" | jq -e 'type == "object"' >/dev/null 2>&1; then
+            all_applied=$(printf '%s' "$payload" | jq -r '.all_applied // true')
+            if [ "$all_applied" = "false" ]; then
+                printf '%s' "$payload" | jq -r '.unapplied[]?' | while read -r item; do
+                    emit_finding_model "blocker" "coder-self-review" "completeness" "unapplied verb: $item"
+                done
+                emit_event '{"error":"self-review found unapplied verbs"}'
+                emit_done "failed"; exit 0
+            fi
+            emit_event '{"msg":"self-review: all verbs applied"}'
+        else
+            emit_event '{"warn":"self-review response not a JSON object; proceeding"}'
+        fi
+    else
+        emit_event '{"warn":"self-review response missing JSON braces; proceeding"}'
+    fi
+fi
+
 git commit -m "auto(${brief_id}): ${issue_title}" > /dev/null
 sha=$(git rev-parse HEAD)
 emit_event "$(jq -nc --arg br "$branch" --arg s "$sha" '{msg:"committed",branch:$br,sha:$s}')"
@@ -483,7 +544,7 @@ fi
 /// is present. Currently executed after the mechanical reviewer by the
 /// sequential scheduler; message_graph is parallel-capable (issue #13
 /// will enable parallel execution).
-const REVIEWER_CLAUDE_AGENTRY_SCRIPT: &str = r##"#!/usr/bin/env bash
+const REVIEWER_CLAUDE_AGENTRY_SCRIPT: &str = r####"#!/usr/bin/env bash
 set -euo pipefail
 bundle="$(cat)"
 
@@ -550,6 +611,30 @@ Guidance:
 - Maximum 6 findings. Prefer a single Blocker over many Warns.
 - Do not comment on fmt/clippy/test — those are mechanical-reviewer scope.
 
+Scope guardrail (CRITICAL):
+- ONLY flag changes INSIDE the DIFF. Pre-existing inconsistencies in the
+  repo that the diff did not touch are OUT of scope for blocker-level
+  findings.
+- If you notice a pre-existing concern adjacent to the diff, you MAY emit
+  at most ONE warn-level finding with category "scope" describing it, so
+  it is on-record for a follow-up brief — but NEVER emit a blocker for
+  something the diff did not change.
+- The unit of review is "did THIS diff ship broken/unsafe/wrong?", not
+  "is the whole repo now consistent?".
+
+Verb-completeness check (CRITICAL):
+- The TASK BODY above may contain explicit verbs: CREATE, UPDATE, REPLACE,
+  DELETE, MOVE — usually headed as "### N. <VERB> <file:line>" or the bare
+  form "<VERB> <file:line>".
+- For EACH such verb in the body, verify the diff contains the corresponding
+  change at the named location (file path and approximate area).
+- An unapplied verb is a blocker with category "invariant" and message
+  "unapplied verb: <short description of what was missed>".
+- If the body contains no verb syntax (legacy free-form brief), skip this
+  check and apply only the design/naming/clarity/invariant guidance above.
+- Applied-but-incomplete counts as unapplied (e.g. the verb asked to change
+  three sites and only two were touched — the remaining one is unapplied).
+
 Your response, right now, starting with [ and ending with ]:
 PROMPT
 
@@ -598,7 +683,7 @@ else
     emit_event '{"msg":"no blockers — claude-reviewer passes"}'
     emit_done "shipped"
 fi
-"##;
+"####;
 
 /// Shipper role for the `agentry-self-host-v0` team. Pushes the branch
 /// already committed in the brief's workspace (by the coder) and opens a
