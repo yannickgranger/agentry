@@ -555,9 +555,28 @@ emit_done "shipped"
 const ALPINE: &str = "docker.io/library/alpine:3.21";
 const DEBIAN: &str = "docker.io/library/debian:bookworm-slim";
 
+/// Container-scoped Claude permissions. Checked into the repo so agentry
+/// owns its own container settings; not derived from the host user's
+/// `~/.claude/settings.json` (which is host-path-scoped and drifts).
+const CONTAINER_CLAUDE_SETTINGS: &str =
+    include_str!("../../../containers/claude/container-settings.json");
+
+/// Materialize the embedded container settings to a stable host path and
+/// return it. Idempotent — overwrites on every call so the materialized
+/// file always matches the checked-in source.
+fn materialize_container_claude_settings() -> Result<String> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/var/home/yg".into());
+    let dir = format!("{home}/.config/agentry");
+    std::fs::create_dir_all(&dir)?;
+    let path = format!("{dir}/claude-container-settings.json");
+    std::fs::write(&path, CONTAINER_CLAUDE_SETTINGS)?;
+    Ok(path)
+}
+
 /// Seed the registry (roles + teams) using the URL from `Config`.
 pub async fn seed_m0(cfg: &Config) -> Result<()> {
     let mut conn = redis_io::connect(&cfg.redis.url).await?;
+    let claude_settings_path = materialize_container_claude_settings()?;
 
     // ---- echo-agent (stateless hello → done shipped) ----
     let echo = AgentRole {
@@ -725,7 +744,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
                 readonly: true,
             },
             Mount {
-                source: format!("{home}/.claude/settings.json"),
+                source: claude_settings_path.clone(),
                 target: "/root/.claude/settings.json".into(),
                 readonly: true,
             },
@@ -959,7 +978,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
                 readonly: true,
             },
             Mount {
-                source: format!("{home}/.claude/settings.json"),
+                source: claude_settings_path.clone(),
                 target: "/root/.claude/settings.json".into(),
                 readonly: true,
             },
