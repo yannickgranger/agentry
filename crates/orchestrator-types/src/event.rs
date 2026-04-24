@@ -4,18 +4,26 @@
 //! runner mirrors every event to `agentry:brief:{id}:trace`. The permit broker
 //! subscribes and enforces tool allowlists.
 
-use crate::{now, Ts};
+use crate::{now, review::ReviewFinding, Ts};
 use serde::{Deserialize, Serialize};
 
 /// Verdict emitted by an agent at the end of its run. Distinct from the
 /// team-level `crate::verdict::Verdict` — this one travels on the stdout
 /// NDJSON wire, the team-level one is persisted as the brief's outcome.
+///
+/// `ReworkNeeded` and `Rejected` are review-producer verdicts. `ReworkNeeded`
+/// signals the daemon to rewind to the upstream worker; the findings
+/// themselves travel as separate `EventKind::Finding` events emitted BEFORE
+/// the `Done` event and accumulated by the spawner. `Rejected` signals "don't
+/// bother retrying".
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EventVerdict {
     Shipped,
     Failed,
     Escalated,
+    ReworkNeeded,
+    Rejected,
 }
 
 /// A tool call attempt — content that the permit broker inspects.
@@ -41,6 +49,10 @@ pub enum EventKind {
     },
     /// Human-readable log line.
     Log { level: String, msg: String },
+    /// One review finding; the spawner accumulates findings and attaches
+    /// them to the team-level `Verdict` when the `Done` event's verdict is
+    /// `ReworkNeeded`.
+    Finding { finding: ReviewFinding },
     /// Agent is done; terminal.
     Done { verdict: EventVerdict },
 }

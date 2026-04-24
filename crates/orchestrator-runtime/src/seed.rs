@@ -23,7 +23,8 @@ use orchestrator_types::{
 // ---------------------------------------------------------------------------
 
 /// Bash helpers injected at the top of scripts that build structured events
-/// via jq. Defines `emit_event <payload-json>` and `emit_done <verdict>`.
+/// via jq. Defines `emit_event <payload-json>`, `emit_done <verdict>`, and
+/// `emit_finding <severity> <tool> <category> <message>` (mechanical origin).
 const BASH_PRELUDE: &str = r#"emit_event() {
     jq -nc --arg at "$(date -Iseconds)" --argjson payload "$1" \
         '{at:$at, type:"event", payload:$payload}'
@@ -31,6 +32,17 @@ const BASH_PRELUDE: &str = r#"emit_event() {
 emit_done() {
     jq -nc --arg at "$(date -Iseconds)" --arg v "$1" \
         '{at:$at, type:"done", verdict:$v}'
+}
+emit_finding() {
+    # args: severity (blocker|warn), tool, category, message
+    jq -nc --arg at "$(date -Iseconds)" \
+        --arg sev "$1" --arg tool "$2" --arg cat "$3" --arg msg "$4" \
+        '{at:$at, type:"finding", finding:{
+            severity:$sev,
+            origin:{kind:"mechanical", tool:$tool, rule:null},
+            file:null, line:null,
+            category:$cat, message:$msg, suggested_fix:null
+        }}'
 }
 "#;
 
@@ -400,7 +412,12 @@ else
     err=$(tail -50 /tmp/rev.err)
     out=$(tail -20 /tmp/rev.out)
     emit_event "$(jq -nc --arg err "$err" --arg out "$out" '{error:"acceptance failed",stderr:$err,stdout:$out}')"
-    emit_done "failed"
+    # Minimal single-finding emit — one blocker bundling the full stderr+stdout
+    # tail. Per-lint structured parsing (cargo clippy --message-format=json,
+    # test --format json) is a follow-up; the primitive is the point here.
+    combined=$(printf '%s\n---stdout---\n%s' "$err" "$out" | head -c 2000)
+    emit_finding "blocker" "cargo" "acceptance" "$combined"
+    emit_done "rework_needed"
 fi
 "##;
 

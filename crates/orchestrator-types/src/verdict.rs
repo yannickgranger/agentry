@@ -3,10 +3,18 @@
 //! Appended to `agentry:verdicts` stream. Drives the dashboard's verdict-history
 //! view and satisfies the "no verdict, no close" drift rule.
 
-use crate::{brief::BriefId, event::EventVerdict, now, Ts};
+use crate::{brief::BriefId, event::EventVerdict, now, review::ReviewFinding, Ts};
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// The terminal kind of a role's outcome.
+///
+/// `ReworkNeeded` carries findings so the daemon can route them back to the
+/// upstream worker via the team's `message_graph`. `Rejected` is the
+/// "unfixable — don't bother retrying" escape hatch; it short-circuits the
+/// rework loop and produces a `Failed` team verdict.
+///
+/// Not `Copy` — `ReworkNeeded` carries a `Vec`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VerdictKind {
     Shipped,
@@ -15,6 +23,8 @@ pub enum VerdictKind {
     PermitViolation,
     BudgetExceeded,
     Aborted,
+    Rejected,
+    ReworkNeeded { findings: Vec<ReviewFinding> },
 }
 
 impl From<EventVerdict> for VerdictKind {
@@ -23,6 +33,11 @@ impl From<EventVerdict> for VerdictKind {
             EventVerdict::Shipped => Self::Shipped,
             EventVerdict::Failed => Self::Failed,
             EventVerdict::Escalated => Self::Escalated,
+            EventVerdict::Rejected => Self::Rejected,
+            // Findings travel as separate events and are merged by the
+            // spawner's `compute_verdict` — this placeholder lets callers
+            // with no accumulated findings still produce a valid kind.
+            EventVerdict::ReworkNeeded => Self::ReworkNeeded { findings: vec![] },
         }
     }
 }
@@ -79,5 +94,39 @@ mod tests {
             VerdictKind::Shipped
         );
         assert_eq!(VerdictKind::from(EventVerdict::Failed), VerdictKind::Failed);
+    }
+
+    #[test]
+    fn rejected_roundtrips() {
+        let v = Verdict::new(BriefId("brf_xyz".into()), VerdictKind::Rejected)
+            .with_reason("fundamentally wrong approach");
+        let s = serde_json::to_string(&v).expect("ser");
+        let back: Verdict = serde_json::from_str(&s).expect("de");
+        assert_eq!(v, back);
+    }
+
+    #[test]
+    fn rework_needed_roundtrips() {
+        use crate::review::{FindingOrigin, ReviewFinding, Severity};
+        let v = Verdict::new(
+            BriefId("brf_xyz".into()),
+            VerdictKind::ReworkNeeded {
+                findings: vec![ReviewFinding {
+                    file: Some("src/lib.rs".into()),
+                    line: Some(10),
+                    severity: Severity::Blocker,
+                    origin: FindingOrigin::Mechanical {
+                        tool: "clippy".into(),
+                        rule: None,
+                    },
+                    category: "lint".into(),
+                    message: "example".into(),
+                    suggested_fix: None,
+                }],
+            },
+        );
+        let s = serde_json::to_string(&v).expect("ser");
+        let back: Verdict = serde_json::from_str(&s).expect("de");
+        assert_eq!(v, back);
     }
 }
