@@ -397,32 +397,66 @@ async fn handle_brief(
         return Ok(());
     }
 
-    // Chain trigger: if every role shipped AND the brief's payload names a
-    // `next_brief_ref` (an absolute file path containing another Brief JSON),
-    // submit that brief to the queue.
-    if let Some(next_ref) = brief.payload.get("next_brief_ref").and_then(|v| v.as_str()) {
-        match tokio::fs::read_to_string(next_ref).await {
-            Ok(text) => match serde_json::from_str::<Brief>(&text) {
-                Ok(next_brief) => {
-                    redis_io::submit_brief(conn, &next_brief).await?;
-                    tracing::info!(
-                        from = %brief.id,
-                        next = %next_brief.id,
-                        path = %next_ref,
-                        "chain trigger: next brief submitted"
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(path=%next_ref, error=%e, "chain: next brief JSON parse failed");
-                }
-            },
-            Err(e) => {
-                tracing::warn!(path=%next_ref, error=%e, "chain: next brief file read failed");
-            }
+    // Chain trigger: if every role shipped AND the brief's payload names
+    // one or more next briefs (each an absolute file path containing another
+    // Brief JSON), submit each to the queue. Plural form `next_brief_refs`
+    // (JSON array of strings) takes precedence; singular `next_brief_ref`
+    // is preserved for backward compatibility.
+    for next_ref in next_brief_paths(&brief.payload) {
+        if let Some(next_brief) = load_next_brief(&next_ref).await {
+            redis_io::submit_brief(conn, &next_brief).await?;
+            tracing::info!(
+                from = %brief.id,
+                next = %next_brief.id,
+                path = %next_ref,
+                "chain trigger: next brief submitted"
+            );
         }
     }
 
     Ok(())
+}
+
+/// Extract the ordered list of next-brief file paths from `payload`.
+/// Plural `next_brief_refs` (array of strings) takes precedence; falls back
+/// to singular `next_brief_ref` for backward compatibility. Non-string
+/// entries in the plural array are logged at WARN and skipped.
+fn next_brief_paths(payload: &serde_json::Value) -> Vec<String> {
+    if let Some(arr) = payload.get("next_brief_refs").and_then(|v| v.as_array()) {
+        let mut paths = Vec::with_capacity(arr.len());
+        for v in arr {
+            match v.as_str() {
+                Some(s) => paths.push(s.to_string()),
+                None => {
+                    tracing::warn!(value = %v, "chain: next_brief_refs entry is not a string; skipping");
+                }
+            }
+        }
+        return paths;
+    }
+    if let Some(s) = payload.get("next_brief_ref").and_then(|v| v.as_str()) {
+        return vec![s.to_string()];
+    }
+    Vec::new()
+}
+
+/// Read and deserialize a Brief from `path`. Returns `None` on read or parse
+/// failure; each is logged at WARN so the chain-trigger loop can skip the
+/// bad entry without aborting the others.
+async fn load_next_brief(path: &str) -> Option<Brief> {
+    match tokio::fs::read_to_string(path).await {
+        Ok(text) => match serde_json::from_str::<Brief>(&text) {
+            Ok(b) => Some(b),
+            Err(e) => {
+                tracing::warn!(path=%path, error=%e, "chain: next brief JSON parse failed");
+                None
+            }
+        },
+        Err(e) => {
+            tracing::warn!(path=%path, error=%e, "chain: next brief file read failed");
+            None
+        }
+    }
 }
 
 /// True iff every upstream role of `role` is in `shipped`. Roles with no
@@ -676,5 +710,121 @@ mod tests {
         let t = diamond_team();
         let sub = downstream_subdag(&rn("shipper"), &t);
         assert!(sub.is_empty());
+    }
+
+    fn make_child_brief(id: &str) -> Brief {
+        let mut b = Brief::new(
+            "test",
+            VersionedRef::new("test-team", 1),
+            serde_json::json!({}),
+        );
+        b.id = BriefId(id.into());
+        b
+    }
+
+    async fn write_brief(dir: &std::path::Path, name: &str, brief: &Brief) -> String {
+        let path = dir.join(name);
+        let body = serde_json::to_string(brief).expect("serialize brief");
+        tokio::fs::write(&path, body).await.expect("write brief");
+        path.to_str().expect("utf8 path").to_string()
+    }
+
+    #[tokio::test]
+    async fn chain_trigger_dispatches_plural_next_brief_refs() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let b1 = make_child_brief("brf_chain_a");
+        let b2 = make_child_brief("brf_chain_b");
+        let p1 = write_brief(tmp.path(), "a.json", &b1).await;
+        let p2 = write_brief(tmp.path(), "b.json", &b2).await;
+
+        let payload = serde_json::json!({ "next_brief_refs": [p1, p2] });
+        let paths = next_brief_paths(&payload);
+        assert_eq!(paths.len(), 2);
+
+        let mut loaded: Vec<Brief> = Vec::new();
+        for p in &paths {
+            if let Some(b) = load_next_brief(p).await {
+                loaded.push(b);
+            }
+        }
+        assert_eq!(loaded.len(), 2, "both child briefs should load");
+        assert_eq!(loaded[0].id, b1.id);
+        assert_eq!(loaded[1].id, b2.id);
+    }
+
+    #[tokio::test]
+    async fn chain_trigger_skips_bad_path_continues_others() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let b_good = make_child_brief("brf_chain_good");
+        let p_good = write_brief(tmp.path(), "good.json", &b_good).await;
+
+        let payload = serde_json::json!({
+            "next_brief_refs": ["/tmp/agentry-does-not-exist-xyz-47", p_good],
+        });
+        let paths = next_brief_paths(&payload);
+        assert_eq!(paths.len(), 2);
+
+        let mut loaded: Vec<Brief> = Vec::new();
+        for p in &paths {
+            if let Some(b) = load_next_brief(p).await {
+                loaded.push(b);
+            }
+        }
+        assert_eq!(loaded.len(), 1, "bad path is skipped, valid one survives");
+        assert_eq!(loaded[0].id, b_good.id);
+    }
+
+    #[tokio::test]
+    async fn chain_trigger_single_form_backward_compat() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let b = make_child_brief("brf_chain_legacy");
+        let p = write_brief(tmp.path(), "legacy.json", &b).await;
+
+        let payload = serde_json::json!({ "next_brief_ref": p });
+        let paths = next_brief_paths(&payload);
+        assert_eq!(paths, vec![p.clone()]);
+
+        let loaded = load_next_brief(&paths[0]).await.expect("brief loads");
+        assert_eq!(loaded.id, b.id);
+    }
+
+    #[tokio::test]
+    async fn chain_trigger_plural_takes_precedence_over_singular() {
+        let payload = serde_json::json!({
+            "next_brief_refs": ["/tmp/p1", "/tmp/p2"],
+            "next_brief_ref": "/tmp/legacy",
+        });
+        let paths = next_brief_paths(&payload);
+        assert_eq!(paths, vec!["/tmp/p1".to_string(), "/tmp/p2".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn chain_trigger_skips_non_string_array_entries() {
+        let payload = serde_json::json!({
+            "next_brief_refs": ["/tmp/ok", 42, "/tmp/also-ok"],
+        });
+        let paths = next_brief_paths(&payload);
+        assert_eq!(
+            paths,
+            vec!["/tmp/ok".to_string(), "/tmp/also-ok".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn chain_trigger_no_refs_yields_empty() {
+        let payload = serde_json::json!({});
+        assert!(next_brief_paths(&payload).is_empty());
+    }
+
+    #[tokio::test]
+    async fn chain_trigger_load_returns_none_on_bad_json() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let p = tmp.path().join("garbage.json");
+        tokio::fs::write(&p, b"{ not json")
+            .await
+            .expect("write garbage");
+        assert!(load_next_brief(p.to_str().expect("utf8 path"))
+            .await
+            .is_none());
     }
 }
