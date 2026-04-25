@@ -81,3 +81,4 @@ Rootless podman on the dev box. Local `agentry-dev-redis` container on `127.0.0.
 - `AGENTRY_RESUME.md` — current state for session resumption.
 - `TODO.md` — tracker-style view of what's next.
 - `docs/PROPOSAL.md` — original design proposal (2026-04-23).
+_poc_v5: 2026-04-25_
