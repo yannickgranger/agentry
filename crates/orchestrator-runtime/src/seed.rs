@@ -1131,17 +1131,22 @@ DISCOVERY (size=${discovery_size} bytes, truncated=${discovery_truncated}):
 $discovery_excerpt
 
 CHILD BOILERPLATE (apply to every element):
-- topology: $child_topology
 - target_repo: $target_repo
 - base_branch: $base_branch
 - budget.max_wall_seconds: 900
 - escalation: autonomous
+
+TOPOLOGY SELECTION — pick per child by task signature:
+- agentry-spec-edit-v0  → specs/* or docs/* changes only, no Rust code touched
+- agentry-bugfix-v0     → sub-30-LOC bug fix in Rust, no new types/traits, no spec change
+- agentry-self-host-v0  → everything else (default; new features, schema changes, multi-file refactors)
 
 Output EXACTLY one JSON array — no markdown fences, no prose. Cap at
 $max_children elements. Schema per element:
 
 {
   "title": "<short verb-payload title>",
+  "topology": "agentry-self-host-v0" | "agentry-bugfix-v0" | "agentry-spec-edit-v0",
   "verbs": "<full verb-payload markdown using CREATE/UPDATE/REPLACE/DELETE/MOVE>",
   "acceptance": "<bash command, e.g. cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace>",
   "estimated_files": ["<crate>:<file>"]
@@ -1186,6 +1191,10 @@ while [ "$i" -lt "$count" ]; do
     title=$(printf '%s' "$elem" | jq -r '.title // ""')
     verbs=$(printf '%s' "$elem" | jq -r '.verbs // ""')
     acceptance=$(printf '%s' "$elem" | jq -r '.acceptance // ""')
+    elem_topology=$(printf '%s' "$elem" | jq -r '.topology // empty')
+    if [ -z "$elem_topology" ] || [ "$elem_topology" = "null" ]; then
+        elem_topology="$child_topology"
+    fi
 
     pr_title="auto(planner-${brief_id}): ${title}"
     pr_body="Authored by planner-claude-agentry from meta-brief ${brief_id}. Verbs:
@@ -1195,7 +1204,7 @@ ${verbs}"
     child_path="/workspace/planner-children/child-${i}.json"
     jq -nc \
         --arg id "brf_planner_${brief_id}_child_${i}" \
-        --arg topology "$child_topology" \
+        --arg topology "$elem_topology" \
         --arg title "$title" \
         --arg verbs "$verbs" \
         --arg acceptance "$acceptance" \
