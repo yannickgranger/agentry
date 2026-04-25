@@ -49,3 +49,4 @@ must have a heading in `specs/concepts/`; every heading in
 `specs/concepts/` must have a matching pub type. Zero tolerance, no
 baseline. Signature- and relationship-level gates are added later, rule
 by rule — see `.cfdb/README.md`.
+_poc_v6: 2026-04-25_
