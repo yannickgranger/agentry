@@ -119,3 +119,4 @@ a git worktree off a shared bare clone of `repo_url`, tracking
 `base_branch`. Briefs without a project fall back to reading `target_repo`
 + `base_branch` from `brief.payload` — this is the transitional path until
 every brief carries a project.
+_poc_v4: 2026-04-25_
