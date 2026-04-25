@@ -26,6 +26,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Async + Redis
 redis = { version = "0.27", features = ["tokio-comp", "streams", "aio", "connection-manager"] }
 async-trait = "0.1"
+futures = "0.3"
 
 # Time + IDs
 chrono = { version = "0.4", features = ["serde"] }

@@ -50,6 +50,17 @@ in `agentry-self-host-v0` reads its inputs (`pr_number`, `pr_url`,
 `head_sha`) entirely from `TeamContext.messages`; the shipper emits a
 Message addressed to the ci-watcher immediately before `emit_done "shipped"`.
 
+The team's `message_graph` defines both message routing AND the execution
+DAG. Roles with no inbound edges fire first; roles with multiple inbound
+edges fire when ALL their upstreams have shipped (the join). Sibling roles
+with identical upstream sets run concurrently via `tokio::join!`. The
+daemon's sequential iteration is gone; rework still rewinds to the single
+upstream named by `team.incoming(role).first()`, but the downstream
+sub-DAG re-enters the pending state on rework and re-fires when upstream
+ships again. Concurrent roles share the brief workspace as readers; the
+DAG must be authored so that at most one parallel role mutates the
+workspace at a time.
+
 ## AgentHandle
 
 The teardown-facing reference to a spawned container: agent id and
