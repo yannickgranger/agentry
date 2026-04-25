@@ -821,23 +821,58 @@ for i in $(seq 1 "$max_polls"); do
         '{msg:"polling CI",state:$s,iteration:$i}')"
     case "$state" in
         success)
+            # Merge with retry on transient 405/409. When N parallel children
+            # all turn CI-green within the same second, the forge serialises
+            # merges: only the first lands cleanly. The losers see 405
+            # ("Please try again later" — rate-limit / mergeability still
+            # recomputing) or 409 ("refusing to merge unrelated histories" —
+            # ref moved under us). Both clear once the leader's merge lands;
+            # retry with backoff + jitter unblocks the squad. Other codes
+            # (401, 422, ...) are non-transient — fail fast to preserve
+            # diagnostics.
             merge_body='{"Do":"merge"}'
-            merge_resp=$(curl -sS -k -X POST \
-                "https://${forge_host}/api/v1/repos/${owner}/${repo_name}/pulls/${pr_number}/merge" \
-                -H "Authorization: token ${GITEA_TOKEN}" \
-                -H "Content-Type: application/json" \
-                -d "$merge_body" \
-                -o /tmp/merge.body -w '%{http_code}')
-            if [ "$merge_resp" = "200" ] || [ "$merge_resp" = "204" ]; then
-                emit_event "$(jq -nc --argjson n "$pr_number" --arg u "$pr_url" \
-                    '{msg:"merged",pr_number:$n,pr_url:$u}')"
-                emit_done "shipped"; exit 0
-            else
-                detail=$(cat /tmp/merge.body 2>/dev/null || echo "")
-                emit_event "$(jq -nc --arg code "$merge_resp" --arg d "$detail" \
-                    '{error:"merge API call failed",http_code:$code,detail:$d}')"
+            merge_max_retries=6
+            merge_attempt=0
+            merge_http_code=""
+            merge_detail=""
+            while [ "$merge_attempt" -lt "$merge_max_retries" ]; do
+                merge_attempt=$((merge_attempt + 1))
+                merge_http_code=$(curl -sS -k -X POST \
+                    "https://${forge_host}/api/v1/repos/${owner}/${repo_name}/pulls/${pr_number}/merge" \
+                    -H "Authorization: token ${GITEA_TOKEN}" \
+                    -H "Content-Type: application/json" \
+                    -d "$merge_body" \
+                    -o /tmp/merge.body -w '%{http_code}')
+                merge_detail=$(cat /tmp/merge.body 2>/dev/null || echo "")
+                if [ "$merge_http_code" = "200" ] || [ "$merge_http_code" = "204" ]; then
+                    emit_event "$(jq -nc --argjson n "$pr_number" --arg u "$pr_url" --argjson a "$merge_attempt" \
+                        '{msg:"merged",pr_number:$n,pr_url:$u,merge_attempt:$a}')"
+                    emit_done "shipped"; exit 0
+                fi
+                if [ "$merge_http_code" = "405" ] || [ "$merge_http_code" = "409" ]; then
+                    if [ "$merge_attempt" -lt "$merge_max_retries" ]; then
+                        merge_backoff=$((10 * merge_attempt))
+                        if [ "$merge_backoff" -gt 60 ]; then
+                            merge_backoff=60
+                        fi
+                        merge_jitter=$((RANDOM % 10))
+                        merge_sleep=$((merge_backoff + merge_jitter))
+                        emit_event "$(jq -nc --arg code "$merge_http_code" --arg d "$merge_detail" --argjson a "$merge_attempt" --argjson s "$merge_sleep" \
+                            '{msg:"merge transient failure — retrying",http_code:$code,detail:$d,merge_attempt:$a,sleep_seconds:$s}')"
+                        sleep "$merge_sleep"
+                        continue
+                    fi
+                    # transient but budget exhausted — falls through to post-loop branch
+                    break
+                fi
+                # Non-transient: fail immediately, preserves diagnostics.
+                emit_event "$(jq -nc --arg code "$merge_http_code" --arg d "$merge_detail" --argjson a "$merge_attempt" \
+                    '{error:"merge API call failed (non-transient)",http_code:$code,detail:$d,merge_attempt:$a}')"
                 emit_done "failed"; exit 0
-            fi
+            done
+            emit_event "$(jq -nc --arg code "$merge_http_code" --arg d "$merge_detail" --argjson a "$merge_attempt" --argjson m "$merge_max_retries" \
+                '{error:"merge retry budget exhausted (transient)",http_code:$code,detail:$d,merge_attempt:$a,merge_max_retries:$m}')"
+            emit_done "failed"; exit 0
             ;;
         failure|error)
             # Pull the first failing context for reason.
@@ -2565,5 +2600,58 @@ mod tests {
             .expect("verifier needs workspace_mount");
         assert_eq!(ws.container_path, "/workspace");
         assert!(ws.readonly, "verifier workspace must be read-only");
+    }
+
+    #[test]
+    fn ci_watcher_merge_retries_transient_405_and_409() {
+        let s = CI_WATCHER_AGENTRY_SCRIPT;
+
+        // Retry budget identifier is present.
+        assert!(
+            s.contains("merge_max_retries"),
+            "ci-watcher must declare a merge_max_retries budget"
+        );
+
+        // Both transient codes are explicitly handled as retry triggers.
+        assert!(
+            s.contains("\"405\""),
+            "ci-watcher must treat 405 as a retry-able transient code"
+        );
+        assert!(
+            s.contains("\"409\""),
+            "ci-watcher must treat 409 as a retry-able transient code"
+        );
+
+        // Backoff uses sleep + $RANDOM jitter.
+        assert!(
+            s.contains("sleep \"$merge_sleep\""),
+            "ci-watcher must sleep between merge retries"
+        );
+        assert!(
+            s.contains("RANDOM"),
+            "ci-watcher must use $RANDOM for jitter to avoid thundering herd"
+        );
+        assert!(
+            s.contains("merge_jitter"),
+            "ci-watcher must compute a named merge_jitter from $RANDOM"
+        );
+
+        // Non-transient failures are explicitly distinguished and fail fast.
+        assert!(
+            s.contains("non-transient"),
+            "ci-watcher must distinguish non-transient merge failures explicitly"
+        );
+
+        // Successful merge event carries the attempt count.
+        assert!(
+            s.contains("merge_attempt:$a"),
+            "ci-watcher merged event must include the merge_attempt count"
+        );
+
+        // Budget-exhaustion path emits the last http code + body and fails.
+        assert!(
+            s.contains("merge retry budget exhausted"),
+            "ci-watcher must emit a budget-exhausted error event when retries run out"
+        );
     }
 }
