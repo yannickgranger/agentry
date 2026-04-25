@@ -80,3 +80,4 @@ Adding, renaming, or removing a top-level `pub struct/enum/trait/type` without u
 Prior to the current state, the project landed in a 2-hour burst of M0-M8 theater milestones on a dead feature branch, all demonstrating shell scripts emitting what their own verify greps expected. That work was reframed: specs + cfdb gate installed (PR #4), per-agent Containerfiles consolidated into inline scripts + `package_manager` + `entrypoint_script` (PRs #2 then #15), infra for real self-hosting added (PRs #18 = recovered #16 + #17).
 
 The milestone-number narrative does not return. Every future change is a verb-targeted brief against a specced codebase.
+_poc_v5: 2026-04-25_
