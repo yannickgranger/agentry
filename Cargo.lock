@@ -1093,6 +1093,7 @@ dependencies = [
  "clap",
  "ed25519-dalek",
  "figment",
+ "futures",
  "hex",
  "orchestrator-types",
  "rand_core",

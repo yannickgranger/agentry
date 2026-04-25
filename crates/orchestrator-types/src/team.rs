@@ -87,6 +87,20 @@ impl TeamTopology {
             .filter(|e| e.to == *role)
             .collect()
     }
+
+    /// Distinct upstream role names that feed this role (deduplicated `from`
+    /// of `incoming(role)`). Used by the DAG walker to decide when a role's
+    /// inbound joins are satisfied.
+    #[must_use]
+    pub fn inbound_roles(&self, role: &RoleName) -> Vec<&RoleName> {
+        let mut out: Vec<&RoleName> = Vec::new();
+        for edge in self.incoming(role) {
+            if !out.iter().any(|r| **r == edge.from) {
+                out.push(&edge.from);
+            }
+        }
+        out
+    }
 }
 
 #[cfg(test)]
@@ -152,6 +166,41 @@ mod tests {
         };
         assert!(t.outgoing(&rn("echo-agent")).is_empty());
         assert!(t.incoming(&rn("echo-agent")).is_empty());
+    }
+
+    #[test]
+    fn inbound_roles_dedup_and_order() {
+        // Two upstreams routing to `to` via two edges from one of them — the
+        // helper should deduplicate, preserving first-seen order.
+        let t = TeamTopology {
+            name: TeamName("t".into()),
+            version: 1,
+            roles: vec![rn("a"), rn("b"), rn("c")],
+            message_graph: vec![
+                MessageEdge {
+                    from: rn("a"),
+                    to: rn("c"),
+                    permit_overrides_from: None,
+                },
+                MessageEdge {
+                    from: rn("b"),
+                    to: rn("c"),
+                    permit_overrides_from: None,
+                },
+                MessageEdge {
+                    from: rn("a"),
+                    to: rn("c"),
+                    permit_overrides_from: Some("k".into()),
+                },
+            ],
+            terminal_role: rn("c"),
+            max_retries: 0,
+        };
+        let upstreams = t.inbound_roles(&rn("c"));
+        assert_eq!(upstreams.len(), 2);
+        assert_eq!(upstreams[0], &rn("a"));
+        assert_eq!(upstreams[1], &rn("b"));
+        assert!(t.inbound_roles(&rn("a")).is_empty());
     }
 
     #[test]

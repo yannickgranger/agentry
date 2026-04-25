@@ -93,6 +93,7 @@ pub trait Spawner: Send + Sync {
 }
 
 /// Podman spawner.
+#[derive(Clone)]
 pub struct PodmanSpawner;
 
 impl PodmanSpawner {

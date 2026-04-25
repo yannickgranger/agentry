@@ -24,6 +24,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 redis.workspace = true
 async-trait.workspace = true
+futures.workspace = true
 chrono.workspace = true
 uuid.workspace = true
 clap.workspace = true
