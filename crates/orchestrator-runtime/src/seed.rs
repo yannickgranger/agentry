@@ -860,6 +860,17 @@ emit_event '{"error":"CI poll exhausted 30min without success — giving up"}'
 emit_done "failed"
 "##;
 
+/// Null role for `agentry-null-v0` team. Emits one event then `done shipped`
+/// and exits. Zero work — used as a shake-down for the role-introduction
+/// pipeline (reviewer-claude `Role-spec audit` clause; permit broker; spawner
+/// teardown). NOT a probe role's substrate-style probe; deliberately the
+/// simplest possible AgentRole.
+const NULL_AGENT_AGENTRY_SCRIPT: &str = r#"#!/usr/bin/env bash
+set -euo pipefail
+emit_event '{"msg":"null-agent shake-down","status":"ok"}'
+emit_done "shipped"
+"#;
+
 const SHIPPER_SCRIPT: &str = r#"#!/usr/bin/env bash
 # Reads {repo, branch, file, content, commit_msg, pr_title, pr_body, base,
 # forge_host} from brief.payload. Clones forge repo with GITEA_TOKEN,
@@ -1543,6 +1554,40 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         workspace_mount: None,
         sccache: false,
     };
+    // ---- agentry-null-v0 team (shake-down for role-introduction pipeline) ----
+    // null-agent emits one event then `done shipped`. Zero work — exercises
+    // the reviewer-claude Role-spec audit clause, permit broker, and spawner
+    // teardown on a deliberately minimal-permitted, well-formed role before
+    // real planner roles (archaeologist, planner, verifier) land.
+    let null_agent_agentry = AgentRole {
+        name: RoleName("null-agent-agentry".into()),
+        version: 1,
+        model: None,
+        system_prompt: None,
+        image: ALPINE.into(),
+        substrate_class: SubstrateClass::Podman,
+        package_manager: PackageManager::Apk,
+        entrypoint_script: format!("{BASH_PRELUDE}{NULL_AGENT_AGENTRY_SCRIPT}"),
+        exitpoint_script: None,
+        binaries: vec![],
+        mcp_servers: vec![],
+        tool_allowlist: ToolAllowlist::default(),
+        permit_scope: PermitScope::default(),
+        passthru_env: vec![],
+        extra_bootstrap: vec![],
+        mounts: vec![],
+        workspace_mount: None,
+        sccache: false,
+    };
+    let agentry_null_v0 = TeamTopology {
+        name: TeamName("agentry-null-v0".into()),
+        version: 1,
+        roles: vec![null_agent_agentry.name.clone()],
+        message_graph: Vec::<MessageEdge>::new(),
+        terminal_role: null_agent_agentry.name.clone(),
+        max_retries: 0,
+    };
+
     let agentry_self_host_v0 = TeamTopology {
         name: TeamName("agentry-self-host-v0".into()),
         version: 1,
@@ -1620,9 +1665,11 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
     redis_io::save_role(&mut conn, &shipper_agentry).await?;
     redis_io::save_role(&mut conn, &ci_watcher_agentry).await?;
     redis_io::save_team(&mut conn, &agentry_self_host_v0).await?;
+    redis_io::save_role(&mut conn, &null_agent_agentry).await?;
+    redis_io::save_team(&mut conn, &agentry_null_v0).await?;
 
     tracing::info!(
-        "seeded: roles [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker, listener, grok-echo, claude-echo, synthesizer, narrowed-coder, shipper, coder-claude-agentry, reviewer-mechanical-agentry, shipper-agentry, ci-watcher-agentry, reviewer-claude-agentry] (inline entrypoint scripts); teams [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker-listener, grok-echo, claude-echo, narrowed-team, shipper-solo-team, agentry-self-host-v0]"
+        "seeded: roles [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker, listener, grok-echo, claude-echo, synthesizer, narrowed-coder, shipper, coder-claude-agentry, reviewer-mechanical-agentry, shipper-agentry, ci-watcher-agentry, reviewer-claude-agentry, null-agent-agentry] (inline entrypoint scripts); teams [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker-listener, grok-echo, claude-echo, narrowed-team, shipper-solo-team, agentry-self-host-v0, agentry-null-v0]"
     );
     Ok(())
 }
@@ -1645,5 +1692,25 @@ mod tests {
             REVIEWER_CLAUDE_AGENTRY_SCRIPT.contains("tool_allowlist"),
             "Role-spec audit clause must reference tool_allowlist"
         );
+    }
+
+    #[test]
+    fn null_agent_agentry_script_minimal() {
+        assert!(
+            NULL_AGENT_AGENTRY_SCRIPT.contains("emit_done \"shipped\""),
+            "null-agent script must emit shipped"
+        );
+        assert!(
+            NULL_AGENT_AGENTRY_SCRIPT.contains("emit_event"),
+            "null-agent script must emit at least one event"
+        );
+        // Defensive: forbid claude / git / curl / cargo references in the body.
+        for forbidden in ["claude", "git ", "curl", "cargo"] {
+            assert!(
+                !NULL_AGENT_AGENTRY_SCRIPT.contains(forbidden),
+                "null-agent script must not contain {}",
+                forbidden
+            );
+        }
     }
 }
