@@ -1262,8 +1262,8 @@ fn build_archaeologist_claude_agentry_role(home: &str, claude_settings_path: &st
         extra_bootstrap: vec![
             "rustup component add rustfmt clippy".into(),
             "git config --global http.sslVerify false".into(),
-            "CARGO_NET_GIT_FETCH_WITH_CLI=true cargo install --git https://oauth2:${GITEA_TOKEN}@agency.lab:3000/yg/cfdb.git --rev 02c5a45 --bin cfdb --root /usr/local --locked --quiet".into(),
-            "CARGO_NET_GIT_FETCH_WITH_CLI=true cargo install --git https://oauth2:${GITEA_TOKEN}@agency.lab:3000/yg/graph-specs-rust.git --rev ecaedb9 --bin graph-specs --root /usr/local --locked --quiet".into(),
+            "CARGO_NET_GIT_FETCH_WITH_CLI=true cargo install --git https://oauth2:${GITEA_TOKEN}@agency.lab:3000/yg/cfdb.git --rev 02c5a45 --root /usr/local --locked --quiet cfdb-cli || true".into(),
+            "CARGO_NET_GIT_FETCH_WITH_CLI=true cargo install --git https://oauth2:${GITEA_TOKEN}@agency.lab:3000/yg/graph-specs-rust.git --rev ecaedb9 --root /usr/local --locked --quiet application || true".into(),
         ],
         mounts: vec![
             Mount {
@@ -2355,6 +2355,41 @@ mod tests {
         assert!(
             bootstrap_joined.contains("graph-specs"),
             "extra_bootstrap must cargo install graph-specs"
+        );
+    }
+
+    #[test]
+    fn archaeologist_bootstrap_uses_canonical_cargo_install_pattern() {
+        let role = build_archaeologist_claude_agentry_role(
+            "/var/home/test",
+            "/var/home/test/.config/agentry/claude-container-settings.json",
+        );
+        let bootstrap_text = role.extra_bootstrap.join("\n");
+
+        // cfdb install: must use positional cfdb-cli, must not use --bin cfdb
+        assert!(
+            bootstrap_text.contains("cfdb-cli"),
+            "archaeologist must install cfdb-cli (positional package name); current: {bootstrap_text}"
+        );
+        assert!(
+            !bootstrap_text.contains("--bin cfdb "),
+            "archaeologist must NOT use --bin cfdb (cfdb workspace has multiple binaries; use positional cfdb-cli)"
+        );
+
+        // graph-specs install: must use positional application
+        assert!(
+            bootstrap_text.contains(" application "),
+            "archaeologist must install graph-specs via positional 'application' package"
+        );
+        assert!(
+            !bootstrap_text.contains("--bin graph-specs"),
+            "archaeologist must NOT use --bin graph-specs (use positional 'application')"
+        );
+
+        // Fault tolerance — matches existing reviewer-mechanical-agentry pattern.
+        assert!(
+            bootstrap_text.contains("|| true"),
+            "archaeologist cargo installs must include || true fault tolerance"
         );
     }
 
