@@ -10,7 +10,7 @@
 //! Only Podman is implemented today; other substrates (Docker, LXC, SSH, VM)
 //! will land as sibling adapters implementing the same `Spawner` trait.
 
-use crate::{permit as permit_mod, redis_io, workspace::BriefWorkspace, Error, Result};
+use crate::{delivery, permit as permit_mod, redis_io, workspace::BriefWorkspace, Error, Result};
 use async_trait::async_trait;
 use ed25519_dalek::VerifyingKey;
 use orchestrator_types::{
@@ -332,6 +332,7 @@ impl Spawner for PodmanSpawner {
                                 );
                                 permit_violation = Some(reason);
                                 redis_io::append_trace(conn, &brief.id, agent_id, &ev).await?;
+                                let _ = delivery::record(conn, &brief.id, agent_id, &ev).await;
                                 let _ = tokio::process::Command::new("podman")
                                     .args(["stop", "-t", "1", &name])
                                     .output()
@@ -353,6 +354,7 @@ impl Spawner for PodmanSpawner {
                             findings.push(finding.clone());
                         }
                         redis_io::append_trace(conn, &brief.id, agent_id, &ev).await?;
+                        let _ = delivery::record(conn, &brief.id, agent_id, &ev).await;
                         if ev.is_terminal() {
                             terminal = Some(ev);
                             break;
