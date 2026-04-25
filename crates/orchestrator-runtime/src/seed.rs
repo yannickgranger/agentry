@@ -1404,6 +1404,19 @@ else
 fi
 "##;
 
+const AUDITOR_CLAUDE_AGENTRY_SCRIPT: &str = r##"#!/usr/bin/env bash
+set -uo pipefail
+cd /workspace || { emit_event '{"error":"cd /workspace failed"}'; emit_done "failed"; exit 0; }
+emit_event '{"msg":"auditor starting"}'
+clippy_out=$(cargo clippy --workspace --all-targets -- -D warnings 2>&1 | tail -c 8192 || true)
+emit_event "$(jq -nc --arg out "$clippy_out" '{msg:"clippy_report",out:$out}')"
+build_out=$(RUSTFLAGS="-Dwarnings" cargo build --workspace 2>&1 | tail -c 8192 || true)
+emit_event "$(jq -nc --arg out "$build_out" '{msg:"build_report",out:$out}')"
+test_out=$(cargo test --workspace 2>&1 | tail -c 8192 || true)
+emit_event "$(jq -nc --arg out "$test_out" '{msg:"test_report",out:$out}')"
+emit_done "shipped"
+"##;
+
 /// Build the verifier-claude-agentry role. Despite the `claude` in the name —
 /// kept for symmetry with the other agentry-* roles — the verifier never
 /// invokes claude; it just runs `success_criteria` as a shell command on a
@@ -2316,6 +2329,42 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         max_retries: 1,
     };
 
+    let auditor_claude_agentry = AgentRole {
+        name: RoleName("auditor-claude-agentry".into()),
+        version: 1,
+        model: None,
+        system_prompt: None,
+        image: "docker.io/library/rust:1.93".into(),
+        substrate_class: SubstrateClass::Podman,
+        package_manager: PackageManager::Apt,
+        entrypoint_script: format!("{BASH_PRELUDE}{AUDITOR_CLAUDE_AGENTRY_SCRIPT}"),
+        exitpoint_script: None,
+        binaries: vec![],
+        mcp_servers: vec![],
+        tool_allowlist: ToolAllowlist(vec![]),
+        permit_scope: PermitScope(vec![
+            "fs:read:/workspace/**".into(),
+            "fs:write:/workspace/**".into(),
+            "net:allow:agentry-sccache-redis".into(),
+        ]),
+        passthru_env: vec![],
+        extra_bootstrap: vec!["rustup component add rustfmt clippy".into()],
+        mounts: vec![],
+        workspace_mount: Some(WorkspaceMount {
+            container_path: "/workspace".into(),
+            readonly: false,
+        }),
+        sccache: true,
+    };
+    let agentry_self_audit_v0 = TeamTopology {
+        name: TeamName("agentry-self-audit-v0".into()),
+        version: 1,
+        roles: vec![auditor_claude_agentry.name.clone()],
+        message_graph: Vec::<MessageEdge>::new(),
+        terminal_role: auditor_claude_agentry.name.clone(),
+        max_retries: 0,
+    };
+
     // ---- persist everything ----
     redis_io::save_role(&mut conn, &echo).await?;
     redis_io::save_team(&mut conn, &echo_team).await?;
@@ -2347,6 +2396,8 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
     redis_io::save_team(&mut conn, &agentry_self_host_v0).await?;
     redis_io::save_team(&mut conn, &agentry_bugfix_v0).await?;
     redis_io::save_team(&mut conn, &agentry_spec_edit_v0).await?;
+    redis_io::save_role(&mut conn, &auditor_claude_agentry).await?;
+    redis_io::save_team(&mut conn, &agentry_self_audit_v0).await?;
     redis_io::save_role(&mut conn, &null_agent_agentry).await?;
     redis_io::save_team(&mut conn, &agentry_null_v0).await?;
     redis_io::save_role(&mut conn, &archaeologist_claude_agentry).await?;
