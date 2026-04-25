@@ -176,7 +176,7 @@ fi
 
 emit_event "$(jq -nc --arg p "$prompt" '{msg:"calling Claude Max (headless)", prompt_chars:($p|length)}')"
 
-reply=$(HOME=/root claude -p "$prompt" 2>&1) || {
+reply=$(HOME=/root timeout 600 claude -p "$prompt" 2>&1) || {
     emit_event "$(jq -nc --arg err "$reply" '{error:"claude -p failed", detail:$err}')"
     emit_done "failed"
     exit 0
@@ -369,7 +369,7 @@ PROMPT
 
 emit_event "$(jq -nc --arg len "$(wc -c < /tmp/prompt.txt)" '{msg:"calling claude -p",prompt_bytes:$len}')"
 
-reply=$(HOME=/root claude -p "$(cat /tmp/prompt.txt)" 2>&1) || {
+reply=$(HOME=/root timeout 600 claude -p "$(cat /tmp/prompt.txt)" 2>&1) || {
     emit_event "$(jq -nc --arg err "$reply" '{error:"claude -p failed",detail:$err}')"
     emit_done "failed"; exit 0
 }
@@ -459,7 +459,7 @@ as a short description (max 200 chars each, max 6 entries).
 
 Your response, right now, starting with { and ending with }:
 PROMPT
-    sr=$(HOME=/root claude -p "$(cat /tmp/self_rev.txt)" 2>&1) || {
+    sr=$(HOME=/root timeout 600 claude -p "$(cat /tmp/self_rev.txt)" 2>&1) || {
         emit_event "$(jq -nc --arg err "$(printf '%s' "$sr" | head -c 300)" '{warn:"self-review claude call failed; proceeding",detail:$err}')"
         sr='{"all_applied":true,"unapplied":[]}'
     }
@@ -665,7 +665,7 @@ State-machine emission idempotency (CRITICAL):
 Your response, right now, starting with [ and ending with ]:
 PROMPT
 
-response=$(HOME=/root claude -p "$(cat /tmp/rev_prompt.txt)" 2>&1) || {
+response=$(HOME=/root timeout 600 claude -p "$(cat /tmp/rev_prompt.txt)" 2>&1) || {
     emit_event "$(jq -nc --arg err "$response" '{error:"claude -p failed",detail:$err}')"
     emit_done "failed"; exit 0
 }
@@ -1023,7 +1023,7 @@ PROMPT
 
 emit_event "$(jq -nc --arg len "$(wc -c < /tmp/arch_prompt.txt)" '{msg:"calling claude -p",prompt_bytes:$len}')"
 
-response=$(HOME=/root claude -p "$(cat /tmp/arch_prompt.txt)" 2>&1) || {
+response=$(HOME=/root timeout 600 claude -p "$(cat /tmp/arch_prompt.txt)" 2>&1) || {
     emit_event "$(jq -nc --arg err "$response" '{error:"claude -p failed",detail:$err}')"
     emit_done "failed"; exit 0
 }
@@ -1135,7 +1135,7 @@ PROMPT
 
 emit_event "$(jq -nc --arg len "$(wc -c < /tmp/planner_prompt.txt)" '{msg:"calling claude -p",prompt_bytes:$len}')"
 
-response=$(HOME=/root claude -p "$(cat /tmp/planner_prompt.txt)" 2>&1) || {
+response=$(HOME=/root timeout 600 claude -p "$(cat /tmp/planner_prompt.txt)" 2>&1) || {
     emit_event "$(jq -nc --arg err "$response" '{error:"claude -p failed",detail:$err}')"
     emit_done "failed"; exit 0
 }
