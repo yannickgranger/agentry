@@ -328,3 +328,5 @@ After submitting: watch the trace stream until a verdict lands. Don't
 walk away from a brief before it terminates — a stuck brief should
 itself become a bug report (either raise the budget, or investigate
 why a role didn't respect the wall-clock timeout).
+
+_poc_v6: 2026-04-25_
