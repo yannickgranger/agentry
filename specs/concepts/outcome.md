@@ -24,3 +24,5 @@ resolves the team as `Shipped` from the outside view.
 The full verdict record: brief id, kind, timestamp, trace stream reference,
 optional human-readable reason. Written to `agentry:verdicts` as an XADD
 entry and to the dashboard's SSE feed.
+
+The daemon maintains a `Delivery` projection at `agentry:delivery:<brief_id>` (Redis hash) plus an append-only attempts list at `agentry:delivery:<brief_id>:attempts`, derived from trace events. Hash carries pr_number, pr_url, branch, head_sha, ci_state, merged, terminal_kind. Attempts list captures ci_poll, merge_attempt, and rework entries. Untyped Redis access; no pub types.
