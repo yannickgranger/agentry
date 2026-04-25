@@ -871,6 +871,202 @@ emit_event '{"msg":"null-agent shake-down","status":"ok"}'
 emit_done "shipped"
 "#;
 
+/// Archaeologist role for the `agentry-discovery-v0` team. First stage of the
+/// upcoming `agentry-planner-v0` pipeline (#49). Runs `cfdb extract` and
+/// `graph-specs check --json`, optionally evaluates seed cypher queries, then
+/// asks `claude -p` to synthesize a structured `discovery.json` consumed by
+/// the planner. Mechanical-plus-narrative: cfdb + graph-specs are factual,
+/// claude produces summary + candidate list.
+const ARCHAEOLOGIST_CLAUDE_AGENTRY_SCRIPT: &str = r##"#!/usr/bin/env bash
+set -euo pipefail
+bundle="$(cat)"
+
+intent=$(jq -r '.brief.payload.intent // ""' <<<"$bundle")
+success_criteria=$(jq -r '.brief.payload.success_criteria // ""' <<<"$bundle")
+discovery_seeds=$(jq -c '.brief.payload.discovery_seeds // []' <<<"$bundle")
+
+if [ ! -d /workspace/.git ] && [ ! -f /workspace/.git ]; then
+    emit_event '{"error":"workspace missing — no .git found at /workspace"}'
+    emit_done "failed"; exit 0
+fi
+
+cd /workspace
+export HOME=/root
+
+emit_event '{"msg":"running cfdb extract"}'
+if ! cfdb extract --workspace . --db .cfdb/db-discovery --keyspace agentry > /tmp/cfdb-extract.log 2>&1; then
+    err=$(tail -30 /tmp/cfdb-extract.log)
+    emit_event "$(jq -nc --arg err "$err" '{error:"cfdb extract failed",detail:$err}')"
+    emit_done "failed"; exit 0
+fi
+
+# Pull node/edge counts from the canonical "extract: N nodes, M edges" log line.
+counts_line=$(grep -E 'extract: [0-9]+ nodes' /tmp/cfdb-extract.log | tail -1 || true)
+nodes=$(printf '%s' "$counts_line" | sed -nE 's/.*extract: ([0-9]+) nodes.*/\1/p')
+edges=$(printf '%s' "$counts_line" | sed -nE 's/.*nodes, ([0-9]+) edges.*/\1/p')
+nodes=${nodes:-0}
+edges=${edges:-0}
+emit_event "$(jq -nc --argjson n "$nodes" --argjson e "$edges" '{msg:"cfdb extract done",nodes:$n,edges:$e}')"
+
+# graph-specs check is intentionally non-fatal: violations are signal for the
+# discovery, not a stop. Capture stdout+stderr.
+graph_specs_out=$(graph-specs check --specs specs/concepts/ --code crates/ --json 2>&1 || true)
+emit_event "$(jq -nc --arg head "$(printf '%s' "$graph_specs_out" | head -c 500)" '{msg:"graph-specs done",head:$head}')"
+
+# Optional seed cypher queries against the just-built db.
+seed_results='[]'
+seed_count=$(jq 'length' <<<"$discovery_seeds")
+if [ "$seed_count" -gt 0 ]; then
+    i=0
+    while [ "$i" -lt "$seed_count" ]; do
+        q=$(jq -r ".[$i]" <<<"$discovery_seeds")
+        rows=$(cfdb query --db .cfdb/db-discovery --keyspace agentry "$q" 2>/tmp/cfdb-q.err || echo '[]')
+        if ! printf '%s' "$rows" | jq empty 2>/dev/null; then
+            rows='[]'
+        fi
+        seed_results=$(jq -nc --argjson cur "$seed_results" --arg q "$q" --argjson r "$rows" \
+            '$cur + [{query:$q, rows:$r}]')
+        i=$((i+1))
+    done
+fi
+
+cat > /tmp/arch_prompt.txt <<PROMPT
+You are the archaeologist role for the agentry project. Synthesize a
+discovery.json for downstream planner consumption based on the inputs below.
+
+INTENT:
+$intent
+
+SUCCESS CRITERIA:
+$success_criteria
+
+CFDB EXTRACT SUMMARY:
+nodes=$nodes, edges=$edges
+
+GRAPH-SPECS OUTPUT (first 4000 chars):
+$(printf '%s' "$graph_specs_out" | head -c 4000)
+
+SEED-QUERY RESULTS (JSON):
+$seed_results
+
+Output EXACTLY one JSON object — no markdown fences, no prose. Schema:
+
+{
+  "intent": "<copied verbatim from INTENT above>",
+  "summary": "<1-3 sentence narrative about workspace state relative to intent>",
+  "raw_facts": {
+    "cfdb": {"nodes": $nodes, "edges": $edges},
+    "graph_specs_violations": [<pass-through of any violations parsed from GRAPH-SPECS OUTPUT, or []>],
+    "seed_queries": $seed_results
+  },
+  "candidates": [
+    {"target": "<qname or file:line>", "kind": "<reuse|extend|create|fix>", "rationale": "<short>"}
+  ],
+  "success_criteria": "<copied verbatim from SUCCESS CRITERIA above, or empty string>"
+}
+
+Your response, right now, starting with { and ending with }:
+PROMPT
+
+emit_event "$(jq -nc --arg len "$(wc -c < /tmp/arch_prompt.txt)" '{msg:"calling claude -p",prompt_bytes:$len}')"
+
+response=$(HOME=/root claude -p "$(cat /tmp/arch_prompt.txt)" 2>&1) || {
+    emit_event "$(jq -nc --arg err "$response" '{error:"claude -p failed",detail:$err}')"
+    emit_done "failed"; exit 0
+}
+
+# Same fence-stripping + brace-slice pattern as REVIEWER_CLAUDE_AGENTRY_SCRIPT,
+# but for an object ({...}) instead of an array ([...]).
+cleaned=$(printf '%s' "$response" | sed -e 's/^```json$//' -e 's/^```$//' -e '/^$/d' | tr -d '\r')
+start=$(printf '%s' "$cleaned" | grep -b -m1 '{' | head -1 | cut -d: -f1)
+end=$(printf '%s' "$cleaned" | grep -bo '}' | tail -1 | cut -d: -f1)
+if [ -z "$start" ] || [ -z "$end" ]; then
+    emit_event "$(jq -nc --arg r "$(printf '%s' "$cleaned" | head -c 300)" '{error:"claude response missing JSON object braces",head:$r}')"
+    emit_done "failed"; exit 0
+fi
+payload=$(printf '%s' "$cleaned" | tail -c +$((start+1)) | head -c $((end-start+1)))
+
+if ! printf '%s' "$payload" | jq -e 'type == "object"' >/dev/null 2>&1; then
+    emit_event "$(jq -nc --arg r "$(printf '%s' "$payload" | head -c 300)" '{error:"claude response not a JSON object",head:$r}')"
+    emit_done "failed"; exit 0
+fi
+if ! printf '%s' "$payload" | jq empty 2>/dev/null; then
+    emit_event "$(jq -nc --arg r "$(printf '%s' "$payload" | head -c 300)" '{error:"claude response invalid JSON",head:$r}')"
+    emit_done "failed"; exit 0
+fi
+
+printf '%s' "$payload" > /workspace/discovery.json
+bytes=$(wc -c < /workspace/discovery.json)
+emit_event "$(jq -nc --arg path "/workspace/discovery.json" --argjson bytes "$bytes" '{msg:"discovery.json written",path:$path,bytes:$bytes}')"
+emit_done "shipped"
+"##;
+
+/// Build the archaeologist-claude-agentry role. Extracted from `seed_m0` so
+/// the permit-scope + tool-allowlist invariants can be asserted in a unit test
+/// without rebuilding the entire seed flow.
+fn build_archaeologist_claude_agentry_role(home: &str, claude_settings_path: &str) -> AgentRole {
+    AgentRole {
+        name: RoleName("archaeologist-claude-agentry".into()),
+        version: 1,
+        model: Some("claude-max".into()),
+        system_prompt: None,
+        // Same toolchain as coder-claude-agentry — needed for the cfdb +
+        // graph-specs `cargo install` in extra_bootstrap.
+        image: "docker.io/library/rust:1.93".into(),
+        substrate_class: SubstrateClass::Podman,
+        package_manager: PackageManager::Apt,
+        entrypoint_script: format!("{BASH_PRELUDE}{ARCHAEOLOGIST_CLAUDE_AGENTRY_SCRIPT}"),
+        exitpoint_script: None,
+        // cfdb + graph-specs come via extra_bootstrap cargo install (same
+        // pattern as quality-hygiene in coder-claude-agentry).
+        binaries: vec![],
+        mcp_servers: vec![],
+        tool_allowlist: ToolAllowlist(vec![]),
+        permit_scope: PermitScope(vec![
+            "fs:read:/workspace/**".into(),
+            "fs:write:/workspace/**".into(),
+            "net:allow:api.anthropic.com".into(),
+            "net:allow:agency.lab".into(),
+            "net:allow:agentry-sccache-redis".into(),
+        ]),
+        passthru_env: vec!["GITEA_TOKEN".into()],
+        // cfdb rev `02c5a45` and graph-specs-rust rev `ecaedb9` mirror the
+        // pinned revs in the workspace's `.cfdb/cfdb.rev` and
+        // `.cfdb/graph-specs.rev` files used by `scripts/arch-check.sh`.
+        // A future brief can wire them through dynamically.
+        extra_bootstrap: vec![
+            "rustup component add rustfmt clippy".into(),
+            "git config --global http.sslVerify false".into(),
+            "CARGO_NET_GIT_FETCH_WITH_CLI=true cargo install --git https://oauth2:${GITEA_TOKEN}@agency.lab:3000/yg/cfdb.git --rev 02c5a45 --bin cfdb --root /usr/local --locked --quiet".into(),
+            "CARGO_NET_GIT_FETCH_WITH_CLI=true cargo install --git https://oauth2:${GITEA_TOKEN}@agency.lab:3000/yg/graph-specs-rust.git --rev ecaedb9 --bin graph-specs --root /usr/local --locked --quiet".into(),
+        ],
+        mounts: vec![
+            Mount {
+                source: format!("{home}/.local/bin/claude"),
+                target: "/usr/local/bin/claude".into(),
+                readonly: true,
+            },
+            Mount {
+                source: format!("{home}/.claude/.credentials.json"),
+                target: "/root/.claude/.credentials.json".into(),
+                readonly: true,
+            },
+            Mount {
+                source: claude_settings_path.into(),
+                target: "/root/.claude/settings.json".into(),
+                readonly: true,
+            },
+        ],
+        workspace_mount: Some(WorkspaceMount {
+            container_path: "/workspace".into(),
+            readonly: false,
+        }),
+        // Real cargo compilation in extra_bootstrap — share build cache with
+        // coder/reviewer roles via the shared sccache-redis container.
+        sccache: true,
+    }
+}
+
 const SHIPPER_SCRIPT: &str = r#"#!/usr/bin/env bash
 # Reads {repo, branch, file, content, commit_msg, pr_title, pr_body, base,
 # forge_host} from brief.payload. Clones forge repo with GITEA_TOKEN,
@@ -1588,6 +1784,20 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         max_retries: 0,
     };
 
+    // ---- agentry-discovery-v0 team (first stage of the planner pipeline) ----
+    // archaeologist-claude-agentry runs cfdb extract + graph-specs check, then
+    // synthesizes a discovery.json via `claude -p`.
+    let archaeologist_claude_agentry =
+        build_archaeologist_claude_agentry_role(&home, &claude_settings_path);
+    let agentry_discovery_v0 = TeamTopology {
+        name: TeamName("agentry-discovery-v0".into()),
+        version: 1,
+        roles: vec![archaeologist_claude_agentry.name.clone()],
+        message_graph: Vec::<MessageEdge>::new(),
+        terminal_role: archaeologist_claude_agentry.name.clone(),
+        max_retries: 0,
+    };
+
     let agentry_self_host_v0 = TeamTopology {
         name: TeamName("agentry-self-host-v0".into()),
         version: 1,
@@ -1667,9 +1877,11 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
     redis_io::save_team(&mut conn, &agentry_self_host_v0).await?;
     redis_io::save_role(&mut conn, &null_agent_agentry).await?;
     redis_io::save_team(&mut conn, &agentry_null_v0).await?;
+    redis_io::save_role(&mut conn, &archaeologist_claude_agentry).await?;
+    redis_io::save_team(&mut conn, &agentry_discovery_v0).await?;
 
     tracing::info!(
-        "seeded: roles [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker, listener, grok-echo, claude-echo, synthesizer, narrowed-coder, shipper, coder-claude-agentry, reviewer-mechanical-agentry, shipper-agentry, ci-watcher-agentry, reviewer-claude-agentry, null-agent-agentry] (inline entrypoint scripts); teams [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker-listener, grok-echo, claude-echo, narrowed-team, shipper-solo-team, agentry-self-host-v0, agentry-null-v0]"
+        "seeded: roles [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker, listener, grok-echo, claude-echo, synthesizer, narrowed-coder, shipper, coder-claude-agentry, reviewer-mechanical-agentry, shipper-agentry, ci-watcher-agentry, reviewer-claude-agentry, null-agent-agentry, archaeologist-claude-agentry] (inline entrypoint scripts); teams [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker-listener, grok-echo, claude-echo, narrowed-team, shipper-solo-team, agentry-self-host-v0, agentry-null-v0, agentry-discovery-v0]"
     );
     Ok(())
 }
@@ -1712,5 +1924,96 @@ mod tests {
                 forbidden
             );
         }
+    }
+
+    #[test]
+    fn archaeologist_script_invariants() {
+        let s = ARCHAEOLOGIST_CLAUDE_AGENTRY_SCRIPT;
+        assert!(s.contains("cfdb extract"), "script must run cfdb extract");
+        assert!(
+            s.contains("graph-specs check"),
+            "script must run graph-specs check"
+        );
+        assert!(
+            s.contains("/workspace/discovery.json"),
+            "script must write discovery.json"
+        );
+        assert!(
+            s.contains("claude -p"),
+            "script must invoke claude -p for synthesis"
+        );
+        assert!(
+            s.contains("emit_done \"shipped\""),
+            "script must emit shipped on success"
+        );
+        // No git push, no curl-of-anything-but-claude.
+        assert!(!s.contains("git push"), "archaeologist must not push");
+    }
+
+    #[test]
+    fn archaeologist_role_permits_minimal() {
+        let role = build_archaeologist_claude_agentry_role(
+            "/var/home/test",
+            "/var/home/test/.config/agentry/claude-container-settings.json",
+        );
+
+        // Exactly the five expected scopes — workspace r/w (2), claude API (1),
+        // agency.lab for cargo install (1), sccache redis (1).
+        let scopes: Vec<&str> = role.permit_scope.0.iter().map(String::as_str).collect();
+        let expected = [
+            "fs:read:/workspace/**",
+            "fs:write:/workspace/**",
+            "net:allow:api.anthropic.com",
+            "net:allow:agency.lab",
+            "net:allow:agentry-sccache-redis",
+        ];
+        assert_eq!(
+            scopes.len(),
+            expected.len(),
+            "archaeologist permit_scope must have exactly {} entries, got {:?}",
+            expected.len(),
+            scopes
+        );
+        for want in expected {
+            assert!(
+                scopes.contains(&want),
+                "archaeologist permit_scope missing {want}: {scopes:?}"
+            );
+        }
+
+        // No broad net:allow:*, no fs:write outside /workspace.
+        for s in &scopes {
+            assert!(
+                *s != "net:allow:*",
+                "archaeologist must not have broad net:allow:*"
+            );
+            if let Some(rest) = s.strip_prefix("fs:write:") {
+                assert!(
+                    rest.starts_with("/workspace"),
+                    "archaeologist fs:write must be inside /workspace, got {s}"
+                );
+            }
+        }
+
+        // tool_allowlist is empty — only built-in emit_event/emit_done used.
+        assert!(
+            role.tool_allowlist.0.is_empty(),
+            "archaeologist tool_allowlist must be empty (only emit_event/emit_done used)"
+        );
+
+        // No declared binaries — cfdb + graph-specs come via cargo install.
+        assert!(
+            role.binaries.is_empty(),
+            "archaeologist binaries must be empty (cfdb/graph-specs via extra_bootstrap)"
+        );
+        let bootstrap_joined = role.extra_bootstrap.join("\n");
+        assert!(
+            bootstrap_joined.contains("cargo install") && bootstrap_joined.contains("cfdb"),
+            "extra_bootstrap must cargo install cfdb"
+        );
+        assert!(
+            bootstrap_joined.contains("graph-specs"),
+            "extra_bootstrap must cargo install graph-specs"
+        );
     }
 }
