@@ -15,10 +15,42 @@
 
 use crate::{Error, Result};
 use orchestrator_types::BriefId;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use tokio::sync::Mutex as TokioMutex;
 
 /// Default host root — overridable via `AGENTRY_WORKSPACE_ROOT`.
 const DEFAULT_ROOT: &str = "/var/mnt/workspaces/agentry-work";
+
+/// Per-bare-clone async lock registry.
+///
+/// Concurrent `allocate` calls against the SAME bare clone race on
+/// `git fetch --prune` and `git worktree add ... <base_branch>`: a fetch
+/// can leave `refs/heads/<base>` transiently unborn while another worktree-add
+/// resolves it, producing a worktree with unborn HEAD whose first commit is
+/// orphaned (no parent). PRs from such worktrees are rejected by the forge
+/// with "fatal: refusing to merge unrelated histories" — observed in A7v3
+/// (PR #61) and A7v4 (PR #68).
+///
+/// The lock serializes the (fetch + worktree add) window per bare-clone path.
+/// Allocations against DIFFERENT repos still run concurrently because each
+/// has its own lock.
+fn bare_clone_locks() -> &'static StdMutex<HashMap<PathBuf, Arc<TokioMutex<()>>>> {
+    static LOCKS: OnceLock<StdMutex<HashMap<PathBuf, Arc<TokioMutex<()>>>>> =
+        OnceLock::new();
+    LOCKS.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+fn lock_for_bare(bare: &Path) -> Arc<TokioMutex<()>> {
+    let mut guard = bare_clone_locks()
+        .lock()
+        .expect("bare-clone lock registry poisoned");
+    guard
+        .entry(bare.to_path_buf())
+        .or_insert_with(|| Arc::new(TokioMutex::new(())))
+        .clone()
+}
 
 /// Live handle to a brief's host workspace. Held by the daemon across the
 /// brief's roles; bind-mounted into each role that declares it.
@@ -84,13 +116,24 @@ pub async fn ensure_bare_clone(repo_url: &str, root: &Path) -> Result<PathBuf> {
     let already_cloned = tokio::fs::metadata(bare.join("HEAD")).await.is_ok();
 
     if already_cloned {
+        // CRITICAL: do NOT pass `--prune`. The fetch refspec set on
+        // `git clone --bare` is `+refs/heads/*:refs/heads/*` (mirror).
+        // With `--prune`, git deletes any local `refs/heads/*` not present
+        // on upstream — including the per-brief `auto/<brief_id>` branches
+        // that prior allocations created via `git worktree add -b`. That
+        // leaves their worktrees with unborn HEAD → coder produces an
+        // orphan commit → forge merge fails with "refusing to merge
+        // unrelated histories" (observed A7v3 PR #61, A7v4 PR #68).
+        //
+        // Without `--prune`, locally-created auto/* refs survive across
+        // fetches. Stale upstream-deleted branches accumulate harmlessly
+        // (they take space but don't affect correctness).
         let out = tokio::process::Command::new("git")
             .arg("-c")
             .arg("http.sslVerify=false")
             .arg("-C")
             .arg(&bare)
             .arg("fetch")
-            .arg("--prune")
             .output()
             .await
             .map_err(|e| Error::Config(format!("git fetch: {e}")))?;
@@ -169,7 +212,17 @@ pub async fn allocate_at(
 ) -> Result<BriefWorkspace> {
     let host_path = root.join("briefs").join(&brief_id.0);
     if let Some((repo_url, base_branch)) = repo {
+        // Compute bare path UPFRONT and take the per-bare-clone lock BEFORE
+        // any git operation. This serializes concurrent fetch+worktree-add
+        // against the same bare clone, eliminating the orphan-commit race
+        // observed in A7v3/A7v4. Different repos still run concurrently.
+        let (org, repo_name) = derive_org_repo(repo_url)?;
+        let bare_path = root.join(".clones").join(&org).join(&repo_name);
+        let lock = lock_for_bare(&bare_path);
+        let _guard = lock.lock().await;
+
         let bare = ensure_bare_clone(repo_url, root).await?;
+        debug_assert_eq!(bare, bare_path, "ensure_bare_clone path drift");
         // If the worktree dir already exists (e.g. resumed brief), remove it
         // first so the worktree add doesn't conflict.
         if host_path.exists() {
@@ -201,6 +254,41 @@ pub async fn allocate_at(
             return Err(Error::Config(format!(
                 "git worktree add failed: {}",
                 String::from_utf8_lossy(&out.stderr)
+            )));
+        }
+
+        // Defense-in-depth: verify the new worktree's HEAD points at a real
+        // commit. If git silently created an unborn-HEAD worktree (because
+        // base_branch resolved to nothing — e.g. fetch race left the ref
+        // transient, or base_branch is misspelled), reject the allocation
+        // here rather than letting the coder commit an orphan that fails to
+        // merge later.
+        let head_check = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(&host_path)
+            .arg("rev-parse")
+            .arg("--verify")
+            .arg("HEAD")
+            .output()
+            .await
+            .map_err(|e| Error::Config(format!("git rev-parse HEAD: {e}")))?;
+        if !head_check.status.success()
+            || String::from_utf8_lossy(&head_check.stdout).trim().is_empty()
+        {
+            // Tear down the broken worktree so the bare clone forgets it.
+            let _ = tokio::process::Command::new("git")
+                .arg("-C")
+                .arg(&bare)
+                .arg("worktree")
+                .arg("remove")
+                .arg("--force")
+                .arg(&host_path)
+                .output()
+                .await;
+            return Err(Error::Config(format!(
+                "worktree HEAD is unborn after add (base_branch={base_branch} \
+                 likely unreachable in bare clone {}); refusing to allocate",
+                bare.display()
             )));
         }
     } else {
@@ -483,5 +571,93 @@ mod tests {
                 .any(|l| l.trim() == "+refs/heads/*:refs/heads/*"),
             "expected +refs/heads/*:refs/heads/* in remote.origin.fetch, got: {refspecs:?}"
         );
+    }
+
+    /// Regression for the orphan-commit race that bit A7v3 (PR #61) and A7v4
+    /// (PR #68): when N concurrent allocations target the same bare clone,
+    /// a `git fetch --prune` on one task could leave `refs/heads/<base>`
+    /// transiently unborn while another task's `git worktree add ... <base>`
+    /// resolved it, producing a worktree with unborn HEAD. The coder's commit
+    /// in such a worktree had no parent — the forge later rejected the merge
+    /// with "fatal: refusing to merge unrelated histories".
+    ///
+    /// With the per-bare-clone async lock, every concurrent allocation lands
+    /// a worktree whose HEAD points at a real commit on the base branch.
+    #[tokio::test]
+    async fn concurrent_allocate_against_same_repo_no_orphan_heads() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let url = setup_upstream(tmp.path()).await;
+        let root = tmp.path().to_path_buf();
+
+        // Spawn 5 concurrent allocations against the same bare clone.
+        let mut handles = Vec::new();
+        for i in 0..5 {
+            let url = url.clone();
+            let root = root.clone();
+            handles.push(tokio::spawn(async move {
+                let bid = brief(&format!("brf_concur_{i}"));
+                allocate_at(&bid, Some((url.as_str(), "main")), &root).await
+            }));
+        }
+
+        let mut workspaces = Vec::new();
+        for h in handles {
+            let ws = h.await.expect("join").expect("alloc must succeed");
+            workspaces.push(ws);
+        }
+        assert_eq!(workspaces.len(), 5, "all concurrent allocations succeed");
+
+        // Every worktree's HEAD must point at a real commit (no unborn HEAD).
+        for ws in &workspaces {
+            let out = tokio::process::Command::new("git")
+                .arg("-C")
+                .arg(&ws.host_path)
+                .arg("rev-parse")
+                .arg("--verify")
+                .arg("HEAD")
+                .output()
+                .await
+                .expect("git rev-parse HEAD");
+            assert!(
+                out.status.success(),
+                "rev-parse HEAD failed for {}: {}",
+                ws.host_path.display(),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            assert!(
+                !sha.is_empty(),
+                "worktree {} has empty HEAD — orphan-prone state",
+                ws.host_path.display()
+            );
+            // And HEAD's commit must have NO empty parent line. We test this
+            // by reading the commit object: a normal commit has at least one
+            // `parent <sha>` line OR is a root commit reachable from main.
+            // Stronger assertion: the commit equals or is reachable from main.
+            // The bare clone uses the `+refs/heads/*:refs/heads/*` refspec, so
+            // `main` (not `origin/main`) is the canonical local ref.
+            let merge_base = tokio::process::Command::new("git")
+                .arg("-C")
+                .arg(&ws.host_path)
+                .arg("merge-base")
+                .arg("HEAD")
+                .arg("main")
+                .output()
+                .await
+                .expect("git merge-base");
+            assert!(
+                merge_base.status.success(),
+                "no merge-base between worktree HEAD and main for {} — \
+                 worktree was created from an unborn ref (orphan-commit race): {}",
+                ws.host_path.display(),
+                String::from_utf8_lossy(&merge_base.stderr)
+            );
+            let mb_sha = String::from_utf8_lossy(&merge_base.stdout).trim().to_string();
+            assert!(
+                !mb_sha.is_empty(),
+                "merge-base returned empty SHA for {}",
+                ws.host_path.display()
+            );
+        }
     }
 }
