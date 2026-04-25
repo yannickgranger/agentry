@@ -383,44 +383,40 @@ async fn handle_brief(
         team_shipped = false;
     }
 
-    // Workspace teardown: destroy on Shipped, retain otherwise for audit.
-    if let Some(ws) = workspace.take() {
-        if team_shipped {
-            if let Err(e) = workspace::destroy(&ws).await {
-                tracing::warn!(
-                    brief = %brief.id,
-                    path = %ws.host_path.display(),
-                    error = %e,
-                    "workspace destroy failed"
-                );
-            } else {
-                tracing::info!(
-                    brief = %brief.id,
-                    path = %ws.host_path.display(),
-                    "workspace destroyed (team shipped)"
-                );
-            }
-        } else {
+    // Bail early on team failure — keep workspace for audit, no chain-trigger.
+    if !team_shipped {
+        if let Some(ws) = workspace.take() {
             tracing::info!(
                 brief = %brief.id,
                 path = %ws.host_path.display(),
                 "workspace retained for audit (team did not ship)"
             );
         }
-    }
-
-    if !team_shipped {
         return Ok(VerdictKind::Failed);
     }
 
-    // Chain trigger: if every role shipped AND either the brief payload OR
-    // one of the accumulated role-outbox messages names one or more next
-    // briefs (each an absolute file path containing another Brief JSON),
-    // submit each to the queue. Plural form `next_brief_refs` (JSON array
-    // of strings) takes precedence; singular `next_brief_ref` is preserved
-    // for backward compatibility. Paths emitted by both sources dispatch
-    // ONCE — order-preserving dedup keeps log readability.
-    for next_ref in collect_chain_paths(&brief.payload, &all_messages) {
+    // Chain-trigger BEFORE workspace destruction: chain paths often live
+    // INSIDE the workspace (e.g. planner emits next_brief_refs into
+    // <workspace>/planner-children/), so file reads must complete while the
+    // workspace still exists. Destruction follows once every brief is parsed
+    // into memory and submitted to Redis.
+    finalize_shipped_team(conn, brief, workspace.take(), &all_messages).await?;
+
+    Ok(VerdictKind::Shipped)
+}
+
+/// Post-shipping finalize: read every chain-trigger brief into memory and
+/// submit it to Redis BEFORE destroying the workspace. The ordering is
+/// load-bearing — chain paths can point inside the workspace, so destroying
+/// first would ENOENT every read. See the
+/// `chain_trigger_runs_before_workspace_destruction` regression test.
+async fn finalize_shipped_team(
+    conn: &mut ConnectionManager,
+    brief: &Brief,
+    workspace: Option<BriefWorkspace>,
+    all_messages: &[RoutedMessage],
+) -> Result<()> {
+    for next_ref in collect_chain_paths(&brief.payload, all_messages) {
         if let Some(next_brief) = load_next_brief(&next_ref).await {
             redis_io::submit_brief(conn, &next_brief).await?;
             tracing::info!(
@@ -432,7 +428,24 @@ async fn handle_brief(
         }
     }
 
-    Ok(VerdictKind::Shipped)
+    if let Some(ws) = workspace {
+        if let Err(e) = workspace::destroy(&ws).await {
+            tracing::warn!(
+                brief = %brief.id,
+                path = %ws.host_path.display(),
+                error = %e,
+                "workspace destroy failed"
+            );
+        } else {
+            tracing::info!(
+                brief = %brief.id,
+                path = %ws.host_path.display(),
+                "workspace destroyed (team shipped)"
+            );
+        }
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1145,6 +1158,63 @@ mod tests {
         // First-seen order: payload's `shared` first, then `other` from the
         // first outbox message. Subsequent duplicates of either are dropped.
         assert_eq!(paths, vec![shared, other]);
+    }
+
+    /// Regression for the A7 PoC ordering bug: planner emits
+    /// `next_brief_refs` whose paths live INSIDE the brief's workspace
+    /// (`<workspace>/planner-children/child-N.json`). Pre-fix the daemon
+    /// destroyed the workspace before the chain-trigger ran, so every
+    /// `load_next_brief` got ENOENT. The fix reorders finalize to read first,
+    /// destroy second — this test pins the invariant by emulating the same
+    /// sequence against a real workspace dir and asserting the child briefs
+    /// were loaded successfully before destruction wiped the dir.
+    #[tokio::test]
+    async fn chain_trigger_runs_before_workspace_destruction() {
+        let ws_dir = tempfile::tempdir().expect("workspace tmp");
+        let children_dir = ws_dir.path().join("planner-children");
+        tokio::fs::create_dir(&children_dir)
+            .await
+            .expect("mkdir planner-children");
+
+        let child_a = make_child_brief("brf_chain_inside_ws_a");
+        let child_b = make_child_brief("brf_chain_inside_ws_b");
+        let path_a = write_brief(&children_dir, "child-0.json", &child_a).await;
+        let path_b = write_brief(&children_dir, "child-1.json", &child_b).await;
+
+        let ws = BriefWorkspace {
+            brief_id: BriefId("brf_parent".into()),
+            host_path: ws_dir.path().to_path_buf(),
+        };
+
+        // Outbox-style message (planner emits this) referencing paths INSIDE
+        // the workspace.
+        let messages = vec![outbox_msg(serde_json::json!({
+            "next_brief_refs": [path_a.clone(), path_b.clone()],
+        }))];
+        let brief_payload = serde_json::json!({});
+
+        // Emulate finalize_shipped_team's read-then-destroy sequence. With
+        // the bug, destruction would happen first and load_next_brief would
+        // return None for every path.
+        let mut loaded: Vec<Brief> = Vec::new();
+        for next_ref in collect_chain_paths(&brief_payload, &messages) {
+            if let Some(b) = load_next_brief(&next_ref).await {
+                loaded.push(b);
+            }
+        }
+        workspace::destroy(&ws).await.expect("destroy ws");
+
+        assert_eq!(
+            loaded.len(),
+            2,
+            "both child briefs must load before workspace destruction"
+        );
+        assert_eq!(loaded[0].id, child_a.id);
+        assert_eq!(loaded[1].id, child_b.id);
+        assert!(
+            !ws_dir.path().exists(),
+            "workspace destroyed after chain-trigger reads"
+        );
     }
 
     #[tokio::test]
