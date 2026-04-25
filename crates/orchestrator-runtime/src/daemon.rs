@@ -397,12 +397,14 @@ async fn handle_brief(
         return Ok(());
     }
 
-    // Chain trigger: if every role shipped AND the brief's payload names
-    // one or more next briefs (each an absolute file path containing another
-    // Brief JSON), submit each to the queue. Plural form `next_brief_refs`
-    // (JSON array of strings) takes precedence; singular `next_brief_ref`
-    // is preserved for backward compatibility.
-    for next_ref in next_brief_paths(&brief.payload) {
+    // Chain trigger: if every role shipped AND either the brief payload OR
+    // one of the accumulated role-outbox messages names one or more next
+    // briefs (each an absolute file path containing another Brief JSON),
+    // submit each to the queue. Plural form `next_brief_refs` (JSON array
+    // of strings) takes precedence; singular `next_brief_ref` is preserved
+    // for backward compatibility. Paths emitted by both sources dispatch
+    // ONCE — order-preserving dedup keeps log readability.
+    for next_ref in collect_chain_paths(&brief.payload, &all_messages) {
         if let Some(next_brief) = load_next_brief(&next_ref).await {
             redis_io::submit_brief(conn, &next_brief).await?;
             tracing::info!(
@@ -415,6 +417,21 @@ async fn handle_brief(
     }
 
     Ok(())
+}
+
+/// Combine chain-trigger paths from the brief payload and every accumulated
+/// role-outbox message, then de-duplicate while preserving first-seen order.
+fn collect_chain_paths(
+    brief_payload: &serde_json::Value,
+    messages: &[RoutedMessage],
+) -> Vec<String> {
+    let mut paths = next_brief_paths(brief_payload);
+    for msg in messages {
+        paths.extend(next_brief_paths(&msg.payload));
+    }
+    let mut seen: HashSet<String> = HashSet::new();
+    paths.retain(|p| seen.insert(p.clone()));
+    paths
 }
 
 /// Extract the ordered list of next-brief file paths from `payload`.
@@ -814,6 +831,56 @@ mod tests {
     async fn chain_trigger_no_refs_yields_empty() {
         let payload = serde_json::json!({});
         assert!(next_brief_paths(&payload).is_empty());
+    }
+
+    fn outbox_msg(payload: serde_json::Value) -> RoutedMessage {
+        RoutedMessage {
+            from: "some-role".into(),
+            to: "downstream".into(),
+            payload,
+            at: now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn chain_trigger_dispatches_from_role_outbox_message() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let b = make_child_brief("brf_chain_outbox");
+        let p = write_brief(tmp.path(), "outbox.json", &b).await;
+
+        // brief.payload carries no next_brief_refs; the planner-style outbox
+        // message does.
+        let brief_payload = serde_json::json!({});
+        let messages = vec![outbox_msg(serde_json::json!({
+            "next_brief_refs": [p.clone()],
+        }))];
+        let paths = collect_chain_paths(&brief_payload, &messages);
+        assert_eq!(paths, vec![p.clone()]);
+
+        let loaded = load_next_brief(&paths[0]).await.expect("brief loads");
+        assert_eq!(loaded.id, b.id);
+    }
+
+    #[tokio::test]
+    async fn chain_trigger_deduplicates_payload_and_outbox_paths() {
+        let shared = "/tmp/agentry-chain-shared".to_string();
+        let other = "/tmp/agentry-chain-other".to_string();
+        let brief_payload = serde_json::json!({
+            "next_brief_refs": [shared.clone()],
+        });
+        let messages = vec![
+            outbox_msg(serde_json::json!({
+                "next_brief_refs": [shared.clone(), other.clone()],
+            })),
+            outbox_msg(serde_json::json!({
+                "next_brief_refs": [other.clone()],
+            })),
+        ];
+
+        let paths = collect_chain_paths(&brief_payload, &messages);
+        // First-seen order: payload's `shared` first, then `other` from the
+        // first outbox message. Subsequent duplicates of either are dropped.
+        assert_eq!(paths, vec![shared, other]);
     }
 
     #[tokio::test]

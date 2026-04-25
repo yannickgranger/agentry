@@ -1001,6 +1001,231 @@ emit_event "$(jq -nc --arg path "/workspace/discovery.json" --argjson bytes "$by
 emit_done "shipped"
 "##;
 
+/// Planner role for the `agentry-planner-v0` team. Reads the
+/// `discovery.json` synthesized by the upstream archaeologist, asks
+/// `claude -p` to decompose the meta-brief intent into a JSON ARRAY of
+/// child-brief descriptors, materializes each as a Brief JSON file under
+/// `/workspace/planner-children/`, then emits a single outbox `Message`
+/// whose payload carries `next_brief_refs` — a list of ABSOLUTE host paths
+/// to those child files. The daemon's chain-trigger (extended to scan
+/// accumulated role-outbox messages) auto-dispatches each child via
+/// `submit_brief` once this brief ships. Planner never calls the
+/// orchestrator CLI directly and never touches the forge.
+const PLANNER_CLAUDE_AGENTRY_SCRIPT: &str = r##"#!/usr/bin/env bash
+set -euo pipefail
+bundle="$(cat)"
+
+brief_id=$(jq -r '.brief.id' <<<"$bundle")
+intent=$(jq -r '.brief.payload.intent // ""' <<<"$bundle")
+success_criteria=$(jq -r '.brief.payload.success_criteria // ""' <<<"$bundle")
+child_topology=$(jq -r '.brief.payload.child_topology // "agentry-self-host-v0"' <<<"$bundle")
+max_children=$(jq -r '.brief.payload.max_children // 10' <<<"$bundle")
+base_branch=$(jq -r '.brief.payload.base_branch // "develop"' <<<"$bundle")
+target_repo=$(jq -r '.brief.payload.target_repo // "yg/agentry"' <<<"$bundle")
+
+# Children's brief JSON files live on the shared workspace under the brief's
+# host directory. The daemon's chain-trigger reads them off-container, so the
+# paths emitted in next_brief_refs MUST be absolute host paths.
+host_workspace="/var/mnt/workspaces/agentry-work/briefs/${brief_id}"
+
+if [ ! -f /workspace/discovery.json ]; then
+    emit_event '{"error":"discovery.json missing — upstream archaeologist must produce it at /workspace/discovery.json"}'
+    emit_done "failed"; exit 0
+fi
+
+mkdir -p /workspace/planner-children
+
+# Bound the inline discovery slice in the prompt to ~50KB.
+discovery_size=$(wc -c < /workspace/discovery.json)
+if [ "$discovery_size" -gt 51200 ]; then
+    discovery_excerpt=$(head -c 51200 /workspace/discovery.json)
+    discovery_truncated="true"
+else
+    discovery_excerpt=$(cat /workspace/discovery.json)
+    discovery_truncated="false"
+fi
+
+cat > /tmp/planner_prompt.txt <<PROMPT
+You are the planner role for the agentry project. Decompose the META-BRIEF
+intent into a JSON ARRAY of child briefs. Each child must be a focused,
+verifiable transformation expressed as verbs (CREATE/UPDATE/REPLACE/DELETE/MOVE)
+on specific file:line targets — NOT freeform "fix this issue" prose.
+
+META-BRIEF INTENT:
+$intent
+
+SUCCESS CRITERIA:
+$success_criteria
+
+DISCOVERY (size=${discovery_size} bytes, truncated=${discovery_truncated}):
+$discovery_excerpt
+
+CHILD BOILERPLATE (apply to every element):
+- topology: $child_topology
+- target_repo: $target_repo
+- base_branch: $base_branch
+- budget.max_wall_seconds: 900
+- escalation: autonomous
+
+Output EXACTLY one JSON array — no markdown fences, no prose. Cap at
+$max_children elements. Schema per element:
+
+{
+  "title": "<short verb-payload title>",
+  "verbs": "<full verb-payload markdown using CREATE/UPDATE/REPLACE/DELETE/MOVE>",
+  "acceptance": "<bash command, e.g. cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace>",
+  "estimated_files": ["<crate>:<file>"]
+}
+
+Your response, right now, starting with [ and ending with ]:
+PROMPT
+
+emit_event "$(jq -nc --arg len "$(wc -c < /tmp/planner_prompt.txt)" '{msg:"calling claude -p",prompt_bytes:$len}')"
+
+response=$(HOME=/root claude -p "$(cat /tmp/planner_prompt.txt)" 2>&1) || {
+    emit_event "$(jq -nc --arg err "$response" '{error:"claude -p failed",detail:$err}')"
+    emit_done "failed"; exit 0
+}
+
+# Same fence-stripping + bracket-slice pattern as REVIEWER_CLAUDE_AGENTRY_SCRIPT.
+cleaned=$(printf '%s' "$response" | sed -e 's/^```json$//' -e 's/^```$//' -e '/^$/d' | tr -d '\r')
+start=$(printf '%s' "$cleaned" | grep -b -m1 '\[' | head -1 | cut -d: -f1)
+end=$(printf '%s' "$cleaned" | grep -bo '\]' | tail -1 | cut -d: -f1)
+if [ -z "$start" ] || [ -z "$end" ]; then
+    emit_event "$(jq -nc --arg r "$(printf '%s' "$cleaned" | head -c 300)" '{error:"claude response missing JSON array brackets",head:$r}')"
+    emit_done "failed"; exit 0
+fi
+payload=$(printf '%s' "$cleaned" | tail -c +$((start+1)) | head -c $((end-start+1)))
+
+if ! printf '%s' "$payload" | jq -e 'type == "array"' >/dev/null 2>&1; then
+    emit_event "$(jq -nc --arg r "$(printf '%s' "$payload" | head -c 300)" '{error:"claude response not a JSON array",head:$r}')"
+    emit_done "failed"; exit 0
+fi
+
+count=$(printf '%s' "$payload" | jq 'length')
+if [ "$count" -gt "$max_children" ]; then
+    payload=$(printf '%s' "$payload" | jq --argjson n "$max_children" '.[:$n]')
+    count=$max_children
+fi
+
+submitted_at=$(date -Iseconds)
+host_paths='[]'
+i=0
+while [ "$i" -lt "$count" ]; do
+    elem=$(printf '%s' "$payload" | jq -c ".[$i]")
+    title=$(printf '%s' "$elem" | jq -r '.title // ""')
+    verbs=$(printf '%s' "$elem" | jq -r '.verbs // ""')
+    acceptance=$(printf '%s' "$elem" | jq -r '.acceptance // ""')
+
+    pr_title="auto(planner-${brief_id}): ${title}"
+    pr_body="Authored by planner-claude-agentry from meta-brief ${brief_id}. Verbs:
+
+${verbs}"
+
+    child_path="/workspace/planner-children/child-${i}.json"
+    jq -nc \
+        --arg id "brf_planner_${brief_id}_child_${i}" \
+        --arg topology "$child_topology" \
+        --arg title "$title" \
+        --arg verbs "$verbs" \
+        --arg acceptance "$acceptance" \
+        --arg target_repo "$target_repo" \
+        --arg base_branch "$base_branch" \
+        --arg pr_title "$pr_title" \
+        --arg pr_body "$pr_body" \
+        --arg parent "$brief_id" \
+        --arg submitted_by "planner-claude-agentry-${brief_id}" \
+        --arg submitted_at "$submitted_at" \
+        '{
+            id: $id,
+            project: null,
+            topology: { name: $topology, version: 1 },
+            payload: {
+                issue_number: 0,
+                issue_title: $title,
+                issue_body: $verbs,
+                acceptance: $acceptance,
+                target_repo: $target_repo,
+                base_branch: $base_branch,
+                pr_title: $pr_title,
+                pr_body: $pr_body
+            },
+            budget: { max_wall_seconds: 900 },
+            escalation: "autonomous",
+            parent_brief: $parent,
+            submitted_by: $submitted_by,
+            submitted_at: $submitted_at
+        }' > "$child_path"
+
+    host_paths=$(jq -nc --argjson cur "$host_paths" \
+        --arg p "${host_workspace}/planner-children/child-${i}.json" \
+        '$cur + [$p]')
+    i=$((i+1))
+done
+
+# Sentinel target `_chain_trigger`: there is no role by that name on the
+# planner topology — the daemon's chain-trigger scans every accumulated
+# outbox payload for next_brief_refs regardless of `to`, so this Message
+# carries the dispatch list without targeting any sibling role.
+emit_message "_chain_trigger" "$(jq -nc --argjson refs "$host_paths" '{next_brief_refs:$refs}')"
+emit_event "$(jq -nc --argjson n "$count" --arg m "/workspace/planner-children/" '{msg:"planner produced N children",count:$n,manifest:$m}')"
+emit_done "shipped"
+"##;
+
+/// Build the planner-claude-agentry role. Extracted from `seed_m0` so the
+/// permit-scope invariants can be asserted in a unit test without rebuilding
+/// the entire seed flow.
+fn build_planner_claude_agentry_role(home: &str, claude_settings_path: &str) -> AgentRole {
+    AgentRole {
+        name: RoleName("planner-claude-agentry".into()),
+        version: 1,
+        model: Some("claude-max".into()),
+        system_prompt: None,
+        // Same toolchain as archaeologist for a uniform claude-mounted base,
+        // but planner installs nothing and runs no compilation.
+        image: "docker.io/library/rust:1.93".into(),
+        substrate_class: SubstrateClass::Podman,
+        package_manager: PackageManager::Apt,
+        entrypoint_script: format!("{BASH_PRELUDE}{PLANNER_CLAUDE_AGENTRY_SCRIPT}"),
+        exitpoint_script: None,
+        binaries: vec![],
+        mcp_servers: vec![],
+        tool_allowlist: ToolAllowlist(vec![]),
+        // Strictly tighter than archaeologist: no agency.lab (no cargo install),
+        // no agentry-sccache-redis (no compilation).
+        permit_scope: PermitScope(vec![
+            "fs:read:/workspace/**".into(),
+            "fs:write:/workspace/**".into(),
+            "net:allow:api.anthropic.com".into(),
+        ]),
+        // No GITEA_TOKEN — planner does not touch the forge.
+        passthru_env: vec![],
+        extra_bootstrap: vec![],
+        mounts: vec![
+            Mount {
+                source: format!("{home}/.local/bin/claude"),
+                target: "/usr/local/bin/claude".into(),
+                readonly: true,
+            },
+            Mount {
+                source: format!("{home}/.claude/.credentials.json"),
+                target: "/root/.claude/.credentials.json".into(),
+                readonly: true,
+            },
+            Mount {
+                source: claude_settings_path.into(),
+                target: "/root/.claude/settings.json".into(),
+                readonly: true,
+            },
+        ],
+        workspace_mount: Some(WorkspaceMount {
+            container_path: "/workspace".into(),
+            readonly: false,
+        }),
+        sccache: false,
+    }
+}
+
 /// Build the archaeologist-claude-agentry role. Extracted from `seed_m0` so
 /// the permit-scope + tool-allowlist invariants can be asserted in a unit test
 /// without rebuilding the entire seed flow.
@@ -1798,6 +2023,31 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         max_retries: 0,
     };
 
+    // ---- agentry-planner-v0 team (autonomous decomposition) ----
+    // archaeologist → planner: archaeologist writes /workspace/discovery.json,
+    // planner reads it and emits an outbox Message whose payload carries
+    // `next_brief_refs` — a list of absolute host paths to child brief JSONs.
+    // The daemon's chain-trigger auto-dispatches each child via submit_brief
+    // once the planner ships.
+    let planner_claude_agentry = build_planner_claude_agentry_role(&home, &claude_settings_path);
+    let agentry_planner_v0 = TeamTopology {
+        name: TeamName("agentry-planner-v0".into()),
+        version: 1,
+        roles: vec![
+            archaeologist_claude_agentry.name.clone(),
+            planner_claude_agentry.name.clone(),
+        ],
+        // discovery.json is on the shared workspace, not message-borne — the
+        // edge exists only to gate the planner on the archaeologist shipping.
+        message_graph: vec![MessageEdge {
+            from: archaeologist_claude_agentry.name.clone(),
+            to: planner_claude_agentry.name.clone(),
+            permit_overrides_from: None,
+        }],
+        terminal_role: planner_claude_agentry.name.clone(),
+        max_retries: 0,
+    };
+
     let agentry_self_host_v0 = TeamTopology {
         name: TeamName("agentry-self-host-v0".into()),
         version: 1,
@@ -1879,9 +2129,11 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
     redis_io::save_team(&mut conn, &agentry_null_v0).await?;
     redis_io::save_role(&mut conn, &archaeologist_claude_agentry).await?;
     redis_io::save_team(&mut conn, &agentry_discovery_v0).await?;
+    redis_io::save_role(&mut conn, &planner_claude_agentry).await?;
+    redis_io::save_team(&mut conn, &agentry_planner_v0).await?;
 
     tracing::info!(
-        "seeded: roles [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker, listener, grok-echo, claude-echo, synthesizer, narrowed-coder, shipper, coder-claude-agentry, reviewer-mechanical-agentry, shipper-agentry, ci-watcher-agentry, reviewer-claude-agentry, null-agent-agentry, archaeologist-claude-agentry] (inline entrypoint scripts); teams [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker-listener, grok-echo, claude-echo, narrowed-team, shipper-solo-team, agentry-self-host-v0, agentry-null-v0, agentry-discovery-v0]"
+        "seeded: roles [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker, listener, grok-echo, claude-echo, synthesizer, narrowed-coder, shipper, coder-claude-agentry, reviewer-mechanical-agentry, shipper-agentry, ci-watcher-agentry, reviewer-claude-agentry, null-agent-agentry, archaeologist-claude-agentry, planner-claude-agentry] (inline entrypoint scripts); teams [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker-listener, grok-echo, claude-echo, narrowed-team, shipper-solo-team, agentry-self-host-v0, agentry-null-v0, agentry-discovery-v0, agentry-planner-v0]"
     );
     Ok(())
 }
@@ -2015,5 +2267,99 @@ mod tests {
             bootstrap_joined.contains("graph-specs"),
             "extra_bootstrap must cargo install graph-specs"
         );
+    }
+
+    #[test]
+    fn planner_script_invariants() {
+        let s = PLANNER_CLAUDE_AGENTRY_SCRIPT;
+        assert!(
+            s.contains("/workspace/discovery.json"),
+            "must read discovery.json"
+        );
+        assert!(
+            s.contains("/workspace/planner-children"),
+            "must write children to manifest dir"
+        );
+        assert!(s.contains("claude -p"), "must invoke claude -p");
+        assert!(
+            s.contains("next_brief_refs"),
+            "must emit next_brief_refs in outbox message"
+        );
+        assert!(
+            s.contains("emit_done \"shipped\""),
+            "must emit shipped on success"
+        );
+        assert!(!s.contains("git push"), "planner must not push");
+        assert!(
+            !s.contains("orchestrator submit"),
+            "planner must NOT call CLI directly — children dispatched by daemon chain-trigger"
+        );
+    }
+
+    #[test]
+    fn planner_role_permits_minimal() {
+        let role = build_planner_claude_agentry_role(
+            "/var/home/test",
+            "/var/home/test/.config/agentry/claude-container-settings.json",
+        );
+
+        // Strictly tighter than archaeologist: only workspace r/w + claude API.
+        let scopes: Vec<&str> = role.permit_scope.0.iter().map(String::as_str).collect();
+        let expected = [
+            "fs:read:/workspace/**",
+            "fs:write:/workspace/**",
+            "net:allow:api.anthropic.com",
+        ];
+        assert_eq!(
+            scopes.len(),
+            expected.len(),
+            "planner permit_scope must have exactly {} entries, got {:?}",
+            expected.len(),
+            scopes
+        );
+        for want in expected {
+            assert!(
+                scopes.contains(&want),
+                "planner permit_scope missing {want}: {scopes:?}"
+            );
+        }
+
+        // Forbidden scopes — planner does not cargo-install, compile, or
+        // touch the forge.
+        for forbidden in [
+            "net:allow:agency.lab",
+            "net:allow:agentry-sccache-redis",
+            "net:allow:*",
+        ] {
+            assert!(
+                !scopes.contains(&forbidden),
+                "planner permit_scope must not contain {forbidden}: {scopes:?}"
+            );
+        }
+
+        // No GITEA_TOKEN — planner does not touch the forge.
+        assert!(
+            !role.passthru_env.iter().any(|e| e == "GITEA_TOKEN"),
+            "planner must not pass through GITEA_TOKEN: {:?}",
+            role.passthru_env
+        );
+
+        // No declared binaries, no extra_bootstrap — planner installs nothing.
+        assert!(role.binaries.is_empty(), "planner binaries must be empty");
+        assert!(
+            role.extra_bootstrap.is_empty(),
+            "planner extra_bootstrap must be empty"
+        );
+
+        // tool_allowlist empty — only built-in emit_event/emit_message/emit_done.
+        assert!(
+            role.tool_allowlist.0.is_empty(),
+            "planner tool_allowlist must be empty"
+        );
+
+        // Workspace mount is writable so the planner can write child JSONs.
+        let ws = role.workspace_mount.expect("planner needs workspace_mount");
+        assert_eq!(ws.container_path, "/workspace");
+        assert!(!ws.readonly, "planner workspace must be writable");
     }
 }
