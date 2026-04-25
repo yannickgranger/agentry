@@ -1406,6 +1406,7 @@ fi
 
 const AUDITOR_CLAUDE_AGENTRY_SCRIPT: &str = r##"#!/usr/bin/env bash
 set -uo pipefail
+bundle=$(cat); brief_id=$(jq -r '.brief.id' <<<"$bundle")
 cd /workspace || { emit_event '{"error":"cd /workspace failed"}'; emit_done "failed"; exit 0; }
 emit_event '{"msg":"auditor starting"}'
 clippy_out=$(cargo clippy --workspace --all-targets -- -D warnings 2>&1 | tail -c 8192 || true)
@@ -1414,6 +1415,30 @@ build_out=$(RUSTFLAGS="-Dwarnings" cargo build --workspace 2>&1 | tail -c 8192 |
 emit_event "$(jq -nc --arg out "$build_out" '{msg:"build_report",out:$out}')"
 test_out=$(cargo test --workspace 2>&1 | tail -c 8192 || true)
 emit_event "$(jq -nc --arg out "$test_out" '{msg:"test_report",out:$out}')"
+udeps_json=$(cargo +nightly udeps --workspace --output json 2>/dev/null || echo '{}')
+emit_event "$(jq -nc --arg out "$(echo "$udeps_json" | tail -c 4096)" '{msg:"udeps_report",out:$out}')"
+mkdir -p /workspace/audit-children
+host_workspace="/var/mnt/workspaces/agentry-work/briefs/${brief_id}"
+pairs=$(echo "$udeps_json" | jq -c '[.unused_deps // {} | to_entries[] | .key as $k | ((.value.normal // []) + (.value.development // []) + (.value.build // []))[] as $d | {crate:($k|split(" ")[0]), dep:$d}]')
+count=$(echo "$pairs" | jq 'length')
+refs='[]'; i=0
+while [ "$i" -lt "$count" ]; do
+  crate=$(echo "$pairs" | jq -r ".[$i].crate"); dep=$(echo "$pairs" | jq -r ".[$i].dep")
+  child="/workspace/audit-children/child-${i}.json"
+  jq -nc --arg id "brf_self_heal_${brief_id}_udep_${i}" --arg crate "$crate" --arg dep "$dep" --arg parent "$brief_id" \
+    '{id:$id, project:null, topology:{name:"agentry-bugfix-v0",version:1},
+      payload:{issue_number:0, issue_title:("fix(deps): remove unused "+$dep+" from "+$crate),
+        issue_body:("DELETE `"+$dep+".workspace = true` from crates/"+$crate+"/Cargo.toml. cargo-udeps reports unused."),
+        acceptance:"cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && RUSTFLAGS=\"-Dwarnings\" cargo build --workspace && cargo test --workspace",
+        target_repo:"yg/agentry", base_branch:"develop",
+        pr_title:("fix(deps): remove unused "+$dep+" from "+$crate),
+        pr_body:"Auto-dispatched by auditor."},
+      budget:{max_wall_seconds:900}, escalation:"autonomous", parent_brief:$parent,
+      submitted_by:"auditor-self-heal", submitted_at:(now|todate)}' > "$child"
+  refs=$(echo "$refs" | jq -c --arg p "${host_workspace}/audit-children/child-${i}.json" '. + [$p]')
+  i=$((i+1))
+done
+[ "$count" -gt 0 ] && emit_message "_chain_trigger" "$(jq -nc --argjson r "$refs" '{next_brief_refs:$r}')"
 emit_done "shipped"
 "##;
 
@@ -2346,9 +2371,17 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
             "fs:read:/workspace/**".into(),
             "fs:write:/workspace/**".into(),
             "net:allow:agentry-sccache-redis".into(),
+            "net:allow:static.rust-lang.org".into(),
+            "net:allow:crates.io".into(),
+            "net:allow:index.crates.io".into(),
+            "net:allow:static.crates.io".into(),
         ]),
         passthru_env: vec![],
-        extra_bootstrap: vec!["rustup component add rustfmt clippy".into()],
+        extra_bootstrap: vec![
+            "rustup component add rustfmt clippy || true".into(),
+            "rustup toolchain install nightly --profile minimal || true".into(),
+            "cargo +nightly install cargo-udeps --locked --quiet || true".into(),
+        ],
         mounts: vec![],
         workspace_mount: Some(WorkspaceMount {
             container_path: "/workspace".into(),

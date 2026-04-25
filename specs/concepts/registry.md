@@ -125,4 +125,6 @@ Beyond `agentry-self-host-v0` (full pipeline), two lighter topologies exist. `ag
 The planner role picks each child's topology from the task signature: `agentry-spec-edit-v0` for specs/docs-only edits, `agentry-bugfix-v0` for sub-30-LOC Rust bug fixes, `agentry-self-host-v0` (default) for everything else. The meta-brief's `payload.child_topology` provides the fallback if the planner omits a child's topology.
 
 The `auditor-claude-agentry` role and `agentry-self-audit-v0` topology emit cargo clippy/build/test reports as trace-stream events. Offline (no LLM, no forge, no claude mounts); reports persist in `agentry:brief:<id>:trace` for Phase 2 consumers.
+
+Phase 2 — auditor runs `cargo +nightly udeps --output json`, emits one child brief per unused normal/dev/build dep targeting `agentry-bugfix-v0`. Dispatch via `emit_message "_chain_trigger" {next_brief_refs}`.
 _poc_v4: 2026-04-25_
