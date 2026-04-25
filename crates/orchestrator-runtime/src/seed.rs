@@ -644,6 +644,24 @@ Role-spec audit (CRITICAL):
 - Mismatches are blockers with category "invariant" and a message starting with "role-spec audit:".
 - This complements (does not replace) the scope-guardrail and verb-completeness checks above.
 
+Bootstrap-command audit (CRITICAL):
+- If the diff modifies any role's \`extra_bootstrap\` shell strings, verify each shell command:
+  (a) \`cargo install --git URL --bin <name>\` is rejected when the target is a workspace with multiple binaries — must use positional package name (e.g. \`cfdb-cli\`, \`application\`) or \`--package\`.
+  (b) Bootstrap commands that may transiently fail must end with \`|| true\` for fault tolerance, matching the existing \`reviewer-mechanical-agentry\` quality-hygiene install pattern.
+  Mismatch is a blocker with category "invariant".
+
+Daemon-lifecycle ordering (CRITICAL):
+- If the diff modifies the daemon's \`handle_brief\` shipping flow (workspace teardown, chain-trigger, terminal-handler), verify the ORDER:
+  chain-trigger MUST read \`next_brief_refs\` and submit children to Redis BEFORE workspace destruction.
+  Reason: planner-emitted child JSONs live IN the workspace; destroyed-before-read = lost children.
+  Wrong order is a blocker with category "invariant".
+
+State-machine emission idempotency (CRITICAL):
+- If the diff adds or modifies a state-machine compose/finalize function (DOL \`compose_meta_verdict\`, future composers in recursive sub-planning, etc.), verify exactly-once semantics:
+  guard the emission with SETNX on a Redis marker key, OR a Redis transaction, OR an equivalent atomic check.
+  Concurrent terminal handlers can re-enter; without the gate, duplicate verdicts will fire (observed in A7v3: 3× duplicate failed-verdicts for one meta-brief).
+  Missing idempotency gate is a blocker with category "invariant".
+
 Your response, right now, starting with [ and ending with ]:
 PROMPT
 
@@ -2279,6 +2297,30 @@ mod tests {
         assert!(
             REVIEWER_CLAUDE_AGENTRY_SCRIPT.contains("tool_allowlist"),
             "Role-spec audit clause must reference tool_allowlist"
+        );
+    }
+
+    #[test]
+    fn reviewer_claude_prompt_includes_bootstrap_command_audit_clause() {
+        assert!(
+            REVIEWER_CLAUDE_AGENTRY_SCRIPT.contains("Bootstrap-command audit (CRITICAL)"),
+            "reviewer-claude prompt must include the Bootstrap-command audit critical clause"
+        );
+    }
+
+    #[test]
+    fn reviewer_claude_prompt_includes_daemon_lifecycle_ordering_clause() {
+        assert!(
+            REVIEWER_CLAUDE_AGENTRY_SCRIPT.contains("Daemon-lifecycle ordering (CRITICAL)"),
+            "reviewer-claude prompt must include the Daemon-lifecycle ordering critical clause"
+        );
+    }
+
+    #[test]
+    fn reviewer_claude_prompt_includes_state_machine_emission_idempotency_clause() {
+        assert!(
+            REVIEWER_CLAUDE_AGENTRY_SCRIPT.contains("State-machine emission idempotency (CRITICAL)"),
+            "reviewer-claude prompt must include the State-machine emission idempotency critical clause"
         );
     }
 
