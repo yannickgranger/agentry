@@ -25,7 +25,7 @@ use orchestrator_types::{
 /// Bash helpers injected at the top of scripts that build structured events
 /// via jq. Defines `emit_event <payload-json>`, `emit_done <verdict>`,
 /// `emit_finding <severity> <tool> <category> <message>` (mechanical origin),
-/// `emit_finding_model <severity> <agent-id> <category> <message>` (LLM origin),
+/// `emit_finding_model <severity> <agent-id> <category> <message> [prohibitions-json] [requirements-json]` (LLM origin),
 /// and `emit_message <to> <payload-json>`.
 const BASH_PRELUDE: &str = r#"emit_event() {
     jq -nc --arg at "$(date -Iseconds)" --argjson payload "$1" \
@@ -43,7 +43,8 @@ emit_finding() {
             severity:$sev,
             origin:{kind:"mechanical", tool:$tool, rule:null},
             file:null, line:null,
-            category:$cat, message:$msg, suggested_fix:null
+            category:$cat, message:$msg, suggested_fix:null,
+            prohibitions:[], requirements:[]
         }}'
 }
 emit_message() {
@@ -52,14 +53,21 @@ emit_message() {
         '{at:$at, type:"message", to:$to, payload:$payload}'
 }
 emit_finding_model() {
-    # args: severity (blocker|warn), reviewer_agent_id, category, message
+    # args: severity (blocker|warn), reviewer_agent_id, category, message,
+    #       [prohibitions JSON array], [requirements JSON array]
+    # Last two args default to "[]" when omitted, so legacy 4-arg call sites
+    # keep working unchanged.
+    local prohibitions="${5:-[]}"
+    local requirements="${6:-[]}"
     jq -nc --arg at "$(date -Iseconds)" \
         --arg sev "$1" --arg aid "$2" --arg cat "$3" --arg msg "$4" \
+        --argjson proh "$prohibitions" --argjson reqs "$requirements" \
         '{at:$at, type:"finding", finding:{
             severity:$sev,
             origin:{kind:"model", reviewer_agent_id:$aid},
             file:null, line:null,
-            category:$cat, message:$msg, suggested_fix:null
+            category:$cat, message:$msg, suggested_fix:null,
+            prohibitions:$proh, requirements:$reqs
         }}'
 }
 "#;
@@ -601,7 +609,9 @@ no prose, no preamble, no explanation. Each element:
 {
   "severity": "blocker" | "warn",
   "category": "design" | "naming" | "clarity" | "invariant" | "other",
-  "message": "one-sentence human-readable description (max 200 chars)"
+  "message": "one-sentence human-readable description (max 200 chars)",
+  "prohibitions": ["..."],   // for blockers, what the rework must NOT do
+  "requirements": ["..."]    // for blockers, what the rework MUST do
 }
 
 Guidance:
@@ -610,6 +620,11 @@ Guidance:
 - If the diff is acceptable as-is, output exactly: []
 - Maximum 6 findings. Prefer a single Blocker over many Warns.
 - Do not comment on fmt/clippy/test — those are mechanical-reviewer scope.
+- For each Blocker, populate \`prohibitions\` (things the next coder pass
+  MUST NOT do) and \`requirements\` (things the next coder pass MUST do).
+  These anchor the rework so the coder does not solve the wrong problem.
+- For Warns, both arrays SHOULD be empty — a warn is informational, not
+  a rework constraint.
 
 Scope guardrail (CRITICAL):
 - ONLY flag changes INSIDE the DIFF. Pre-existing inconsistencies in the
@@ -697,7 +712,9 @@ printf '%s' "$payload" | jq -c '.[]' | while read -r finding; do
     severity=$(jq -r '.severity // "warn"' <<<"$finding")
     category=$(jq -r '.category // "other"' <<<"$finding")
     message=$(jq -r '.message // ""' <<<"$finding")
-    emit_finding_model "$severity" "$agent_id" "$category" "$message"
+    prohibitions=$(jq -c '[.prohibitions[]?]' <<<"$finding")
+    requirements=$(jq -c '[.requirements[]?]' <<<"$finding")
+    emit_finding_model "$severity" "$agent_id" "$category" "$message" "$prohibitions" "$requirements"
     if [ "$severity" = "blocker" ]; then
         touch /tmp/has_blocker.marker
     fi

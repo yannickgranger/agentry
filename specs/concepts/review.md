@@ -44,6 +44,8 @@ One actionable issue against a candidate change. Fields:
 - `category` — free-form string (lint, test, fmt, arch, design)
 - `message` — human-readable body
 - `suggested_fix` — optional proposed remediation
+- `prohibitions` — list of constraints the next coder iteration MUST NOT violate (populated by Blockers to anchor rework; empty for Warns)
+- `requirements` — list of constraints the next coder iteration MUST satisfy (populated by Blockers to anchor rework; empty for Warns)
 
 Round-trips through serde so the daemon can ship a finding inside a
 `RoutedMessage.payload` to an upstream role on rework.

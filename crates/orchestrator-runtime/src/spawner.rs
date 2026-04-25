@@ -638,6 +638,8 @@ mod tests {
             category: "acceptance".into(),
             message: "stderr blob".into(),
             suggested_fix: None,
+            prohibitions: Vec::new(),
+            requirements: Vec::new(),
         }];
         let v = compute_verdict(
             &bid(),
