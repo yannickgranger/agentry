@@ -127,4 +127,6 @@ The planner role picks each child's topology from the task signature: `agentry-s
 The `auditor-claude-agentry` role and `agentry-self-audit-v0` topology emit cargo clippy/build/test reports as trace-stream events. Offline (no LLM, no forge, no claude mounts); reports persist in `agentry:brief:<id>:trace` for Phase 2 consumers.
 
 Phase 2 — auditor runs `cargo +nightly udeps --output json`, emits one child brief per unused normal/dev/build dep targeting `agentry-bugfix-v0`. Dispatch via `emit_message "_chain_trigger" {next_brief_refs}`.
+
+Roles using `BASH_PRELUDE` export `GIT_SSL_NO_VERIFY=true` and `CARGO_NET_GIT_FETCH_WITH_CLI=true` so cargo can fetch private git deps from internal forges (agency.lab, git.lab) whose certs aren't in the container CA bundle. This matches the pattern projects' own CI workflows already use.
 _poc_v4: 2026-04-25_

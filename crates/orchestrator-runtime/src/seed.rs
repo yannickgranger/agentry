@@ -27,7 +27,9 @@ use orchestrator_types::{
 /// `emit_finding <severity> <tool> <category> <message>` (mechanical origin),
 /// `emit_finding_model <severity> <agent-id> <category> <message> [prohibitions-json] [requirements-json]` (LLM origin),
 /// and `emit_message <to> <payload-json>`.
-const BASH_PRELUDE: &str = r#"emit_event() {
+const BASH_PRELUDE: &str = r#"export GIT_SSL_NO_VERIFY=true
+export CARGO_NET_GIT_FETCH_WITH_CLI=true
+emit_event() {
     jq -nc --arg at "$(date -Iseconds)" --argjson payload "$1" \
         '{at:$at, type:"event", payload:$payload}'
 }
