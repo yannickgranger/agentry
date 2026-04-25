@@ -37,8 +37,7 @@ const DEFAULT_ROOT: &str = "/var/mnt/workspaces/agentry-work";
 /// Allocations against DIFFERENT repos still run concurrently because each
 /// has its own lock.
 fn bare_clone_locks() -> &'static StdMutex<HashMap<PathBuf, Arc<TokioMutex<()>>>> {
-    static LOCKS: OnceLock<StdMutex<HashMap<PathBuf, Arc<TokioMutex<()>>>>> =
-        OnceLock::new();
+    static LOCKS: OnceLock<StdMutex<HashMap<PathBuf, Arc<TokioMutex<()>>>>> = OnceLock::new();
     LOCKS.get_or_init(|| StdMutex::new(HashMap::new()))
 }
 
@@ -273,7 +272,9 @@ pub async fn allocate_at(
             .await
             .map_err(|e| Error::Config(format!("git rev-parse HEAD: {e}")))?;
         if !head_check.status.success()
-            || String::from_utf8_lossy(&head_check.stdout).trim().is_empty()
+            || String::from_utf8_lossy(&head_check.stdout)
+                .trim()
+                .is_empty()
         {
             // Tear down the broken worktree so the bare clone forgets it.
             let _ = tokio::process::Command::new("git")
@@ -652,7 +653,9 @@ mod tests {
                 ws.host_path.display(),
                 String::from_utf8_lossy(&merge_base.stderr)
             );
-            let mb_sha = String::from_utf8_lossy(&merge_base.stdout).trim().to_string();
+            let mb_sha = String::from_utf8_lossy(&merge_base.stdout)
+                .trim()
+                .to_string();
             assert!(
                 !mb_sha.is_empty(),
                 "merge-base returned empty SHA for {}",
