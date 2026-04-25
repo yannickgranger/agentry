@@ -50,6 +50,14 @@ pub struct ReviewFinding {
     pub message: String,
     #[serde(default)]
     pub suggested_fix: Option<String>,
+    /// Constraints on the next coder iteration: things it MUST NOT do.
+    /// Populated by Blocker findings to anchor rework; empty for Warns.
+    #[serde(default)]
+    pub prohibitions: Vec<String>,
+    /// Constraints on the next coder iteration: things it MUST do.
+    /// Populated by Blocker findings to anchor rework; empty for Warns.
+    #[serde(default)]
+    pub requirements: Vec<String>,
 }
 
 #[cfg(test)]
@@ -69,6 +77,8 @@ mod tests {
             category: "correctness".into(),
             message: "used `unwrap` on a `Result` value".into(),
             suggested_fix: None,
+            prohibitions: Vec::new(),
+            requirements: Vec::new(),
         };
         let s = serde_json::to_string(&f).expect("ser");
         let back: ReviewFinding = serde_json::from_str(&s).expect("de");
@@ -87,10 +97,58 @@ mod tests {
             category: "design".into(),
             message: "consider splitting this function".into(),
             suggested_fix: Some("extract lines 40-55 into a helper".into()),
+            prohibitions: Vec::new(),
+            requirements: Vec::new(),
         };
         let s = serde_json::to_string(&f).expect("ser");
         let back: ReviewFinding = serde_json::from_str(&s).expect("de");
         assert_eq!(f, back);
+    }
+
+    #[test]
+    fn finding_roundtrip_with_prohibitions_and_requirements() {
+        let f = ReviewFinding {
+            file: Some("crates/y/src/lib.rs".into()),
+            line: Some(7),
+            severity: Severity::Blocker,
+            origin: FindingOrigin::Model {
+                reviewer_agent_id: "rev-claude-agentry:def456".into(),
+            },
+            category: "design".into(),
+            message: "rework needed: invariant violation".into(),
+            suggested_fix: None,
+            prohibitions: vec![
+                "do not introduce a new abstraction".into(),
+                "do not modify files outside the diff scope".into(),
+            ],
+            requirements: vec![
+                "preserve the existing AgentRole permit_scope minimality".into(),
+                "the marker line must be the LAST non-empty line".into(),
+            ],
+        };
+        let s = serde_json::to_string(&f).expect("ser");
+        let back: ReviewFinding = serde_json::from_str(&s).expect("de");
+        assert_eq!(f, back);
+        assert_eq!(back.prohibitions.len(), 2);
+        assert_eq!(back.requirements.len(), 2);
+    }
+
+    #[test]
+    fn finding_deserializes_legacy_json_without_new_fields() {
+        // Old emitter (before prohibitions/requirements existed) — must still
+        // deserialize, with both new fields defaulting to empty Vec.
+        let legacy = r#"{
+            "file": "crates/z/src/lib.rs",
+            "line": 1,
+            "severity": "blocker",
+            "origin": {"kind": "mechanical", "tool": "clippy", "rule": null},
+            "category": "lint",
+            "message": "old finding",
+            "suggested_fix": null
+        }"#;
+        let f: ReviewFinding = serde_json::from_str(legacy).expect("de legacy");
+        assert!(f.prohibitions.is_empty());
+        assert!(f.requirements.is_empty());
     }
 
     #[test]

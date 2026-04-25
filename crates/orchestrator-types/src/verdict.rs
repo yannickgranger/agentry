@@ -122,6 +122,8 @@ mod tests {
                     category: "lint".into(),
                     message: "example".into(),
                     suggested_fix: None,
+                    prohibitions: Vec::new(),
+                    requirements: Vec::new(),
                 }],
             },
         );
