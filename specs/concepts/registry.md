@@ -129,4 +129,6 @@ The `auditor-claude-agentry` role and `agentry-self-audit-v0` topology emit carg
 Phase 2 — auditor runs `cargo +nightly udeps --output json`, emits one child brief per unused normal/dev/build dep targeting `agentry-bugfix-v0`. Dispatch via `emit_message "_chain_trigger" {next_brief_refs}`.
 
 Roles using `BASH_PRELUDE` export `GIT_SSL_NO_VERIFY=true` and `CARGO_NET_GIT_FETCH_WITH_CLI=true` so cargo can fetch private git deps from internal forges (agency.lab, git.lab) whose certs aren't in the container CA bundle. This matches the pattern projects' own CI workflows already use.
+
+Roles using `BASH_PRELUDE` derive their `claude -p` timeout from the `CLAUDE_P_TIMEOUT` env (default 1200s). Spawner can override per-role for tighter budgets (e.g. reviewer-claude: 300s; archaeologist: 600s) without touching role scripts.
 _poc_v4: 2026-04-25_

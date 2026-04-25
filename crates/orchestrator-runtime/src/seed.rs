@@ -29,6 +29,7 @@ use orchestrator_types::{
 /// and `emit_message <to> <payload-json>`.
 const BASH_PRELUDE: &str = r#"export GIT_SSL_NO_VERIFY=true
 export CARGO_NET_GIT_FETCH_WITH_CLI=true
+CLAUDE_P_TIMEOUT="${CLAUDE_P_TIMEOUT:-1200}"
 emit_event() {
     jq -nc --arg at "$(date -Iseconds)" --argjson payload "$1" \
         '{at:$at, type:"event", payload:$payload}'
@@ -186,7 +187,7 @@ fi
 
 emit_event "$(jq -nc --arg p "$prompt" '{msg:"calling Claude Max (headless)", prompt_chars:($p|length)}')"
 
-reply=$(HOME=/root timeout 600 claude -p "$prompt" 2>&1) || {
+reply=$(HOME=/root timeout "$CLAUDE_P_TIMEOUT" claude -p "$prompt" 2>&1) || {
     emit_event "$(jq -nc --arg err "$reply" '{error:"claude -p failed", detail:$err}')"
     emit_done "failed"
     exit 0
@@ -379,7 +380,7 @@ PROMPT
 
 emit_event "$(jq -nc --arg len "$(wc -c < /tmp/prompt.txt)" '{msg:"calling claude -p",prompt_bytes:$len}')"
 
-reply=$(HOME=/root timeout 600 claude -p "$(cat /tmp/prompt.txt)" 2>&1) || {
+reply=$(HOME=/root timeout "$CLAUDE_P_TIMEOUT" claude -p "$(cat /tmp/prompt.txt)" 2>&1) || {
     emit_event "$(jq -nc --arg err "$reply" '{error:"claude -p failed",detail:$err}')"
     emit_done "failed"; exit 0
 }
@@ -469,7 +470,7 @@ as a short description (max 200 chars each, max 6 entries).
 
 Your response, right now, starting with { and ending with }:
 PROMPT
-    sr=$(HOME=/root timeout 600 claude -p "$(cat /tmp/self_rev.txt)" 2>&1) || {
+    sr=$(HOME=/root timeout "$CLAUDE_P_TIMEOUT" claude -p "$(cat /tmp/self_rev.txt)" 2>&1) || {
         emit_event "$(jq -nc --arg err "$(printf '%s' "$sr" | head -c 300)" '{warn:"self-review claude call failed; proceeding",detail:$err}')"
         sr='{"all_applied":true,"unapplied":[]}'
     }
@@ -682,7 +683,7 @@ State-machine emission idempotency (CRITICAL):
 Your response, right now, starting with [ and ending with ]:
 PROMPT
 
-response=$(HOME=/root timeout 600 claude -p "$(cat /tmp/rev_prompt.txt)" 2>&1) || {
+response=$(HOME=/root timeout "$CLAUDE_P_TIMEOUT" claude -p "$(cat /tmp/rev_prompt.txt)" 2>&1) || {
     emit_event "$(jq -nc --arg err "$response" '{error:"claude -p failed",detail:$err}')"
     emit_done "failed"; exit 0
 }
@@ -1042,7 +1043,7 @@ PROMPT
 
 emit_event "$(jq -nc --arg len "$(wc -c < /tmp/arch_prompt.txt)" '{msg:"calling claude -p",prompt_bytes:$len}')"
 
-response=$(HOME=/root timeout 600 claude -p "$(cat /tmp/arch_prompt.txt)" 2>&1) || {
+response=$(HOME=/root timeout "$CLAUDE_P_TIMEOUT" claude -p "$(cat /tmp/arch_prompt.txt)" 2>&1) || {
     emit_event "$(jq -nc --arg err "$response" '{error:"claude -p failed",detail:$err}')"
     emit_done "failed"; exit 0
 }
@@ -1159,7 +1160,7 @@ PROMPT
 
 emit_event "$(jq -nc --arg len "$(wc -c < /tmp/planner_prompt.txt)" '{msg:"calling claude -p",prompt_bytes:$len}')"
 
-response=$(HOME=/root timeout 600 claude -p "$(cat /tmp/planner_prompt.txt)" 2>&1) || {
+response=$(HOME=/root timeout "$CLAUDE_P_TIMEOUT" claude -p "$(cat /tmp/planner_prompt.txt)" 2>&1) || {
     emit_event "$(jq -nc --arg err "$response" '{error:"claude -p failed",detail:$err}')"
     emit_done "failed"; exit 0
 }
@@ -2451,6 +2452,12 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claude_p_timeout_is_env_overridable_in_bash_prelude() {
+        assert!(BASH_PRELUDE.contains("CLAUDE_P_TIMEOUT=\"${CLAUDE_P_TIMEOUT:-1200}\""));
+        assert!(!BASH_PRELUDE.contains("timeout 600"));
+    }
 
     #[test]
     fn reviewer_claude_prompt_includes_role_spec_audit_clause() {
