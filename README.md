@@ -4,7 +4,9 @@ Minimal orchestrator for ephemeral agent containers. Methodology as data, enforc
 
 ## What it does
 
-Reads a `Brief` off a Redis stream. Resolves the named `TeamTopology`. For each role in the team: mints + narrows + signs a `WorkPermit`, allocates a per-brief workspace if the role declares one, spawns a fresh container on a user-chosen substrate (Podman today), enforces the permit on every `tool_call` the agent emits, routes inter-role messages per the team's message graph, records a verdict.
+Reads a `Brief` off a Redis stream. Resolves the named `TeamTopology` from a registry of role-DAGs. For each role in the team: mints + narrows + signs a `WorkPermit`, allocates a per-brief workspace if the role declares one, spawns a fresh container on a user-chosen substrate (Podman today), enforces the permit on every `tool_call` the agent emits, routes inter-role messages per the team's message graph, records a verdict.
+
+Topologies range from full-pipeline (coder + reviewer-mechanical + reviewer-claude + shipper + ci-watcher) down to single-role (offline auditor). The planner role (`agentry-planner-v0`) decomposes a meta-brief into child briefs, picking each child's topology by task signature. The auditor role (`agentry-self-audit-v0`) inspects develop for unused dependencies via cargo-udeps and auto-dispatches fix briefs through the chain-trigger — no human in the loop.
 
 The orchestrator doesn't know what "TDD", "gate", or "review" mean — that's what team topologies encode.
 
@@ -50,6 +52,18 @@ All four are edited via dashboard forms. No YAML files.
 - `orchestrator-types` — pure data + serde. Brief, AgentRole, TeamTopology, Project, WorkPermit, Event, Verdict, WorkspaceMount.
 - `orchestrator-runtime` — daemon, Spawner trait + Podman adapter, permit broker, workspace lifecycle, inline-script bootstrap, CLI.
 - `orchestrator-dashboard` — Axum + htmx + SSE + webhook intake.
+
+### Topologies
+
+Built-in topologies (in addition to internal probes):
+
+- `agentry-self-host-v0` — full pipeline (coder → reviewer-mechanical + reviewer-claude → shipper → ci-watcher). Default for feature work.
+- `agentry-bugfix-v0` — drops reviewer-claude. For sub-30-LOC mechanical fixes where CI suffices.
+- `agentry-spec-edit-v0` — drops both reviewers. For specs/docs-only changes; merged-PR CI is the only gate.
+- `agentry-discovery-v0` — single-role archaeologist that produces `discovery.json` from cfdb + graph-specs.
+- `agentry-planner-v0` — archaeologist + planner; planner decomposes a meta-brief intent into child briefs and emits `next_brief_refs` for chain-trigger dispatch.
+- `agentry-verify-v0` — single-role verifier; runs the meta-brief's `success_criteria` after children resolve. DOL composer combines child + verifier verdicts into the meta verdict.
+- `agentry-self-audit-v0` — offline auditor. Runs cargo clippy/build/test/udeps against develop, persists findings as trace events, auto-dispatches `agentry-bugfix-v0` fix briefs for each unused-dep finding.
 
 ### Spawner behavior
 
