@@ -21,12 +21,44 @@ pub async fn connect(url: &str) -> Result<ConnectionManager> {
 }
 
 /// Submit a brief to the `agentry:briefs` stream. Returns the Redis stream id.
+///
+/// As a side effect:
+/// * stashes the full brief body at `agentry:brief:<id>:body` so the DOL
+///   composer (see `daemon::compose_meta_verdict`) can replay it without
+///   scanning the stream.
+/// * if the brief carries `parent_brief = Some(meta_id)`, registers it in the
+///   meta-brief's `agentry:brief:<meta_id>:children_pending` set BEFORE the
+///   XADD so the daemon can never observe the child reaching terminal verdict
+///   while the set is missing the entry.
 pub async fn submit_brief(conn: &mut ConnectionManager, brief: &Brief) -> Result<String> {
     let body = serde_json::to_string(brief)?;
+
+    let body_key = format!("agentry:brief:{}:body", brief.id.0);
+    let _: () = conn.set(&body_key, body.as_str()).await?;
+
+    if let Some(meta_id) = &brief.parent_brief {
+        let pending_key = format!("agentry:brief:{}:children_pending", meta_id.0);
+        let _: () = conn.sadd(&pending_key, brief.id.0.as_str()).await?;
+    }
+
     let id: String = conn
         .xadd(STREAM_BRIEFS, "*", &[("brief", body.as_str())])
         .await?;
     Ok(id)
+}
+
+/// Fetch a previously-submitted brief by id. Reads the body stashed at
+/// `agentry:brief:<id>:body` by `submit_brief`. Used by the DOL composer to
+/// replay a meta-brief's payload (notably its `success_criteria`) when its
+/// last child resolves.
+pub async fn fetch_brief_body(conn: &mut ConnectionManager, brief_id: &str) -> Result<Brief> {
+    let key = format!("agentry:brief:{brief_id}:body");
+    let raw: Option<String> = conn.get(&key).await?;
+    let raw = raw.ok_or_else(|| crate::Error::NotFound {
+        kind: "brief",
+        key: key.clone(),
+    })?;
+    Ok(serde_json::from_str(&raw)?)
 }
 
 /// Append an event to a brief's trace stream.

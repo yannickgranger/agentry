@@ -1292,6 +1292,78 @@ fn build_archaeologist_claude_agentry_role(home: &str, claude_settings_path: &st
     }
 }
 
+/// Verifier role for the `agentry-verify-v0` team. The DOL composer
+/// (daemon-side, see `daemon.rs::on_all_children_resolved`) auto-dispatches a
+/// verifier brief whenever a meta-brief's children all reach terminal verdict
+/// AND the meta-brief carried a `success_criteria`. The verifier runs the
+/// criterion as a shell command on a read-only snapshot of the workspace and
+/// emits `done shipped` / `done failed`. The daemon composes that with the
+/// children's verdicts to produce the meta-brief's terminal verdict.
+const VERIFIER_CLAUDE_AGENTRY_SCRIPT: &str = r##"#!/usr/bin/env bash
+set -uo pipefail
+bundle="$(cat)"
+criterion=$(jq -r '.brief.payload.success_criteria // ""' <<<"$bundle")
+verifies=$(jq -r '.brief.payload.verifies_brief_id // ""' <<<"$bundle")
+
+if [ -z "$criterion" ]; then
+    emit_event '{"error":"verifier missing success_criteria in payload"}'
+    emit_done "failed"; exit 0
+fi
+
+cd /workspace
+emit_event "$(jq -nc --arg c "$criterion" --arg v "$verifies" '{msg:"running success_criteria",criterion:$c,verifies:$v}')"
+
+if bash -c "$criterion" > /tmp/criterion.out 2>&1; then
+    out=$(tail -c 4096 /tmp/criterion.out)
+    emit_event "$(jq -nc --arg o "$out" '{msg:"criterion passed",output:$o}')"
+    emit_done "shipped"
+else
+    rc=$?
+    out=$(tail -c 4096 /tmp/criterion.out)
+    emit_event "$(jq -nc --arg o "$out" --argjson rc "$rc" '{msg:"criterion failed",exit_code:$rc,output:$o}')"
+    emit_done "failed"
+fi
+"##;
+
+/// Build the verifier-claude-agentry role. Despite the `claude` in the name —
+/// kept for symmetry with the other agentry-* roles — the verifier never
+/// invokes claude; it just runs `success_criteria` as a shell command on a
+/// read-only snapshot of the workspace. Strictest permits in the registry:
+/// fs:read on /workspace, fs:write on /tmp only, no net, no git, no claude.
+fn build_verifier_claude_agentry_role() -> AgentRole {
+    AgentRole {
+        name: RoleName("verifier-claude-agentry".into()),
+        version: 1,
+        // No claude needed — criterion is shell.
+        model: None,
+        system_prompt: None,
+        // Same rust-bookworm base as archaeologist so criteria can run cargo,
+        // ripgrep, jq, etc. without per-criterion bootstrap.
+        image: "docker.io/library/rust:1.93".into(),
+        substrate_class: SubstrateClass::Podman,
+        package_manager: PackageManager::Apt,
+        entrypoint_script: format!("{BASH_PRELUDE}{VERIFIER_CLAUDE_AGENTRY_SCRIPT}"),
+        exitpoint_script: None,
+        binaries: vec![],
+        mcp_servers: vec![],
+        tool_allowlist: ToolAllowlist(vec![]),
+        // Strictly read-only on workspace (criterion shouldn't mutate). /tmp
+        // write for criterion temp files. No net, no git, no claude.
+        permit_scope: PermitScope(vec![
+            "fs:read:/workspace/**".into(),
+            "fs:write:/tmp/**".into(),
+        ]),
+        passthru_env: vec![],
+        extra_bootstrap: vec![],
+        mounts: vec![],
+        workspace_mount: Some(WorkspaceMount {
+            container_path: "/workspace".into(),
+            readonly: true,
+        }),
+        sccache: false,
+    }
+}
+
 const SHIPPER_SCRIPT: &str = r#"#!/usr/bin/env bash
 # Reads {repo, branch, file, content, commit_msg, pr_title, pr_body, base,
 # forge_host} from brief.payload. Clones forge repo with GITEA_TOKEN,
@@ -2048,6 +2120,21 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         max_retries: 0,
     };
 
+    // ---- agentry-verify-v0 team (DOL verifier — runs success_criteria) ----
+    // Daemon-Orchestrated Lifecycle: when all children of a meta-brief reach
+    // terminal verdict, the daemon auto-dispatches a verifier brief that runs
+    // the meta-brief's success_criteria. The verifier's verdict composes with
+    // the children's verdicts to produce the meta-brief's terminal verdict.
+    let verifier_claude_agentry = build_verifier_claude_agentry_role();
+    let agentry_verify_v0 = TeamTopology {
+        name: TeamName("agentry-verify-v0".into()),
+        version: 1,
+        roles: vec![verifier_claude_agentry.name.clone()],
+        message_graph: Vec::<MessageEdge>::new(),
+        terminal_role: verifier_claude_agentry.name.clone(),
+        max_retries: 0,
+    };
+
     let agentry_self_host_v0 = TeamTopology {
         name: TeamName("agentry-self-host-v0".into()),
         version: 1,
@@ -2131,9 +2218,11 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
     redis_io::save_team(&mut conn, &agentry_discovery_v0).await?;
     redis_io::save_role(&mut conn, &planner_claude_agentry).await?;
     redis_io::save_team(&mut conn, &agentry_planner_v0).await?;
+    redis_io::save_role(&mut conn, &verifier_claude_agentry).await?;
+    redis_io::save_team(&mut conn, &agentry_verify_v0).await?;
 
     tracing::info!(
-        "seeded: roles [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker, listener, grok-echo, claude-echo, synthesizer, narrowed-coder, shipper, coder-claude-agentry, reviewer-mechanical-agentry, shipper-agentry, ci-watcher-agentry, reviewer-claude-agentry, null-agent-agentry, archaeologist-claude-agentry, planner-claude-agentry] (inline entrypoint scripts); teams [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker-listener, grok-echo, claude-echo, narrowed-team, shipper-solo-team, agentry-self-host-v0, agentry-null-v0, agentry-discovery-v0, agentry-planner-v0]"
+        "seeded: roles [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker, listener, grok-echo, claude-echo, synthesizer, narrowed-coder, shipper, coder-claude-agentry, reviewer-mechanical-agentry, shipper-agentry, ci-watcher-agentry, reviewer-claude-agentry, null-agent-agentry, archaeologist-claude-agentry, planner-claude-agentry, verifier-claude-agentry] (inline entrypoint scripts); teams [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker-listener, grok-echo, claude-echo, narrowed-team, shipper-solo-team, agentry-self-host-v0, agentry-null-v0, agentry-discovery-v0, agentry-planner-v0, agentry-verify-v0]"
     );
     Ok(())
 }
@@ -2361,5 +2450,85 @@ mod tests {
         let ws = role.workspace_mount.expect("planner needs workspace_mount");
         assert_eq!(ws.container_path, "/workspace");
         assert!(!ws.readonly, "planner workspace must be writable");
+    }
+
+    #[test]
+    fn verifier_script_invariants() {
+        let s = VERIFIER_CLAUDE_AGENTRY_SCRIPT;
+        assert!(s.contains("success_criteria"), "must read success_criteria");
+        assert!(
+            s.contains("emit_done \"shipped\""),
+            "must emit shipped on pass"
+        );
+        assert!(
+            s.contains("emit_done \"failed\""),
+            "must emit failed on fail"
+        );
+        assert!(!s.contains("git"), "verifier must not touch git");
+        assert!(!s.contains("curl"), "verifier must not call curl");
+    }
+
+    #[test]
+    fn verifier_role_permits_strictest() {
+        let role = build_verifier_claude_agentry_role();
+
+        // Exactly two scopes — workspace read, /tmp write. No net at all.
+        let scopes: Vec<&str> = role.permit_scope.0.iter().map(String::as_str).collect();
+        let expected = ["fs:read:/workspace/**", "fs:write:/tmp/**"];
+        assert_eq!(
+            scopes.len(),
+            expected.len(),
+            "verifier permit_scope must have exactly {} entries, got {:?}",
+            expected.len(),
+            scopes
+        );
+        for want in expected {
+            assert!(
+                scopes.contains(&want),
+                "verifier permit_scope missing {want}: {scopes:?}"
+            );
+        }
+
+        // No net:allow:* of any kind — criterion is local-only in v0.
+        for s in &scopes {
+            assert!(
+                !s.starts_with("net:"),
+                "verifier must not have any net scope, got {s}"
+            );
+        }
+
+        // No fs:write outside /tmp.
+        for s in &scopes {
+            if let Some(rest) = s.strip_prefix("fs:write:") {
+                assert!(
+                    rest.starts_with("/tmp"),
+                    "verifier fs:write must be /tmp only, got {s}"
+                );
+            }
+        }
+
+        // No claude / forge / cargo install — verifier installs nothing.
+        assert!(role.binaries.is_empty(), "verifier binaries must be empty");
+        assert!(
+            role.extra_bootstrap.is_empty(),
+            "verifier extra_bootstrap must be empty"
+        );
+        assert!(role.mounts.is_empty(), "verifier mounts must be empty");
+        assert!(
+            !role.passthru_env.iter().any(|e| e == "GITEA_TOKEN"),
+            "verifier must not pass through GITEA_TOKEN"
+        );
+        assert!(
+            role.tool_allowlist.0.is_empty(),
+            "verifier tool_allowlist must be empty"
+        );
+        assert!(role.model.is_none(), "verifier must not declare a model");
+
+        // Workspace mount is read-only.
+        let ws = role
+            .workspace_mount
+            .expect("verifier needs workspace_mount");
+        assert_eq!(ws.container_path, "/workspace");
+        assert!(ws.readonly, "verifier workspace must be read-only");
     }
 }
