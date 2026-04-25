@@ -119,4 +119,6 @@ a git worktree off a shared bare clone of `repo_url`, tracking
 `base_branch`. Briefs without a project fall back to reading `target_repo`
 + `base_branch` from `brief.payload` — this is the transitional path until
 every brief carries a project.
+
+Beyond `agentry-self-host-v0` (full pipeline), two lighter topologies exist. `agentry-bugfix-v0` drops `reviewer-claude-agentry` for sub-30-LOC bug fixes where mechanical CI is sufficient. `agentry-spec-edit-v0` drops both reviewers for specs/docs-only changes; the merged-PR CI run catches any spec/code mismatch.
 _poc_v4: 2026-04-25_

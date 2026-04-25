@@ -2253,6 +2253,60 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         max_retries: 2,
     };
 
+    let agentry_bugfix_v0 = TeamTopology {
+        name: TeamName("agentry-bugfix-v0".into()),
+        version: 1,
+        roles: vec![
+            coder_claude_agentry.name.clone(),
+            reviewer_mechanical_agentry.name.clone(),
+            shipper_agentry.name.clone(),
+            ci_watcher_agentry.name.clone(),
+        ],
+        message_graph: vec![
+            MessageEdge {
+                from: coder_claude_agentry.name.clone(),
+                to: reviewer_mechanical_agentry.name.clone(),
+                permit_overrides_from: None,
+            },
+            MessageEdge {
+                from: reviewer_mechanical_agentry.name.clone(),
+                to: shipper_agentry.name.clone(),
+                permit_overrides_from: None,
+            },
+            MessageEdge {
+                from: shipper_agentry.name.clone(),
+                to: ci_watcher_agentry.name.clone(),
+                permit_overrides_from: None,
+            },
+        ],
+        terminal_role: ci_watcher_agentry.name.clone(),
+        max_retries: 2,
+    };
+
+    let agentry_spec_edit_v0 = TeamTopology {
+        name: TeamName("agentry-spec-edit-v0".into()),
+        version: 1,
+        roles: vec![
+            coder_claude_agentry.name.clone(),
+            shipper_agentry.name.clone(),
+            ci_watcher_agentry.name.clone(),
+        ],
+        message_graph: vec![
+            MessageEdge {
+                from: coder_claude_agentry.name.clone(),
+                to: shipper_agentry.name.clone(),
+                permit_overrides_from: None,
+            },
+            MessageEdge {
+                from: shipper_agentry.name.clone(),
+                to: ci_watcher_agentry.name.clone(),
+                permit_overrides_from: None,
+            },
+        ],
+        terminal_role: ci_watcher_agentry.name.clone(),
+        max_retries: 1,
+    };
+
     // ---- persist everything ----
     redis_io::save_role(&mut conn, &echo).await?;
     redis_io::save_team(&mut conn, &echo_team).await?;
@@ -2282,6 +2336,8 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
     redis_io::save_role(&mut conn, &shipper_agentry).await?;
     redis_io::save_role(&mut conn, &ci_watcher_agentry).await?;
     redis_io::save_team(&mut conn, &agentry_self_host_v0).await?;
+    redis_io::save_team(&mut conn, &agentry_bugfix_v0).await?;
+    redis_io::save_team(&mut conn, &agentry_spec_edit_v0).await?;
     redis_io::save_role(&mut conn, &null_agent_agentry).await?;
     redis_io::save_team(&mut conn, &agentry_null_v0).await?;
     redis_io::save_role(&mut conn, &archaeologist_claude_agentry).await?;
