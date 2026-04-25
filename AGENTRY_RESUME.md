@@ -94,3 +94,4 @@ Do not invent new primitives, add new crates, or re-open deferred features. If t
 ## Last updated
 
 See `git log -1 AGENTRY_RESUME.md`. If this document drifts from the code, the code is right and this document is a bug to fix via a brief.
+_poc_v6: 2026-04-25_
