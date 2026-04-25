@@ -110,3 +110,5 @@ Surfaced at the daemon boundary; never crosses into the container.
 
 The runtime's `Result` alias bound to `Error`. Used as the return type of
 every fallible function inside `orchestrator-runtime`.
+
+_marker: 2026-04-25-poc_
