@@ -635,6 +635,15 @@ Verb-completeness check (CRITICAL):
 - Applied-but-incomplete counts as unapplied (e.g. the verb asked to change
   three sites and only two were touched — the remaining one is unapplied).
 
+Role-spec audit (CRITICAL):
+- If the diff adds or modifies an \`AgentRole\` (i.e. introduces a \`RoleName(...)\` registration in seed.rs or changes the fields of an existing one), verify each of:
+  (a) \`permit_scope\` is minimal for the stated job — no fs:write outside the workspace, no net access unless justified, no git tools on roles that do not ship code.
+  (b) \`tool_allowlist\` matches what the role's entrypoint actually does (a read-only role must not be allowed to write arbitrary streams).
+  (c) the deny-list is explicit for the categories of tool the role does not need.
+  (d) any \`binaries\` or \`mcp_servers\` named are justified by the role's job.
+- Mismatches are blockers with category "invariant" and a message starting with "role-spec audit:".
+- This complements (does not replace) the scope-guardrail and verb-completeness checks above.
+
 Your response, right now, starting with [ and ending with ]:
 PROMPT
 
@@ -1616,4 +1625,25 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         "seeded: roles [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker, listener, grok-echo, claude-echo, synthesizer, narrowed-coder, shipper, coder-claude-agentry, reviewer-mechanical-agentry, shipper-agentry, ci-watcher-agentry, reviewer-claude-agentry] (inline entrypoint scripts); teams [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker-listener, grok-echo, claude-echo, narrowed-team, shipper-solo-team, agentry-self-host-v0]"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reviewer_claude_prompt_includes_role_spec_audit_clause() {
+        assert!(
+            REVIEWER_CLAUDE_AGENTRY_SCRIPT.contains("Role-spec audit (CRITICAL)"),
+            "reviewer-claude prompt must include the Role-spec audit critical clause"
+        );
+        assert!(
+            REVIEWER_CLAUDE_AGENTRY_SCRIPT.contains("permit_scope"),
+            "Role-spec audit clause must reference permit_scope"
+        );
+        assert!(
+            REVIEWER_CLAUDE_AGENTRY_SCRIPT.contains("tool_allowlist"),
+            "Role-spec audit clause must reference tool_allowlist"
+        );
+    }
 }
