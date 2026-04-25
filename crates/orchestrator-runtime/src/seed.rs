@@ -514,7 +514,7 @@ cd /workspace
 emit_event '{"msg":"reviewer starting"}'
 
 # Diff summary. base_branch is on `origin/<base_branch>`.
-diff_stat=$(git diff --stat "${base_branch}"..HEAD 2>&1 | tail -1 || true)
+diff_stat=$(git diff --stat "${base_branch}"...HEAD 2>&1 | tail -1 || true)
 emit_event "$(jq -nc --arg d "$diff_stat" '{msg:"diff",summary:$d}')"
 
 # Workspace is read-only for this role — redirect Cargo's target/ to /tmp.
@@ -564,7 +564,7 @@ cd /workspace
 
 # Diff against develop. The coder produces commits on top of origin/develop;
 # we review what was ADDED, not the whole file set.
-if ! git diff "${base_branch}..HEAD" > /tmp/diff.patch 2>/tmp/diff.err; then
+if ! git diff "${base_branch}...HEAD" > /tmp/diff.patch 2>/tmp/diff.err; then
     err=$(tail -20 /tmp/diff.err)
     emit_event "$(jq -nc --arg err "$err" '{error:"git diff failed",detail:$err}')"
     emit_done "failed"; exit 0
