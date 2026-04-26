@@ -35,3 +35,10 @@ it is Published Language between the submitter and the team.
 The full record: id, project (optional), topology ref, payload, budget,
 escalation mode, parent brief (optional), submitter, submission timestamp.
 Persisted on `agentry:briefs` as the XADD entry that starts the workflow.
+
+A brief may also carry `cohort_labels`: an optional list of free-form strings
+propagated to every agent the brief spawns. Set by the dispatching authority
+(captain, officer, or human submitter); the orchestrator does not assign or
+interpret them. Monitoring selectors use cohort labels to address subsets of
+the agent fleet — "every coder in the self-host topology", "every agent in
+phase X" — without the orchestrator having to know what those subsets mean.

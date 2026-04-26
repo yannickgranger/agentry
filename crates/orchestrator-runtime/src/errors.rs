@@ -12,6 +12,8 @@ pub enum Error {
     Json(#[from] serde_json::Error),
     #[error("podman: {0}")]
     Podman(String),
+    #[error("sqlite: {0}")]
+    Sqlite(#[from] rusqlite::Error),
     #[error("not found: {kind} {key}")]
     NotFound { kind: &'static str, key: String },
     #[error("config: {0}")]

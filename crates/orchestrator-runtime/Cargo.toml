@@ -33,6 +33,7 @@ rand_core.workspace = true
 hex.workspace = true
 figment.workspace = true
 anyhow = "1.0.102"
+rusqlite = { version = "0.32", features = ["bundled", "chrono"] }
 
 [dev-dependencies]
 tempfile = "3.14"
