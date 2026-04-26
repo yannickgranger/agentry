@@ -15,7 +15,8 @@ echo "==> graph-specs check (concept-level equivalence)"
 graph-specs check --specs specs/concepts/ --code crates/
 
 echo "==> cfdb extract (x-ray the workspace)"
-DB_DIR=".cfdb/db-local"
+DB_DIR="${CFDB_DB_DIR:-/tmp/agentry-cfdb-db-local}"
+mkdir -p "$DB_DIR"
 rm -rf "$DB_DIR"
 cfdb extract --workspace . --db "$DB_DIR" --keyspace agentry
 
