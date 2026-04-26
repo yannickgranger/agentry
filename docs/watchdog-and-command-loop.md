@@ -136,15 +136,59 @@ resolves against one of these.
 
 ### Reading the trace stream
 
-Follow one brief from spawn to ship:
+Follow one agent across all known briefs (NDJSON, oldest-first):
+
+```bash
+orchestrator agents trace <agent_id> --last 200
+```
+
+Extract just the watchdog's Status verdicts on one agent:
+
+```bash
+orchestrator agents recent-status <agent_id> --count 20
+```
+
+### Reading the agent index
+
+List the running fleet:
+
+```bash
+orchestrator agents list
+```
+
+List everything (terminated agents included):
+
+```bash
+orchestrator agents list --all
+```
+
+Run an arbitrary read-only selector against the index — `State::query`'s
+SELECT/WITH guard rejects any non-readonly SQL structurally:
+
+```bash
+orchestrator agents query \
+    "SELECT agent_id, role_name, status, verdict FROM agents \
+     WHERE brief_id = 'brf_work_…' ORDER BY started_at"
+```
+
+Fleet-wide selectors are the same shape the watchdog already runs
+internally — the `all_running` selector is just
+`SELECT … FROM agents WHERE status = 'running'`.
+
+### Raw equivalents (for unwritten queries)
+
+When an answer doesn't fit the canned subcommands above, talk to the
+substrate directly. These are what the CLI wraps.
+
+Trace stream (one brief, all events, oldest-first):
 
 ```bash
 redis-cli -p 6380 -a "$(cat ~/.config/agentry/redis.password)" \
     XRANGE agentry:brief:<brief_id>:trace - +
 ```
 
-Follow one agent across that brief (filter the stream by the `agent`
-field client-side):
+Trace stream filtered to one agent (Python — `redis-cli` can't filter
+hash fields):
 
 ```python
 import redis, json, os
@@ -156,29 +200,13 @@ for sid, fields in r.xrange("agentry:brief:<brief_id>:trace", count=500):
         print(sid, json.loads(fields["event"]))
 ```
 
-Extract just the watchdog's verdicts on one agent:
-
-```python
-for sid, fields in r.xrange("agentry:brief:<brief_id>:trace", count=500):
-    ev = json.loads(fields["event"])
-    if ev.get("type") == "status":
-        print(sid, ev["agent_id"], "ok=", ev["ok"], "reason=", ev["reason"])
-```
-
-### Reading the agent index
-
-The SQLite store accepts SELECT/WITH only via `State::query`; in the
-shell, use the read-only `sqlite3` CLI (or `python3 sqlite3`):
+Agent index via the read-only `sqlite3` CLI:
 
 ```bash
 sqlite3 -readonly ~/.config/agentry/state.db \
     "SELECT agent_id, role_name, status, verdict FROM agents \
      WHERE brief_id = 'brf_work_…' ORDER BY started_at"
 ```
-
-Fleet-wide selectors are the same shape the watchdog already runs
-internally — the `all_running` selector is just
-`SELECT … FROM agents WHERE status = 'running'`.
 
 ### Stuck-agent forensics recipe
 

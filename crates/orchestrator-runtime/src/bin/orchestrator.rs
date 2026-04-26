@@ -5,9 +5,9 @@
 //! `orchestrator abort --all` — abort all running briefs.
 
 use clap::{Parser, Subcommand};
-use orchestrator_runtime::{permit, redis_io, seed, Config, Result};
+use orchestrator_runtime::{cli_agents, permit, redis_io, seed, state, Config, Result};
 use orchestrator_types::Brief;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Parser, Debug)]
 #[command(name = "orchestrator", version)]
@@ -40,6 +40,34 @@ enum Cmd {
         /// Overwrite if the key already exists.
         #[arg(long)]
         force: bool,
+    },
+    /// Inspect the running fleet (NDJSON output).
+    Agents {
+        #[command(subcommand)]
+        sub: AgentsCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum AgentsCmd {
+    /// List agents (default: status='running').
+    List {
+        #[arg(long)]
+        all: bool,
+    },
+    /// Run a read-only SELECT against the agent index.
+    Query { sql: String },
+    /// Show recent trace events for an agent.
+    Trace {
+        agent_id: String,
+        #[arg(long, default_value_t = 50)]
+        last: usize,
+    },
+    /// Show recent Status verdicts for an agent.
+    RecentStatus {
+        agent_id: String,
+        #[arg(long, default_value_t = 10)]
+        count: usize,
     },
 }
 
@@ -116,6 +144,44 @@ async fn main() -> Result<()> {
             } else {
                 eprintln!("abort requires --all for M0");
                 std::process::exit(2);
+            }
+        }
+        Cmd::Agents { sub } => {
+            let state_path = std::env::var("AGENTRY_STATE_PATH").unwrap_or_else(|_| {
+                format!(
+                    "{}/.config/agentry/state.db",
+                    std::env::var("HOME").unwrap_or_else(|_| "/tmp".into())
+                )
+            });
+            match sub {
+                AgentsCmd::List { all } => {
+                    let state = state::open_or_init(Path::new(&state_path))?;
+                    let rows = cli_agents::list(&state, all).await?;
+                    for v in rows {
+                        println!("{}", serde_json::to_string(&v)?);
+                    }
+                }
+                AgentsCmd::Query { sql } => {
+                    let state = state::open_or_init(Path::new(&state_path))?;
+                    let rows = cli_agents::query(&state, &sql).await?;
+                    for v in rows {
+                        println!("{}", serde_json::to_string(&v)?);
+                    }
+                }
+                AgentsCmd::Trace { agent_id, last } => {
+                    let mut conn = redis_io::connect(&cfg.redis.url).await?;
+                    let rows = cli_agents::trace(&mut conn, &agent_id, last).await?;
+                    for v in rows {
+                        println!("{}", serde_json::to_string(&v)?);
+                    }
+                }
+                AgentsCmd::RecentStatus { agent_id, count } => {
+                    let mut conn = redis_io::connect(&cfg.redis.url).await?;
+                    let rows = cli_agents::recent_status(&mut conn, &agent_id, count).await?;
+                    for v in rows {
+                        println!("{}", serde_json::to_string(&v)?);
+                    }
+                }
             }
         }
     }

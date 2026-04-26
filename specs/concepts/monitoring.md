@@ -23,6 +23,10 @@ The store is opened once at daemon startup (path overridable via the
 `AGENTRY_STATE_PATH` env, defaulting under `$HOME/.config/agentry/`) and
 shared across the daemon by Arc.
 
+The store is also exposed via the `orchestrator agents` CLI for ad-hoc
+operator queries (`agents list`, `agents query <sql>`); the same
+SELECT/WITH guard applies to CLI passthru.
+
 ## AgentRow
 
 The materialized record for one agent: id, brief id, role name, optional
