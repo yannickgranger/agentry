@@ -34,6 +34,7 @@ const DEFAULT_GROK_MODEL: &str = "grok-4-fast";
 /// container and lets the spawner emit a Failed verdict via its
 /// exit-without-Done fall-through.
 const DEFAULT_STUCK_THRESHOLD: u32 = 3;
+const DEFAULT_DISTINCT_PAYLOAD_THRESHOLD: usize = 2;
 
 /// A named read-only SQL query against the agent index. The watchdog
 /// tick iterates these; each row in a selector's result becomes one
@@ -57,6 +58,13 @@ pub struct Watchdog {
     /// agent before the watchdog kills its container. Env-overridable
     /// via `AGENTRY_WATCHDOG__STUCK_THRESHOLD`.
     pub stuck_threshold: u32,
+    /// Minimum number of distinct event payloads in the recent
+    /// evidence tail required before a `stuck=true` verdict is allowed
+    /// to escalate to a container kill. Defends against false positives
+    /// on legitimate long-poll-loop agents (e.g. ci-watcher) whose tail
+    /// is the same payload repeating but whose work is healthy.
+    /// Env-overridable via `AGENTRY_WATCHDOG__DISTINCT_PAYLOAD_THRESHOLD`.
+    pub distinct_payload_threshold: usize,
 }
 
 impl Watchdog {
@@ -84,6 +92,10 @@ impl Watchdog {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(DEFAULT_STUCK_THRESHOLD),
+            distinct_payload_threshold: std::env::var("AGENTRY_WATCHDOG__DISTINCT_PAYLOAD_THRESHOLD")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(DEFAULT_DISTINCT_PAYLOAD_THRESHOLD),
         }
     }
 }
@@ -180,7 +192,8 @@ async fn judge_row(
 
     // Update consecutive-stuck counter for this agent.
     let new_count = update_stuck_count(stuck_counts, agent_id, stuck);
-    if stuck && new_count >= cfg.stuck_threshold {
+    let distinct = distinct_payload_count(&evidence);
+    if stuck && new_count >= cfg.stuck_threshold && distinct >= cfg.distinct_payload_threshold {
         // Threshold reached — kill the container and emit an audit event.
         // The Status event with the triggering verdict is still emitted
         // below, so consumers see the final stuck judgment that fired
@@ -195,6 +208,14 @@ async fn judge_row(
         // Drop the entry so a (theoretical) re-spawn of the same agent
         // id starts fresh.
         stuck_counts.remove(agent_id);
+    } else if stuck && new_count >= cfg.stuck_threshold {
+        tracing::debug!(
+            agent = %agent_id,
+            consecutive_stuck = new_count,
+            distinct_payload_count = distinct,
+            distinct_payload_threshold = cfg.distinct_payload_threshold,
+            "watchdog: stuck threshold reached but tail is uniform (poll-loop signature) — not escalating"
+        );
     }
 
     let status = Event::new(EventKind::Status {
@@ -387,6 +408,20 @@ fn update_stuck_count(counts: &mut HashMap<String, u32>, agent_id: &str, stuck: 
     }
 }
 
+/// Count distinct event payload bodies in the evidence tail. Used
+/// to distinguish a healthy poll-loop tail (same payload repeating,
+/// distinct count low) from a genuinely stuck tail (variety of
+/// events petering out, distinct count moderate-to-high). Trades
+/// off allocation cost (one HashSet of borrowed &str) against
+/// avoiding a false-positive kill — acceptable on a 60s tick.
+fn distinct_payload_count(evidence: &[(String, String)]) -> usize {
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for (_, body) in evidence {
+        seen.insert(body.as_str());
+    }
+    seen.len()
+}
+
 /// XADD an audit-trail annotation to the agent's brief trace stream
 /// recording that the watchdog killed the container after N
 /// consecutive stuck verdicts. Mirrors the spawner's spawn-event
@@ -426,15 +461,16 @@ async fn kill_container(agent_id: &str) -> anyhow::Result<()> {
     let name = format!("agentry-{agent_id}");
     let out = tokio::process::Command::new("podman")
         .arg("kill")
+        .arg("--ignore")
         .arg(&name)
         .output()
         .await?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let exit = out.status.code().unwrap_or(-1);
         tracing::warn!(
-            container = %name,
-            stderr = %stderr,
-            "watchdog: podman kill returned non-zero (continuing)"
+            "watchdog: podman kill --ignore returned non-zero (continuing) container={name} exit={exit} stderr={stderr} stdout={stdout}"
         );
     }
     Ok(())
@@ -537,6 +573,40 @@ mod tests {
         update_stuck_count(&mut counts, "agt_a", true);
         assert_eq!(counts["agt_a"], 2);
         assert_eq!(counts["agt_b"], 1);
+    }
+
+    #[test]
+    fn distinct_payload_count_handles_empty() {
+        assert_eq!(distinct_payload_count(&[]), 0);
+    }
+
+    #[test]
+    fn distinct_payload_count_dedupes_identical_bodies() {
+        let ev: Vec<(String, String)> = (0..5)
+            .map(|i| {
+                (
+                    format!("{i}-0"),
+                    "{\"type\":\"event\",\"payload\":{\"msg\":\"polling CI\"}}".to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(distinct_payload_count(&ev), 1);
+    }
+
+    #[test]
+    fn distinct_payload_count_distinct_bodies() {
+        let ev = vec![
+            ("1-0".into(), "{\"msg\":\"a\"}".into()),
+            ("2-0".into(), "{\"msg\":\"b\"}".into()),
+            ("3-0".into(), "{\"msg\":\"c\"}".into()),
+        ];
+        assert_eq!(distinct_payload_count(&ev), 3);
+    }
+
+    #[test]
+    fn watchdog_default_distinct_payload_threshold_is_two() {
+        let w = Watchdog::new_default("k".into());
+        assert_eq!(w.distinct_payload_threshold, 2);
     }
 
     #[test]

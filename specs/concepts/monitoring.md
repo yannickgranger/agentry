@@ -73,3 +73,15 @@ daemon's team-failure path preserves the workspace for audit. The
 counter resets when an `ok=true` verdict arrives, so a transient stall
 followed by recovery does not escalate. Counters live in memory only;
 daemon restart resets them and the next tick begins fresh.
+
+Kill escalation is also gated on the *distinct-payload count* of the
+recent evidence tail. If `stuck_threshold` consecutive `stuck=true`
+verdicts arrive but the tail consists of fewer than
+`distinct_payload_threshold` (default 2, env-overridable via
+`AGENTRY_WATCHDOG__DISTINCT_PAYLOAD_THRESHOLD`) distinct payload
+bodies, the Watchdog logs at debug and skips the kill. This
+defends against false positives on legitimate long-poll-loop
+agents (e.g. ci-watcher) whose tail is the same payload repeating
+but whose work is healthy. The consecutive-stuck counter still
+increments, so an agent that subsequently emits variety while
+remaining stuck does escalate correctly.
