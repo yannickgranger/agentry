@@ -34,3 +34,30 @@ projector folding `agent_event=spawned` and `agent_event=terminated`
 events emitted by the spawner around the container's lifecycle. Watchdog
 and Grok-diagnostic layers in subsequent briefs read AgentRow snapshots
 to decide whether an agent looks stuck and what to do about it.
+
+## Selector
+
+A named read-only SQL query against the agent index. The watchdog tick
+iterates registered Selectors; each row in a Selector's result becomes
+one Grok diagnostic call and one Status event. Selectors are how
+monitoring addresses "which agents to look at" without coupling to
+brief, cohort, or squad shape — any subset expressible as SQL against
+`agents` and `cohort_labels` is reachable. v1 ships a single hardcoded
+Selector (`all_running`); persisted-Selector storage is a later brief.
+The Selector's `sql` string flows through `State::query`'s SELECT/WITH
+guard, so write access is structurally impossible from this path.
+
+## Watchdog
+
+The long-running task that consumes the agent index through registered
+Selectors, diagnoses each selected agent via an external LLM probe
+(xAI Grok-fast), and emits one typed Status event per agent per tick.
+The Watchdog runs alongside the projector inside the daemon. Without an
+`XAI_API_KEY` in the daemon environment, the daemon does not spawn the
+Watchdog at all — diagnostics are an optional augmentation, never a
+hard requirement for brief execution. Tick cadence, Grok endpoint, and
+Grok model name are env-overridable via `AGENTRY_WATCHDOG__TICK_SECONDS`,
+`AGENTRY_WATCHDOG__GROK_API_URL`, `AGENTRY_WATCHDOG__GROK_MODEL`. Per-
+agent failures (Grok HTTP, malformed JSON, evidence-scan errors) are
+logged and skipped — the Watchdog never crashes the daemon nor blocks
+brief execution.

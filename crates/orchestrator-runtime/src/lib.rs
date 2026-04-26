@@ -17,6 +17,7 @@ pub mod redis_io;
 pub mod seed;
 pub mod spawner;
 pub mod state;
+pub mod watchdog;
 pub mod workspace;
 
 pub use config::Config;

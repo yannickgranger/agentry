@@ -42,6 +42,19 @@ pub async fn run(cfg: &crate::Config) -> Result<()> {
     let state = std::sync::Arc::new(state::open_or_init(std::path::Path::new(&state_path))?);
     tracing::info!(path = %state_path, "agent state store ready");
     tokio::spawn(projector::run(state.clone(), conn.clone()));
+    match std::env::var("XAI_API_KEY") {
+        Ok(key) if !key.is_empty() => {
+            let watchdog_cfg = crate::watchdog::Watchdog::new_default(key);
+            tokio::spawn(crate::watchdog::run(
+                state.clone(),
+                conn.clone(),
+                watchdog_cfg,
+            ));
+        }
+        _ => {
+            tracing::info!("XAI_API_KEY not set; watchdog dormant — set it in orchestratord env to enable per-agent diagnostics");
+        }
+    }
 
     // Load signing key. Fail loudly if missing.
     let key_path = &cfg.signing.key_path;

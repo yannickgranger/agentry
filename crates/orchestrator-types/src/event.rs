@@ -53,6 +53,19 @@ pub enum EventKind {
     /// them to the team-level `Verdict` when the `Done` event's verdict is
     /// `ReworkNeeded`.
     Finding { finding: ReviewFinding },
+    /// Watchdog-emitted diagnosis: an agent's progress judgment plus the
+    /// trace evidence that backed it. XADDed by the watchdog tick to the
+    /// agent's brief trace stream so projector watermarks advance and
+    /// downstream consumers (dashboards, captain, future commandant
+    /// officer council) read it on the same wire as every other event.
+    Status {
+        agent_id: String,
+        ok: bool,
+        stuck: bool,
+        reason: String,
+        selector_name: String,
+        evidence_event_ids: Vec<String>,
+    },
     /// Agent is done; terminal.
     Done { verdict: EventVerdict },
 }
@@ -140,5 +153,23 @@ mod tests {
         let line = r#"{"at":"2026-04-23T10:00:01Z","type":"done","verdict":"shipped"}"#;
         let e: Event = serde_json::from_str(line).expect("parse");
         assert_eq!(e.verdict(), Some(EventVerdict::Shipped));
+    }
+
+    #[test]
+    fn status_event_serializes_with_type_tag() {
+        let e = Event::new(EventKind::Status {
+            agent_id: "agt_x".into(),
+            ok: true,
+            stuck: false,
+            reason: "progressing".into(),
+            selector_name: "all_running".into(),
+            evidence_event_ids: vec!["1234-0".into(), "5678-0".into()],
+        });
+        let s = serde_json::to_string(&e).expect("ser");
+        assert!(s.contains("\"type\":\"status\""), "got: {s}");
+        assert!(!e.is_terminal());
+        assert_eq!(e.verdict(), None);
+        let back: Event = serde_json::from_str(&s).expect("de");
+        assert_eq!(e, back);
     }
 }

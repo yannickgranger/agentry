@@ -27,6 +27,15 @@ The sum type over all event shapes the agent may emit: freeform event,
 tool call attempt, inter-role message, log line, done/terminal. Serialised
 with a `type` discriminator tag so each NDJSON line is self-describing.
 
+A `status` variant carries a watchdog-emitted diagnosis: the agent id,
+the selector that matched it, an `ok`/`stuck` boolean pair, the
+diagnostician's natural-language reason, and the trace event ids that
+backed the judgment. Watchdog ticks XADD Status events to the agent's
+brief trace stream so projector watermarks advance consistently and
+downstream consumers (dashboards, captain stdin-daemon, future
+commandant officer council) read them on the same wire as every other
+agent event.
+
 ## Event
 
 A timestamped event: `Ts` + `EventKind`. The unit that the spawner reads
