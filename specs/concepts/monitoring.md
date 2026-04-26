@@ -61,3 +61,15 @@ Grok model name are env-overridable via `AGENTRY_WATCHDOG__TICK_SECONDS`,
 agent failures (Grok HTTP, malformed JSON, evidence-scan errors) are
 logged and skipped — the Watchdog never crashes the daemon nor blocks
 brief execution.
+
+Beyond observation, the Watchdog escalates: after `stuck_threshold`
+consecutive `stuck=true` Status verdicts on the same agent (default 3,
+overridable via `AGENTRY_WATCHDOG__STUCK_THRESHOLD`), it XADDs a
+`watchdog_kill` annotation event to the agent's brief trace stream and
+issues `podman kill` against the agent's container. The spawner's
+stdout reader then sees EOF without a Done event, and its
+`compute_verdict` fall-through emits a Failed verdict naturally; the
+daemon's team-failure path preserves the workspace for audit. The
+counter resets when an `ok=true` verdict arrives, so a transient stall
+followed by recovery does not escalate. Counters live in memory only;
+daemon restart resets them and the next tick begins fresh.
