@@ -71,6 +71,12 @@ pub struct Brief {
     /// If this brief replaces/extends an earlier one, reference it.
     #[serde(default)]
     pub parent_brief: Option<BriefId>,
+    /// Free-form cohort labels propagated to every agent the brief spawns.
+    /// Set by the dispatching authority (captain/officer/human submitter);
+    /// the orchestrator does not assign or interpret them. Monitoring
+    /// selectors use these to address subsets of the agent fleet.
+    #[serde(default)]
+    pub cohort_labels: Vec<String>,
     /// Who submitted this brief (opaque identifier of the client).
     pub submitted_by: String,
     /// Submission time.
@@ -89,6 +95,7 @@ impl Brief {
             budget: Budget::default(),
             escalation: EscalationMode::default(),
             parent_brief: None,
+            cohort_labels: Vec::new(),
             submitted_by: submitted_by.into(),
             submitted_at: now(),
         }
@@ -109,6 +116,12 @@ impl Brief {
     #[must_use]
     pub fn with_escalation(mut self, m: EscalationMode) -> Self {
         self.escalation = m;
+        self
+    }
+
+    #[must_use]
+    pub fn with_cohort_labels(mut self, labels: Vec<String>) -> Self {
+        self.cohort_labels = labels;
         self
     }
 }

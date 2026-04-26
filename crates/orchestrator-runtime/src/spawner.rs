@@ -150,6 +150,25 @@ impl Spawner for PodmanSpawner {
             "spawning container"
         );
 
+        // Announce the spawn on the trace stream so the projector can
+        // materialize a row in the agent-state store. The projector discovers
+        // brief streams by polling `agentry:projector:streams`; sadd on every
+        // spawn is idempotent and cheap.
+        let spawn_ev = Event::new(EventKind::Event {
+            payload: serde_json::json!({
+                "agent_event": "spawned",
+                "brief_id": brief.id.0,
+                "role_name": role.name.0,
+                "project": brief.project,
+                "cohort_labels": brief.cohort_labels,
+                "started_at": chrono::Utc::now().to_rfc3339(),
+            }),
+        });
+        redis_io::append_trace(conn, &brief.id, agent_id, &spawn_ev).await?;
+        let _: () = conn
+            .sadd("agentry:projector:streams", brief.id.0.as_str())
+            .await?;
+
         let mut cmd = Command::new("podman");
         cmd.arg("run")
             .arg("--rm")
@@ -422,6 +441,15 @@ impl Spawner for PodmanSpawner {
             status.code(),
             findings,
         );
+
+        let term_ev = Event::new(EventKind::Event {
+            payload: serde_json::json!({
+                "agent_event": "terminated",
+                "verdict": format!("{:?}", verdict.kind).to_lowercase(),
+                "exit_code": status.code(),
+            }),
+        });
+        redis_io::append_trace(conn, &brief.id, agent_id, &term_ev).await?;
 
         Ok(AgentOutcome {
             handle: AgentHandle {

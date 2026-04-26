@@ -12,9 +12,11 @@ pub mod daemon;
 pub mod delivery;
 pub mod errors;
 pub mod permit;
+pub mod projector;
 pub mod redis_io;
 pub mod seed;
 pub mod spawner;
+pub mod state;
 pub mod workspace;
 
 pub use config::Config;

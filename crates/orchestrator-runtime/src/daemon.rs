@@ -9,8 +9,9 @@
 //! re-fire once the upstream re-ships.
 
 use crate::{
-    permit as permit_mod, redis_io,
+    permit as permit_mod, projector, redis_io,
     spawner::{PodmanSpawner, RoutedMessage, RunAgentCtx, Spawner, TeamContext},
+    state,
     workspace::{self, BriefWorkspace},
     Error, Result,
 };
@@ -29,6 +30,18 @@ use std::sync::Arc;
 pub async fn run(cfg: &crate::Config) -> Result<()> {
     let mut conn = redis_io::connect(&cfg.redis.url).await?;
     tracing::info!(url = %cfg.redis.url.rsplit('@').next().unwrap_or("?"), "connected to Redis");
+
+    let state_path = std::env::var("AGENTRY_STATE_PATH").unwrap_or_else(|_| {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        format!("{home}/.config/agentry/state.db")
+    });
+    let parent = std::path::Path::new(&state_path)
+        .parent()
+        .expect("state path has parent dir");
+    std::fs::create_dir_all(parent).map_err(|e| Error::Config(format!("create state dir: {e}")))?;
+    let state = std::sync::Arc::new(state::open_or_init(std::path::Path::new(&state_path))?);
+    tracing::info!(path = %state_path, "agent state store ready");
+    tokio::spawn(projector::run(state.clone(), conn.clone()));
 
     // Load signing key. Fail loudly if missing.
     let key_path = &cfg.signing.key_path;
@@ -600,6 +613,7 @@ async fn on_all_children_resolved(conn: &mut ConnectionManager, meta_id: &str) -
             escalation: meta_brief.escalation,
             // Verifier is in its own DOL slot — NOT a child of the meta-brief.
             parent_brief: None,
+            cohort_labels: meta_brief.cohort_labels.clone(),
             submitted_by: "daemon-dol-verifier".into(),
             submitted_at: now(),
         };
