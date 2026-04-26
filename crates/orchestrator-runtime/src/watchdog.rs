@@ -22,6 +22,7 @@ use orchestrator_types::{Event, EventKind};
 use redis::aio::ConnectionManager;
 use redis::AsyncCommands;
 use serde_json::{json, Value as JsonValue};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -29,6 +30,10 @@ const DEFAULT_EVIDENCE_CAP: usize = 200;
 const DEFAULT_TICK_SECONDS: u64 = 60;
 const DEFAULT_GROK_API_URL: &str = "https://api.x.ai/v1/chat/completions";
 const DEFAULT_GROK_MODEL: &str = "grok-4-fast";
+/// Default consecutive-stuck count before the watchdog kills the agent
+/// container and lets the spawner emit a Failed verdict via its
+/// exit-without-Done fall-through.
+const DEFAULT_STUCK_THRESHOLD: u32 = 3;
 
 /// A named read-only SQL query against the agent index. The watchdog
 /// tick iterates these; each row in a selector's result becomes one
@@ -48,6 +53,10 @@ pub struct Watchdog {
     pub grok_model: String,
     pub grok_api_key: String,
     pub evidence_event_cap: usize,
+    /// Number of consecutive `stuck=true` Status verdicts on the same
+    /// agent before the watchdog kills its container. Env-overridable
+    /// via `AGENTRY_WATCHDOG__STUCK_THRESHOLD`.
+    pub stuck_threshold: u32,
 }
 
 impl Watchdog {
@@ -71,6 +80,10 @@ impl Watchdog {
                 .unwrap_or_else(|_| DEFAULT_GROK_MODEL.into()),
             grok_api_key,
             evidence_event_cap: DEFAULT_EVIDENCE_CAP,
+            stuck_threshold: std::env::var("AGENTRY_WATCHDOG__STUCK_THRESHOLD")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(DEFAULT_STUCK_THRESHOLD),
         }
     }
 }
@@ -97,9 +110,10 @@ pub async fn run(state: Arc<State>, mut conn: ConnectionManager, cfg: Watchdog) 
     };
     let mut ticker = tokio::time::interval(cfg.tick_interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut stuck_counts: HashMap<String, u32> = HashMap::new();
     loop {
         ticker.tick().await;
-        if let Err(e) = tick(&state, &mut conn, &cfg, &http).await {
+        if let Err(e) = tick(&state, &mut conn, &cfg, &http, &mut stuck_counts).await {
             tracing::warn!(error = %e, "watchdog: tick failed (continuing)");
         }
     }
@@ -110,7 +124,9 @@ async fn tick(
     conn: &mut ConnectionManager,
     cfg: &Watchdog,
     http: &reqwest::Client,
+    stuck_counts: &mut HashMap<String, u32>,
 ) -> anyhow::Result<()> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for selector in &cfg.selectors {
         let rows = match state.query(&selector.sql).await {
             Ok(r) => r,
@@ -120,7 +136,10 @@ async fn tick(
             }
         };
         for row in rows {
-            if let Err(e) = judge_row(conn, cfg, http, &selector.name, &row).await {
+            if let Some(aid) = row.get("agent_id").and_then(JsonValue::as_str) {
+                seen.insert(aid.to_string());
+            }
+            if let Err(e) = judge_row(conn, cfg, http, &selector.name, &row, stuck_counts).await {
                 let aid = row
                     .get("agent_id")
                     .and_then(JsonValue::as_str)
@@ -129,6 +148,11 @@ async fn tick(
             }
         }
     }
+    // Prune count map: any entry whose agent did not appear in this
+    // tick's selector results is a stale entry (agent terminated
+    // naturally, or was killed by us in a prior tick). Drop it so the
+    // map stays bounded by the number of currently-running agents.
+    stuck_counts.retain(|aid, _| seen.contains(aid));
     Ok(())
 }
 
@@ -138,6 +162,7 @@ async fn judge_row(
     http: &reqwest::Client,
     selector_name: &str,
     row: &std::collections::HashMap<String, JsonValue>,
+    stuck_counts: &mut HashMap<String, u32>,
 ) -> anyhow::Result<()> {
     let agent_id = row
         .get("agent_id")
@@ -152,6 +177,25 @@ async fn judge_row(
     let evidence_event_ids: Vec<String> = evidence.iter().map(|(id, _)| id.clone()).collect();
 
     let (ok, stuck, reason) = call_grok(http, cfg, agent_id, &evidence).await?;
+
+    // Update consecutive-stuck counter for this agent.
+    let new_count = update_stuck_count(stuck_counts, agent_id, stuck);
+    if stuck && new_count >= cfg.stuck_threshold {
+        // Threshold reached — kill the container and emit an audit event.
+        // The Status event with the triggering verdict is still emitted
+        // below, so consumers see the final stuck judgment that fired
+        // the kill. After emit, the spawner's stdout reader sees EOF
+        // (kill) and `compute_verdict` returns Failed via its
+        // exit-without-Done fall-through; daemon's team-failure path
+        // then preserves the workspace for audit.
+        emit_kill_annotation(conn, brief_id, agent_id, new_count, &reason).await?;
+        if let Err(e) = kill_container(agent_id).await {
+            tracing::warn!(agent = %agent_id, error = %e, "watchdog: kill_container failed");
+        }
+        // Drop the entry so a (theoretical) re-spawn of the same agent
+        // id starts fresh.
+        stuck_counts.remove(agent_id);
+    }
 
     let status = Event::new(EventKind::Status {
         agent_id: agent_id.to_string(),
@@ -329,6 +373,73 @@ async fn emit_status(
     Ok(())
 }
 
+/// Update the consecutive-stuck counter for `agent_id` based on the
+/// current tick's `stuck` judgment. Returns the new count. ok=true
+/// resets to 0 (and removes the entry); stuck=true increments.
+fn update_stuck_count(counts: &mut HashMap<String, u32>, agent_id: &str, stuck: bool) -> u32 {
+    if stuck {
+        let entry = counts.entry(agent_id.to_string()).or_insert(0);
+        *entry += 1;
+        *entry
+    } else {
+        counts.remove(agent_id);
+        0
+    }
+}
+
+/// XADD an audit-trail annotation to the agent's brief trace stream
+/// recording that the watchdog killed the container after N
+/// consecutive stuck verdicts. Mirrors the spawner's spawn-event
+/// emission shape so the projector advances the watermark.
+async fn emit_kill_annotation(
+    conn: &mut ConnectionManager,
+    brief_id: &str,
+    agent_id: &str,
+    consecutive_stuck: u32,
+    reason: &str,
+) -> anyhow::Result<()> {
+    let stream_key = format!("agentry:brief:{brief_id}:trace");
+    let event = Event::new(EventKind::Event {
+        payload: serde_json::json!({
+            "agent_event": "watchdog_kill",
+            "consecutive_stuck": consecutive_stuck,
+            "reason": reason,
+        }),
+    });
+    let body = serde_json::to_string(&event)?;
+    let _: String = conn
+        .xadd(
+            stream_key.as_str(),
+            "*",
+            &[("agent", agent_id), ("event", body.as_str())],
+        )
+        .await?;
+    Ok(())
+}
+
+/// Best-effort `podman kill` against the container running this agent.
+/// Container name is `agentry-<agent_id>` per the spawner's naming
+/// scheme. A non-zero exit is logged at warn (the container may have
+/// already exited on its own between the watchdog's last observation
+/// and this kill); the watchdog does not treat it as a failure.
+async fn kill_container(agent_id: &str) -> anyhow::Result<()> {
+    let name = format!("agentry-{agent_id}");
+    let out = tokio::process::Command::new("podman")
+        .arg("kill")
+        .arg(&name)
+        .output()
+        .await?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        tracing::warn!(
+            container = %name,
+            stderr = %stderr,
+            "watchdog: podman kill returned non-zero (continuing)"
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -395,6 +506,43 @@ mod tests {
         assert!(!is_status_event_body(
             "{\"type\":\"done\",\"verdict\":\"shipped\"}"
         ));
+    }
+
+    #[test]
+    fn update_stuck_count_increments_on_stuck() {
+        let mut counts: HashMap<String, u32> = HashMap::new();
+        assert_eq!(update_stuck_count(&mut counts, "agt_a", true), 1);
+        assert_eq!(update_stuck_count(&mut counts, "agt_a", true), 2);
+        assert_eq!(update_stuck_count(&mut counts, "agt_a", true), 3);
+        assert_eq!(counts["agt_a"], 3);
+    }
+
+    #[test]
+    fn update_stuck_count_resets_on_ok() {
+        let mut counts: HashMap<String, u32> = HashMap::new();
+        update_stuck_count(&mut counts, "agt_a", true);
+        update_stuck_count(&mut counts, "agt_a", true);
+        assert_eq!(update_stuck_count(&mut counts, "agt_a", false), 0);
+        assert!(
+            !counts.contains_key("agt_a"),
+            "ok=true must remove the entry (recovered)"
+        );
+    }
+
+    #[test]
+    fn update_stuck_count_isolates_agents() {
+        let mut counts: HashMap<String, u32> = HashMap::new();
+        update_stuck_count(&mut counts, "agt_a", true);
+        update_stuck_count(&mut counts, "agt_b", true);
+        update_stuck_count(&mut counts, "agt_a", true);
+        assert_eq!(counts["agt_a"], 2);
+        assert_eq!(counts["agt_b"], 1);
+    }
+
+    #[test]
+    fn watchdog_default_threshold_is_three() {
+        let w = Watchdog::new_default("k".into());
+        assert_eq!(w.stuck_threshold, 3);
     }
 
     #[test]
