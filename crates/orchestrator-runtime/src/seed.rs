@@ -2147,7 +2147,7 @@ if command -v ra-query >/dev/null 2>&1; then
         cout=$(ra-query complexity "$f" --threshold 15 --format json 2>/dev/null || echo '{"functions":[]}')
         ccnt=$(echo "$cout" | jq '[.functions[]?] | length')
         if [ "$ccnt" -gt 0 ]; then
-            cfindings=$(echo "$cfindings" | jq --argjson r "$cout" --arg p "$f" '. + [{file:$p, complex_count:$ccnt, result:$r}]')
+            cfindings=$(echo "$cfindings" | jq --argjson r "$cout" --arg p "$f" '. + [{file:$p, complex_count:($r.functions|length), result:$r}]')
             total_complex=$((total_complex + ccnt))
         fi
     done < <(find crates -name '*.rs' -not -path '*/tests/*' -not -name 'tests.rs' -not -path '*/target/*')
@@ -4301,6 +4301,22 @@ mod tests {
         assert!(
             !AUDITOR_CLAUDE_AGENTRY_SCRIPT.contains("_complex_"),
             "auditor v1.5 must NOT generate per-complexity child-brief identifiers"
+        );
+    }
+
+    #[test]
+    fn auditor_complexity_jq_does_not_reference_undeclared_ccnt() {
+        assert!(
+            !AUDITOR_CLAUDE_AGENTRY_SCRIPT.contains("complex_count:$ccnt"),
+            "issue #147: auditor complexity jq filter must not reference \
+             undeclared jq variable $ccnt (the bash $ccnt is not passed via \
+             --argjson, so jq aborts and findings_json_tail goes empty)"
+        );
+        assert!(
+            AUDITOR_CLAUDE_AGENTRY_SCRIPT.contains("complex_count:($r.functions|length)"),
+            "issue #147: auditor complexity jq filter must compute \
+             complex_count from $r.functions|length (mirroring the unwraps \
+             stage which uses ($r.functions|map(.unwraps|length)|add // 0))"
         );
     }
 }
