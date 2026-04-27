@@ -70,6 +70,30 @@ impl BriefWorkspace {
     }
 }
 
+/// Whether the daemon should remove a brief's workspace on termination, or
+/// preserve it on disk for forensics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminationDisposition {
+    TearDown,
+    Preserve,
+}
+
+/// Map a verdict string (the same form persisted to `agentry:verdicts`) onto
+/// the host-side teardown disposition for the brief's workspace.
+///
+/// Default is `Preserve`: any verdict not recognized as cleanly shipped (or
+/// review-blocked, where the diff already lives in the forge as a PR) keeps
+/// the workspace on disk so an operator can inspect the failure with
+/// `agentry-workspace path <brief_id>`.
+#[must_use]
+pub fn disposition_for(verdict_str: &str) -> TerminationDisposition {
+    match verdict_str {
+        "shipped" => TerminationDisposition::TearDown,
+        v if v.starts_with("review-blocked") => TerminationDisposition::TearDown,
+        _ => TerminationDisposition::Preserve,
+    }
+}
+
 /// Derive `<org>/<repo>` from a repo URL: take the trailing two non-empty
 /// path components and strip a `.git` suffix from the final one. Examples:
 /// `https://forge.example/org/name.git` → `("org", "name")`,
@@ -305,10 +329,145 @@ pub async fn allocate_at(
     })
 }
 
+/// Destroy a workspace iff `disposition` is `TearDown`; on `Preserve`, log
+/// the retained path and return `Ok(())` without touching the dir. The daemon
+/// derives the disposition from the brief's verdict string via
+/// [`disposition_for`].
+pub async fn destroy_with_disposition(
+    ws: &BriefWorkspace,
+    disposition: TerminationDisposition,
+) -> Result<()> {
+    match disposition {
+        TerminationDisposition::TearDown => destroy(ws).await,
+        TerminationDisposition::Preserve => {
+            tracing::info!(
+                "workspace preserved for forensics: {}",
+                ws.host_path.display()
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Filesystem record for one preserved per-brief workspace dir.
+///
+/// Produced by [`scan_workspaces`] and consumed by `agentry-workspace list/gc`.
+#[derive(Debug, Clone)]
+pub struct WorkspaceEntry {
+    pub brief_id: String,
+    pub path: PathBuf,
+    pub age: std::time::Duration,
+    pub disk_usage_bytes: u64,
+    pub branch: Option<String>,
+}
+
+/// Walk `<root>/briefs/` and return one [`WorkspaceEntry`] per immediate
+/// subdir. Errors reading any individual entry are skipped (the operator can
+/// re-run if a transient ENOENT bites a single dir). Returns an empty Vec if
+/// the briefs dir does not exist.
+pub fn scan_workspaces(root: &Path) -> Vec<WorkspaceEntry> {
+    let briefs_dir = root.join("briefs");
+    let Ok(read) = std::fs::read_dir(&briefs_dir) else {
+        return Vec::new();
+    };
+    let now = std::time::SystemTime::now();
+    let mut out = Vec::new();
+    for entry in read.flatten() {
+        let path = entry.path();
+        let Ok(meta) = entry.metadata() else { continue };
+        if !meta.is_dir() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let age = meta
+            .modified()
+            .ok()
+            .and_then(|m| now.duration_since(m).ok())
+            .unwrap_or(std::time::Duration::ZERO);
+        out.push(WorkspaceEntry {
+            brief_id: name.to_string(),
+            path: path.clone(),
+            age,
+            disk_usage_bytes: dir_size(&path),
+            branch: read_worktree_branch(&path),
+        });
+    }
+    out.sort_by(|a, b| a.brief_id.cmp(&b.brief_id));
+    out
+}
+
+/// Recursive byte-sum of every regular file under `dir`. Returns 0 on missing
+/// dir or permission denied — the operator-facing column is best-effort.
+fn dir_size(dir: &Path) -> u64 {
+    let mut total: u64 = 0;
+    let mut stack: Vec<PathBuf> = vec![dir.to_path_buf()];
+    while let Some(p) = stack.pop() {
+        let Ok(read) = std::fs::read_dir(&p) else {
+            continue;
+        };
+        for entry in read.flatten() {
+            let Ok(ft) = entry.file_type() else { continue };
+            if ft.is_symlink() {
+                continue;
+            }
+            if ft.is_dir() {
+                stack.push(entry.path());
+            } else if ft.is_file() {
+                if let Ok(meta) = entry.metadata() {
+                    total = total.saturating_add(meta.len());
+                }
+            }
+        }
+    }
+    total
+}
+
+/// Worktree's `.git` is a file containing `gitdir: <bare>/worktrees/<branch>`;
+/// returns the trailing component as the branch hint, or None if absent.
+fn read_worktree_branch(workspace: &Path) -> Option<String> {
+    let head = workspace.join(".git");
+    let raw = std::fs::read_to_string(&head).ok()?;
+    let line = raw.lines().next()?;
+    let suffix = line.strip_prefix("gitdir:")?.trim();
+    let p = Path::new(suffix);
+    p.file_name()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_string())
+}
+
+/// One target of a GC run: a workspace dir plus its scan metadata.
+#[derive(Debug, Clone)]
+pub struct GcTarget {
+    pub entry: WorkspaceEntry,
+    pub removed: bool,
+}
+
+/// Run a GC pass: scan, filter to entries older than `threshold`, optionally
+/// remove. Returns one [`GcTarget`] per matched entry. With `dry_run = true`
+/// no dir is touched and `removed` is false on every entry.
+pub fn gc_run(root: &Path, threshold: std::time::Duration, dry_run: bool) -> Vec<GcTarget> {
+    let mut out = Vec::new();
+    for entry in scan_workspaces(root) {
+        if entry.age < threshold {
+            continue;
+        }
+        let removed = if dry_run {
+            false
+        } else {
+            std::fs::remove_dir_all(&entry.path).is_ok()
+        };
+        out.push(GcTarget { entry, removed });
+    }
+    out
+}
+
 /// Destroy a workspace. Safe on a nonexistent path (no-op).
 ///
-/// Called by the daemon only on `VerdictKind::Shipped` — on any other verdict
-/// the workspace is retained for audit until a future `orchestrator prune`.
+/// Direct callers tear the workspace down unconditionally. The daemon should
+/// route through [`destroy_with_disposition`] so a non-shipping verdict
+/// preserves the dir for audit.
 pub async fn destroy(ws: &BriefWorkspace) -> Result<()> {
     if !ws.host_path.exists() {
         return Ok(());

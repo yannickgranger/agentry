@@ -73,7 +73,7 @@ Enforcements baked into the spawner:
 
 - **Permit broker:** every stdout `tool_call` event is audited and checked against the permit's `tool_allowlist` + `permit_scope`. Violations kill the container and emit `VerdictKind::PermitViolation`.
 - **Wall-clock timeout:** when the brief's `budget.max_wall_seconds` is set, the stdout-read loop is wrapped in `tokio::time::timeout`. On elapse, `podman stop -t 1` runs and the verdict is `Failed` with reason `"wall-clock budget exceeded"`.
-- **Workspace lifecycle:** if any role in the team declares `workspace_mount`, the daemon allocates `/var/mnt/workspaces/agentry-work/briefs/<brief_id>/`, bind-mounts it into each opting-in role, and destroys it on team-level `Shipped`. Failure paths retain the dir for audit.
+- **Workspace lifecycle:** if any role in the team declares `workspace_mount`, the daemon allocates `/var/mnt/workspaces/agentry-work/briefs/<brief_id>/`, bind-mounts it into each opting-in role, and tears it down only when the brief actually ships (or its diff is already pushed as a PR — `review-blocked*` verdicts). Every other failure mode (`failed: acceptance`, `failed: claude-timeout`, `failed: stalled`, `failed: spawner-error`, anything unrecognized) preserves the dir for forensics.
 
 ### Agent contract
 
@@ -82,6 +82,29 @@ Every container's stdout is parsed line-by-line as NDJSON `Event`s. Each is mirr
 ### Architecture gate
 
 Every PR runs `graph-specs check` (concept-level equivalence between `specs/concepts/*.md` and the pub surface of every crate) plus `cfdb extract` (a full fact-graph dump, archived). Tool revisions pinned in `.cfdb/cfdb.rev` + `.cfdb/graph-specs.rev`. Ban rules land one at a time in `.cfdb/queries/*.cypher`, each with its own justified PR and zero existing violations at introduction. Run the same checks locally with `scripts/arch-check.sh`.
+
+## Workspace lifecycle
+
+Per-brief workspaces live under `/var/mnt/workspaces/agentry-work/briefs/<brief_id>/` (override with `AGENTRY_WORKSPACE_ROOT`). Default teardown policy:
+
+| Verdict | Disposition |
+|---|---|
+| `shipped` | TearDown |
+| `review-blocked*` | TearDown (diff is in the forge as a PR) |
+| `failed: acceptance` / `claude-timeout` / `stalled` / `spawner-error` | Preserve |
+| any other / unknown | Preserve (default safe) |
+
+Preserved workspaces accumulate disk — Rust `target/` is the dominant cost — so they need periodic GC. Use the `agentry-workspace` CLI for triage and lifecycle:
+
+```bash
+agentry-workspace list                       # table: brief_id, branch, age, disk_usage_mb, last_verdict
+agentry-workspace path <brief_id>            # absolute host path; exit 1 if absent
+agentry-workspace gc --older-than 7d         # remove preserved workspaces older than threshold
+agentry-workspace gc --older-than 7d --dry-run   # list targets without removing
+agentry-workspace remove <brief_id> --yes    # manual single-target removal
+```
+
+Recommended operator setup: a weekly `agentry-workspace gc --older-than 7d` cron entry. There is no auto-GC daemon — preservation defaults to safe, and reclamation is operator-driven.
 
 ## Infra prerequisites
 

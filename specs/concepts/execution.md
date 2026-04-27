@@ -21,9 +21,34 @@ entrypoint script.
 
 The per-brief host scratch directory. Allocated by the daemon on the first
 role in the team that declares a `WorkspaceMount`, shared across all
-subsequent roles in the same brief, torn down on team-level `Shipped` and
-retained on any other terminal state for audit. Gives roles a place to
-clone, edit, and commit that survives across role boundaries.
+subsequent roles in the same brief, torn down on `shipped` /
+`review-blocked*` verdicts and retained on every other terminal state for
+audit. Gives roles a place to clone, edit, and commit that survives across
+role boundaries.
+
+## TerminationDisposition
+
+Two-state verdict-driven disposition for a brief workspace at termination:
+`TearDown` (the brief shipped, or its diff lives in a forge PR via a
+`review-blocked*` verdict) or `Preserve` (every other failure or unknown
+verdict — workspace is kept on disk for forensics until an operator GCs it).
+The pure `disposition_for(verdict_str)` function maps the verdict string to
+a disposition; the daemon routes through `destroy_with_disposition` so the
+two paths share one source of truth.
+
+## WorkspaceEntry
+
+One filesystem record produced by the `agentry-workspace` triage CLI when
+walking the briefs root: brief id, host path, age, disk-usage byte count,
+and an optional worktree branch hint. Operator-facing data only — the
+runtime daemon does not consume it.
+
+## GcTarget
+
+One entry returned by a `gc_run` pass: a `WorkspaceEntry` plus a `removed`
+flag indicating whether the dir was actually deleted (always false in
+`--dry-run` mode). Lets the CLI report what was reclaimed in a single
+structured pass.
 
 When the brief's project (or payload) names a `repo_url` + `base_branch`,
 the daemon allocates the workspace as a **git worktree** off a shared

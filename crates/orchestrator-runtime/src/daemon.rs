@@ -455,7 +455,13 @@ async fn finalize_shipped_team(
     }
 
     if let Some(ws) = workspace {
-        if let Err(e) = workspace::destroy(&ws).await {
+        // The team shipped — this finalize path only runs when team_shipped is
+        // true, so the operator-visible verdict for this brief is "shipped".
+        // Route through `disposition_for` to keep the daemon's teardown rule
+        // aligned with the disposition table even as future verdict variants
+        // (e.g. "review-blocked-*") are added.
+        let disposition = workspace::disposition_for("shipped");
+        if let Err(e) = workspace::destroy_with_disposition(&ws, disposition).await {
             tracing::warn!(
                 brief = %brief.id,
                 path = %ws.host_path.display(),
@@ -466,7 +472,8 @@ async fn finalize_shipped_team(
             tracing::info!(
                 brief = %brief.id,
                 path = %ws.host_path.display(),
-                "workspace destroyed (team shipped)"
+                ?disposition,
+                "workspace teardown routed (team shipped)"
             );
         }
     }
@@ -1254,7 +1261,9 @@ mod tests {
                 loaded.push(b);
             }
         }
-        workspace::destroy(&ws).await.expect("destroy ws");
+        workspace::destroy_with_disposition(&ws, workspace::TerminationDisposition::TearDown)
+            .await
+            .expect("destroy ws");
 
         assert_eq!(
             loaded.len(),
