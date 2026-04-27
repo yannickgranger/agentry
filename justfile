@@ -22,6 +22,19 @@ export RUST_LOG := env_var_or_default("RUST_LOG", "orchestrator=info,info")
 default:
     @just --list
 
+# Build ra-query into ~/.local/bin/ra-query for the reviewer-claude bind-mount.
+# Operator-invoked; idempotent. Reviewer-claude container expects the binary
+# at this path (matches the existing ~/.local/bin/claude pattern).
+ra-query-binary:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    : ${GITEA_TOKEN:?GITEA_TOKEN must be set}
+    CARGO_NET_GIT_FETCH_WITH_CLI=true cargo install \
+        --git https://oauth2:${GITEA_TOKEN}@agency.lab:3000/yg/ra-query.git \
+        --rev 2200414 --root ~/.local --locked ra-query
+    test -x ~/.local/bin/ra-query
+    echo "ra-query installed at ~/.local/bin/ra-query"
+
 # Build everything
 build:
     cargo build --workspace --release

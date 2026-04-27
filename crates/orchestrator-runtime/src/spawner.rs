@@ -226,6 +226,24 @@ impl Spawner for PodmanSpawner {
             cmd.arg("--security-opt").arg("label=disable");
         }
         for m in &role.mounts {
+            // ra-query is operator-installed via `just ra-query-binary`. A
+            // missing host binary must NOT block the reviewer-claude spawn —
+            // the entrypoint script falls back to `command -v ra-query` and
+            // skips the pre-pass with a `ra_query_unavailable` event. Other
+            // mounts (claude, credentials, settings) keep podman's default
+            // fail-fast behaviour: a missing source surfaces as a spawn error.
+            if role.name.0 == "reviewer-claude-agentry"
+                && m.target == "/usr/local/bin/ra-query"
+                && !std::path::Path::new(&m.source).exists()
+            {
+                tracing::warn!(
+                    role = %role.name,
+                    path = %m.source,
+                    "ra-query host binary missing at {}; reviewer pre-pass will be skipped — run 'just ra-query-binary' on the host",
+                    m.source
+                );
+                continue;
+            }
             let spec = if m.readonly {
                 format!("{}:{}:ro", m.source, m.target)
             } else {
