@@ -1736,6 +1736,46 @@ fn build_ac_verifier_gemini_agentry_role(home: &str) -> AgentRole {
     }
 }
 
+/// Build the ac-verifier-grok-agentry role. Sibling of the claude variant
+/// (brief 4 of #134). Registered in Redis but NOT yet wired into
+/// `agentry-self-host-v0`; brief 5 enables parallel mode. Same degradation
+/// envelope: missing/empty AC list, missing binary, or invalid grok JSON
+/// degrades to `done shipped`.
+fn build_ac_verifier_grok_agentry_role(home: &str) -> AgentRole {
+    AgentRole {
+        name: RoleName("ac-verifier-grok-agentry".into()),
+        version: 1,
+        model: Some("grok-4-fast".into()),
+        system_prompt: None,
+        // No rust toolchain — the binary is bind-mounted from the host.
+        image: "docker.io/library/debian:bookworm-slim".into(),
+        substrate_class: SubstrateClass::Podman,
+        package_manager: PackageManager::Apt,
+        entrypoint_script: format!("{BASH_PRELUDE}{AC_VERIFIER_GROK_AGENTRY_SCRIPT}"),
+        exitpoint_script: None,
+        binaries: vec!["git".into(), "curl".into(), "ca-certificates".into()],
+        mcp_servers: vec![],
+        tool_allowlist: ToolAllowlist(vec![]),
+        permit_scope: PermitScope(vec![
+            "fs:read:/workspace/**".into(),
+            "net:allow:api.x.ai".into(),
+            "net:allow:agency.lab".into(),
+        ]),
+        passthru_env: vec!["XAI_API_KEY".into()],
+        extra_bootstrap: vec![],
+        mounts: vec![Mount {
+            source: format!("{home}/.local/bin/ac-verifier-grok"),
+            target: "/usr/local/bin/ac-verifier-grok".into(),
+            readonly: true,
+        }],
+        workspace_mount: Some(WorkspaceMount {
+            container_path: "/workspace".into(),
+            readonly: true,
+        }),
+        sccache: false,
+    }
+}
+
 /// Build the coder-claude-agentry role. Extracted from `seed_m0` so the
 /// bind-mounts (claude, credentials, settings, transcripts, ra-query) can be
 /// asserted in unit tests. ra-query is operator-installed via
@@ -1993,6 +2033,80 @@ if [ "$outcome" = "rework" ]; then
     emit_done "rework_needed"
 else
     emit_event '{"msg":"ac-verifier-gemini shipped — all acceptance criteria met or unverifiable"}'
+    emit_done "shipped"
+fi
+"##;
+
+/// Entrypoint for `ac-verifier-grok-agentry`. Sibling of the claude variant —
+/// same bash shape (read bundle, short-circuit on empty AC list, fetch
+/// base_branch + diff HEAD, build binary stdin JSON, pre-flight binary
+/// presence) but invokes `ac-verifier-grok` and the binary itself talks to
+/// the xAI API with `XAI_API_KEY`. Brief 4 of #134 — registered in seed but
+/// not wired into a topology (brief 5 enables parallel mode).
+const AC_VERIFIER_GROK_AGENTRY_SCRIPT: &str = r##"#!/usr/bin/env bash
+set -uo pipefail
+bundle="$(cat)"
+
+agent_id=$(jq -r '.permit.agent_id' <<<"$bundle")
+base_branch=$(jq -r '.brief.payload.base_branch // "develop"' <<<"$bundle")
+verb_body=$(jq -r '.brief.payload.issue_body // ""' <<<"$bundle")
+acs_json=$(jq -c '.brief.payload.acceptance_criteria // null' <<<"$bundle")
+
+# Fast path: no acceptance_criteria carried on this brief — short-circuit
+# without spending any grok tokens. Reviewer-claude still runs.
+if [ "$acs_json" = "null" ] || [ "$(jq 'length' <<<"$acs_json")" -eq 0 ]; then
+    emit_event '{"msg":"no acceptance_criteria in payload — skipping ac-verifier-grok"}'
+    emit_done "shipped"; exit 0
+fi
+
+if [ ! -d /workspace/.git ] && [ ! -f /workspace/.git ]; then
+    emit_event '{"error":"workspace is not a git repo — coder did not produce it"}'
+    emit_done "shipped"; exit 0
+fi
+
+cd /workspace
+if ! git fetch origin "$base_branch" >/tmp/acv_fetch.err 2>&1; then
+    err=$(tail -20 /tmp/acv_fetch.err)
+    emit_event "$(jq -nc --arg err "$err" '{msg:"git fetch failed — degrading to shipped",detail:$err}')"
+    emit_done "shipped"; exit 0
+fi
+if ! git diff "origin/${base_branch}..HEAD" > /tmp/acv_diff.patch 2>/tmp/acv_diff.err; then
+    err=$(tail -20 /tmp/acv_diff.err)
+    emit_event "$(jq -nc --arg err "$err" '{msg:"git diff failed — degrading to shipped",detail:$err}')"
+    emit_done "shipped"; exit 0
+fi
+diff_text=$(cat /tmp/acv_diff.patch)
+
+if ! command -v ac-verifier-grok >/dev/null 2>&1; then
+    emit_event '{"warn":"ac_verifier_unavailable","detail":"ac-verifier-grok binary not on PATH; reviewer-claude is the backstop"}'
+    emit_done "shipped"; exit 0
+fi
+
+bundle_json=$(jq -nc --argjson acs "$acs_json" --arg diff "$diff_text" --arg vb "$verb_body" \
+    '{acceptance_criteria:$acs, diff:$diff, verb_body:$vb}')
+
+if ! outcome_json=$(timeout "$CLAUDE_P_TIMEOUT" ac-verifier-grok <<<"$bundle_json" 2>/tmp/acv.err); then
+    rc=$?
+    err=$(tail -c 2048 /tmp/acv.err)
+    emit_event "$(jq -nc --argjson rc "$rc" --arg err "$err" '{msg:"ac-verifier-grok invocation failed — degrading to shipped",exit_code:$rc,detail:$err}')"
+    emit_done "shipped"; exit 0
+fi
+
+outcome=$(jq -r '.outcome // "shipped"' <<<"$outcome_json")
+if [ "$outcome" = "rework" ]; then
+    findings_count=$(jq '.findings | length' <<<"$outcome_json")
+    emit_event "$(jq -nc --argjson n "$findings_count" '{msg:"ac-verifier-grok rework",findings_count:$n}')"
+    i=0
+    while [ "$i" -lt "$findings_count" ]; do
+        sev=$(jq -r ".findings[$i].severity" <<<"$outcome_json")
+        cat=$(jq -r ".findings[$i].category" <<<"$outcome_json")
+        msg=$(jq -r ".findings[$i].message" <<<"$outcome_json")
+        emit_finding_model "$sev" "$agent_id" "$cat" "$msg"
+        i=$((i+1))
+    done
+    emit_done "rework_needed"
+else
+    emit_event '{"msg":"ac-verifier-grok shipped — all acceptance criteria met or unverifiable"}'
     emit_done "shipped"
 fi
 "##;
@@ -2737,6 +2851,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
     let ac_verifier_claude_agentry =
         build_ac_verifier_claude_agentry_role(&home, &claude_settings_path);
     let ac_verifier_gemini_agentry = build_ac_verifier_gemini_agentry_role(&home);
+    let ac_verifier_grok_agentry = build_ac_verifier_grok_agentry_role(&home);
     let shipper_agentry = AgentRole {
         name: RoleName("shipper-agentry".into()),
         version: 1,
@@ -3042,6 +3157,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
     redis_io::save_role(&mut conn, &reviewer_claude_agentry).await?;
     redis_io::save_role(&mut conn, &ac_verifier_claude_agentry).await?;
     redis_io::save_role(&mut conn, &ac_verifier_gemini_agentry).await?;
+    redis_io::save_role(&mut conn, &ac_verifier_grok_agentry).await?;
     redis_io::save_role(&mut conn, &shipper_agentry).await?;
     redis_io::save_role(&mut conn, &ci_watcher_agentry).await?;
     redis_io::save_team(&mut conn, &agentry_self_host_v0).await?;
@@ -3059,7 +3175,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
     redis_io::save_team(&mut conn, &agentry_verify_v0).await?;
 
     tracing::info!(
-        "seeded: roles [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker, listener, grok-echo, claude-echo, synthesizer, narrowed-coder, shipper, coder-claude-agentry, ac-verifier-claude-agentry, ac-verifier-gemini-agentry, reviewer-mechanical-agentry, shipper-agentry, ci-watcher-agentry, reviewer-claude-agentry, null-agent-agentry, archaeologist-claude-agentry, planner-claude-agentry, verifier-claude-agentry] (inline entrypoint scripts); teams [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker-listener, grok-echo, claude-echo, narrowed-team, shipper-solo-team, agentry-self-host-v0, agentry-null-v0, agentry-discovery-v0, agentry-planner-v0, agentry-verify-v0]"
+        "seeded: roles [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker, listener, grok-echo, claude-echo, synthesizer, narrowed-coder, shipper, coder-claude-agentry, ac-verifier-claude-agentry, ac-verifier-gemini-agentry, ac-verifier-grok-agentry, reviewer-mechanical-agentry, shipper-agentry, ci-watcher-agentry, reviewer-claude-agentry, null-agent-agentry, archaeologist-claude-agentry, planner-claude-agentry, verifier-claude-agentry] (inline entrypoint scripts); teams [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker-listener, grok-echo, claude-echo, narrowed-team, shipper-solo-team, agentry-self-host-v0, agentry-null-v0, agentry-discovery-v0, agentry-planner-v0, agentry-verify-v0]"
     );
     Ok(())
 }
@@ -3450,6 +3566,14 @@ mod tests {
     }
 
     #[test]
+    fn ac_verifier_grok_script_invokes_binary() {
+        assert!(
+            AC_VERIFIER_GROK_AGENTRY_SCRIPT.contains("ac-verifier-grok"),
+            "ac-verifier-grok script must invoke the ac-verifier-grok binary"
+        );
+    }
+
+    #[test]
     fn ac_verifier_gemini_script_reads_acceptance_criteria_payload_key() {
         assert!(
             AC_VERIFIER_GEMINI_AGENTRY_SCRIPT.contains("acceptance_criteria"),
@@ -3458,10 +3582,26 @@ mod tests {
     }
 
     #[test]
+    fn ac_verifier_grok_script_reads_acceptance_criteria_payload_key() {
+        assert!(
+            AC_VERIFIER_GROK_AGENTRY_SCRIPT.contains("acceptance_criteria"),
+            "ac-verifier-grok script must read brief.payload.acceptance_criteria"
+        );
+    }
+
+    #[test]
     fn ac_verifier_gemini_script_handles_missing_binary() {
         assert!(
             AC_VERIFIER_GEMINI_AGENTRY_SCRIPT.contains("ac_verifier_unavailable"),
             "ac-verifier-gemini script must emit ac_verifier_unavailable when the binary is missing"
+        );
+    }
+
+    #[test]
+    fn ac_verifier_grok_script_handles_missing_binary() {
+        assert!(
+            AC_VERIFIER_GROK_AGENTRY_SCRIPT.contains("ac_verifier_unavailable"),
+            "ac-verifier-grok script must emit ac_verifier_unavailable when the binary is missing"
         );
     }
 
@@ -3477,12 +3617,32 @@ mod tests {
     }
 
     #[test]
+    fn ac_verifier_grok_role_bind_mounts_ac_verifier_grok_binary() {
+        let role = build_ac_verifier_grok_agentry_role("/h");
+        assert!(
+            role.mounts
+                .iter()
+                .any(|m| m.target == "/usr/local/bin/ac-verifier-grok" && m.readonly),
+            "ac-verifier-grok role must bind-mount ac-verifier-grok read-only at /usr/local/bin/ac-verifier-grok"
+        );
+    }
+
+    #[test]
     fn ac_verifier_gemini_role_passes_through_gemini_api_key() {
         let role = build_ac_verifier_gemini_agentry_role("/h");
         assert!(
             role.passthru_env.contains(&"GEMINI_API_KEY".to_string()),
             "ac-verifier-gemini role must pass through GEMINI_API_KEY: {:?}",
             role.passthru_env
+        );
+    }
+
+    #[test]
+    fn ac_verifier_grok_role_passes_through_xai_api_key() {
+        let role = build_ac_verifier_grok_agentry_role("/h");
+        assert!(
+            role.passthru_env.contains(&"XAI_API_KEY".to_string()),
+            "ac-verifier-grok role must passthru XAI_API_KEY"
         );
     }
 
@@ -3496,6 +3656,15 @@ mod tests {
                 .any(|s| s.contains("generativelanguage.googleapis.com")),
             "ac-verifier-gemini role must allow generativelanguage.googleapis.com: {:?}",
             role.permit_scope.0
+        );
+    }
+
+    #[test]
+    fn ac_verifier_grok_role_permit_scope_allows_xai_api() {
+        let role = build_ac_verifier_grok_agentry_role("/h");
+        assert!(
+            role.permit_scope.0.iter().any(|s| s.contains("api.x.ai")),
+            "ac-verifier-grok role permit_scope must allow api.x.ai"
         );
     }
 

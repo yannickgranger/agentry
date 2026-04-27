@@ -11,6 +11,9 @@ pub use claude::ClaudeProvider;
 pub mod gemini;
 pub use gemini::GeminiProvider;
 
+pub mod grok;
+pub use grok::GrokProvider;
+
 #[cfg(test)]
 pub mod mock;
 #[cfg(test)]

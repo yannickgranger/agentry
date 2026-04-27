@@ -124,6 +124,8 @@ Beyond `agentry-self-host-v0` (full pipeline), two lighter topologies exist. `ag
 
 The `ac-verifier-claude-agentry` role is an instance of `AgentRole` slotted between the coder and the reviewer pair in `agentry-self-host-v0`. It reads `brief.payload.acceptance_criteria` (a `Vec<String>`) plus the coder's git diff against `base_branch`, asks claude for a strict-JSON per-AC verdict, and emits one `Finding(blocker, category=ac-violation)` per failed AC plus `done rework_needed`. Empty/missing AC list, missing binary, or invalid claude JSON all degrade to `done shipped` — `reviewer-claude-agentry` is the architectural backstop. The team's `message_graph` uses a dual-inbound trick: the existing `coder→reviewer` edges are preserved, and new `coder→ac-verifier` and `ac-verifier→reviewer` edges are appended AFTER them. The daemon's `team.incoming(reviewer).first()` rework lookup therefore rewinds to the coder (the corrective upstream), not to the (non-corrective) ac-verifier.
 
+The `ac-verifier-grok-agentry` role is the Grok-backed sibling of the claude variant in the AC verifier role family (brief 4 of #134). Same bash shape (read bundle, short-circuit on empty AC list, fetch base_branch + diff HEAD, build binary stdin JSON, pre-flight `command -v ac-verifier-grok`, degrade to `done shipped` on any failure), but the bind-mounted binary is `ac-verifier-grok` and it talks to the xAI API via `XAI_API_KEY` instead of the host `claude` CLI. Permit scope grants `net:allow:api.x.ai`; `XAI_API_KEY` is in `passthru_env`. Registered in seed but NOT yet wired into a team — brief 5 enables parallel mode (the claude variant alone runs in `agentry-self-host-v0` until then).
+
 ## AcVerifierProvider
 
 Trait implemented by every LLM backend the ac-verifier binary can call. Single method `verify(system, user) -> io::Result<String>` returns the provider's raw response; the verifier core parses the JSON. Brief 2 ships `ClaudeProvider` only; briefs 3 (Gemini) and 4 (Grok) add per-file siblings as text-only adds. Tests use `MockProvider` to drive the core logic without spawning a real LLM.
@@ -135,6 +137,10 @@ The `claude -p --output-format text` provider impl. Shells out to the host claud
 ## GeminiProvider
 
 The Gemini `generateContent` provider impl. Shells out to `curl` and POSTs to `https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent` with the system + user prompt split into `system_instruction` and `contents`, `responseMimeType=application/json`. Reads `GEMINI_API_KEY` from the process env and passes it to the curl child via env (never as a literal Rust-level argv entry). Default model is `gemini-3-flash-preview`. No timeout in the binary — the role's bash script wraps the whole invocation in `timeout $CLAUDE_P_TIMEOUT`.
+
+## GrokProvider
+
+The xAI Grok provider impl, sibling of `ClaudeProvider`. Shells out to `curl` to POST to `https://api.x.ai/v1/chat/completions` with `Authorization: Bearer $XAI_API_KEY`. The API key is read from the binary's process env (`XAI_API_KEY`) and passed to curl via env + stdin so it never appears in argv. Default model is `grok-4-fast` (matches the existing grok-echo role); request body uses `max_tokens: 4096` to give the verifier room for the verdicts JSON. Powers the `ac-verifier-grok-agentry` role (registered in seed but not yet wired into a team — brief 5 enables parallel mode).
 
 ## Input
 
