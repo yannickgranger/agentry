@@ -73,6 +73,56 @@ emit_finding_model() {
             prohibitions:$proh, requirements:$reqs
         }}'
 }
+# Stream `claude -p` to a transcript file under /transcripts/ AND emit each
+# stream-json line as a structured trace event. Captures the assistant's
+# final text into the named output variable for downstream parsing.
+#
+#   stream_claude <out_var> <suffix> <prompt>
+#
+# - <out_var>: bash variable name to receive the assistant's final text
+# - <suffix>:  appended to ${brief_id} for the transcript filename, e.g.
+#              "" / ".coder" / ".reviewer" — extension `.jsonl` is added
+# - <prompt>:  the prompt string to pass to claude -p
+#
+# Caller MUST have set $brief_id before invoking. On `claude -p` failure
+# the helper emits an error event + emit_done "failed" + `exit 0` (so the
+# script terminates with the role marked failed). Because the pipeline is
+# wrapped in `{ ... } || true`, `set -e` does not race the failure branch:
+# `${PIPESTATUS[0]}` reflects `timeout`'s exit code (e.g. 124 on timeout).
+stream_claude() {
+    local _out_var="$1"
+    local _suffix="$2"
+    local _prompt="$3"
+    mkdir -p /transcripts
+    local _t="/transcripts/${brief_id}${_suffix}.jsonl"
+    {
+        HOME=/root timeout "$CLAUDE_P_TIMEOUT" claude -p \
+            --output-format stream-json --verbose \
+            "$_prompt" 2>&1 \
+          | tee "$_t" \
+          | while IFS= read -r _line; do
+                if printf '%s' "$_line" | jq -e . >/dev/null 2>&1; then
+                    emit_event "$(jq -nc --argjson c "$_line" '{claude:$c}')"
+                else
+                    emit_event "$(jq -nc --arg s "$_line" '{claude_raw:$s}')"
+                fi
+            done
+    } || true
+    local _ec=${PIPESTATUS[0]}
+    if [ "$_ec" -ne 0 ]; then
+        emit_event "$(jq -nc --arg ec "$_ec" '{error:"claude -p failed",exit_code:$ec}')"
+        emit_done "failed"
+        exit 0
+    fi
+    # Reconstruct the assistant's final text from the transcript so callers
+    # that previously consumed `$reply` / `$response` keep working.
+    local _r
+    _r=$(jq -r 'select(.type=="result") | .result' "$_t" 2>/dev/null | tail -1)
+    if [ -z "$_r" ]; then
+        _r=$(jq -r 'select(.type=="assistant") | .message.content[]? | select(.type=="text") | .text' "$_t" 2>/dev/null | tail -1)
+    fi
+    printf -v "$_out_var" '%s' "$_r"
+}
 "#;
 
 const ECHO_SCRIPT: &str = r#"#!/usr/bin/env bash
@@ -167,6 +217,7 @@ const CLAUDE_SCRIPT: &str = r#"#!/usr/bin/env bash
 # from host at /usr/local/bin/claude; OAuth credentials at /root/.claude/.
 set -euo pipefail
 bundle="$(cat)"
+brief_id="$(jq -r '.brief.id' <<<"$bundle")"
 prompt="$(jq -r '.brief.payload.prompt // "Hello?"' <<<"$bundle")"
 
 # The bind-mount target directory must exist before podman mounts the creds
@@ -187,11 +238,7 @@ fi
 
 emit_event "$(jq -nc --arg p "$prompt" '{msg:"calling Claude Max (headless)", prompt_chars:($p|length)}')"
 
-reply=$(HOME=/root timeout "$CLAUDE_P_TIMEOUT" claude -p "$prompt" 2>&1) || {
-    emit_event "$(jq -nc --arg err "$reply" '{error:"claude -p failed", detail:$err}')"
-    emit_done "failed"
-    exit 0
-}
+stream_claude reply "" "$prompt"
 
 emit_event "$(jq -nc --arg r "$reply" '{reply:$r}')"
 emit_done "shipped"
@@ -380,10 +427,7 @@ PROMPT
 
 emit_event "$(jq -nc --arg len "$(wc -c < /tmp/prompt.txt)" '{msg:"calling claude -p",prompt_bytes:$len}')"
 
-reply=$(HOME=/root timeout "$CLAUDE_P_TIMEOUT" claude -p "$(cat /tmp/prompt.txt)" 2>&1) || {
-    emit_event "$(jq -nc --arg err "$reply" '{error:"claude -p failed",detail:$err}')"
-    emit_done "failed"; exit 0
-}
+stream_claude reply ".coder" "$(cat /tmp/prompt.txt)"
 
 emit_event "$(jq -nc --arg len "${#reply}" '{msg:"claude reply received",bytes:$len}')"
 "##;
@@ -470,10 +514,37 @@ as a short description (max 200 chars each, max 6 entries).
 
 Your response, right now, starting with { and ending with }:
 PROMPT
-    sr=$(HOME=/root timeout "$CLAUDE_P_TIMEOUT" claude -p "$(cat /tmp/self_rev.txt)" 2>&1) || {
-        emit_event "$(jq -nc --arg err "$(printf '%s' "$sr" | head -c 300)" '{warn:"self-review claude call failed; proceeding",detail:$err}')"
+    # Self-review tolerates failure: instead of `exit 0` (which `stream_claude`
+    # does on hard failure), wrap so a transient claude error degrades to
+    # "all applied" rather than killing the role. Skip stream_claude here
+    # because we need the soft-fail; emit the call directly under the same
+    # set -e + pipefail guard pattern.
+    mkdir -p /transcripts
+    SR_TRANSCRIPT="/transcripts/${brief_id}.self-review.jsonl"
+    {
+        HOME=/root timeout "$CLAUDE_P_TIMEOUT" claude -p \
+            --output-format stream-json --verbose \
+            "$(cat /tmp/self_rev.txt)" 2>&1 \
+          | tee "$SR_TRANSCRIPT" \
+          | while IFS= read -r _line; do
+                if printf '%s' "$_line" | jq -e . >/dev/null 2>&1; then
+                    emit_event "$(jq -nc --argjson c "$_line" '{claude:$c}')"
+                else
+                    emit_event "$(jq -nc --arg s "$_line" '{claude_raw:$s}')"
+                fi
+            done
+    } || true
+    sr_ec=${PIPESTATUS[0]}
+    if [ "$sr_ec" -ne 0 ]; then
+        emit_event "$(jq -nc --arg ec "$sr_ec" '{warn:"self-review claude call failed; proceeding",exit_code:$ec}')"
         sr='{"all_applied":true,"unapplied":[]}'
-    }
+    else
+        sr=$(jq -r 'select(.type=="result") | .result' "$SR_TRANSCRIPT" 2>/dev/null | tail -1)
+        if [ -z "$sr" ]; then
+            sr=$(jq -r 'select(.type=="assistant") | .message.content[]? | select(.type=="text") | .text' "$SR_TRANSCRIPT" 2>/dev/null | tail -1)
+        fi
+        [ -z "$sr" ] && sr='{"all_applied":true,"unapplied":[]}'
+    fi
     cleaned=$(printf '%s' "$sr" | sed -e 's/^```json$//' -e 's/^```$//' -e '/^$/d' | tr -d '\r')
     start=$(printf '%s' "$cleaned" | grep -b -m1 '{' | head -1 | cut -d: -f1)
     end=$(printf '%s' "$cleaned" | grep -bo '}' | tail -1 | cut -d: -f1)
@@ -559,6 +630,7 @@ const REVIEWER_CLAUDE_AGENTRY_SCRIPT: &str = r####"#!/usr/bin/env bash
 set -euo pipefail
 bundle="$(cat)"
 
+brief_id=$(jq -r '.brief.id' <<<"$bundle")
 base_branch=$(jq -r '.brief.payload.base_branch // "develop"' <<<"$bundle")
 issue_title=$(jq -r '.brief.payload.issue_title // ""' <<<"$bundle")
 issue_body=$(jq -r '.brief.payload.issue_body // ""' <<<"$bundle")
@@ -683,10 +755,7 @@ State-machine emission idempotency (CRITICAL):
 Your response, right now, starting with [ and ending with ]:
 PROMPT
 
-response=$(HOME=/root timeout "$CLAUDE_P_TIMEOUT" claude -p "$(cat /tmp/rev_prompt.txt)" 2>&1) || {
-    emit_event "$(jq -nc --arg err "$response" '{error:"claude -p failed",detail:$err}')"
-    emit_done "failed"; exit 0
-}
+stream_claude response ".reviewer" "$(cat /tmp/rev_prompt.txt)"
 
 # Tolerate (and strip) leading/trailing fences if claude adds them despite
 # the instruction — common drift pattern.
@@ -954,6 +1023,7 @@ const ARCHAEOLOGIST_CLAUDE_AGENTRY_SCRIPT: &str = r##"#!/usr/bin/env bash
 set -euo pipefail
 bundle="$(cat)"
 
+brief_id=$(jq -r '.brief.id' <<<"$bundle")
 intent=$(jq -r '.brief.payload.intent // ""' <<<"$bundle")
 success_criteria=$(jq -r '.brief.payload.success_criteria // ""' <<<"$bundle")
 discovery_seeds=$(jq -c '.brief.payload.discovery_seeds // []' <<<"$bundle")
@@ -1043,10 +1113,7 @@ PROMPT
 
 emit_event "$(jq -nc --arg len "$(wc -c < /tmp/arch_prompt.txt)" '{msg:"calling claude -p",prompt_bytes:$len}')"
 
-response=$(HOME=/root timeout "$CLAUDE_P_TIMEOUT" claude -p "$(cat /tmp/arch_prompt.txt)" 2>&1) || {
-    emit_event "$(jq -nc --arg err "$response" '{error:"claude -p failed",detail:$err}')"
-    emit_done "failed"; exit 0
-}
+stream_claude response ".archaeologist" "$(cat /tmp/arch_prompt.txt)"
 
 # Same fence-stripping + brace-slice pattern as REVIEWER_CLAUDE_AGENTRY_SCRIPT,
 # but for an object ({...}) instead of an array ([...]).
@@ -1160,10 +1227,7 @@ PROMPT
 
 emit_event "$(jq -nc --arg len "$(wc -c < /tmp/planner_prompt.txt)" '{msg:"calling claude -p",prompt_bytes:$len}')"
 
-response=$(HOME=/root timeout "$CLAUDE_P_TIMEOUT" claude -p "$(cat /tmp/planner_prompt.txt)" 2>&1) || {
-    emit_event "$(jq -nc --arg err "$response" '{error:"claude -p failed",detail:$err}')"
-    emit_done "failed"; exit 0
-}
+stream_claude response ".planner" "$(cat /tmp/planner_prompt.txt)"
 
 # Same fence-stripping + bracket-slice pattern as REVIEWER_CLAUDE_AGENTRY_SCRIPT.
 cleaned=$(printf '%s' "$response" | sed -e 's/^```json$//' -e 's/^```$//' -e '/^$/d' | tr -d '\r')
@@ -1299,6 +1363,11 @@ fn build_planner_claude_agentry_role(home: &str, claude_settings_path: &str) -> 
                 target: "/root/.claude/settings.json".into(),
                 readonly: true,
             },
+            Mount {
+                source: "/var/lib/agentry/transcripts".into(),
+                target: "/transcripts".into(),
+                readonly: false,
+            },
         ],
         workspace_mount: Some(WorkspaceMount {
             container_path: "/workspace".into(),
@@ -1362,6 +1431,11 @@ fn build_archaeologist_claude_agentry_role(home: &str, claude_settings_path: &st
                 source: claude_settings_path.into(),
                 target: "/root/.claude/settings.json".into(),
                 readonly: true,
+            },
+            Mount {
+                source: "/var/lib/agentry/transcripts".into(),
+                target: "/transcripts".into(),
+                readonly: false,
             },
         ],
         workspace_mount: Some(WorkspaceMount {
@@ -1778,6 +1852,11 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
                 target: "/root/.claude/settings.json".into(),
                 readonly: true,
             },
+            Mount {
+                source: "/var/lib/agentry/transcripts".into(),
+                target: "/transcripts".into(),
+                readonly: false,
+            },
         ],
         workspace_mount: None,
         sccache: false,
@@ -2032,6 +2111,11 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
                 target: "/root/.claude/settings.json".into(),
                 readonly: true,
             },
+            Mount {
+                source: "/var/lib/agentry/transcripts".into(),
+                target: "/transcripts".into(),
+                readonly: false,
+            },
         ],
         workspace_mount: Some(WorkspaceMount {
             container_path: "/workspace".into(),
@@ -2114,6 +2198,11 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
                 source: claude_settings_path.clone(),
                 target: "/root/.claude/settings.json".into(),
                 readonly: true,
+            },
+            Mount {
+                source: "/var/lib/agentry/transcripts".into(),
+                target: "/transcripts".into(),
+                readonly: false,
             },
         ],
         // Read-only workspace — LLM reviewer does not mutate the coder's tree.
@@ -2526,6 +2615,117 @@ mod tests {
                 "null-agent script must not contain {}",
                 forbidden
             );
+        }
+    }
+
+    #[test]
+    fn bash_prelude_defines_stream_claude_with_pipefail_guard() {
+        let p = BASH_PRELUDE;
+        assert!(
+            p.contains("stream_claude()"),
+            "prelude must define stream_claude helper"
+        );
+        assert!(
+            p.contains("--output-format stream-json --verbose"),
+            "stream_claude must invoke claude -p with stream-json + verbose"
+        );
+        assert!(
+            p.contains("} || true"),
+            "stream_claude must wrap pipeline in `}} || true` so set -e does not race the failure branch"
+        );
+        assert!(
+            p.contains("PIPESTATUS[0]"),
+            "stream_claude must capture timeout's exit code via PIPESTATUS[0], not $?"
+        );
+        assert!(
+            p.contains("/transcripts/${brief_id}"),
+            "stream_claude must tee to /transcripts/${{brief_id}}<suffix>.jsonl"
+        );
+    }
+
+    #[test]
+    fn all_claude_call_sites_use_stream_claude() {
+        // Every script that previously did `reply=$(... claude -p ...)` /
+        // `response=$(... claude -p ...)` must now go through stream_claude
+        // so the streaming + pipefail guard is uniform. Self-review is the
+        // one exception (intentional soft-fail; uses inline pipeline that
+        // mirrors stream_claude's guard).
+        for (name, s) in [
+            ("CLAUDE_SCRIPT", CLAUDE_SCRIPT),
+            ("CODER_CLAUDE_AGENTRY_SCRIPT", CODER_CLAUDE_AGENTRY_SCRIPT),
+            (
+                "REVIEWER_CLAUDE_AGENTRY_SCRIPT",
+                REVIEWER_CLAUDE_AGENTRY_SCRIPT,
+            ),
+            (
+                "ARCHAEOLOGIST_CLAUDE_AGENTRY_SCRIPT",
+                ARCHAEOLOGIST_CLAUDE_AGENTRY_SCRIPT,
+            ),
+            (
+                "PLANNER_CLAUDE_AGENTRY_SCRIPT",
+                PLANNER_CLAUDE_AGENTRY_SCRIPT,
+            ),
+        ] {
+            assert!(
+                s.contains("stream_claude "),
+                "{name} must call stream_claude (no buffered claude -p)"
+            );
+            assert!(
+                !s.contains("reply=$(HOME=/root timeout")
+                    && !s.contains("response=$(HOME=/root timeout"),
+                "{name} must not retain the buffered `reply=$(... claude -p ...)` pattern"
+            );
+        }
+    }
+
+    #[test]
+    fn coder_exitpoint_self_review_uses_pipefail_guard() {
+        // Self-review is intentionally soft-fail (degrades to all_applied:true
+        // on claude error) so it does not use stream_claude — but it MUST use
+        // the same pipeline guard so set -e + pipefail does not kill the role
+        // before the failure branch runs.
+        let s = CODER_CLAUDE_AGENTRY_EXITPOINT;
+        assert!(
+            s.contains("--output-format stream-json --verbose"),
+            "self-review must use stream-json output"
+        );
+        assert!(
+            s.contains("PIPESTATUS[0]"),
+            "self-review must capture exit via PIPESTATUS[0]"
+        );
+        assert!(
+            s.contains(".self-review.jsonl"),
+            "self-review transcript filename suffix"
+        );
+    }
+
+    #[test]
+    fn claude_using_roles_mount_transcripts_dir() {
+        // Every role that mounts /usr/local/bin/claude must also mount
+        // /var/lib/agentry/transcripts → /transcripts so stream_claude has a
+        // host-bind-mounted directory to tee into.
+        let home = "/var/home/test";
+        let settings = "/var/home/test/.config/agentry/claude-container-settings.json";
+        let roles = [
+            ("planner", build_planner_claude_agentry_role(home, settings)),
+            (
+                "archaeologist",
+                build_archaeologist_claude_agentry_role(home, settings),
+            ),
+            ("verifier", build_verifier_claude_agentry_role()),
+        ];
+        for (name, role) in roles {
+            let mounts_claude = role
+                .mounts
+                .iter()
+                .any(|m| m.target == "/usr/local/bin/claude");
+            let mounts_transcripts = role.mounts.iter().any(|m| m.target == "/transcripts");
+            if mounts_claude {
+                assert!(
+                    mounts_transcripts,
+                    "role {name} mounts claude but not /transcripts"
+                );
+            }
         }
     }
 
