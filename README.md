@@ -87,6 +87,14 @@ Every PR runs `graph-specs check` (concept-level equivalence between `specs/conc
 
 Rootless podman on the dev box. Local `agentry-dev-redis` container on `127.0.0.1:6380` with a password at `~/.config/agentry/redis.password`. Local `agentry-sccache-redis` container attached to `agentry-net`. Ed25519 signing key at `~/.config/agentry/signing.key`. Never point agentry at a production Redis — the default config has pin tests to ensure `127.0.0.1` is the only baked-in target.
 
+Claude-using roles (`coder-claude-agentry`, `reviewer-claude-agentry`, `archaeologist-claude-agentry`, `planner-claude-agentry`, plus the `claude-echo` probe) bind-mount a host directory at `/var/lib/agentry/transcripts/` into the container at `/transcripts/`. Each `claude -p` invocation tees its `--output-format stream-json --verbose` output into `/transcripts/${brief_id}<.role-suffix>.jsonl`, so on `timeout`/OOM/crash the partial trace survives container teardown for forensics. Create the host directory once before running:
+
+```bash
+sudo mkdir -p /var/lib/agentry/transcripts && sudo chmod 0755 /var/lib/agentry/transcripts
+```
+
+Operators on systemd setups should add `/var/lib/agentry/transcripts` to the orchestratord unit's `ReadWritePaths=` and rotate/GC the directory periodically — transcripts are ephemeral by design but accumulate one `.jsonl` per `claude -p` call.
+
 ## Further reading
 
 - `CLAUDE.md` — project rules for Claude-driven development, including the cutoff.
