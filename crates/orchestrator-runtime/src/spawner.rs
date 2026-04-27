@@ -328,12 +328,13 @@ impl Spawner for PodmanSpawner {
         }
         for m in &role.mounts {
             // ra-query is operator-installed via `just ra-query-binary`. A
-            // missing host binary must NOT block the reviewer-claude spawn —
-            // the entrypoint script falls back to `command -v ra-query` and
-            // skips the pre-pass with a `ra_query_unavailable` event. Other
+            // missing host binary must NOT block the reviewer-claude or
+            // coder-claude spawn — both entrypoints fall back to
+            // `command -v ra-query` and skip the pre-pass / pre-commit
+            // dead-pub gate with a `ra_query_unavailable` event. Other
             // mounts (claude, credentials, settings) keep podman's default
             // fail-fast behaviour: a missing source surfaces as a spawn error.
-            if role.name.0 == "reviewer-claude-agentry"
+            if ra_query_mount_role_can_warn_skip(role.name.0.as_str())
                 && m.target == "/usr/local/bin/ra-query"
                 && !std::path::Path::new(&m.source).exists()
             {
@@ -678,6 +679,17 @@ async fn append_audit(
     Ok(())
 }
 
+/// Roles whose ra-query bind-mount may be silently skipped when the host
+/// binary is missing. Both the reviewer pre-pass and the coder's pre-commit
+/// dead-pub gate degrade gracefully via `command -v ra-query`; for other
+/// roles a missing source must surface as a spawn error.
+fn ra_query_mount_role_can_warn_skip(role_name: &str) -> bool {
+    matches!(
+        role_name,
+        "reviewer-claude-agentry" | "coder-claude-agentry"
+    )
+}
+
 /// Host-side preflight for the `/transcripts` bind mount.
 ///
 /// Test-touches a `.spawner-preflight` sentinel inside `source` and unlinks
@@ -964,6 +976,22 @@ mod tests {
         assert!(s.contains("AGENTRY_EXITPOINT"));
         assert!(s.contains("exec bash -c \"$AGENTRY_EXITPOINT\""));
         assert!(!s.contains("exec bash -c \"$AGENTRY_SCRIPT\""));
+    }
+
+    #[test]
+    fn ra_query_mount_warn_skip_covers_reviewer_and_coder() {
+        // The pre-pass (reviewer) and the pre-commit dead-pub gate (coder)
+        // both tolerate a missing host ra-query binary via `command -v`. Any
+        // other role with an ra-query mount declared MUST fail-fast on a
+        // missing source — silently dropping the mount could mask a config
+        // bug for a role that doesn't `command -v` first.
+        assert!(ra_query_mount_role_can_warn_skip("reviewer-claude-agentry"));
+        assert!(ra_query_mount_role_can_warn_skip("coder-claude-agentry"));
+        assert!(!ra_query_mount_role_can_warn_skip("auditor-claude-agentry"));
+        assert!(!ra_query_mount_role_can_warn_skip(
+            "reviewer-mechanical-agentry"
+        ));
+        assert!(!ra_query_mount_role_can_warn_skip(""));
     }
 
     #[test]

@@ -616,6 +616,31 @@ PROMPT
     fi
 fi
 
+# Pre-commit dead-pub gate: WARN-level findings for newly-added pub items
+# with zero callers. ra-query is bind-mounted from host; missing binary
+# degrades to a `ra_query_unavailable` event and skip (matching reviewer
+# pre-pass tolerance). v1 emits warn-level findings only — no failed verdict
+# — so false positives don't block the pipeline. Upgrade to blocker in a
+# follow-up brief once the signal is validated.
+if command -v ra-query >/dev/null 2>&1; then
+    emit_event '{"msg":"running ra_query_callers on newly-added pub items"}'
+    new_pub=$(git diff --cached -U0 | grep -E '^\+(pub (fn|struct|enum|trait|type|const|static)) ' \
+        | grep -oE 'pub (fn|struct|enum|trait|type|const|static) +[a-zA-Z_][a-zA-Z0-9_]*' \
+        | awk '{print $NF}' | sort -u)
+    dead_count=0
+    while IFS= read -r sym; do
+        [ -z "$sym" ] && continue
+        callers=$(ra-query callers "$sym" --format json 2>/dev/null | jq -r '.callers // [] | length' 2>/dev/null || echo "-1")
+        if [ "$callers" = "0" ]; then
+            emit_finding "warn" "ra-query" "dead-pub" "newly-added pub item '$sym' has zero callers in workspace"
+            dead_count=$((dead_count+1))
+        fi
+    done <<< "$new_pub"
+    emit_event "$(jq -nc --argjson d "$dead_count" '{msg:"dead_pub_gate_complete",zero_caller_count:$d}')"
+else
+    emit_event '{"msg":"ra_query_unavailable","detail":"skipping coder dead-pub gate"}'
+fi
+
 git commit -m "auto(${brief_id}): ${issue_title}" > /dev/null
 sha=$(git rev-parse HEAD)
 emit_event "$(jq -nc --arg br "$branch" --arg s "$sha" '{msg:"committed",branch:$br,sha:$s}')"
@@ -1602,6 +1627,80 @@ fn build_reviewer_claude_agentry_role(home: &str, claude_settings_path: &str) ->
     }
 }
 
+/// Build the coder-claude-agentry role. Extracted from `seed_m0` so the
+/// bind-mounts (claude, credentials, settings, transcripts, ra-query) can be
+/// asserted in unit tests. ra-query is operator-installed via
+/// `just ra-query-binary` and bind-mounted at /usr/local/bin/ra-query; the
+/// exitpoint's pre-commit dead-pub gate tolerates a missing binary.
+fn build_coder_claude_agentry_role(home: &str, claude_settings_path: &str) -> AgentRole {
+    AgentRole {
+        name: RoleName("coder-claude-agentry".into()),
+        version: 1,
+        model: Some("claude-max".into()),
+        system_prompt: None,
+        // rust:1.93 already has cargo + rustc. Apt installs the git client
+        // + ca-certificates; claude CLI is bind-mounted from the host.
+        image: "docker.io/library/rust:1.93".into(),
+        substrate_class: SubstrateClass::Podman,
+        package_manager: PackageManager::Apt,
+        entrypoint_script: format!("{BASH_PRELUDE}{CODER_CLAUDE_AGENTRY_SCRIPT}"),
+        exitpoint_script: Some(format!("{BASH_PRELUDE}{CODER_CLAUDE_AGENTRY_EXITPOINT}")),
+        binaries: vec!["git".into(), "curl".into(), "ca-certificates".into()],
+        mcp_servers: vec![],
+        tool_allowlist: ToolAllowlist(vec![]),
+        permit_scope: PermitScope(vec![
+            "fs:read:/workspace/**".into(),
+            "fs:write:/workspace/**".into(),
+            "net:allow:api.anthropic.com".into(),
+            "net:allow:agency.lab".into(),
+        ]),
+        passthru_env: vec!["GITEA_TOKEN".into()],
+        extra_bootstrap: vec![
+            "rustup component add rustfmt clippy".into(),
+            "git config --global http.sslVerify false".into(),
+            "CARGO_NET_GIT_FETCH_WITH_CLI=true cargo install --git https://oauth2:${GITEA_TOKEN}@agency.lab:3000/yg/quality-architecture.git --bin quality-hygiene --root /usr/local --locked --quiet || true".into(),
+            "CARGO_NET_GIT_FETCH_WITH_CLI=true cargo install --git https://oauth2:${GITEA_TOKEN}@agency.lab:3000/yg/cfdb.git --rev 02c5a45 --root /usr/local --locked --quiet cfdb-cli || true".into(),
+            "CARGO_NET_GIT_FETCH_WITH_CLI=true cargo install --git https://oauth2:${GITEA_TOKEN}@agency.lab:3000/yg/graph-specs-rust.git --rev ecaedb9 --root /usr/local --locked --quiet application || true".into(),
+        ],
+        mounts: vec![
+            Mount {
+                source: format!("{home}/.local/bin/claude"),
+                target: "/usr/local/bin/claude".into(),
+                readonly: true,
+            },
+            Mount {
+                source: format!("{home}/.claude/.credentials.json"),
+                target: "/root/.claude/.credentials.json".into(),
+                readonly: true,
+            },
+            Mount {
+                source: claude_settings_path.into(),
+                target: "/root/.claude/settings.json".into(),
+                readonly: true,
+            },
+            Mount {
+                source: "/var/lib/agentry/transcripts".into(),
+                target: "/transcripts".into(),
+                readonly: false,
+            },
+            Mount {
+                source: format!("{home}/.local/bin/ra-query"),
+                target: "/usr/local/bin/ra-query".into(),
+                readonly: true,
+            },
+        ],
+        workspace_mount: Some(WorkspaceMount {
+            container_path: "/workspace".into(),
+            readonly: false,
+        }),
+        // sccache disabled for v0 — rust:1.93 is debian-based; sccache is not
+        // in apt/bookworm. Issue #9/#10 or a follow-up brief will add a
+        // static binary download here. Without sccache, each brief does a
+        // cold compile of the target repo (~60–90s for agentry itself).
+        sccache: false,
+    }
+}
+
 /// Verifier role for the `agentry-verify-v0` team. The DOL composer
 /// (daemon-side, see `daemon.rs::on_all_children_resolved`) auto-dispatches a
 /// verifier brief whenever a meta-brief's children all reach terminal verdict
@@ -2295,67 +2394,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
     // Shipper pushes the branch and opens a PR on the forge.
     // Ci-watcher polls forge CI on the PR's head sha and merges on green.
     let home = std::env::var("HOME").unwrap_or_else(|_| "/var/home/yg".into());
-    let coder_claude_agentry = AgentRole {
-        name: RoleName("coder-claude-agentry".into()),
-        version: 1,
-        model: Some("claude-max".into()),
-        system_prompt: None,
-        // rust:1.93 already has cargo + rustc. Apt installs the git client
-        // + ca-certificates; claude CLI is bind-mounted from the host.
-        image: "docker.io/library/rust:1.93".into(),
-        substrate_class: SubstrateClass::Podman,
-        package_manager: PackageManager::Apt,
-        entrypoint_script: format!("{BASH_PRELUDE}{CODER_CLAUDE_AGENTRY_SCRIPT}"),
-        exitpoint_script: Some(format!("{BASH_PRELUDE}{CODER_CLAUDE_AGENTRY_EXITPOINT}")),
-        binaries: vec!["git".into(), "curl".into(), "ca-certificates".into()],
-        mcp_servers: vec![],
-        tool_allowlist: ToolAllowlist(vec![]),
-        permit_scope: PermitScope(vec![
-            "fs:read:/workspace/**".into(),
-            "fs:write:/workspace/**".into(),
-            "net:allow:api.anthropic.com".into(),
-            "net:allow:agency.lab".into(),
-        ]),
-        passthru_env: vec!["GITEA_TOKEN".into()],
-        extra_bootstrap: vec![
-            "rustup component add rustfmt clippy".into(),
-            "git config --global http.sslVerify false".into(),
-            "CARGO_NET_GIT_FETCH_WITH_CLI=true cargo install --git https://oauth2:${GITEA_TOKEN}@agency.lab:3000/yg/quality-architecture.git --bin quality-hygiene --root /usr/local --locked --quiet || true".into(),
-            "CARGO_NET_GIT_FETCH_WITH_CLI=true cargo install --git https://oauth2:${GITEA_TOKEN}@agency.lab:3000/yg/cfdb.git --rev 02c5a45 --root /usr/local --locked --quiet cfdb-cli || true".into(),
-            "CARGO_NET_GIT_FETCH_WITH_CLI=true cargo install --git https://oauth2:${GITEA_TOKEN}@agency.lab:3000/yg/graph-specs-rust.git --rev ecaedb9 --root /usr/local --locked --quiet application || true".into(),
-        ],
-        mounts: vec![
-            Mount {
-                source: format!("{home}/.local/bin/claude"),
-                target: "/usr/local/bin/claude".into(),
-                readonly: true,
-            },
-            Mount {
-                source: format!("{home}/.claude/.credentials.json"),
-                target: "/root/.claude/.credentials.json".into(),
-                readonly: true,
-            },
-            Mount {
-                source: claude_settings_path.clone(),
-                target: "/root/.claude/settings.json".into(),
-                readonly: true,
-            },
-            Mount {
-                source: "/var/lib/agentry/transcripts".into(),
-                target: "/transcripts".into(),
-                readonly: false,
-            },
-        ],
-        workspace_mount: Some(WorkspaceMount {
-            container_path: "/workspace".into(),
-            readonly: false,
-        }),
-        // sccache disabled for v0 — rust:1.93 is debian-based; sccache is not
-        // in apt/bookworm. Issue #9/#10 or a follow-up brief will add a
-        // static binary download here. Without sccache, each brief does a
-        // cold compile of the target repo (~60–90s for agentry itself).
-        sccache: false,
-    };
+    let coder_claude_agentry = build_coder_claude_agentry_role(&home, &claude_settings_path);
     let reviewer_mechanical_agentry = AgentRole {
         name: RoleName("reviewer-mechanical-agentry".into()),
         version: 1,
@@ -2795,6 +2834,20 @@ mod tests {
     }
 
     #[test]
+    fn coder_role_has_ra_query_mount() {
+        let role = build_coder_claude_agentry_role(
+            "/var/home/test",
+            "/var/home/test/.config/agentry/claude-container-settings.json",
+        );
+        assert!(
+            role.mounts
+                .iter()
+                .any(|m| m.target == "/usr/local/bin/ra-query" && m.readonly),
+            "coder-claude must bind-mount ra-query read-only at /usr/local/bin/ra-query"
+        );
+    }
+
+    #[test]
     fn reviewer_script_runs_ra_query_pre_pass() {
         let s = REVIEWER_CLAUDE_AGENTRY_SCRIPT;
         assert!(
@@ -2973,6 +3026,27 @@ mod tests {
         assert!(
             !s.contains("select(.type==\"assistant\") | .message.content[]? | select(.type==\"text\") | .text' \"$SR_TRANSCRIPT\" 2>/dev/null | tail"),
             "self-review assistant-text fallback must NOT pipe through tail"
+        );
+    }
+
+    #[test]
+    fn coder_exitpoint_has_dead_pub_gate() {
+        // Lock down the pre-commit dead-pub gate so a future cleanup can't
+        // silently delete it. v1 emits warn-level findings only via
+        // ra_query_callers; a missing ra-query binary degrades to a
+        // ra_query_unavailable event without failing the role.
+        let s = CODER_CLAUDE_AGENTRY_EXITPOINT;
+        assert!(
+            s.contains("ra_query_callers"),
+            "coder exitpoint must mention ra_query_callers in the dead-pub gate"
+        );
+        assert!(
+            s.contains("dead-pub"),
+            "coder exitpoint must emit findings under the dead-pub category"
+        );
+        assert!(
+            s.contains("running ra_query_callers on newly-added pub items"),
+            "coder exitpoint must announce the dead-pub gate before running it"
         );
     }
 
