@@ -571,9 +571,13 @@ PROMPT
         emit_event "$(jq -nc --arg ec "$sr_ec" '{warn:"self-review claude call failed; proceeding",exit_code:$ec}')"
         sr='{"all_applied":true,"unapplied":[]}'
     else
-        sr=$(jq -r 'select(.type=="result") | .result' "$SR_TRANSCRIPT" 2>/dev/null | tail -1)
+        # Same regression class as PR #129: piping `.result` through `tail -1`
+        # silently truncates pretty-printed multi-line JSON to a single trailing
+        # `}`, which then trips the `grep -m1 '{'` + `set -e` chain below. The
+        # result event is unique per transcript, so no `tail` is needed.
+        sr=$(jq -r 'select(.type=="result") | .result' "$SR_TRANSCRIPT" 2>/dev/null)
         if [ -z "$sr" ]; then
-            sr=$(jq -r 'select(.type=="assistant") | .message.content[]? | select(.type=="text") | .text' "$SR_TRANSCRIPT" 2>/dev/null | tail -1)
+            sr=$(jq -r 'select(.type=="assistant") | .message.content[]? | select(.type=="text") | .text' "$SR_TRANSCRIPT" 2>/dev/null)
         fi
         [ -z "$sr" ] && sr='{"all_applied":true,"unapplied":[]}'
     fi
@@ -2932,6 +2936,19 @@ mod tests {
         assert!(
             s.contains(".self-review.jsonl"),
             "self-review transcript filename suffix"
+        );
+        // Same regression class as PR #129's stream_claude fix: piping `.result`
+        // through `tail -1` truncates multi-line JSON to a trailing `}` and
+        // the downstream `grep -m1 '{'` then misses, tripping pipefail+set -e.
+        assert!(
+            !s.contains(
+                "select(.type==\"result\") | .result' \"$SR_TRANSCRIPT\" 2>/dev/null | tail"
+            ),
+            "self-review must NOT pipe .result through tail (truncates multi-line JSON)"
+        );
+        assert!(
+            !s.contains("select(.type==\"assistant\") | .message.content[]? | select(.type==\"text\") | .text' \"$SR_TRANSCRIPT\" 2>/dev/null | tail"),
+            "self-review assistant-text fallback must NOT pipe through tail"
         );
     }
 
