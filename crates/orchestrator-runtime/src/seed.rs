@@ -370,6 +370,32 @@ issue_body=$(jq -r '.brief.payload.issue_body // ""' <<<"$bundle")
 acceptance=$(jq -r '.brief.payload.acceptance // "true"' <<<"$bundle")
 forge_host=$(jq -r '.brief.payload.forge_host // "agency.lab:3000"' <<<"$bundle")
 
+prior_findings=$(jq -c '
+  [ .team_context.messages[]?.payload.findings[]?
+    | select(.severity == "blocker")
+    | { message, prohibitions: (.prohibitions // []), requirements: (.requirements // []) }
+  ]
+' <<<"$bundle")
+finding_count=$(jq 'length' <<<"$prior_findings")
+
+rework_banner=""
+if [ "$finding_count" -gt 0 ]; then
+    feedback_block=$(jq -r '.[] |
+        "- BLOCKER: \(.message)\n  Prohibitions: \(.prohibitions | join("; "))\n  Requirements: \(.requirements | join("; "))"
+    ' <<<"$prior_findings")
+    rework_banner=$(cat <<REWORK_EOF
+**This is a REWORK iteration.**
+
+A prior coder pass on this brief shipped a commit that is already on HEAD of this worktree. The reviewer flagged the following BLOCKER findings against that commit. Read the existing diff with \`git diff \${base_branch}...HEAD\`, identify the sites the findings name, and edit those sites to satisfy each requirement and avoid each prohibition. Do NOT replan from scratch and do NOT recreate files that already exist.
+
+--- Prior reviewer findings ---
+${feedback_block}
+--- End findings ---
+REWORK_EOF
+)
+    emit_event "$(jq -nc --argjson n "$finding_count" '{msg:"rework iteration — injecting prior findings into prompt",blocker_count:$n}')"
+fi
+
 if [ -z "${GITEA_TOKEN:-}" ]; then
     emit_event '{"error":"GITEA_TOKEN not in env"}'
     emit_done "failed"; exit 0
@@ -406,6 +432,8 @@ branch "$base_branch"; you are on a fresh branch "$branch".
 Your task is described in verb-structured form below. Follow it literally:
 each verb (CREATE / UPDATE / REPLACE / DELETE / MOVE) names a transformation
 on a specific file:line target. Do NOT invent additional changes.
+
+${rework_banner}
 
 Task title: $issue_title
 
@@ -2887,6 +2915,56 @@ mod tests {
         assert!(
             s.contains(".self-review.jsonl"),
             "self-review transcript filename suffix"
+        );
+    }
+
+    #[test]
+    fn coder_script_extracts_team_context_messages() {
+        let s = CODER_CLAUDE_AGENTRY_SCRIPT;
+        assert!(
+            s.contains("team_context.messages"),
+            "coder script must read findings from team_context.messages"
+        );
+        assert!(
+            s.contains("prior_findings"),
+            "coder script must materialize a prior_findings variable"
+        );
+        assert!(
+            s.contains("finding_count"),
+            "coder script must compute a finding_count to gate the banner"
+        );
+    }
+
+    #[test]
+    fn coder_script_injects_rework_banner_when_findings_present() {
+        let s = CODER_CLAUDE_AGENTRY_SCRIPT;
+        assert!(
+            s.contains("This is a REWORK iteration"),
+            "coder script must announce rework iteration in the banner"
+        );
+        assert!(
+            s.contains("--- Prior reviewer findings ---"),
+            "coder script must wrap findings with a header delimiter"
+        );
+        assert!(
+            s.contains("--- End findings ---"),
+            "coder script must wrap findings with a footer delimiter"
+        );
+        assert!(
+            s.contains("${rework_banner}"),
+            "coder script prompt heredoc must interpolate the rework_banner shell variable"
+        );
+    }
+
+    #[test]
+    fn coder_script_filters_to_blocker_severity() {
+        // warns are informational and must NOT be injected — they would
+        // confuse Claude into addressing non-issues, and only blockers carry
+        // prohibitions+requirements that the rework prompt depends on.
+        let s = CODER_CLAUDE_AGENTRY_SCRIPT;
+        assert!(
+            s.contains(".severity == \"blocker\""),
+            "coder script must filter findings to blocker severity"
         );
     }
 
