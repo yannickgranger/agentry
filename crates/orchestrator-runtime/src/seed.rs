@@ -616,35 +616,34 @@ PROMPT
     fi
 fi
 
-# Pre-commit dead-pub gate: WARN-level findings for newly-added pub items
-# with zero callers. ra-query is bind-mounted from host; missing binary
-# degrades to a `ra_query_unavailable` event and skip (matching reviewer
-# pre-pass tolerance). v1 emits warn-level findings only — no failed verdict
-# — so false positives don't block the pipeline. Upgrade to blocker in a
-# follow-up brief once the signal is validated.
-#
-# The pipe must be wrapped in `{ ...; } || true` because under
-# `set -euo pipefail` an empty-grep exits 1 and pipefail propagates,
-# killing the assignment and the script. Same regression class as PRs
-# #129 and #130. Track issue #134 ports this gate to a binary.
-if command -v ra-query >/dev/null 2>&1; then
-    emit_event '{"msg":"running ra_query_callers on newly-added pub items"}'
-    new_pub=$( { git diff --cached -U0 \
-        | grep -E '^\+(pub (fn|struct|enum|trait|type|const|static)) ' \
-        | grep -oE 'pub (fn|struct|enum|trait|type|const|static) +[a-zA-Z_][a-zA-Z0-9_]*' \
-        | awk '{print $NF}' | sort -u ; } || true )
-    dead_count=0
-    while IFS= read -r sym; do
-        [ -z "$sym" ] && continue
-        callers=$(ra-query callers "$sym" --format json 2>/dev/null | jq -r '.callers // [] | length' 2>/dev/null || echo "-1")
-        if [ "$callers" = "0" ]; then
-            emit_finding "warn" "ra-query" "dead-pub" "newly-added pub item '$sym' has zero callers in workspace"
-            dead_count=$((dead_count+1))
+# Pre-commit dead-pub gate: invoke the dead-pub-check binary if the host
+# has bind-mounted it. Binary reads {diff, workspace_root} JSON on stdin,
+# emits findings as JSONL on stdout, exits 0. Falls through silently if
+# the binary is missing (warn-skip mount handles that side). Brief 1 of
+# #134 replaces the prior bash pipeline (PR #133, hot-fixed in #135) —
+# the binary is structurally immune to the empty-grep × set -euo pipefail
+# failure class that bit PRs #129/#130/#135.
+if command -v dead-pub-check >/dev/null 2>&1; then
+    emit_event '{"msg":"running dead-pub-check"}'
+    diff_text=$(git diff --cached -U0)
+    findings=$(jq -nc --arg d "$diff_text" --arg w "/workspace" '{diff:$d, workspace_root:$w}' \
+        | dead-pub-check 2>/tmp/dpc.err) || {
+            emit_event "$(jq -nc --arg err "$(tail -c 4096 /tmp/dpc.err)" '{warn:"dead-pub-check failed",detail:$err}')"
+            findings=""
+        }
+    while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        sev=$(jq -r '.severity' <<<"$line" 2>/dev/null || echo "warn")
+        cat=$(jq -r '.category' <<<"$line" 2>/dev/null || echo "dead-pub")
+        msg=$(jq -r '.message' <<<"$line" 2>/dev/null || echo "<malformed finding>")
+        if [ "$sev" = "warn" ]; then
+            emit_finding "warn" "ra-query" "$cat" "$msg"
+        else
+            emit_event "$(jq -nc --arg s "$sev" --arg c "$cat" --arg m "$msg" '{msg:"dead_pub_info",severity:$s,category:$c,detail:$m}')"
         fi
-    done <<< "$new_pub"
-    emit_event "$(jq -nc --argjson d "$dead_count" '{msg:"dead_pub_gate_complete",zero_caller_count:$d}')"
+    done <<< "$findings"
 else
-    emit_event '{"msg":"ra_query_unavailable","detail":"skipping coder dead-pub gate"}'
+    emit_event '{"msg":"dead_pub_check_unavailable","detail":"binary not on PATH; coder gate skipped"}'
 fi
 
 git commit -m "auto(${brief_id}): ${issue_title}" > /dev/null
@@ -1692,6 +1691,11 @@ fn build_coder_claude_agentry_role(home: &str, claude_settings_path: &str) -> Ag
             Mount {
                 source: format!("{home}/.local/bin/ra-query"),
                 target: "/usr/local/bin/ra-query".into(),
+                readonly: true,
+            },
+            Mount {
+                source: format!("{home}/.local/bin/dead-pub-check"),
+                target: "/usr/local/bin/dead-pub-check".into(),
                 readonly: true,
             },
         ],
@@ -3078,30 +3082,35 @@ mod tests {
     #[test]
     fn coder_exitpoint_has_dead_pub_gate() {
         // Lock down the pre-commit dead-pub gate so a future cleanup can't
-        // silently delete it. v1 emits warn-level findings only via
-        // ra_query_callers; a missing ra-query binary degrades to a
-        // ra_query_unavailable event without failing the role.
+        // silently delete it. Brief 1 of #134 ported the bash pipeline to a
+        // Rust binary (`dead-pub-check`); a missing binary degrades to a
+        // `dead_pub_check_unavailable` event without failing the role.
         let s = CODER_CLAUDE_AGENTRY_EXITPOINT;
         assert!(
-            s.contains("ra_query_callers"),
-            "coder exitpoint must mention ra_query_callers in the dead-pub gate"
+            s.contains("dead-pub-check"),
+            "coder exitpoint must invoke the dead-pub-check binary"
         );
         assert!(
-            s.contains("dead-pub"),
-            "coder exitpoint must emit findings under the dead-pub category"
-        );
-        assert!(
-            s.contains("running ra_query_callers on newly-added pub items"),
+            s.contains("running dead-pub-check"),
             "coder exitpoint must announce the dead-pub gate before running it"
         );
-        // Regression for brf_work_87_auditor_unwrap_fix_children failure
-        // (2026-04-27): under `set -euo pipefail` an empty grep exits 1
-        // and pipefail propagates to the assignment, killing the script.
-        // The pipe must be wrapped in `{ ...; } || true`. Same class as
-        // PRs #129 and #130.
         assert!(
-            s.contains("} || true )"),
-            "dead-pub gate's grep pipe must be wrapped in `{{ ...; }} || true` to tolerate empty-match exits"
+            s.contains("dead_pub_check_unavailable"),
+            "coder exitpoint must emit dead_pub_check_unavailable when the binary is missing"
+        );
+    }
+
+    #[test]
+    fn coder_role_has_dead_pub_check_mount() {
+        let role = build_coder_claude_agentry_role(
+            "/var/home/test",
+            "/var/home/test/.config/agentry/claude-container-settings.json",
+        );
+        assert!(
+            role.mounts
+                .iter()
+                .any(|m| m.target == "/usr/local/bin/dead-pub-check" && m.readonly),
+            "coder-claude must bind-mount dead-pub-check read-only at /usr/local/bin/dead-pub-check"
         );
     }
 

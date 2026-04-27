@@ -35,6 +35,16 @@ ra-query-binary:
     test -x ~/.local/bin/ra-query
     echo "ra-query installed at ~/.local/bin/ra-query"
 
+# Build dead-pub-check into ~/.local/bin/dead-pub-check for the coder-claude
+# bind-mount. Operator-invoked; idempotent. Coder-claude container expects the
+# binary at this path (matches the existing ~/.local/bin/ra-query pattern).
+dead-pub-check-binary:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo install --path crates/coder-precommit --bin dead-pub-check --root ~/.local --locked --quiet
+    test -x ~/.local/bin/dead-pub-check
+    echo "dead-pub-check installed at ~/.local/bin/dead-pub-check"
+
 # Build everything
 build:
     cargo build --workspace --release
