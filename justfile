@@ -54,6 +54,15 @@ ac-verifier-binary:
     test -x ~/.local/bin/ac-verifier
     echo "ac-verifier installed at ~/.local/bin/ac-verifier"
 
+# Build ac-verifier-gemini into ~/.local/bin/ac-verifier-gemini for the
+# ac-verifier-gemini-agentry bind-mount. Operator-invoked; idempotent.
+ac-verifier-gemini-binary:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo install --path crates/coder-precommit --bin ac-verifier-gemini --root ~/.local --locked --quiet
+    test -x ~/.local/bin/ac-verifier-gemini
+    echo "ac-verifier-gemini installed at ~/.local/bin/ac-verifier-gemini"
+
 # Build everything
 build:
     cargo build --workspace --release

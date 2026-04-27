@@ -21,5 +21,9 @@ path = "src/bin/dead_pub_check.rs"
 name = "ac-verifier"
 path = "src/bin/ac_verifier.rs"
 
+[[bin]]
+name = "ac-verifier-gemini"
+path = "src/bin/ac_verifier_gemini.rs"
+
 [lints]
 workspace = true

@@ -1696,6 +1696,46 @@ fn build_ac_verifier_claude_agentry_role(home: &str, claude_settings_path: &str)
     }
 }
 
+/// Build the ac-verifier-gemini-agentry role. Sibling of
+/// `ac-verifier-claude-agentry` (brief 2 of #134). Same shape: reads the
+/// brief's `acceptance_criteria` + the coder's git diff, asks Gemini for a
+/// per-AC verdict, emits one blocker `Finding` per failed AC. Registered in
+/// Redis but NOT yet wired into `agentry-self-host-v0` — brief 5 introduces
+/// the parallel-pipeline mode that fans out to all three providers.
+fn build_ac_verifier_gemini_agentry_role(home: &str) -> AgentRole {
+    AgentRole {
+        name: RoleName("ac-verifier-gemini-agentry".into()),
+        version: 1,
+        model: Some("gemini-3-flash-preview".into()),
+        system_prompt: None,
+        image: "docker.io/library/debian:bookworm-slim".into(),
+        substrate_class: SubstrateClass::Podman,
+        package_manager: PackageManager::Apt,
+        entrypoint_script: format!("{BASH_PRELUDE}{AC_VERIFIER_GEMINI_AGENTRY_SCRIPT}"),
+        exitpoint_script: None,
+        binaries: vec!["git".into(), "ca-certificates".into()],
+        mcp_servers: vec![],
+        tool_allowlist: ToolAllowlist(vec![]),
+        permit_scope: PermitScope(vec![
+            "fs:read:/workspace/**".into(),
+            "net:allow:generativelanguage.googleapis.com".into(),
+            "net:allow:agency.lab".into(),
+        ]),
+        passthru_env: vec!["GEMINI_API_KEY".into()],
+        extra_bootstrap: vec![],
+        mounts: vec![Mount {
+            source: format!("{home}/.local/bin/ac-verifier-gemini"),
+            target: "/usr/local/bin/ac-verifier-gemini".into(),
+            readonly: true,
+        }],
+        workspace_mount: Some(WorkspaceMount {
+            container_path: "/workspace".into(),
+            readonly: true,
+        }),
+        sccache: false,
+    }
+}
+
 /// Build the coder-claude-agentry role. Extracted from `seed_m0` so the
 /// bind-mounts (claude, credentials, settings, transcripts, ra-query) can be
 /// asserted in unit tests. ra-query is operator-installed via
@@ -1878,6 +1918,81 @@ if [ "$outcome" = "rework" ]; then
     emit_done "rework_needed"
 else
     emit_event '{"msg":"ac-verifier shipped — all acceptance criteria met or unverifiable"}'
+    emit_done "shipped"
+fi
+"##;
+
+/// Entrypoint for `ac-verifier-gemini-agentry`. Mirrors
+/// `AC_VERIFIER_CLAUDE_AGENTRY_SCRIPT`: reads
+/// `brief.payload.acceptance_criteria`, captures the coder's diff against
+/// `base_branch`, builds the binary's stdin JSON, and runs
+/// `timeout $CLAUDE_P_TIMEOUT ac-verifier-gemini`. Degrades to `done shipped`
+/// when AC list is empty/missing or the binary is not on PATH —
+/// reviewer-claude is the architectural backstop.
+const AC_VERIFIER_GEMINI_AGENTRY_SCRIPT: &str = r##"#!/usr/bin/env bash
+set -uo pipefail
+bundle="$(cat)"
+
+agent_id=$(jq -r '.permit.agent_id' <<<"$bundle")
+base_branch=$(jq -r '.brief.payload.base_branch // "develop"' <<<"$bundle")
+verb_body=$(jq -r '.brief.payload.issue_body // ""' <<<"$bundle")
+acs_json=$(jq -c '.brief.payload.acceptance_criteria // null' <<<"$bundle")
+
+# Fast path: no acceptance_criteria carried on this brief — short-circuit
+# without spending any gemini tokens. Reviewer-claude still runs.
+if [ "$acs_json" = "null" ] || [ "$(jq 'length' <<<"$acs_json")" -eq 0 ]; then
+    emit_event '{"msg":"no acceptance_criteria in payload — skipping ac-verifier-gemini"}'
+    emit_done "shipped"; exit 0
+fi
+
+if [ ! -d /workspace/.git ] && [ ! -f /workspace/.git ]; then
+    emit_event '{"error":"workspace is not a git repo — coder did not produce it"}'
+    emit_done "shipped"; exit 0
+fi
+
+cd /workspace
+if ! git fetch origin "$base_branch" >/tmp/acv_fetch.err 2>&1; then
+    err=$(tail -20 /tmp/acv_fetch.err)
+    emit_event "$(jq -nc --arg err "$err" '{msg:"git fetch failed — degrading to shipped",detail:$err}')"
+    emit_done "shipped"; exit 0
+fi
+if ! git diff "origin/${base_branch}..HEAD" > /tmp/acv_diff.patch 2>/tmp/acv_diff.err; then
+    err=$(tail -20 /tmp/acv_diff.err)
+    emit_event "$(jq -nc --arg err "$err" '{msg:"git diff failed — degrading to shipped",detail:$err}')"
+    emit_done "shipped"; exit 0
+fi
+diff_text=$(cat /tmp/acv_diff.patch)
+
+if ! command -v ac-verifier-gemini >/dev/null 2>&1; then
+    emit_event '{"warn":"ac_verifier_unavailable","detail":"ac-verifier-gemini binary not on PATH; reviewer-claude is the backstop"}'
+    emit_done "shipped"; exit 0
+fi
+
+bundle_json=$(jq -nc --argjson acs "$acs_json" --arg diff "$diff_text" --arg vb "$verb_body" \
+    '{acceptance_criteria:$acs, diff:$diff, verb_body:$vb}')
+
+if ! outcome_json=$(timeout "$CLAUDE_P_TIMEOUT" ac-verifier-gemini <<<"$bundle_json" 2>/tmp/acv.err); then
+    rc=$?
+    err=$(tail -c 2048 /tmp/acv.err)
+    emit_event "$(jq -nc --argjson rc "$rc" --arg err "$err" '{msg:"ac-verifier-gemini invocation failed — degrading to shipped",exit_code:$rc,detail:$err}')"
+    emit_done "shipped"; exit 0
+fi
+
+outcome=$(jq -r '.outcome // "shipped"' <<<"$outcome_json")
+if [ "$outcome" = "rework" ]; then
+    findings_count=$(jq '.findings | length' <<<"$outcome_json")
+    emit_event "$(jq -nc --argjson n "$findings_count" '{msg:"ac-verifier-gemini rework",findings_count:$n}')"
+    i=0
+    while [ "$i" -lt "$findings_count" ]; do
+        sev=$(jq -r ".findings[$i].severity" <<<"$outcome_json")
+        cat=$(jq -r ".findings[$i].category" <<<"$outcome_json")
+        msg=$(jq -r ".findings[$i].message" <<<"$outcome_json")
+        emit_finding_model "$sev" "$agent_id" "$cat" "$msg"
+        i=$((i+1))
+    done
+    emit_done "rework_needed"
+else
+    emit_event '{"msg":"ac-verifier-gemini shipped — all acceptance criteria met or unverifiable"}'
     emit_done "shipped"
 fi
 "##;
@@ -2621,6 +2736,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
     let reviewer_claude_agentry = build_reviewer_claude_agentry_role(&home, &claude_settings_path);
     let ac_verifier_claude_agentry =
         build_ac_verifier_claude_agentry_role(&home, &claude_settings_path);
+    let ac_verifier_gemini_agentry = build_ac_verifier_gemini_agentry_role(&home);
     let shipper_agentry = AgentRole {
         name: RoleName("shipper-agentry".into()),
         version: 1,
@@ -2925,6 +3041,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
     redis_io::save_role(&mut conn, &reviewer_mechanical_agentry).await?;
     redis_io::save_role(&mut conn, &reviewer_claude_agentry).await?;
     redis_io::save_role(&mut conn, &ac_verifier_claude_agentry).await?;
+    redis_io::save_role(&mut conn, &ac_verifier_gemini_agentry).await?;
     redis_io::save_role(&mut conn, &shipper_agentry).await?;
     redis_io::save_role(&mut conn, &ci_watcher_agentry).await?;
     redis_io::save_team(&mut conn, &agentry_self_host_v0).await?;
@@ -2942,7 +3059,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
     redis_io::save_team(&mut conn, &agentry_verify_v0).await?;
 
     tracing::info!(
-        "seeded: roles [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker, listener, grok-echo, claude-echo, synthesizer, narrowed-coder, shipper, coder-claude-agentry, ac-verifier-claude-agentry, reviewer-mechanical-agentry, shipper-agentry, ci-watcher-agentry, reviewer-claude-agentry, null-agent-agentry, archaeologist-claude-agentry, planner-claude-agentry, verifier-claude-agentry] (inline entrypoint scripts); teams [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker-listener, grok-echo, claude-echo, narrowed-team, shipper-solo-team, agentry-self-host-v0, agentry-null-v0, agentry-discovery-v0, agentry-planner-v0, agentry-verify-v0]"
+        "seeded: roles [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker, listener, grok-echo, claude-echo, synthesizer, narrowed-coder, shipper, coder-claude-agentry, ac-verifier-claude-agentry, ac-verifier-gemini-agentry, reviewer-mechanical-agentry, shipper-agentry, ci-watcher-agentry, reviewer-claude-agentry, null-agent-agentry, archaeologist-claude-agentry, planner-claude-agentry, verifier-claude-agentry] (inline entrypoint scripts); teams [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker-listener, grok-echo, claude-echo, narrowed-team, shipper-solo-team, agentry-self-host-v0, agentry-null-v0, agentry-discovery-v0, agentry-planner-v0, agentry-verify-v0]"
     );
     Ok(())
 }
@@ -3321,6 +3438,64 @@ mod tests {
                 .iter()
                 .any(|m| m.target == "/usr/local/bin/claude" && m.readonly),
             "ac-verifier role must bind-mount claude read-only at /usr/local/bin/claude"
+        );
+    }
+
+    #[test]
+    fn ac_verifier_gemini_script_invokes_binary() {
+        assert!(
+            AC_VERIFIER_GEMINI_AGENTRY_SCRIPT.contains("ac-verifier-gemini"),
+            "ac-verifier-gemini script must invoke the ac-verifier-gemini binary"
+        );
+    }
+
+    #[test]
+    fn ac_verifier_gemini_script_reads_acceptance_criteria_payload_key() {
+        assert!(
+            AC_VERIFIER_GEMINI_AGENTRY_SCRIPT.contains("acceptance_criteria"),
+            "ac-verifier-gemini script must read brief.payload.acceptance_criteria"
+        );
+    }
+
+    #[test]
+    fn ac_verifier_gemini_script_handles_missing_binary() {
+        assert!(
+            AC_VERIFIER_GEMINI_AGENTRY_SCRIPT.contains("ac_verifier_unavailable"),
+            "ac-verifier-gemini script must emit ac_verifier_unavailable when the binary is missing"
+        );
+    }
+
+    #[test]
+    fn ac_verifier_gemini_role_bind_mounts_ac_verifier_gemini_binary() {
+        let role = build_ac_verifier_gemini_agentry_role("/h");
+        assert!(
+            role.mounts
+                .iter()
+                .any(|m| m.target == "/usr/local/bin/ac-verifier-gemini" && m.readonly),
+            "ac-verifier-gemini role must bind-mount ac-verifier-gemini read-only at /usr/local/bin/ac-verifier-gemini"
+        );
+    }
+
+    #[test]
+    fn ac_verifier_gemini_role_passes_through_gemini_api_key() {
+        let role = build_ac_verifier_gemini_agentry_role("/h");
+        assert!(
+            role.passthru_env.contains(&"GEMINI_API_KEY".to_string()),
+            "ac-verifier-gemini role must pass through GEMINI_API_KEY: {:?}",
+            role.passthru_env
+        );
+    }
+
+    #[test]
+    fn ac_verifier_gemini_role_permits_gemini_endpoint() {
+        let role = build_ac_verifier_gemini_agentry_role("/h");
+        assert!(
+            role.permit_scope
+                .0
+                .iter()
+                .any(|s| s.contains("generativelanguage.googleapis.com")),
+            "ac-verifier-gemini role must allow generativelanguage.googleapis.com: {:?}",
+            role.permit_scope.0
         );
     }
 
