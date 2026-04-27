@@ -327,22 +327,29 @@ impl Spawner for PodmanSpawner {
             cmd.arg("--security-opt").arg("label=disable");
         }
         for m in &role.mounts {
-            // ra-query is operator-installed via `just ra-query-binary`. A
-            // missing host binary must NOT block the reviewer-claude or
-            // coder-claude spawn — both entrypoints fall back to
-            // `command -v ra-query` and skip the pre-pass / pre-commit
-            // dead-pub gate with a `ra_query_unavailable` event. Other
-            // mounts (claude, credentials, settings) keep podman's default
-            // fail-fast behaviour: a missing source surfaces as a spawn error.
-            if ra_query_mount_role_can_warn_skip(role.name.0.as_str())
-                && m.target == "/usr/local/bin/ra-query"
+            // Coder-tooling host binaries (ra-query, dead-pub-check) are
+            // operator-installed via `just <tool>-binary`. A missing host
+            // binary must NOT block the reviewer-claude or coder-claude
+            // spawn — both entrypoints fall back to `command -v <tool>` and
+            // skip the corresponding gate with a structured trace event.
+            // Other mounts (claude, credentials, settings) keep podman's
+            // default fail-fast behaviour: a missing source surfaces as a
+            // spawn error.
+            if coder_tool_mount_role_can_warn_skip(role.name.0.as_str())
+                && is_coder_tool_mount_target(&m.target)
                 && !std::path::Path::new(&m.source).exists()
             {
+                let tool = std::path::Path::new(&m.target)
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(m.target.as_str());
                 tracing::warn!(
                     role = %role.name,
                     path = %m.source,
-                    "ra-query host binary missing at {}; reviewer pre-pass will be skipped — run 'just ra-query-binary' on the host",
-                    m.source
+                    "{} host binary missing at {}; coder gate will be skipped — run 'just {}-binary' on the host",
+                    tool,
+                    m.source,
+                    tool,
                 );
                 continue;
             }
@@ -679,14 +686,25 @@ async fn append_audit(
     Ok(())
 }
 
-/// Roles whose ra-query bind-mount may be silently skipped when the host
-/// binary is missing. Both the reviewer pre-pass and the coder's pre-commit
-/// dead-pub gate degrade gracefully via `command -v ra-query`; for other
-/// roles a missing source must surface as a spawn error.
-fn ra_query_mount_role_can_warn_skip(role_name: &str) -> bool {
+/// Roles whose coder-tooling bind-mounts (ra-query, dead-pub-check) may be
+/// silently skipped when the host binary is missing. The reviewer pre-pass,
+/// the coder's pre-commit dead-pub gate, and (since brief 1 of #134) the
+/// dead-pub-check binary itself all degrade gracefully via `command -v`;
+/// for other roles a missing source must surface as a spawn error.
+fn coder_tool_mount_role_can_warn_skip(role_name: &str) -> bool {
     matches!(
         role_name,
         "reviewer-claude-agentry" | "coder-claude-agentry"
+    )
+}
+
+/// Coder-tooling mount targets that may be warn-skipped when the host
+/// binary is missing. Adding a new tool mount means listing it here AND
+/// adding the matching `command -v` guard in the role's bash script.
+fn is_coder_tool_mount_target(target: &str) -> bool {
+    matches!(
+        target,
+        "/usr/local/bin/ra-query" | "/usr/local/bin/dead-pub-check"
     )
 }
 
@@ -979,19 +997,32 @@ mod tests {
     }
 
     #[test]
-    fn ra_query_mount_warn_skip_covers_reviewer_and_coder() {
+    fn coder_tool_mount_warn_skip_covers_reviewer_and_coder() {
         // The pre-pass (reviewer) and the pre-commit dead-pub gate (coder)
-        // both tolerate a missing host ra-query binary via `command -v`. Any
-        // other role with an ra-query mount declared MUST fail-fast on a
-        // missing source — silently dropping the mount could mask a config
-        // bug for a role that doesn't `command -v` first.
-        assert!(ra_query_mount_role_can_warn_skip("reviewer-claude-agentry"));
-        assert!(ra_query_mount_role_can_warn_skip("coder-claude-agentry"));
-        assert!(!ra_query_mount_role_can_warn_skip("auditor-claude-agentry"));
-        assert!(!ra_query_mount_role_can_warn_skip(
+        // both tolerate a missing host ra-query / dead-pub-check binary via
+        // `command -v`. Any other role with one of these mounts declared MUST
+        // fail-fast on a missing source — silently dropping the mount could
+        // mask a config bug for a role that doesn't `command -v` first.
+        assert!(coder_tool_mount_role_can_warn_skip(
+            "reviewer-claude-agentry"
+        ));
+        assert!(coder_tool_mount_role_can_warn_skip("coder-claude-agentry"));
+        assert!(!coder_tool_mount_role_can_warn_skip(
+            "auditor-claude-agentry"
+        ));
+        assert!(!coder_tool_mount_role_can_warn_skip(
             "reviewer-mechanical-agentry"
         ));
-        assert!(!ra_query_mount_role_can_warn_skip(""));
+        assert!(!coder_tool_mount_role_can_warn_skip(""));
+    }
+
+    #[test]
+    fn coder_tool_mount_targets_cover_ra_query_and_dead_pub_check() {
+        assert!(is_coder_tool_mount_target("/usr/local/bin/ra-query"));
+        assert!(is_coder_tool_mount_target("/usr/local/bin/dead-pub-check"));
+        assert!(!is_coder_tool_mount_target("/usr/local/bin/claude"));
+        assert!(!is_coder_tool_mount_target("/transcripts"));
+        assert!(!is_coder_tool_mount_target(""));
     }
 
     #[test]
