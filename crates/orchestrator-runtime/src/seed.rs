@@ -1753,8 +1753,9 @@ test_out=$(cargo test --workspace 2>&1 | tail -c 8192 || true)
 emit_event "$(jq -nc --arg out "$test_out" '{msg:"test_report",out:$out}')"
 udeps_json=$(cargo +nightly udeps --workspace --output json 2>/dev/null || echo '{}')
 emit_event "$(jq -nc --arg out "$(echo "$udeps_json" | tail -c 4096)" '{msg:"udeps_report",out:$out}')"
+findings='[]'
 if command -v ra-query >/dev/null 2>&1; then
-    findings='[]'; total_critical=0
+    total_critical=0
     while IFS= read -r f; do
         [ -f "$f" ] || continue
         out=$(ra-query unwraps "$f" --severity critical --format json 2>/dev/null || echo '{"functions":[]}')
@@ -1785,9 +1786,48 @@ else
 fi
 mkdir -p /workspace/audit-children
 host_workspace="/var/mnt/workspaces/agentry-work/briefs/${brief_id}"
+refs='[]'
+top_unwrap_files=$(echo "$findings" | jq -c 'sort_by(-.critical_count) | .[:3]')
+unwrap_k=$(echo "$top_unwrap_files" | jq 'length')
+j=0
+while [ "$j" -lt "$unwrap_k" ]; do
+  ufile=$(echo "$top_unwrap_files" | jq -r ".[$j].file")
+  base=$(basename "$ufile")
+  child="/workspace/audit-children/child-unwrap-${j}.json"
+  jq -nc \
+    --arg id "brf_self_heal_${brief_id}_unwrap_${j}" \
+    --arg parent "$brief_id" \
+    --arg ufile "$ufile" \
+    --arg base "$base" \
+    --argjson finding "$(echo "$top_unwrap_files" | jq ".[$j]")" \
+    --argjson rank "$j" \
+    '($finding.result.functions // []
+        | map(. as $fn | ($fn.unwraps // [])
+            | map("  - " + ($fn.name // "?") + " at " + (.file // "?") + ":" + ((.line // 0) | tostring) + " — critical — " + (.reason // "no reason")))
+        | flatten | join("\n")) as $sites
+     | {id:$id, project:null,
+        topology:{name:"agentry-self-host-v0",version:1},
+        payload:{
+          issue_number:0,
+          issue_title:("fix(unwraps): replace critical unwraps in " + $base),
+          issue_body:("Replace critical unwraps in " + $ufile + ".\n\nSites:\n" + $sites + "\n\nFor each site choose the right replacement: ? if the function returns Result/Option, expect(\"<context>\") if the invariant truly holds and you can articulate why, unwrap_or / unwrap_or_else / ok_or if a fallback is appropriate. Do NOT silently swallow errors. Do NOT add bare expect(\"\") or expect(\"this should not fail\") — provide real context."),
+          acceptance:"cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace && scripts/arch-check.sh",
+          target_repo:"yg/agentry",
+          base_branch:"develop",
+          pr_title:("fix(unwraps): replace critical unwraps in " + $base),
+          pr_body:("Auto-dispatched by auditor (ra-query unwraps --severity critical, file ranked top-" + ($rank|tostring) + " by critical count).")
+        },
+        budget:{max_wall_seconds:1500},
+        escalation:"autonomous",
+        parent_brief:$parent,
+        submitted_by:"auditor-self-heal",
+        submitted_at:(now|todate)}' > "$child"
+  refs=$(echo "$refs" | jq -c --arg p "${host_workspace}/audit-children/child-unwrap-${j}.json" '. + [$p]')
+  j=$((j+1))
+done
 pairs=$(echo "$udeps_json" | jq -c '[.unused_deps // {} | to_entries[] | .key as $k | ((.value.normal // []) + (.value.development // []) + (.value.build // []))[] as $d | {crate:($k|split(" ")[0]), dep:$d}]')
 count=$(echo "$pairs" | jq 'length')
-refs='[]'; i=0
+i=0
 while [ "$i" -lt "$count" ]; do
   crate=$(echo "$pairs" | jq -r ".[$i].crate"); dep=$(echo "$pairs" | jq -r ".[$i].dep")
   child="/workspace/audit-children/child-${i}.json"
@@ -1804,7 +1844,7 @@ while [ "$i" -lt "$count" ]; do
   refs=$(echo "$refs" | jq -c --arg p "${host_workspace}/audit-children/child-${i}.json" '. + [$p]')
   i=$((i+1))
 done
-[ "$count" -gt 0 ] && emit_message "_chain_trigger" "$(jq -nc --argjson r "$refs" '{next_brief_refs:$r}')"
+[ "$(echo "$refs" | jq 'length')" -gt 0 ] && emit_message "_chain_trigger" "$(jq -nc --argjson r "$refs" '{next_brief_refs:$r}')"
 emit_done "shipped"
 "##;
 
@@ -1812,7 +1852,7 @@ emit_done "shipped"
 /// permit-scope, passthru-env, and extra_bootstrap invariants can be asserted
 /// in unit tests. The auditor compiles workspace, runs cargo-udeps and
 /// `ra-query unwraps --severity critical`, and chain-triggers self-heal briefs
-/// for unused-deps findings. ra-query unwrap findings are report-only in v1.
+/// for unused-deps findings. ra-query unwrap findings auto-dispatch fix-child briefs for the top-K=3 files by critical_count (full agentry-self-host-v0 pipeline because unwrap fixes require judgment). Complexity findings remain report-only.
 fn build_auditor_claude_agentry_role() -> AgentRole {
     AgentRole {
         name: RoleName("auditor-claude-agentry".into()),
@@ -3557,16 +3597,30 @@ mod tests {
     }
 
     #[test]
-    fn auditor_script_does_not_chain_trigger_on_unwraps() {
-        // v1 is report-only — unwrap fixes need call-site domain understanding,
-        // so no per-finding self-heal brief generation yet.
+    fn auditor_emits_unwrap_fix_children() {
         assert!(
-            !AUDITOR_CLAUDE_AGENTRY_SCRIPT.contains("brf_self_heal_${brief_id}_unwrap"),
-            "auditor v1 must NOT auto-dispatch unwrap self-heal child briefs"
+            AUDITOR_CLAUDE_AGENTRY_SCRIPT.contains("audit-children/child-unwrap-"),
+            "auditor must write unwrap fix-child briefs to audit-children/child-unwrap-*"
         );
         assert!(
-            !AUDITOR_CLAUDE_AGENTRY_SCRIPT.contains("_unwrap_"),
-            "auditor v1 must NOT generate per-unwrap child-brief identifiers"
+            AUDITOR_CLAUDE_AGENTRY_SCRIPT.contains("brf_self_heal_${brief_id}_unwrap_"),
+            "auditor must generate brf_self_heal_<brief_id>_unwrap_<j> identifiers"
+        );
+        assert!(
+            AUDITOR_CLAUDE_AGENTRY_SCRIPT.contains("agentry-self-host-v0"),
+            "unwrap fix-child briefs must dispatch into agentry-self-host-v0 (not bugfix-v0)"
+        );
+        assert!(
+            AUDITOR_CLAUDE_AGENTRY_SCRIPT.contains("sort_by(-.critical_count)"),
+            "auditor must select top-K unwrap files via sort_by(-.critical_count)"
+        );
+        assert!(
+            AUDITOR_CLAUDE_AGENTRY_SCRIPT.contains("auditor-self-heal"),
+            "unwrap fix-child briefs must reuse the auditor-self-heal submitted_by tag"
+        );
+        assert!(
+            AUDITOR_CLAUDE_AGENTRY_SCRIPT.contains("Do NOT silently swallow errors"),
+            "unwrap fix-child briefs must carry the swallow-errors constraint phrase"
         );
     }
 
