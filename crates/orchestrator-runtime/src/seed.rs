@@ -661,6 +661,30 @@ fi
 
 emit_event "$(jq -nc --argjson b "$diff_bytes" '{msg:"reviewing diff",diff_bytes:$b}')"
 
+# Mechanical pre-pass: when the host-built ra-query binary is bind-mounted
+# in, walk the .rs files touched by the diff and aggregate ra-query findings
+# into a panel. The reviewer prompt receives a short summary so the LLM has
+# anchor points for unwraps + complexity hot-spots without having to
+# re-derive them from raw source. Tolerate a missing binary — operators may
+# not have run `just ra-query-binary` yet.
+panel_summary=""
+if command -v ra-query >/dev/null 2>&1; then
+    changed_files=$(grep -E '^\+\+\+ b/.*\.rs$' /tmp/diff.patch | sed 's|^\+\+\+ b/||' || true)
+    panel='[]'
+    while IFS= read -r f; do
+        [ -z "$f" ] && continue
+        [ -f "/workspace/$f" ] || continue
+        u=$(ra-query unwraps "/workspace/$f" --severity high --format json 2>/dev/null || echo '{"functions":[]}')
+        c=$(ra-query complexity "/workspace/$f" --threshold 15 --format json 2>/dev/null || echo '{"functions":[]}')
+        panel=$(jq --argjson u "$u" --argjson c "$c" --arg f "$f" '. + [{file:$f, unwraps:$u, complexity:$c}]' <<<"$panel")
+    done <<< "$changed_files"
+    panel_tail=$(jq -c . <<<"$panel" | tail -c 8192)
+    emit_event "$(jq -nc --arg out "$panel_tail" '{msg:"ra_query_review_panel",findings_json_tail:$out}')"
+    panel_summary=$(jq -r '[.[] | select(((.unwraps.summary.total // 0) + (.complexity.summary.total // 0)) > 0) | "\(.file): unwraps=\((.unwraps.summary.total // 0)) complexity_hot=\((.complexity.summary.total // 0))"] | join("\n")' <<<"$panel" 2>/dev/null | head -c 512)
+else
+    emit_event '{"msg":"ra_query_unavailable","detail":"skipping reviewer pre-pass"}'
+fi
+
 # Review prompt. The output format is strict so downstream parsing is
 # deterministic. Any prose (fences, explanations) breaks the jq parse and
 # the script resolves the role as Failed — signaling prompt drift.
@@ -677,6 +701,18 @@ $(printf '%s' "$issue_body" | head -c 2000)
 --- DIFF ---
 $(cat /tmp/diff.patch)
 --- END DIFF ---
+PROMPT
+
+if [ -n "$panel_summary" ]; then
+    cat >> /tmp/rev_prompt.txt <<EOM
+
+--- Mechanical findings from ra-query (unwraps>=high, complexity>=15) ---
+${panel_summary}
+--- End mechanical findings ---
+EOM
+fi
+
+cat >> /tmp/rev_prompt.txt <<PROMPT
 
 Output EXACTLY a JSON array of findings — nothing else. No markdown fences,
 no prose, no preamble, no explanation. Each element:
@@ -1452,6 +1488,69 @@ fn build_archaeologist_claude_agentry_role(home: &str, claude_settings_path: &st
         // Real cargo compilation in extra_bootstrap — share build cache with
         // coder/reviewer roles via the shared sccache-redis container.
         sccache: true,
+    }
+}
+
+/// Build the reviewer-claude-agentry role. Extracted from `seed_m0` so the
+/// bind-mounts (claude, credentials, settings, transcripts, ra-query) can be
+/// asserted in unit tests. ra-query is operator-installed via
+/// `just ra-query-binary` and bind-mounted at /usr/local/bin/ra-query; the
+/// entrypoint script's pre-pass tolerates a missing binary.
+fn build_reviewer_claude_agentry_role(home: &str, claude_settings_path: &str) -> AgentRole {
+    AgentRole {
+        name: RoleName("reviewer-claude-agentry".into()),
+        version: 1,
+        model: Some("claude-max".into()),
+        system_prompt: None,
+        image: "docker.io/library/debian:bookworm-slim".into(),
+        substrate_class: SubstrateClass::Podman,
+        package_manager: PackageManager::Apt,
+        entrypoint_script: format!("{BASH_PRELUDE}{REVIEWER_CLAUDE_AGENTRY_SCRIPT}"),
+        exitpoint_script: None,
+        // git for diff; no rust toolchain — LLM reviewer does no compilation.
+        binaries: vec!["git".into(), "ca-certificates".into()],
+        mcp_servers: vec![],
+        tool_allowlist: ToolAllowlist(vec![]),
+        permit_scope: PermitScope(vec![
+            "fs:read:/workspace/**".into(),
+            "net:allow:api.anthropic.com".into(),
+            "net:allow:agency.lab".into(), // for git fetch origin/<base_branch>
+        ]),
+        passthru_env: vec![],
+        extra_bootstrap: vec![],
+        mounts: vec![
+            Mount {
+                source: format!("{home}/.local/bin/claude"),
+                target: "/usr/local/bin/claude".into(),
+                readonly: true,
+            },
+            Mount {
+                source: format!("{home}/.claude/.credentials.json"),
+                target: "/root/.claude/.credentials.json".into(),
+                readonly: true,
+            },
+            Mount {
+                source: claude_settings_path.into(),
+                target: "/root/.claude/settings.json".into(),
+                readonly: true,
+            },
+            Mount {
+                source: "/var/lib/agentry/transcripts".into(),
+                target: "/transcripts".into(),
+                readonly: false,
+            },
+            Mount {
+                source: format!("{home}/.local/bin/ra-query"),
+                target: "/usr/local/bin/ra-query".into(),
+                readonly: true,
+            },
+        ],
+        // Read-only workspace — LLM reviewer does not mutate the coder's tree.
+        workspace_mount: Some(WorkspaceMount {
+            container_path: "/workspace".into(),
+            readonly: true,
+        }),
+        sccache: false,
     }
 }
 
@@ -2244,56 +2343,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         }),
         sccache: false,
     };
-    let reviewer_claude_agentry = AgentRole {
-        name: RoleName("reviewer-claude-agentry".into()),
-        version: 1,
-        model: Some("claude-max".into()),
-        system_prompt: None,
-        image: "docker.io/library/debian:bookworm-slim".into(),
-        substrate_class: SubstrateClass::Podman,
-        package_manager: PackageManager::Apt,
-        entrypoint_script: format!("{BASH_PRELUDE}{REVIEWER_CLAUDE_AGENTRY_SCRIPT}"),
-        exitpoint_script: None,
-        // git for diff; no rust toolchain — LLM reviewer does no compilation.
-        binaries: vec!["git".into(), "ca-certificates".into()],
-        mcp_servers: vec![],
-        tool_allowlist: ToolAllowlist(vec![]),
-        permit_scope: PermitScope(vec![
-            "fs:read:/workspace/**".into(),
-            "net:allow:api.anthropic.com".into(),
-            "net:allow:agency.lab".into(), // for git fetch origin/<base_branch>
-        ]),
-        passthru_env: vec![],
-        extra_bootstrap: vec![],
-        mounts: vec![
-            Mount {
-                source: format!("{home}/.local/bin/claude"),
-                target: "/usr/local/bin/claude".into(),
-                readonly: true,
-            },
-            Mount {
-                source: format!("{home}/.claude/.credentials.json"),
-                target: "/root/.claude/.credentials.json".into(),
-                readonly: true,
-            },
-            Mount {
-                source: claude_settings_path.clone(),
-                target: "/root/.claude/settings.json".into(),
-                readonly: true,
-            },
-            Mount {
-                source: "/var/lib/agentry/transcripts".into(),
-                target: "/transcripts".into(),
-                readonly: false,
-            },
-        ],
-        // Read-only workspace — LLM reviewer does not mutate the coder's tree.
-        workspace_mount: Some(WorkspaceMount {
-            container_path: "/workspace".into(),
-            readonly: true,
-        }),
-        sccache: false,
-    };
+    let reviewer_claude_agentry = build_reviewer_claude_agentry_role(&home, &claude_settings_path);
     let shipper_agentry = AgentRole {
         name: RoleName("shipper-agentry".into()),
         version: 1,
@@ -2680,6 +2730,63 @@ mod tests {
                 "reviewer salvage path after {marker:?} must not emit_done \"failed\"; window was: {window}"
             );
         }
+    }
+
+    #[test]
+    fn reviewer_role_bind_mounts_ra_query() {
+        let role = build_reviewer_claude_agentry_role(
+            "/var/home/test",
+            "/var/home/test/.config/agentry/claude-container-settings.json",
+        );
+        assert!(
+            role.mounts
+                .iter()
+                .any(|m| m.target == "/usr/local/bin/ra-query" && m.readonly),
+            "reviewer-claude must bind-mount ra-query read-only at /usr/local/bin/ra-query"
+        );
+    }
+
+    #[test]
+    fn reviewer_script_runs_ra_query_pre_pass() {
+        let s = REVIEWER_CLAUDE_AGENTRY_SCRIPT;
+        assert!(
+            s.contains("ra-query unwraps"),
+            "reviewer pre-pass must invoke ra-query unwraps"
+        );
+        assert!(
+            s.contains("ra-query complexity"),
+            "reviewer pre-pass must invoke ra-query complexity"
+        );
+        assert!(
+            s.contains("ra_query_review_panel"),
+            "reviewer pre-pass must emit ra_query_review_panel event"
+        );
+    }
+
+    #[test]
+    fn reviewer_script_tolerates_missing_ra_query() {
+        let s = REVIEWER_CLAUDE_AGENTRY_SCRIPT;
+        assert!(
+            s.contains("command -v ra-query"),
+            "reviewer pre-pass must guard ra-query with command -v"
+        );
+        assert!(
+            s.contains("ra_query_unavailable"),
+            "reviewer pre-pass must emit ra_query_unavailable when binary is missing"
+        );
+    }
+
+    #[test]
+    fn reviewer_script_injects_panel_summary_into_prompt() {
+        let s = REVIEWER_CLAUDE_AGENTRY_SCRIPT;
+        assert!(
+            s.contains("Mechanical findings from ra-query"),
+            "reviewer prompt must include the mechanical-findings header"
+        );
+        assert!(
+            s.contains("--- End mechanical findings ---"),
+            "reviewer prompt must include the mechanical-findings footer"
+        );
     }
 
     #[test]
