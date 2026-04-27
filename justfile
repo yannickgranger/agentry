@@ -63,6 +63,15 @@ ac-verifier-gemini-binary:
     test -x ~/.local/bin/ac-verifier-gemini
     echo "ac-verifier-gemini installed at ~/.local/bin/ac-verifier-gemini"
 
+# Build ac-verifier-grok into ~/.local/bin/ac-verifier-grok for the
+# ac-verifier-grok-agentry bind-mount. Operator-invoked; idempotent.
+ac-verifier-grok-binary:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo install --path crates/coder-precommit --bin ac-verifier-grok --root ~/.local --locked --quiet
+    test -x ~/.local/bin/ac-verifier-grok
+    echo "ac-verifier-grok installed at ~/.local/bin/ac-verifier-grok"
+
 # Build everything
 build:
     cargo build --workspace --release
