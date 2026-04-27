@@ -24,6 +24,8 @@
 
 #![forbid(unsafe_code)]
 
+use orchestrator_dashboard::routes;
+
 use axum::extract::{Form, Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -142,7 +144,13 @@ async fn main() -> anyhow::Result<()> {
         .route("/projects", get(projects_list))
         .route("/projects/new", get(project_new_form))
         .route("/projects", post(project_create))
-        .with_state(state);
+        .with_state(state)
+        // Phase 1 substrate-forensics routes (issue #94). Mounted via .merge
+        // so existing route URLs are unchanged. The briefs subtree carries
+        // its own state (transcripts dir).
+        .merge(routes::briefs::router(
+            routes::briefs::BriefsState::default(),
+        ));
 
     let addr: SocketAddr = ([0, 0, 0, 0], port).into();
     let listener = tokio::net::TcpListener::bind(addr).await?;

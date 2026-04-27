@@ -92,6 +92,18 @@ The teardown-facing reference to a spawned container: agent id and
 container name. Returned by the `Spawner` so the daemon can reference the
 container post-run.
 
+## ContainerHandle
+
+The dashboard-facing reference to a *running* role container, held in a
+process-wide `BriefId`-keyed registry inside the spawner. Carries the
+container name and the host workspace path (when the role declares a
+`WorkspaceMount`). Inserted on `cmd.spawn()` via an RAII
+`RegistrationGuard` whose `Drop` removes the entry on every exit path —
+including any `?`-bubbled error before `child.wait()` returns — so the
+registry never leaks. Read by the dashboard's `kill` and `workspace_path`
+helpers to address a brief's running container without grepping podman
+state.
+
 ## AgentOutcome
 
 The full post-run record for one role: the handle, the verdict, and the
