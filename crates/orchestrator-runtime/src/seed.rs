@@ -1494,6 +1494,21 @@ test_out=$(cargo test --workspace 2>&1 | tail -c 8192 || true)
 emit_event "$(jq -nc --arg out "$test_out" '{msg:"test_report",out:$out}')"
 udeps_json=$(cargo +nightly udeps --workspace --output json 2>/dev/null || echo '{}')
 emit_event "$(jq -nc --arg out "$(echo "$udeps_json" | tail -c 4096)" '{msg:"udeps_report",out:$out}')"
+if command -v ra-query >/dev/null 2>&1; then
+    findings='[]'; total_critical=0
+    while IFS= read -r f; do
+        [ -f "$f" ] || continue
+        out=$(ra-query unwraps "$f" --severity critical --format json 2>/dev/null || echo '{"functions":[]}')
+        cnt=$(echo "$out" | jq '[.functions[]?.unwraps[]?] | length')
+        if [ "$cnt" -gt 0 ]; then
+            findings=$(echo "$findings" | jq --argjson r "$out" --arg p "$f" '. + [{file:$p, critical_count:($r.functions|map(.unwraps|length)|add // 0), result:$r}]')
+            total_critical=$((total_critical + cnt))
+        fi
+    done < <(find crates -name '*.rs' -not -path '*/tests/*' -not -name 'tests.rs' -not -path '*/target/*')
+    emit_event "$(jq -nc --argjson cnt "$total_critical" --arg out "$(echo "$findings" | jq -c . | tail -c 8192)" '{msg:"unwraps_report",critical_total:$cnt,findings_json_tail:$out}')"
+else
+    emit_event '{"msg":"ra_query_unavailable","detail":"skipping unwraps stage"}'
+fi
 mkdir -p /workspace/audit-children
 host_workspace="/var/mnt/workspaces/agentry-work/briefs/${brief_id}"
 pairs=$(echo "$udeps_json" | jq -c '[.unused_deps // {} | to_entries[] | .key as $k | ((.value.normal // []) + (.value.development // []) + (.value.build // []))[] as $d | {crate:($k|split(" ")[0]), dep:$d}]')
@@ -1518,6 +1533,51 @@ done
 [ "$count" -gt 0 ] && emit_message "_chain_trigger" "$(jq -nc --argjson r "$refs" '{next_brief_refs:$r}')"
 emit_done "shipped"
 "##;
+
+/// Build the auditor-claude-agentry role. Extracted from `seed_m0` so the
+/// permit-scope, passthru-env, and extra_bootstrap invariants can be asserted
+/// in unit tests. The auditor compiles workspace, runs cargo-udeps and
+/// `ra-query unwraps --severity critical`, and chain-triggers self-heal briefs
+/// for unused-deps findings. ra-query unwrap findings are report-only in v1.
+fn build_auditor_claude_agentry_role() -> AgentRole {
+    AgentRole {
+        name: RoleName("auditor-claude-agentry".into()),
+        version: 1,
+        model: None,
+        system_prompt: None,
+        image: "docker.io/library/rust:1.93".into(),
+        substrate_class: SubstrateClass::Podman,
+        package_manager: PackageManager::Apt,
+        entrypoint_script: format!("{BASH_PRELUDE}{AUDITOR_CLAUDE_AGENTRY_SCRIPT}"),
+        exitpoint_script: None,
+        binaries: vec![],
+        mcp_servers: vec![],
+        tool_allowlist: ToolAllowlist(vec![]),
+        permit_scope: PermitScope(vec![
+            "fs:read:/workspace/**".into(),
+            "fs:write:/workspace/**".into(),
+            "net:allow:agentry-sccache-redis".into(),
+            "net:allow:static.rust-lang.org".into(),
+            "net:allow:crates.io".into(),
+            "net:allow:index.crates.io".into(),
+            "net:allow:static.crates.io".into(),
+            "net:allow:agency.lab".into(),
+        ]),
+        passthru_env: vec!["GITEA_TOKEN".into()],
+        extra_bootstrap: vec![
+            "rustup component add rustfmt clippy || true".into(),
+            "rustup toolchain install nightly --profile minimal || true".into(),
+            "cargo +nightly install cargo-udeps --locked --quiet || true".into(),
+            "CARGO_NET_GIT_FETCH_WITH_CLI=true cargo install --git https://oauth2:${GITEA_TOKEN}@agency.lab:3000/yg/ra-query.git --rev 2200414 --root /usr/local --locked --quiet ra-query || true".into(),
+        ],
+        mounts: vec![],
+        workspace_mount: Some(WorkspaceMount {
+            container_path: "/workspace".into(),
+            readonly: false,
+        }),
+        sccache: true,
+    }
+}
 
 /// Build the verifier-claude-agentry role. Despite the `claude` in the name —
 /// kept for symmetry with the other agentry-* roles — the verifier never
@@ -2456,41 +2516,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         max_retries: 1,
     };
 
-    let auditor_claude_agentry = AgentRole {
-        name: RoleName("auditor-claude-agentry".into()),
-        version: 1,
-        model: None,
-        system_prompt: None,
-        image: "docker.io/library/rust:1.93".into(),
-        substrate_class: SubstrateClass::Podman,
-        package_manager: PackageManager::Apt,
-        entrypoint_script: format!("{BASH_PRELUDE}{AUDITOR_CLAUDE_AGENTRY_SCRIPT}"),
-        exitpoint_script: None,
-        binaries: vec![],
-        mcp_servers: vec![],
-        tool_allowlist: ToolAllowlist(vec![]),
-        permit_scope: PermitScope(vec![
-            "fs:read:/workspace/**".into(),
-            "fs:write:/workspace/**".into(),
-            "net:allow:agentry-sccache-redis".into(),
-            "net:allow:static.rust-lang.org".into(),
-            "net:allow:crates.io".into(),
-            "net:allow:index.crates.io".into(),
-            "net:allow:static.crates.io".into(),
-        ]),
-        passthru_env: vec![],
-        extra_bootstrap: vec![
-            "rustup component add rustfmt clippy || true".into(),
-            "rustup toolchain install nightly --profile minimal || true".into(),
-            "cargo +nightly install cargo-udeps --locked --quiet || true".into(),
-        ],
-        mounts: vec![],
-        workspace_mount: Some(WorkspaceMount {
-            container_path: "/workspace".into(),
-            readonly: false,
-        }),
-        sccache: true,
-    };
+    let auditor_claude_agentry = build_auditor_claude_agentry_role();
     let agentry_self_audit_v0 = TeamTopology {
         name: TeamName("agentry-self-audit-v0".into()),
         version: 1,
@@ -3079,6 +3105,78 @@ mod tests {
         assert!(
             s.contains("merge retry budget exhausted"),
             "ci-watcher must emit a budget-exhausted error event when retries run out"
+        );
+    }
+
+    #[test]
+    fn auditor_role_passes_through_gitea_token() {
+        let auditor = build_auditor_claude_agentry_role();
+        assert!(
+            auditor.passthru_env.iter().any(|e| e == "GITEA_TOKEN"),
+            "auditor must pass GITEA_TOKEN so the ra-query cargo install can authenticate against agency.lab: {:?}",
+            auditor.passthru_env
+        );
+    }
+
+    #[test]
+    fn auditor_role_permit_includes_agency_lab() {
+        let auditor = build_auditor_claude_agentry_role();
+        assert!(
+            auditor
+                .permit_scope
+                .0
+                .iter()
+                .any(|s| s == "net:allow:agency.lab"),
+            "auditor permit_scope must allow agency.lab for the ra-query cargo install: {:?}",
+            auditor.permit_scope.0
+        );
+    }
+
+    #[test]
+    fn auditor_extra_bootstrap_installs_ra_query() {
+        let auditor = build_auditor_claude_agentry_role();
+        let bootstrap = auditor.extra_bootstrap.join("\n");
+        assert!(
+            bootstrap.contains("ra-query.git"),
+            "auditor extra_bootstrap must cargo install ra-query.git: {bootstrap}"
+        );
+        assert!(
+            bootstrap.contains("--rev 2200414"),
+            "auditor extra_bootstrap must pin ra-query to --rev 2200414: {bootstrap}"
+        );
+        assert!(
+            bootstrap.contains("|| true"),
+            "auditor ra-query install must end with || true for fault tolerance: {bootstrap}"
+        );
+    }
+
+    #[test]
+    fn auditor_script_runs_ra_query_unwraps_critical() {
+        assert!(
+            AUDITOR_CLAUDE_AGENTRY_SCRIPT.contains("ra-query unwraps"),
+            "auditor script must invoke `ra-query unwraps`"
+        );
+        assert!(
+            AUDITOR_CLAUDE_AGENTRY_SCRIPT.contains("--severity critical"),
+            "auditor script must filter ra-query unwraps with --severity critical"
+        );
+        assert!(
+            AUDITOR_CLAUDE_AGENTRY_SCRIPT.contains("unwraps_report"),
+            "auditor script must emit an unwraps_report trace event"
+        );
+    }
+
+    #[test]
+    fn auditor_script_does_not_chain_trigger_on_unwraps() {
+        // v1 is report-only — unwrap fixes need call-site domain understanding,
+        // so no per-finding self-heal brief generation yet.
+        assert!(
+            !AUDITOR_CLAUDE_AGENTRY_SCRIPT.contains("brf_self_heal_${brief_id}_unwrap"),
+            "auditor v1 must NOT auto-dispatch unwrap self-heal child briefs"
+        );
+        assert!(
+            !AUDITOR_CLAUDE_AGENTRY_SCRIPT.contains("_unwrap_"),
+            "auditor v1 must NOT generate per-unwrap child-brief identifiers"
         );
     }
 }
