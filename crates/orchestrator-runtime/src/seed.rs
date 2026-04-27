@@ -114,6 +114,18 @@ stream_claude() {
         emit_done "failed"
         exit 0
     fi
+    # Defence in depth: claude -p reported success but the transcript file
+    # is missing or empty. The likely cause is a host /transcripts/ bind
+    # mount the container UID can't write (default install is root:root,
+    # rootless podman maps container-root to a non-zero host UID via
+    # subuid). tee swallows the EACCES while the upstream pipeline still
+    # exits 0. Surface as an explicit event so the operator sees the real
+    # failure mode instead of a bare exit-2 elsewhere.
+    if [ ! -s "$_t" ]; then
+        emit_event "$(jq -nc --arg p "$_t" '{error:"tee_or_transcript_write_failed",transcript_path:$p}')"
+        emit_done "failed"
+        exit 0
+    fi
     # Reconstruct the assistant's final text from the transcript so callers
     # that previously consumed `$reply` / `$response` keep working.
     # The transcript carries exactly one `result` event; piping its `.result`
@@ -2880,6 +2892,18 @@ mod tests {
         assert!(
             !p.contains("select(.type==\"assistant\") | .message.content[]? | select(.type==\"text\") | .text' \"$_t\" 2>/dev/null | tail"),
             "stream_claude must NOT pipe assistant text through tail (truncates multi-line content)"
+        );
+        // Defence in depth: the tee/transcript-write failure mode is the
+        // operator-trap behind brf_work_94 + brf_work_126 silent exit-2.
+        // A future cleanup of stream_claude must NOT silently delete the
+        // explicit `! -s "$_t"` empty-transcript guard or its trace event.
+        assert!(
+            p.contains("tee_or_transcript_write_failed"),
+            "stream_claude must emit `tee_or_transcript_write_failed` when transcript is missing/empty"
+        );
+        assert!(
+            p.contains("! -s \"$_t\""),
+            "stream_claude must guard against an empty transcript via `! -s \"$_t\"`"
         );
     }
 

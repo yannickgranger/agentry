@@ -345,6 +345,16 @@ impl Spawner for PodmanSpawner {
                 );
                 continue;
             }
+            // /transcripts is a critical mount: stream_claude tee-writes
+            // to it on every claude -p call. If the host source isn't
+            // writable by the rootless-podman container UID (default
+            // install owner is root:root), tee silently fails and the
+            // agent exits with a bare 2 — operator has no signal. Mirror
+            // the workspace_mount fail-fast below: surface a structured
+            // Error::Config with the explicit chown command.
+            if m.target == "/transcripts" {
+                preflight_transcripts_mount(&brief.id, role.name.0.as_str(), &m.source)?;
+            }
             let spec = if m.readonly {
                 format!("{}:{}:ro", m.source, m.target)
             } else {
@@ -668,6 +678,29 @@ async fn append_audit(
     Ok(())
 }
 
+/// Host-side preflight for the `/transcripts` bind mount.
+///
+/// Test-touches a `.spawner-preflight` sentinel inside `source` and unlinks
+/// it. Any IO error (EACCES, EROFS, ENOENT-on-create, ENOTDIR, …) is
+/// reported as `Error::Config` with explicit operator instructions —
+/// mirroring the structured-error shape of the `workspace_mount` fail-fast
+/// (rather than the warn-only `ra-query` pattern, which would mask the
+/// failure). `stream_claude` tees every `claude -p` invocation through
+/// this directory; if it isn't writable by the rootless-podman container
+/// UID, every brief silently exits 2.
+fn preflight_transcripts_mount(brief_id: &BriefId, role_name: &str, source: &str) -> Result<()> {
+    let sentinel = std::path::Path::new(source).join(".spawner-preflight");
+    let probe = std::fs::write(&sentinel, b"").and_then(|()| std::fs::remove_file(&sentinel));
+    match probe {
+        Ok(()) => Ok(()),
+        Err(e) => Err(Error::Config(format!(
+            "brief {brief_id} role '{role_name}': /transcripts mount source '{source}' is not writable (errno {errno}: {e}). \
+             Fix on host: mkdir -p {source} && sudo chown $USER {source}",
+            errno = e.raw_os_error().unwrap_or(0),
+        ))),
+    }
+}
+
 /// Build the `sh -c` argument that the container runs as its command.
 ///
 /// Installs a baseline (`bash ca-certificates coreutils jq`) plus role-specific
@@ -931,5 +964,44 @@ mod tests {
         assert!(s.contains("AGENTRY_EXITPOINT"));
         assert!(s.contains("exec bash -c \"$AGENTRY_EXITPOINT\""));
         assert!(!s.contains("exec bash -c \"$AGENTRY_SCRIPT\""));
+    }
+
+    #[test]
+    fn transcripts_mount_preflight_rejects_unwritable_source() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let src = tmp.path();
+        let mut perm = std::fs::metadata(src).expect("metadata").permissions();
+        perm.set_mode(0o555);
+        std::fs::set_permissions(src, perm).expect("chmod 0555");
+
+        // Root bypasses DAC, so chmod 0o555 doesn't deny it. Probe first;
+        // skip the assertion when running as root (test is a no-op there).
+        let probe = src.join(".root-probe");
+        if std::fs::write(&probe, b"").is_ok() {
+            let _ = std::fs::remove_file(&probe);
+            return;
+        }
+
+        let src_str = src.to_str().expect("utf-8 path");
+        let err = preflight_transcripts_mount(
+            &BriefId("brf_preflight_test".into()),
+            "coder-claude-agentry",
+            src_str,
+        )
+        .expect_err("preflight must reject an unwritable /transcripts source");
+        match err {
+            Error::Config(msg) => {
+                assert!(
+                    msg.contains(src_str),
+                    "error message must include the source path: {msg}"
+                );
+                assert!(
+                    msg.contains("chown"),
+                    "error message must include the chown instruction: {msg}"
+                );
+            }
+            other => panic!("expected Error::Config, got {other:?}"),
+        }
     }
 }

@@ -286,6 +286,9 @@ pipeline (reseed-with-stale-binary is the classic pitfall).
 # 1. Pull develop on the host clone.
 cd /var/home/yg/workspaces/agentry && git pull --ff-only origin develop
 
+# Transcripts dir must be writable by the host UID — rootless podman maps container-root to this UID via subuid; default install owner is root:root and breaks tee writes silently.
+mkdir -p /var/lib/agentry/transcripts && [ "$(stat -c %u /var/lib/agentry/transcripts)" = "$(id -u)" ] || sudo chown $USER /var/lib/agentry/transcripts/
+
 # 2. Rebuild orchestratord + orchestrator CLI.
 cargo build --release --bin orchestrator --bin orchestratord
 
