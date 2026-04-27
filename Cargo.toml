@@ -4,6 +4,7 @@ members = [
     "crates/orchestrator-types",
     "crates/orchestrator-runtime",
     "crates/orchestrator-dashboard",
+    "crates/coder-precommit",
 ]
 
 [workspace.package]
