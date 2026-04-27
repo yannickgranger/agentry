@@ -19,6 +19,18 @@
 use std::fs;
 use std::process::Command;
 
+/// Skip-if-absent: returns true when `jq` is on the runner's PATH. Production
+/// containers always install jq (it is part of every role's package manifest);
+/// CI runners may not. The two tests that shell out to jq use this gate so
+/// they validate the production query when run locally and no-op otherwise.
+fn jq_available() -> bool {
+    Command::new("jq")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 /// Sample stream-json output as produced by `claude -p --output-format stream-json --verbose`
 /// for the prompt "Reply with exactly one word: pong". Captured from a real
 /// Claude Max run; trimmed to the structurally relevant events.
@@ -70,7 +82,12 @@ fn jq_extraction_recovers_assistant_final_text() {
     // The production script (stream_claude in BASH_PRELUDE) extracts the
     // assistant's final text from the transcript by running:
     //   jq -r 'select(.type=="result") | .result' "$_t" | tail -1
-    // This test verifies that extraction against the fixture.
+    // This test verifies that extraction against the fixture when `jq` is
+    // available; CI runners without jq skip with a notice.
+    if !jq_available() {
+        eprintln!("[skip] jq not on PATH; production containers always install it");
+        return;
+    }
     let dir = tempfile::tempdir().expect("tmpdir");
     let path = dir.path().join("brf_test_capture.jsonl");
     fs::write(&path, FIXTURE_TRANSCRIPT).expect("write fixture");
@@ -79,7 +96,7 @@ fn jq_extraction_recovers_assistant_final_text() {
         .args(["-r", r#"select(.type=="result") | .result"#])
         .arg(&path)
         .output()
-        .expect("jq must be on PATH for this test");
+        .expect("jq invocation");
     assert!(
         out.status.success(),
         "jq exited non-zero: stderr={:?}",
@@ -93,17 +110,45 @@ fn jq_extraction_recovers_assistant_final_text() {
 }
 
 #[test]
+fn serde_extraction_recovers_assistant_final_text() {
+    // Rust mirror of the jq query — runs everywhere, including CI runners
+    // without jq. If this passes and jq's version fails, the regression is
+    // in jq usage / install. If both pass, the contract holds end-to-end.
+    let lines: Vec<serde_json::Value> = FIXTURE_TRANSCRIPT
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| serde_json::from_str(l).expect("fixture line valid JSON"))
+        .collect();
+    let result_text: Option<&str> = lines
+        .iter()
+        .filter(|v| v.get("type").and_then(|t| t.as_str()) == Some("result"))
+        .filter_map(|v| v.get("result").and_then(|r| r.as_str()))
+        .next_back();
+    assert_eq!(
+        result_text,
+        Some("pong"),
+        "serde must mirror jq's `select(.type==\"result\") | .result` extraction"
+    );
+}
+
+const TRUNCATED_FIXTURE: &str = r#"{"type":"system","subtype":"init"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"partial"}]}}
+"#;
+
+#[test]
 fn jq_fallback_extracts_assistant_text_when_no_result_event() {
     // If a transcript ends without a `result` event (e.g. claude was killed
     // mid-stream by `timeout`), stream_claude falls back to the last
-    // `assistant` event's text content. Build a fixture with an assistant
-    // event but no result and verify the fallback jq query.
+    // `assistant` event's text content. Verifies the fallback jq query when
+    // jq is on PATH; otherwise skipped (see `serde_fallback_*` for the
+    // always-runs Rust mirror).
+    if !jq_available() {
+        eprintln!("[skip] jq not on PATH; production containers always install it");
+        return;
+    }
     let dir = tempfile::tempdir().expect("tmpdir");
     let path = dir.path().join("brf_truncated.jsonl");
-    let truncated = r#"{"type":"system","subtype":"init"}
-{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"partial"}]}}
-"#;
-    fs::write(&path, truncated).expect("write fixture");
+    fs::write(&path, TRUNCATED_FIXTURE).expect("write fixture");
 
     let out = Command::new("jq")
         .args([
@@ -112,12 +157,42 @@ fn jq_fallback_extracts_assistant_text_when_no_result_event() {
         ])
         .arg(&path)
         .output()
-        .expect("jq must be on PATH for this test");
+        .expect("jq invocation");
     assert!(out.status.success(), "jq exited non-zero");
     let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
     assert_eq!(
         text, "partial",
         "fallback jq must extract the assistant's last text when no result event"
+    );
+}
+
+#[test]
+fn serde_fallback_extracts_assistant_text_when_no_result_event() {
+    // Rust mirror of the fallback jq query — same shape, runs without jq.
+    let lines: Vec<serde_json::Value> = TRUNCATED_FIXTURE
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| serde_json::from_str(l).expect("fixture line valid JSON"))
+        .collect();
+    let text: Option<&str> = lines
+        .iter()
+        .filter(|v| v.get("type").and_then(|t| t.as_str()) == Some("assistant"))
+        .filter_map(|v| {
+            v.get("message")
+                .and_then(|m| m.get("content"))
+                .and_then(|c| c.as_array())
+                .and_then(|arr| {
+                    arr.iter()
+                        .filter(|c| c.get("type").and_then(|t| t.as_str()) == Some("text"))
+                        .filter_map(|c| c.get("text").and_then(|t| t.as_str()))
+                        .next_back()
+                })
+        })
+        .next_back();
+    assert_eq!(
+        text,
+        Some("partial"),
+        "serde fallback must mirror jq's assistant.message.content[].text extraction"
     );
 }
 
