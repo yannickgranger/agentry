@@ -8,6 +8,9 @@ pub trait AcVerifierProvider {
 pub mod claude;
 pub use claude::ClaudeProvider;
 
+pub mod gemini;
+pub use gemini::GeminiProvider;
+
 #[cfg(test)]
 pub mod mock;
 #[cfg(test)]

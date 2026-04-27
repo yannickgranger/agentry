@@ -132,6 +132,10 @@ Trait implemented by every LLM backend the ac-verifier binary can call. Single m
 
 The `claude -p --output-format text` provider impl. Shells out to the host claude CLI (bind-mounted at /usr/local/bin/claude inside the ac-verifier container) with the concatenated `system\n\n---\n\nuser` prompt as a single positional arg. No timeout in the binary — the role's bash script wraps the whole invocation in `timeout $CLAUDE_P_TIMEOUT`.
 
+## GeminiProvider
+
+The Gemini `generateContent` provider impl. Shells out to `curl` and POSTs to `https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent` with the system + user prompt split into `system_instruction` and `contents`, `responseMimeType=application/json`. Reads `GEMINI_API_KEY` from the process env and passes it to the curl child via env (never as a literal Rust-level argv entry). Default model is `gemini-3-flash-preview`. No timeout in the binary — the role's bash script wraps the whole invocation in `timeout $CLAUDE_P_TIMEOUT`.
+
 ## Input
 
 The JSON shape the ac-verifier binary reads on stdin: `acceptance_criteria` (`Option<Vec<String>>`), `diff` (raw unified-diff text), and `verb_body` (the brief's verb body). Built by the role's bash script from the startup bundle's `brief.payload` + a fresh `git diff origin/<base_branch>..HEAD`.
@@ -153,4 +157,6 @@ Phase 2 — auditor runs `cargo +nightly udeps --output json`, emits one child b
 Roles using `BASH_PRELUDE` export `GIT_SSL_NO_VERIFY=true` and `CARGO_NET_GIT_FETCH_WITH_CLI=true` so cargo can fetch private git deps from internal forges (agency.lab, git.lab) whose certs aren't in the container CA bundle. This matches the pattern projects' own CI workflows already use.
 
 Roles using `BASH_PRELUDE` derive their `claude -p` timeout from the `CLAUDE_P_TIMEOUT` env (default 1200s). Spawner can override per-role for tighter budgets (e.g. reviewer-claude: 300s; archaeologist: 600s) without touching role scripts.
+
+The `ac-verifier-gemini-agentry` role is a Gemini-provider variant of the AC-verifier role family, sibling to `ac-verifier-claude-agentry`. It mirrors the claude variant's shape (read brief's `acceptance_criteria` + coder's diff, ask the model for a strict-JSON per-AC verdict, emit one blocker `Finding` per failed AC, degrade to `done shipped` on missing binary / missing key / parse error). Its bind-mount is `~/.local/bin/ac-verifier-gemini` only — Gemini doesn't need the host claude CLI or credentials. `passthru_env` carries `GEMINI_API_KEY`; `permit_scope` allows `generativelanguage.googleapis.com`. The role is registered in the seed but is NOT yet wired into any team — brief 5 introduces parallel-pipeline mode that fans `agentry-self-host-v0` out to all three providers.
 _poc_v4: 2026-04-27_
