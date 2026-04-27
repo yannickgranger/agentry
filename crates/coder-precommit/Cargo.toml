@@ -17,5 +17,9 @@ serde_json = { workspace = true }
 name = "dead-pub-check"
 path = "src/bin/dead_pub_check.rs"
 
+[[bin]]
+name = "ac-verifier"
+path = "src/bin/ac_verifier.rs"
+
 [lints]
 workspace = true

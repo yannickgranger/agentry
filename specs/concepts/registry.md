@@ -122,6 +122,28 @@ every brief carries a project.
 
 Beyond `agentry-self-host-v0` (full pipeline), two lighter topologies exist. `agentry-bugfix-v0` drops `reviewer-claude-agentry` for sub-30-LOC bug fixes where mechanical CI is sufficient. `agentry-spec-edit-v0` drops both reviewers for specs/docs-only changes; the merged-PR CI run catches any spec/code mismatch.
 
+The `ac-verifier-claude-agentry` role is an instance of `AgentRole` slotted between the coder and the reviewer pair in `agentry-self-host-v0`. It reads `brief.payload.acceptance_criteria` (a `Vec<String>`) plus the coder's git diff against `base_branch`, asks claude for a strict-JSON per-AC verdict, and emits one `Finding(blocker, category=ac-violation)` per failed AC plus `done rework_needed`. Empty/missing AC list, missing binary, or invalid claude JSON all degrade to `done shipped` — `reviewer-claude-agentry` is the architectural backstop. The team's `message_graph` uses a dual-inbound trick: the existing `coder→reviewer` edges are preserved, and new `coder→ac-verifier` and `ac-verifier→reviewer` edges are appended AFTER them. The daemon's `team.incoming(reviewer).first()` rework lookup therefore rewinds to the coder (the corrective upstream), not to the (non-corrective) ac-verifier.
+
+## AcVerifierProvider
+
+Trait implemented by every LLM backend the ac-verifier binary can call. Single method `verify(system, user) -> io::Result<String>` returns the provider's raw response; the verifier core parses the JSON. Brief 2 ships `ClaudeProvider` only; briefs 3 (Gemini) and 4 (Grok) add per-file siblings as text-only adds. Tests use `MockProvider` to drive the core logic without spawning a real LLM.
+
+## ClaudeProvider
+
+The `claude -p --output-format text` provider impl. Shells out to the host claude CLI (bind-mounted at /usr/local/bin/claude inside the ac-verifier container) with the concatenated `system\n\n---\n\nuser` prompt as a single positional arg. No timeout in the binary — the role's bash script wraps the whole invocation in `timeout $CLAUDE_P_TIMEOUT`.
+
+## Input
+
+The JSON shape the ac-verifier binary reads on stdin: `acceptance_criteria` (`Option<Vec<String>>`), `diff` (raw unified-diff text), and `verb_body` (the brief's verb body). Built by the role's bash script from the startup bundle's `brief.payload` + a fresh `git diff origin/<base_branch>..HEAD`.
+
+## Outcome
+
+The terminal value of an ac-verifier run. Two variants: `Shipped` (all ACs met, AC list empty/missing, or graceful degradation on provider/parse error) and `Rework { findings: Vec<Finding> }` (one or more failed ACs). The bash script maps `Shipped → emit_done "shipped"` and `Rework → emit_finding_model + emit_done "rework_needed"`.
+
+## Finding
+
+A single failed-AC record produced by the ac-verifier core. Fields: `severity` (always "blocker"), `category` (always "ac-violation"), `message` (AC text + claude's evidence). Distinct from `review::ReviewFinding` because the ac-verifier crate intentionally avoids depending on `orchestrator-types`; the bash script adapts each `Finding` to the structured `Finding` event that the daemon ingests via `emit_finding_model`.
+
 The planner role picks each child's topology from the task signature: `agentry-spec-edit-v0` for specs/docs-only edits, `agentry-bugfix-v0` for sub-30-LOC Rust bug fixes, `agentry-self-host-v0` (default) for everything else. The meta-brief's `payload.child_topology` provides the fallback if the planner omits a child's topology.
 
 The `auditor-claude-agentry` role and `agentry-self-audit-v0` topology emit cargo clippy/build/test reports as trace-stream events. Offline (no LLM, no forge, no claude mounts); reports persist in `agentry:brief:<id>:trace` for Phase 2 consumers.
@@ -131,4 +153,4 @@ Phase 2 — auditor runs `cargo +nightly udeps --output json`, emits one child b
 Roles using `BASH_PRELUDE` export `GIT_SSL_NO_VERIFY=true` and `CARGO_NET_GIT_FETCH_WITH_CLI=true` so cargo can fetch private git deps from internal forges (agency.lab, git.lab) whose certs aren't in the container CA bundle. This matches the pattern projects' own CI workflows already use.
 
 Roles using `BASH_PRELUDE` derive their `claude -p` timeout from the `CLAUDE_P_TIMEOUT` env (default 1200s). Spawner can override per-role for tighter budgets (e.g. reviewer-claude: 300s; archaeologist: 600s) without touching role scripts.
-_poc_v4: 2026-04-25_
+_poc_v4: 2026-04-27_

@@ -1632,6 +1632,70 @@ fn build_reviewer_claude_agentry_role(home: &str, claude_settings_path: &str) ->
     }
 }
 
+/// Build the ac-verifier-claude-agentry role. Slotted between the coder and
+/// the reviewer pair in `agentry-self-host-v0`. Reads the brief's
+/// `acceptance_criteria` (Vec<String>) + the coder's git diff, asks claude
+/// for a per-AC verdict, and emits one blocker `Finding` per failed AC.
+/// Degrades to `done shipped` whenever AC list is missing/empty, the
+/// ac-verifier binary is not on PATH, or claude returns invalid JSON —
+/// reviewer-claude is the architectural backstop.
+fn build_ac_verifier_claude_agentry_role(home: &str, claude_settings_path: &str) -> AgentRole {
+    AgentRole {
+        name: RoleName("ac-verifier-claude-agentry".into()),
+        version: 1,
+        model: Some("claude-max".into()),
+        system_prompt: None,
+        // No rust toolchain — the binary is bind-mounted from the host.
+        image: "docker.io/library/debian:bookworm-slim".into(),
+        substrate_class: SubstrateClass::Podman,
+        package_manager: PackageManager::Apt,
+        entrypoint_script: format!("{BASH_PRELUDE}{AC_VERIFIER_CLAUDE_AGENTRY_SCRIPT}"),
+        exitpoint_script: None,
+        binaries: vec!["git".into(), "ca-certificates".into()],
+        mcp_servers: vec![],
+        tool_allowlist: ToolAllowlist(vec![]),
+        permit_scope: PermitScope(vec![
+            "fs:read:/workspace/**".into(),
+            "net:allow:api.anthropic.com".into(),
+            "net:allow:agency.lab".into(),
+        ]),
+        passthru_env: vec![],
+        extra_bootstrap: vec![],
+        mounts: vec![
+            Mount {
+                source: format!("{home}/.local/bin/claude"),
+                target: "/usr/local/bin/claude".into(),
+                readonly: true,
+            },
+            Mount {
+                source: format!("{home}/.claude/.credentials.json"),
+                target: "/root/.claude/.credentials.json".into(),
+                readonly: true,
+            },
+            Mount {
+                source: claude_settings_path.into(),
+                target: "/root/.claude/settings.json".into(),
+                readonly: true,
+            },
+            Mount {
+                source: "/var/lib/agentry/transcripts".into(),
+                target: "/transcripts".into(),
+                readonly: false,
+            },
+            Mount {
+                source: format!("{home}/.local/bin/ac-verifier"),
+                target: "/usr/local/bin/ac-verifier".into(),
+                readonly: true,
+            },
+        ],
+        workspace_mount: Some(WorkspaceMount {
+            container_path: "/workspace".into(),
+            readonly: true,
+        }),
+        sccache: false,
+    }
+}
+
 /// Build the coder-claude-agentry role. Extracted from `seed_m0` so the
 /// bind-mounts (claude, credentials, settings, transcripts, ra-query) can be
 /// asserted in unit tests. ra-query is operator-installed via
@@ -1741,6 +1805,80 @@ else
     out=$(tail -c 4096 /tmp/criterion.out)
     emit_event "$(jq -nc --arg o "$out" --argjson rc "$rc" '{msg:"criterion failed",exit_code:$rc,output:$o}')"
     emit_done "failed"
+fi
+"##;
+
+/// Entrypoint for `ac-verifier-claude-agentry`. Reads
+/// `brief.payload.acceptance_criteria` (Vec<String>), captures the coder's
+/// diff against `base_branch`, builds the binary's stdin JSON, and runs
+/// `timeout $CLAUDE_P_TIMEOUT ac-verifier`. Degrades to `done shipped` when
+/// AC list is empty/missing or the binary is not on PATH — reviewer-claude
+/// is the architectural backstop.
+const AC_VERIFIER_CLAUDE_AGENTRY_SCRIPT: &str = r##"#!/usr/bin/env bash
+set -uo pipefail
+bundle="$(cat)"
+
+agent_id=$(jq -r '.permit.agent_id' <<<"$bundle")
+base_branch=$(jq -r '.brief.payload.base_branch // "develop"' <<<"$bundle")
+verb_body=$(jq -r '.brief.payload.issue_body // ""' <<<"$bundle")
+acs_json=$(jq -c '.brief.payload.acceptance_criteria // null' <<<"$bundle")
+
+# Fast path: no acceptance_criteria carried on this brief — short-circuit
+# without spending any claude tokens. Reviewer-claude still runs.
+if [ "$acs_json" = "null" ] || [ "$(jq 'length' <<<"$acs_json")" -eq 0 ]; then
+    emit_event '{"msg":"no acceptance_criteria in payload — skipping ac-verifier"}'
+    emit_done "shipped"; exit 0
+fi
+
+if [ ! -d /workspace/.git ] && [ ! -f /workspace/.git ]; then
+    emit_event '{"error":"workspace is not a git repo — coder did not produce it"}'
+    emit_done "shipped"; exit 0
+fi
+
+cd /workspace
+if ! git fetch origin "$base_branch" >/tmp/acv_fetch.err 2>&1; then
+    err=$(tail -20 /tmp/acv_fetch.err)
+    emit_event "$(jq -nc --arg err "$err" '{msg:"git fetch failed — degrading to shipped",detail:$err}')"
+    emit_done "shipped"; exit 0
+fi
+if ! git diff "origin/${base_branch}..HEAD" > /tmp/acv_diff.patch 2>/tmp/acv_diff.err; then
+    err=$(tail -20 /tmp/acv_diff.err)
+    emit_event "$(jq -nc --arg err "$err" '{msg:"git diff failed — degrading to shipped",detail:$err}')"
+    emit_done "shipped"; exit 0
+fi
+diff_text=$(cat /tmp/acv_diff.patch)
+
+if ! command -v ac-verifier >/dev/null 2>&1; then
+    emit_event '{"warn":"ac_verifier_unavailable","detail":"ac-verifier binary not on PATH; reviewer-claude is the backstop"}'
+    emit_done "shipped"; exit 0
+fi
+
+bundle_json=$(jq -nc --argjson acs "$acs_json" --arg diff "$diff_text" --arg vb "$verb_body" \
+    '{acceptance_criteria:$acs, diff:$diff, verb_body:$vb}')
+
+if ! outcome_json=$(timeout "$CLAUDE_P_TIMEOUT" ac-verifier <<<"$bundle_json" 2>/tmp/acv.err); then
+    rc=$?
+    err=$(tail -c 2048 /tmp/acv.err)
+    emit_event "$(jq -nc --argjson rc "$rc" --arg err "$err" '{msg:"ac-verifier invocation failed — degrading to shipped",exit_code:$rc,detail:$err}')"
+    emit_done "shipped"; exit 0
+fi
+
+outcome=$(jq -r '.outcome // "shipped"' <<<"$outcome_json")
+if [ "$outcome" = "rework" ]; then
+    findings_count=$(jq '.findings | length' <<<"$outcome_json")
+    emit_event "$(jq -nc --argjson n "$findings_count" '{msg:"ac-verifier rework",findings_count:$n}')"
+    i=0
+    while [ "$i" -lt "$findings_count" ]; do
+        sev=$(jq -r ".findings[$i].severity" <<<"$outcome_json")
+        cat=$(jq -r ".findings[$i].category" <<<"$outcome_json")
+        msg=$(jq -r ".findings[$i].message" <<<"$outcome_json")
+        emit_finding_model "$sev" "$agent_id" "$cat" "$msg"
+        i=$((i+1))
+    done
+    emit_done "rework_needed"
+else
+    emit_event '{"msg":"ac-verifier shipped — all acceptance criteria met or unverifiable"}'
+    emit_done "shipped"
 fi
 "##;
 
@@ -2481,6 +2619,8 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         sccache: false,
     };
     let reviewer_claude_agentry = build_reviewer_claude_agentry_role(&home, &claude_settings_path);
+    let ac_verifier_claude_agentry =
+        build_ac_verifier_claude_agentry_role(&home, &claude_settings_path);
     let shipper_agentry = AgentRole {
         name: RoleName("shipper-agentry".into()),
         version: 1,
@@ -2628,6 +2768,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         version: 1,
         roles: vec![
             coder_claude_agentry.name.clone(),
+            ac_verifier_claude_agentry.name.clone(),
             reviewer_mechanical_agentry.name.clone(),
             reviewer_claude_agentry.name.clone(),
             shipper_agentry.name.clone(),
@@ -2636,7 +2777,10 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         // Rework loop enabled — max_retries=2 gives the coder two chances to
         // fix findings emitted by the reviewer before the team resolves Failed.
         message_graph: vec![
-            // Both reviewers treat coder as their rework-target upstream.
+            // ORDERING INVARIANT: coder→reviewer edges are listed BEFORE
+            // ac-verifier→reviewer edges so the daemon's
+            // `team.incoming(reviewer).first()` rework lookup rewinds to the
+            // coder, not to the (non-corrective) ac-verifier. Do not reorder.
             MessageEdge {
                 from: coder_claude_agentry.name.clone(),
                 to: reviewer_mechanical_agentry.name.clone(),
@@ -2644,6 +2788,25 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
             },
             MessageEdge {
                 from: coder_claude_agentry.name.clone(),
+                to: reviewer_claude_agentry.name.clone(),
+                permit_overrides_from: None,
+            },
+            // Coder fans out to ac-verifier as well; ac-verifier short-circuits
+            // failed-AC reworks BEFORE reviewer-claude is spent.
+            MessageEdge {
+                from: coder_claude_agentry.name.clone(),
+                to: ac_verifier_claude_agentry.name.clone(),
+                permit_overrides_from: None,
+            },
+            // Dual-inbound trick: ac-verifier also signals each reviewer so the
+            // sequential flow holds, but rework still rewinds to coder above.
+            MessageEdge {
+                from: ac_verifier_claude_agentry.name.clone(),
+                to: reviewer_mechanical_agentry.name.clone(),
+                permit_overrides_from: None,
+            },
+            MessageEdge {
+                from: ac_verifier_claude_agentry.name.clone(),
                 to: reviewer_claude_agentry.name.clone(),
                 permit_overrides_from: None,
             },
@@ -2761,6 +2924,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
     redis_io::save_role(&mut conn, &coder_claude_agentry).await?;
     redis_io::save_role(&mut conn, &reviewer_mechanical_agentry).await?;
     redis_io::save_role(&mut conn, &reviewer_claude_agentry).await?;
+    redis_io::save_role(&mut conn, &ac_verifier_claude_agentry).await?;
     redis_io::save_role(&mut conn, &shipper_agentry).await?;
     redis_io::save_role(&mut conn, &ci_watcher_agentry).await?;
     redis_io::save_team(&mut conn, &agentry_self_host_v0).await?;
@@ -2778,7 +2942,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
     redis_io::save_team(&mut conn, &agentry_verify_v0).await?;
 
     tracing::info!(
-        "seeded: roles [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker, listener, grok-echo, claude-echo, synthesizer, narrowed-coder, shipper, coder-claude-agentry, reviewer-mechanical-agentry, shipper-agentry, ci-watcher-agentry, reviewer-claude-agentry, null-agent-agentry, archaeologist-claude-agentry, planner-claude-agentry, verifier-claude-agentry] (inline entrypoint scripts); teams [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker-listener, grok-echo, claude-echo, narrowed-team, shipper-solo-team, agentry-self-host-v0, agentry-null-v0, agentry-discovery-v0, agentry-planner-v0, agentry-verify-v0]"
+        "seeded: roles [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker, listener, grok-echo, claude-echo, synthesizer, narrowed-coder, shipper, coder-claude-agentry, ac-verifier-claude-agentry, reviewer-mechanical-agentry, shipper-agentry, ci-watcher-agentry, reviewer-claude-agentry, null-agent-agentry, archaeologist-claude-agentry, planner-claude-agentry, verifier-claude-agentry] (inline entrypoint scripts); teams [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker-listener, grok-echo, claude-echo, narrowed-team, shipper-solo-team, agentry-self-host-v0, agentry-null-v0, agentry-discovery-v0, agentry-planner-v0, agentry-verify-v0]"
     );
     Ok(())
 }
@@ -3111,6 +3275,169 @@ mod tests {
                 .iter()
                 .any(|m| m.target == "/usr/local/bin/dead-pub-check" && m.readonly),
             "coder-claude must bind-mount dead-pub-check read-only at /usr/local/bin/dead-pub-check"
+        );
+    }
+
+    #[test]
+    fn ac_verifier_script_invokes_binary() {
+        assert!(
+            AC_VERIFIER_CLAUDE_AGENTRY_SCRIPT.contains("ac-verifier"),
+            "ac-verifier script must invoke the ac-verifier binary"
+        );
+    }
+
+    #[test]
+    fn ac_verifier_script_reads_acceptance_criteria_payload_key() {
+        assert!(
+            AC_VERIFIER_CLAUDE_AGENTRY_SCRIPT.contains("acceptance_criteria"),
+            "ac-verifier script must read brief.payload.acceptance_criteria"
+        );
+    }
+
+    #[test]
+    fn ac_verifier_script_handles_missing_binary() {
+        assert!(
+            AC_VERIFIER_CLAUDE_AGENTRY_SCRIPT.contains("ac_verifier_unavailable"),
+            "ac-verifier script must emit ac_verifier_unavailable when the binary is missing"
+        );
+    }
+
+    #[test]
+    fn ac_verifier_role_bind_mounts_ac_verifier_binary() {
+        let role = build_ac_verifier_claude_agentry_role("/h", "/c");
+        assert!(
+            role.mounts
+                .iter()
+                .any(|m| m.target == "/usr/local/bin/ac-verifier" && m.readonly),
+            "ac-verifier role must bind-mount ac-verifier read-only at /usr/local/bin/ac-verifier"
+        );
+    }
+
+    #[test]
+    fn ac_verifier_role_bind_mounts_claude_binary() {
+        let role = build_ac_verifier_claude_agentry_role("/h", "/c");
+        assert!(
+            role.mounts
+                .iter()
+                .any(|m| m.target == "/usr/local/bin/claude" && m.readonly),
+            "ac-verifier role must bind-mount claude read-only at /usr/local/bin/claude"
+        );
+    }
+
+    #[test]
+    fn agentry_self_host_v0_topology_has_ac_verifier_with_correct_edges() {
+        // Mirror of the agentry-self-host-v0 topology block in seed_m0 — built
+        // here so the dual-inbound ordering invariant is covered without
+        // touching Redis. Keep in sync with seed_m0.
+        let coder = build_coder_claude_agentry_role("/h", "/c");
+        let ac_verifier = build_ac_verifier_claude_agentry_role("/h", "/c");
+        let reviewer_claude = build_reviewer_claude_agentry_role("/h", "/c");
+        // Synthesize the names — mechanical reviewer + shipper + ci-watcher
+        // are inline AgentRole literals in seed_m0; we only need their names
+        // to assert edge presence.
+        let reviewer_mechanical = RoleName("reviewer-mechanical-agentry".into());
+        let shipper = RoleName("shipper-agentry".into());
+        let ci_watcher = RoleName("ci-watcher-agentry".into());
+
+        let topology = TeamTopology {
+            name: TeamName("agentry-self-host-v0".into()),
+            version: 1,
+            roles: vec![
+                coder.name.clone(),
+                ac_verifier.name.clone(),
+                reviewer_mechanical.clone(),
+                reviewer_claude.name.clone(),
+                shipper.clone(),
+                ci_watcher.clone(),
+            ],
+            message_graph: vec![
+                MessageEdge {
+                    from: coder.name.clone(),
+                    to: reviewer_mechanical.clone(),
+                    permit_overrides_from: None,
+                },
+                MessageEdge {
+                    from: coder.name.clone(),
+                    to: reviewer_claude.name.clone(),
+                    permit_overrides_from: None,
+                },
+                MessageEdge {
+                    from: coder.name.clone(),
+                    to: ac_verifier.name.clone(),
+                    permit_overrides_from: None,
+                },
+                MessageEdge {
+                    from: ac_verifier.name.clone(),
+                    to: reviewer_mechanical.clone(),
+                    permit_overrides_from: None,
+                },
+                MessageEdge {
+                    from: ac_verifier.name.clone(),
+                    to: reviewer_claude.name.clone(),
+                    permit_overrides_from: None,
+                },
+                MessageEdge {
+                    from: reviewer_mechanical.clone(),
+                    to: shipper.clone(),
+                    permit_overrides_from: None,
+                },
+                MessageEdge {
+                    from: reviewer_claude.name.clone(),
+                    to: shipper.clone(),
+                    permit_overrides_from: None,
+                },
+                MessageEdge {
+                    from: shipper.clone(),
+                    to: ci_watcher.clone(),
+                    permit_overrides_from: None,
+                },
+            ],
+            terminal_role: ci_watcher.clone(),
+            max_retries: 2,
+        };
+
+        assert!(
+            topology.roles.contains(&ac_verifier.name),
+            "ac-verifier-claude-agentry must be in roles"
+        );
+
+        let edge_idx = |from: &RoleName, to: &RoleName| -> Option<usize> {
+            topology
+                .message_graph
+                .iter()
+                .position(|e| e.from == *from && e.to == *to)
+        };
+
+        let coder_to_acv = edge_idx(&coder.name, &ac_verifier.name);
+        let acv_to_rev_mech = edge_idx(&ac_verifier.name, &reviewer_mechanical);
+        let acv_to_rev_claude = edge_idx(&ac_verifier.name, &reviewer_claude.name);
+        let coder_to_rev_mech = edge_idx(&coder.name, &reviewer_mechanical);
+
+        assert!(coder_to_acv.is_some(), "coder→ac-verifier edge must exist");
+        assert!(
+            acv_to_rev_mech.is_some(),
+            "ac-verifier→reviewer-mechanical edge must exist"
+        );
+        assert!(
+            acv_to_rev_claude.is_some(),
+            "ac-verifier→reviewer-claude edge must exist"
+        );
+        assert!(
+            coder_to_rev_mech.is_some(),
+            "coder→reviewer-mechanical edge must exist (rework target)"
+        );
+
+        // Dual-inbound ordering invariant: coder→reviewer-mechanical MUST
+        // appear BEFORE ac-verifier→reviewer-mechanical so the daemon's
+        // `team.incoming(reviewer).first()` rework lookup rewinds to the
+        // coder, not the (non-corrective) ac-verifier.
+        let coder_pos =
+            coder_to_rev_mech.expect("coder→reviewer-mechanical edge already asserted present");
+        let acv_pos =
+            acv_to_rev_mech.expect("ac-verifier→reviewer-mechanical edge already asserted present");
+        assert!(
+            coder_pos < acv_pos,
+            "coder→reviewer-mechanical must appear before ac-verifier→reviewer-mechanical (rework rewinds to coder, not ac-verifier)"
         );
     }
 

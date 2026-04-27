@@ -45,6 +45,15 @@ dead-pub-check-binary:
     test -x ~/.local/bin/dead-pub-check
     echo "dead-pub-check installed at ~/.local/bin/dead-pub-check"
 
+# Build ac-verifier into ~/.local/bin/ac-verifier for the
+# ac-verifier-claude-agentry bind-mount. Operator-invoked; idempotent.
+ac-verifier-binary:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo install --path crates/coder-precommit --bin ac-verifier --root ~/.local --locked --quiet
+    test -x ~/.local/bin/ac-verifier
+    echo "ac-verifier installed at ~/.local/bin/ac-verifier"
+
 # Build everything
 build:
     cargo build --workspace --release

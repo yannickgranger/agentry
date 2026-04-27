@@ -1,5 +1,8 @@
 //! Pre-commit gates and AC verification binaries used by the coder role.
 
+pub mod ac_verifier;
+pub mod providers;
+
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
