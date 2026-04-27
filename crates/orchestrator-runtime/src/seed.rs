@@ -1509,6 +1509,21 @@ if command -v ra-query >/dev/null 2>&1; then
 else
     emit_event '{"msg":"ra_query_unavailable","detail":"skipping unwraps stage"}'
 fi
+if command -v ra-query >/dev/null 2>&1; then
+    cfindings='[]'; total_complex=0
+    while IFS= read -r f; do
+        [ -f "$f" ] || continue
+        cout=$(ra-query complexity "$f" --threshold 15 --format json 2>/dev/null || echo '{"functions":[]}')
+        ccnt=$(echo "$cout" | jq '[.functions[]?] | length')
+        if [ "$ccnt" -gt 0 ]; then
+            cfindings=$(echo "$cfindings" | jq --argjson r "$cout" --arg p "$f" '. + [{file:$p, complex_count:$ccnt, result:$r}]')
+            total_complex=$((total_complex + ccnt))
+        fi
+    done < <(find crates -name '*.rs' -not -path '*/tests/*' -not -name 'tests.rs' -not -path '*/target/*')
+    emit_event "$(jq -nc --argjson cnt "$total_complex" --arg out "$(echo "$cfindings" | jq -c . | tail -c 8192)" '{msg:"complexity_report",complex_total:$cnt,findings_json_tail:$out}')"
+else
+    emit_event '{"msg":"ra_query_unavailable_complexity","detail":"skipping complexity stage"}'
+fi
 mkdir -p /workspace/audit-children
 host_workspace="/var/mnt/workspaces/agentry-work/briefs/${brief_id}"
 pairs=$(echo "$udeps_json" | jq -c '[.unused_deps // {} | to_entries[] | .key as $k | ((.value.normal // []) + (.value.development // []) + (.value.build // []))[] as $d | {crate:($k|split(" ")[0]), dep:$d}]')
@@ -3177,6 +3192,34 @@ mod tests {
         assert!(
             !AUDITOR_CLAUDE_AGENTRY_SCRIPT.contains("_unwrap_"),
             "auditor v1 must NOT generate per-unwrap child-brief identifiers"
+        );
+    }
+
+    #[test]
+    fn auditor_script_runs_ra_query_complexity() {
+        assert!(
+            AUDITOR_CLAUDE_AGENTRY_SCRIPT.contains("ra-query complexity"),
+            "auditor script must invoke `ra-query complexity`"
+        );
+        assert!(
+            AUDITOR_CLAUDE_AGENTRY_SCRIPT.contains("--threshold 15"),
+            "auditor script must filter ra-query complexity with --threshold 15"
+        );
+        assert!(
+            AUDITOR_CLAUDE_AGENTRY_SCRIPT.contains("complexity_report"),
+            "auditor script must emit a complexity_report trace event"
+        );
+    }
+
+    #[test]
+    fn auditor_script_does_not_chain_trigger_on_complexity() {
+        assert!(
+            !AUDITOR_CLAUDE_AGENTRY_SCRIPT.contains("brf_self_heal_${brief_id}_complex"),
+            "auditor v1.5 must NOT auto-dispatch complexity self-heal child briefs"
+        );
+        assert!(
+            !AUDITOR_CLAUDE_AGENTRY_SCRIPT.contains("_complex_"),
+            "auditor v1.5 must NOT generate per-complexity child-brief identifiers"
         );
     }
 }
