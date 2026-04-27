@@ -765,13 +765,20 @@ start=$(printf '%s' "$cleaned" | grep -b -m1 '\[' | head -1 | cut -d: -f1)
 end=$(printf '%s' "$cleaned" | grep -bo '\]' | tail -1 | cut -d: -f1)
 if [ -z "$start" ] || [ -z "$end" ]; then
     emit_event "$(jq -nc --arg r "$(printf '%s' "$cleaned" | head -c 300)" '{error:"claude response missing JSON array brackets",head:$r}')"
-    emit_done "failed"; exit 0
-fi
-payload=$(printf '%s' "$cleaned" | tail -c +$((start+1)) | head -c $((end-start+1)))
+    # Salvage: prose-only reply (no JSON brackets at all). Wrap as a single
+    # format_deviation finding so the LLM's reasoning reaches the verdict trail.
+    salvaged_msg=$(printf '%s' "$cleaned" | head -c 4096)
+    payload=$(jq -nc --arg m "$salvaged_msg" '[{file:null,line:null,severity:"error",origin:{kind:"model"},category:"format_deviation",message:$m,suggested_fix:null,prohibitions:[],requirements:[]}]')
+    emit_event "$(jq -nc --arg m "$salvaged_msg" '{msg:"reviewer prose-reply salvaged as format_deviation",bytes:($m|length)}')"
+else
+    payload=$(printf '%s' "$cleaned" | tail -c +$((start+1)) | head -c $((end-start+1)))
 
-if ! printf '%s' "$payload" | jq -e 'type == "array"' >/dev/null 2>&1; then
-    emit_event "$(jq -nc --arg r "$(printf '%s' "$payload" | head -c 300)" '{error:"claude response not a JSON array",head:$r}')"
-    emit_done "failed"; exit 0
+    if ! printf '%s' "$payload" | jq -e 'type == "array"' >/dev/null 2>&1; then
+        emit_event "$(jq -nc --arg r "$(printf '%s' "$payload" | head -c 300)" '{error:"claude response not a JSON array",head:$r}')"
+        salvaged_msg=$(printf '%s' "$payload" | head -c 4096)
+        payload=$(jq -nc --arg m "$salvaged_msg" '[{file:null,line:null,severity:"error",origin:{kind:"model"},category:"format_deviation",message:$m,suggested_fix:null,prohibitions:[],requirements:[]}]')
+        emit_event "$(jq -nc --arg m "$salvaged_msg" '{msg:"reviewer prose-reply salvaged as format_deviation",bytes:($m|length)}')"
+    fi
 fi
 
 count=$(printf '%s' "$payload" | jq 'length')
@@ -2637,6 +2644,42 @@ mod tests {
             REVIEWER_CLAUDE_AGENTRY_SCRIPT.contains("State-machine emission idempotency (CRITICAL)"),
             "reviewer-claude prompt must include the State-machine emission idempotency critical clause"
         );
+    }
+
+    #[test]
+    fn reviewer_script_salvages_missing_brackets() {
+        assert!(
+            REVIEWER_CLAUDE_AGENTRY_SCRIPT
+                .contains("reviewer prose-reply salvaged as format_deviation"),
+            "reviewer-claude script must salvage prose replies as format_deviation findings"
+        );
+    }
+
+    #[test]
+    fn reviewer_script_emits_format_deviation_finding() {
+        assert!(
+            REVIEWER_CLAUDE_AGENTRY_SCRIPT.contains("category:\"format_deviation\""),
+            "reviewer-claude script must synthesize a finding with category format_deviation"
+        );
+    }
+
+    #[test]
+    fn reviewer_script_no_failed_emit_on_format_deviation() {
+        let s = REVIEWER_CLAUDE_AGENTRY_SCRIPT;
+        for marker in [
+            "claude response not a JSON array",
+            "claude response missing JSON array brackets",
+        ] {
+            let after = s
+                .split_once(marker)
+                .unwrap_or_else(|| panic!("marker {marker:?} must appear in reviewer script"))
+                .1;
+            let window = &after[..after.len().min(500)];
+            assert!(
+                !window.contains("emit_done \"failed\""),
+                "reviewer salvage path after {marker:?} must not emit_done \"failed\"; window was: {window}"
+            );
+        }
     }
 
     #[test]
