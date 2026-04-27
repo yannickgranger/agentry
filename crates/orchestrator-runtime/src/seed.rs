@@ -622,11 +622,17 @@ fi
 # pre-pass tolerance). v1 emits warn-level findings only — no failed verdict
 # — so false positives don't block the pipeline. Upgrade to blocker in a
 # follow-up brief once the signal is validated.
+#
+# The pipe must be wrapped in `{ ...; } || true` because under
+# `set -euo pipefail` an empty-grep exits 1 and pipefail propagates,
+# killing the assignment and the script. Same regression class as PRs
+# #129 and #130. Track issue #134 ports this gate to a binary.
 if command -v ra-query >/dev/null 2>&1; then
     emit_event '{"msg":"running ra_query_callers on newly-added pub items"}'
-    new_pub=$(git diff --cached -U0 | grep -E '^\+(pub (fn|struct|enum|trait|type|const|static)) ' \
+    new_pub=$( { git diff --cached -U0 \
+        | grep -E '^\+(pub (fn|struct|enum|trait|type|const|static)) ' \
         | grep -oE 'pub (fn|struct|enum|trait|type|const|static) +[a-zA-Z_][a-zA-Z0-9_]*' \
-        | awk '{print $NF}' | sort -u)
+        | awk '{print $NF}' | sort -u ; } || true )
     dead_count=0
     while IFS= read -r sym; do
         [ -z "$sym" ] && continue
@@ -3047,6 +3053,15 @@ mod tests {
         assert!(
             s.contains("running ra_query_callers on newly-added pub items"),
             "coder exitpoint must announce the dead-pub gate before running it"
+        );
+        // Regression for brf_work_87_auditor_unwrap_fix_children failure
+        // (2026-04-27): under `set -euo pipefail` an empty grep exits 1
+        // and pipefail propagates to the assignment, killing the script.
+        // The pipe must be wrapped in `{ ...; } || true`. Same class as
+        // PRs #129 and #130.
+        assert!(
+            s.contains("} || true )"),
+            "dead-pub gate's grep pipe must be wrapped in `{{ ...; }} || true` to tolerate empty-match exits"
         );
     }
 
