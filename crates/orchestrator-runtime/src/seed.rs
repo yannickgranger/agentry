@@ -2221,10 +2221,11 @@ emit_done "shipped"
 
 /// Build the auditor-claude-agentry role. Extracted from `seed_m0` so the
 /// permit-scope, passthru-env, and extra_bootstrap invariants can be asserted
-/// in unit tests. The auditor compiles workspace, runs cargo-udeps and
-/// `ra-query unwraps --severity critical`, and chain-triggers self-heal briefs
-/// for unused-deps findings. ra-query unwrap findings auto-dispatch fix-child briefs for the top-K=3 files by critical_count (full agentry-self-host-v0 pipeline because unwrap fixes require judgment). Complexity findings remain report-only.
-fn build_auditor_claude_agentry_role() -> AgentRole {
+/// in unit tests. Bind-mounts host-built ra-query at /usr/local/bin/ra-query
+/// (operator runs `just ra-query-binary` to provide it); the audit script's
+/// `command -v ra-query` guard tolerates a missing binary by emitting
+/// `ra_query_unavailable` and skipping the relevant stage.
+fn build_auditor_claude_agentry_role(home: &str) -> AgentRole {
     AgentRole {
         name: RoleName("auditor-claude-agentry".into()),
         version: 1,
@@ -2246,16 +2247,18 @@ fn build_auditor_claude_agentry_role() -> AgentRole {
             "net:allow:crates.io".into(),
             "net:allow:index.crates.io".into(),
             "net:allow:static.crates.io".into(),
-            "net:allow:agency.lab".into(),
         ]),
-        passthru_env: vec!["GITEA_TOKEN".into()],
+        passthru_env: vec![],
         extra_bootstrap: vec![
             "rustup component add rustfmt clippy || true".into(),
             "rustup toolchain install nightly --profile minimal || true".into(),
             "cargo +nightly install cargo-udeps --locked --quiet || true".into(),
-            "CARGO_NET_GIT_FETCH_WITH_CLI=true cargo install --git https://oauth2:${GITEA_TOKEN}@agency.lab:3000/yg/ra-query.git --rev 2200414 --root /usr/local --locked --quiet ra-query || true".into(),
         ],
-        mounts: vec![],
+        mounts: vec![Mount {
+            source: format!("{home}/.local/bin/ra-query"),
+            target: "/usr/local/bin/ra-query".into(),
+            readonly: true,
+        }],
         workspace_mount: Some(WorkspaceMount {
             container_path: "/workspace".into(),
             readonly: false,
@@ -3119,7 +3122,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         max_retries: 1,
     };
 
-    let auditor_claude_agentry = build_auditor_claude_agentry_role();
+    let auditor_claude_agentry = build_auditor_claude_agentry_role(&home);
     let agentry_self_audit_v0 = TeamTopology {
         name: TeamName("agentry-self-audit-v0".into()),
         version: 1,
@@ -4219,44 +4222,13 @@ mod tests {
     }
 
     #[test]
-    fn auditor_role_passes_through_gitea_token() {
-        let auditor = build_auditor_claude_agentry_role();
+    fn auditor_role_bind_mounts_ra_query() {
+        let role = build_auditor_claude_agentry_role("/var/home/test");
         assert!(
-            auditor.passthru_env.iter().any(|e| e == "GITEA_TOKEN"),
-            "auditor must pass GITEA_TOKEN so the ra-query cargo install can authenticate against agency.lab: {:?}",
-            auditor.passthru_env
-        );
-    }
-
-    #[test]
-    fn auditor_role_permit_includes_agency_lab() {
-        let auditor = build_auditor_claude_agentry_role();
-        assert!(
-            auditor
-                .permit_scope
-                .0
+            role.mounts
                 .iter()
-                .any(|s| s == "net:allow:agency.lab"),
-            "auditor permit_scope must allow agency.lab for the ra-query cargo install: {:?}",
-            auditor.permit_scope.0
-        );
-    }
-
-    #[test]
-    fn auditor_extra_bootstrap_installs_ra_query() {
-        let auditor = build_auditor_claude_agentry_role();
-        let bootstrap = auditor.extra_bootstrap.join("\n");
-        assert!(
-            bootstrap.contains("ra-query.git"),
-            "auditor extra_bootstrap must cargo install ra-query.git: {bootstrap}"
-        );
-        assert!(
-            bootstrap.contains("--rev 2200414"),
-            "auditor extra_bootstrap must pin ra-query to --rev 2200414: {bootstrap}"
-        );
-        assert!(
-            bootstrap.contains("|| true"),
-            "auditor ra-query install must end with || true for fault tolerance: {bootstrap}"
+                .any(|m| m.target == "/usr/local/bin/ra-query" && m.readonly),
+            "auditor-claude must bind-mount ra-query read-only at /usr/local/bin/ra-query"
         );
     }
 
