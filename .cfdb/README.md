@@ -57,3 +57,10 @@ ratchets, no allowlists).
 - **`arch-ban-unwrap-in-prod.cypher`** — bans `.unwrap()` in prod
   code. Production paths must propagate errors via `?` or attach
   context via `.expect("…")`. Test-gated scopes are exempt.
+- **`arch-ban-process-exit-outside-bin.cypher`** — bans `std::process::exit`
+  calls outside crate `src/bin/` entry points. `process::exit` skips Rust
+  destructors (Drop, async shutdown, Mutex poison cleanup); library /
+  daemon / runtime code must propagate errors via `Result` so the caller
+  decides whether to exit, retry, or convert to a structured failure
+  event. Only the binary entry point (the file containing `fn main`) is
+  exempt.
