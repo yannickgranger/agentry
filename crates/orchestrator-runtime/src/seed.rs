@@ -116,10 +116,14 @@ stream_claude() {
     fi
     # Reconstruct the assistant's final text from the transcript so callers
     # that previously consumed `$reply` / `$response` keep working.
+    # The transcript carries exactly one `result` event; piping its `.result`
+    # through `tail -1` would silently drop multi-line JSON content (claude
+    # pretty-prints arrays of findings) down to a single trailing `]`,
+    # which then trips the reviewer's `grep -m1 '\['` + `set -e` chain.
     local _r
-    _r=$(jq -r 'select(.type=="result") | .result' "$_t" 2>/dev/null | tail -1)
+    _r=$(jq -r 'select(.type=="result") | .result' "$_t" 2>/dev/null)
     if [ -z "$_r" ]; then
-        _r=$(jq -r 'select(.type=="assistant") | .message.content[]? | select(.type=="text") | .text' "$_t" 2>/dev/null | tail -1)
+        _r=$(jq -r 'select(.type=="assistant") | .message.content[]? | select(.type=="text") | .text' "$_t" 2>/dev/null)
     fi
     printf -v "$_out_var" '%s' "$_r"
 }
@@ -2859,6 +2863,19 @@ mod tests {
         assert!(
             p.contains("/transcripts/${brief_id}"),
             "stream_claude must tee to /transcripts/${{brief_id}}<suffix>.jsonl"
+        );
+        // Regression: piping `.result` through `tail -1` silently drops
+        // multi-line JSON content (claude pretty-prints findings arrays)
+        // down to a trailing `]`, which then trips the reviewer's
+        // `grep -m1 '\['` + `set -e` chain. The result event is unique per
+        // transcript, so no `tail` is needed.
+        assert!(
+            !p.contains("select(.type==\"result\") | .result' \"$_t\" 2>/dev/null | tail"),
+            "stream_claude must NOT pipe .result through tail (truncates multi-line JSON)"
+        );
+        assert!(
+            !p.contains("select(.type==\"assistant\") | .message.content[]? | select(.type==\"text\") | .text' \"$_t\" 2>/dev/null | tail"),
+            "stream_claude must NOT pipe assistant text through tail (truncates multi-line content)"
         );
     }
 
