@@ -89,3 +89,47 @@ agents (e.g. ci-watcher) whose tail is the same payload repeating
 but whose work is healthy. The consecutive-stuck counter still
 increments, so an agent that subsequently emits variety while
 remaining stuck does escalate correctly.
+
+## TranscriptEvent
+
+One parsed line from a `claude -p --output-format stream-json --verbose`
+transcript: `SystemInit`, `Assistant`, `User`, `Result`, or `Other`
+(unknown event kinds preserved verbatim). The transcript module is pure —
+callers feed it the JSONL string read from
+`/var/lib/agentry/transcripts/<brief>[.<role>].jsonl` and receive typed
+events with no I/O. Mid-stream truncation (the `timeout`-kill case) is
+tolerated: a partial trailing line is dropped silently.
+
+## ToolUse
+
+One `tool_use` block extracted from an assistant turn: id, tool name,
+input JSON, parse-time started_at. Drives the `tool_histogram` in
+`TranscriptSummary` and the `tool` field in `LastToolCall`.
+
+## ToolResult
+
+One `tool_result` block from a user turn paired with its `ToolUse` by
+`tool_use_id`. Distinguishes a still-running tool call (no matching
+result yet) from a completed one in `LastToolCall.completed`.
+
+## LastToolCall
+
+The transcript's most recent tool invocation, projected for the
+dashboard's "what is this agent doing right now" view: tool name, input
+JSON, started_at, duration so far in seconds, and a `completed` flag.
+Returned by `GET /briefs/{id}/transcript/last-tool-call`.
+
+## TranscriptSummary
+
+Aggregate stats over a transcript: tool histogram, token totals, wall
+clock, event count, and first/last timestamps. Cheap to compute on every
+request because transcripts are small. Returned by
+`GET /briefs/{id}/transcript/summary`.
+
+## BriefsState
+
+The dashboard's brief-routes state: the transcripts root directory under
+which `<brief>[.<role>].jsonl` files are read. Constructed with a
+production default of `/var/lib/agentry/transcripts` and overridable in
+integration tests so the routes can be exercised against a tempdir
+without touching the host filesystem.

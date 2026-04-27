@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# agentry-transcript — operator wrapper around the dashboard's brief routes.
+#
+# Usage:
+#   agentry-transcript <brief_id>             # full transcript (text/plain JSONL)
+#   agentry-transcript <brief_id> --tail [N]  # last N lines (default 20, max 1000)
+#   agentry-transcript <brief_id> --last-tool # JSON: most-recent tool call
+#   agentry-transcript <brief_id> --summary   # JSON: tool histogram + token totals
+#   agentry-transcript <brief_id> --kill      # SIGTERM the role's container
+#
+# Targets ${AGENTRY_DASHBOARD_URL:-http://localhost:7800}.
+
+set -euo pipefail
+
+if [ "$#" -lt 1 ]; then
+    echo "usage: agentry-transcript <brief_id> [--tail [N] | --last-tool | --summary | --kill]" >&2
+    exit 2
+fi
+
+brief_id="$1"
+shift || true
+base="${AGENTRY_DASHBOARD_URL:-http://localhost:7800}"
+
+case "${1:-}" in
+    "")
+        curl -sSf "${base}/briefs/${brief_id}/transcript"
+        ;;
+    --tail)
+        n="${2:-20}"
+        curl -sSf "${base}/briefs/${brief_id}/transcript/tail?n=${n}"
+        ;;
+    --last-tool)
+        curl -sSf "${base}/briefs/${brief_id}/transcript/last-tool-call"
+        ;;
+    --summary)
+        curl -sSf "${base}/briefs/${brief_id}/transcript/summary"
+        ;;
+    --kill)
+        curl -sSf -X POST "${base}/briefs/${brief_id}/kill"
+        ;;
+    *)
+        echo "unknown flag: $1" >&2
+        exit 2
+        ;;
+esac
