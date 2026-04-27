@@ -11,11 +11,13 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use orchestrator_runtime::transcript;
+use chrono::{DateTime, Utc};
+use orchestrator_runtime::transcript::{self, TranscriptTimes};
 use orchestrator_types::BriefId;
 use serde::Deserialize;
-use std::path::PathBuf;
+use std::path::{Path as StdPath, PathBuf};
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use super::validate;
 
@@ -165,8 +167,10 @@ async fn get_last_tool_call(
         Ok(b) => b,
         Err(_) => return (StatusCode::NOT_FOUND, "transcript not found").into_response(),
     };
-    let events = transcript::parse_jsonl_lines(&body);
-    match transcript::extract_last_tool_call(&events) {
+    let now = Utc::now();
+    let times = file_times(&path, now).await;
+    let events = transcript::parse_jsonl_lines(&body, times);
+    match transcript::extract_last_tool_call(&events, now) {
         Some(call) => (StatusCode::OK, Json(call)).into_response(),
         None => (StatusCode::NOT_FOUND, "no tool calls in transcript").into_response(),
     }
@@ -185,9 +189,48 @@ async fn get_summary(
         Ok(b) => b,
         Err(_) => return (StatusCode::NOT_FOUND, "transcript not found").into_response(),
     };
-    let events = transcript::parse_jsonl_lines(&body);
+    let now = Utc::now();
+    let times = file_times(&path, now).await;
+    let events = transcript::parse_jsonl_lines(&body, times);
     let summary = transcript::summarize(&events);
     (StatusCode::OK, Json(summary)).into_response()
+}
+
+/// Derive [`TranscriptTimes`] for `path` from filesystem metadata.
+///
+/// `started_at` is the file's birth time (`created()`) when the platform
+/// supports it, falling back to mtime. `last_event_at` is mtime. If
+/// metadata cannot be read at all (race with teardown, etc.) both fields
+/// fall back to `now` so the parser still produces a coherent — if
+/// degenerate — answer.
+async fn file_times(path: &StdPath, now: DateTime<Utc>) -> TranscriptTimes {
+    match tokio::fs::metadata(path).await {
+        Ok(md) => {
+            let modified = md.modified().ok().map(system_time_to_utc).unwrap_or(now);
+            // Some platforms (older Linux kernels, certain FS combos) report
+            // `created()` ≥ `modified()` when birth time is unavailable. Clamp
+            // `started_at` so the wall-clock invariant `started_at ≤
+            // last_event_at` holds for downstream summarization.
+            let raw_created = md
+                .created()
+                .ok()
+                .map(system_time_to_utc)
+                .unwrap_or(modified);
+            let started_at = raw_created.min(modified);
+            TranscriptTimes {
+                started_at,
+                last_event_at: modified,
+            }
+        }
+        Err(_) => TranscriptTimes {
+            started_at: now,
+            last_event_at: now,
+        },
+    }
+}
+
+fn system_time_to_utc(t: SystemTime) -> DateTime<Utc> {
+    DateTime::<Utc>::from(t)
 }
 
 async fn get_workspace_path(State(_state): State<BriefsState>, Path(id): Path<String>) -> Response {

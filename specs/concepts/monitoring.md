@@ -100,6 +100,18 @@ callers feed it the JSONL string read from
 events with no I/O. Mid-stream truncation (the `timeout`-kill case) is
 tolerated: a partial trailing line is dropped silently.
 
+## TranscriptTimes
+
+Caller-supplied wall-clock pair injected into the parser so durations
+and `wall_clock_secs` reflect real progress without the module reading
+the system clock itself. `started_at` is typically the transcript
+file's birth time (or brief spawn time) and `last_event_at` is its
+mtime; the parser stamps the first parsed event with `started_at` and
+every subsequent event with `last_event_at`. The dashboard handler
+threads its own `Utc::now()` into `extract_last_tool_call` so an
+in-flight tool's `duration_so_far_secs` measures real wall-clock
+progress against the file's mtime.
+
 ## ToolUse
 
 One `tool_use` block extracted from an assistant turn: id, tool name,

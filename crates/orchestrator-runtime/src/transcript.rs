@@ -9,11 +9,39 @@
 //!
 //! The schema mirrors what `BASH_PRELUDE::stream_claude` writes (see
 //! `seed.rs`): each line is one stream-json envelope with a `type` discriminant.
+//!
+//! `claude -p` stream-json envelopes do NOT carry per-event timestamps,
+//! so the parser cannot derive `started_at`/`completed_at` from the data.
+//! To keep the module pure (no `Utc::now()` reads inside), the caller
+//! supplies a [`TranscriptTimes`] pair: `started_at` (e.g. file ctime or
+//! the brief's spawn time) and `last_event_at` (e.g. file mtime). The
+//! parser stamps the first parsed event with `started_at` and every
+//! subsequent event with `last_event_at`, so `summarize` reports a
+//! meaningful `wall_clock_secs` (= last - first) and
+//! `extract_last_tool_call(events, now)` reports a non-zero
+//! `duration_so_far_secs` for an in-flight tool call.
+//!
+//! See the module test
+//! `unfinished_tool_call_has_nonzero_duration_when_now_after_last_event`
+//! and the parser tests in `tests/transcript_parsing.rs` — together they
+//! lock the time-bearing-fields contract down.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
+
+/// Caller-supplied timing source. Both fields are wall-clock UTC.
+///
+/// `started_at` is when the transcript file (or the brief's claude run)
+/// began — typically the file's ctime/birthtime, falling back to mtime.
+/// `last_event_at` is the file's mtime, which bounds the most recent
+/// activity observed on disk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TranscriptTimes {
+    pub started_at: DateTime<Utc>,
+    pub last_event_at: DateTime<Utc>,
+}
 
 /// One parsed stream-json event from a `claude -p` transcript.
 ///
@@ -99,17 +127,19 @@ pub struct TranscriptSummary {
     pub last_event_at: Option<DateTime<Utc>>,
 }
 
-/// Parse the transcript JSONL into a Vec of typed events.
+/// Parse the transcript JSONL into a Vec of typed events using
+/// caller-supplied timing.
 ///
-/// Tolerates a partial trailing line (the `timeout`-kill case): if the
-/// final line fails to parse as JSON it's dropped silently. Earlier
-/// malformed lines are dropped with a `tracing::warn`.
+/// The first parsed event is stamped with `times.started_at`; every
+/// subsequent event with `times.last_event_at`. Tolerates a partial
+/// trailing line (the `timeout`-kill case): if the final line fails to
+/// parse as JSON it's dropped silently. Earlier malformed lines are
+/// dropped with a `tracing::warn`.
 #[must_use]
-pub fn parse_jsonl_lines(s: &str) -> Vec<TranscriptEvent> {
+pub fn parse_jsonl_lines(s: &str, times: TranscriptTimes) -> Vec<TranscriptEvent> {
     let lines: Vec<&str> = s.lines().collect();
     let total = lines.len();
     let mut out: Vec<TranscriptEvent> = Vec::with_capacity(total);
-    let now = Utc::now();
     for (idx, line) in lines.iter().enumerate() {
         if line.is_empty() {
             continue;
@@ -124,7 +154,12 @@ pub fn parse_jsonl_lines(s: &str) -> Vec<TranscriptEvent> {
                 continue;
             }
         };
-        out.push(parse_value(value, now));
+        let at = if out.is_empty() {
+            times.started_at
+        } else {
+            times.last_event_at
+        };
+        out.push(parse_value(value, at));
     }
     out
 }
@@ -264,8 +299,17 @@ fn parse_user(value: &Value, at: DateTime<Utc>) -> TranscriptEvent {
 
 /// Walk the transcript and find the most recent tool invocation. Returns
 /// `None` if there are no `tool_use` blocks anywhere in the stream.
+///
+/// `now` is the caller's wall-clock at request time — typically
+/// `Utc::now()` from the dashboard handler. For an unfinished tool call
+/// (no matching `tool_result`) the duration is `now - tool.started_at`,
+/// which gives the operator the wall-clock time the tool has been
+/// running. For a completed call it's `completed_at - started_at`.
 #[must_use]
-pub fn extract_last_tool_call(events: &[TranscriptEvent]) -> Option<LastToolCall> {
+pub fn extract_last_tool_call(
+    events: &[TranscriptEvent],
+    now: DateTime<Utc>,
+) -> Option<LastToolCall> {
     let mut last: Option<&ToolUse> = None;
     for ev in events {
         if let TranscriptEvent::Assistant { tool_uses, .. } = ev {
@@ -285,7 +329,6 @@ pub fn extract_last_tool_call(events: &[TranscriptEvent]) -> Option<LastToolCall
             }
         }
     }
-    let now = Utc::now();
     let end = completed_at.unwrap_or(now);
     let dur = end.signed_duration_since(tu.started_at);
     let secs: u64 = dur.num_seconds().max(0).try_into().unwrap_or(0);
@@ -299,6 +342,10 @@ pub fn extract_last_tool_call(events: &[TranscriptEvent]) -> Option<LastToolCall
 }
 
 /// Aggregate stats over a transcript.
+///
+/// `wall_clock_secs` is `last_event_at - first_event_at` derived from the
+/// stamped `at` fields, which the caller controls via [`TranscriptTimes`]
+/// in [`parse_jsonl_lines`].
 #[must_use]
 pub fn summarize(events: &[TranscriptEvent]) -> TranscriptSummary {
     let mut tool_histogram: BTreeMap<String, u64> = BTreeMap::new();
@@ -349,10 +396,19 @@ pub fn summarize(events: &[TranscriptEvent]) -> TranscriptSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::{Duration, TimeZone};
+
+    fn fixed_times(span_secs: i64) -> TranscriptTimes {
+        let started_at = Utc.with_ymd_and_hms(2026, 4, 27, 10, 0, 0).unwrap();
+        TranscriptTimes {
+            started_at,
+            last_event_at: started_at + Duration::seconds(span_secs),
+        }
+    }
 
     #[test]
     fn parse_empty_string_yields_empty_vec() {
-        assert!(parse_jsonl_lines("").is_empty());
+        assert!(parse_jsonl_lines("", fixed_times(0)).is_empty());
     }
 
     #[test]
@@ -361,10 +417,38 @@ mod tests {
 {"type":"assistant","message":{"id":"m","role":"assistant","content":[{"type":"text","text":"pong"}]}}
 {"type":"result","subtype":"success","result":"pong","is_error":false,"duration_ms":420}
 "#;
-        let events = parse_jsonl_lines(s);
+        let events = parse_jsonl_lines(s, fixed_times(7));
         assert_eq!(events.len(), 3);
         assert!(matches!(events[0], TranscriptEvent::SystemInit { .. }));
         assert!(matches!(events[1], TranscriptEvent::Assistant { .. }));
         assert!(matches!(events[2], TranscriptEvent::Result { .. }));
+    }
+
+    #[test]
+    fn unfinished_tool_call_has_nonzero_duration_when_now_after_last_event() {
+        // Regression-lock for the v4 reviewer blocker: durations and
+        // wall_clock_secs must be derived from caller-supplied wall-clock,
+        // not from a single `Utc::now()` read inside the parser.
+        let s = r#"{"type":"system","subtype":"init"}
+{"type":"assistant","message":{"id":"m","role":"assistant","content":[{"type":"tool_use","id":"tu","name":"Bash","input":{"command":"sleep 60"}}]}}
+"#;
+        let times = fixed_times(20);
+        let now = times.last_event_at + Duration::seconds(13);
+
+        let events = parse_jsonl_lines(s, times);
+        let summary = summarize(&events);
+        assert_eq!(
+            summary.wall_clock_secs, 20,
+            "wall_clock_secs must reflect caller-provided last - first"
+        );
+        assert_eq!(summary.first_event_at, Some(times.started_at));
+        assert_eq!(summary.last_event_at, Some(times.last_event_at));
+
+        let last = extract_last_tool_call(&events, now).expect("a tool_use exists");
+        assert!(!last.completed, "no tool_result yet → still running");
+        assert_eq!(
+            last.duration_so_far_secs, 13,
+            "duration_so_far_secs must be now - tool.started_at, not zero"
+        );
     }
 }
