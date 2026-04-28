@@ -2314,6 +2314,8 @@ dependencies = [
  "anyhow",
  "async-trait",
  "orchestrator-types",
+ "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
 ]
