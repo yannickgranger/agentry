@@ -145,3 +145,26 @@ which `<brief>[.<role>].jsonl` files are read. Constructed with a
 production default of `/var/lib/agentry/transcripts` and overridable in
 integration tests so the routes can be exercised against a tempdir
 without touching the host filesystem.
+
+## DashboardStore
+
+The typed adapter the dashboard interposes between request handlers and
+Redis. Owns a `redis::aio::ConnectionManager` privately so handlers never
+hold a connection lock; every method clones the manager (cheap — its
+internals are `Arc`-multiplexed) for its own work. Provides the dashboard's
+read paths (`fetch_recent_briefs`, `fetch_recent_verdicts`,
+`fetch_trace`, `active_briefs`), its write paths (`save`, `next_version`,
+`submit_brief`), and its live-stream subscribers (`subscribe_trace`,
+`subscribe_verdicts`). The subscribers maintain a `HashMap<String,
+broadcast::Sender<String>>` keyed by Redis stream name, lazily spawning
+ONE tail loop per stream and fanning out to every subscribed receiver —
+viewer count grows independently of Redis xread cost. The fanout HashMap
+is the only mutex the store holds, and it is a `std::sync::Mutex` released
+synchronously around the lookup-or-insert; no lock is ever held across
+`.await`. Listings flow through the `agentry:{kind}:_index` ZSET (single
+ZRANGE + single MGET per call) instead of the legacy SCAN+N×GET nesting
+that made dashboard pages take 12-20 seconds. Writes through `save`
+maintain the same index. The set `agentry:active_briefs` (maintained by
+the daemon via SADD on intake and SREM after handle_brief) is the source
+of truth for "briefs in flight" — `active_briefs` reads the set and
+MGETs the matching `agentry:brief:<id>:body` keys in one round-trip.
