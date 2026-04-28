@@ -10,6 +10,7 @@ repository.workspace = true
 [lib]
 
 [dependencies]
+clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
@@ -28,6 +29,10 @@ path = "src/bin/ac_verifier_gemini.rs"
 [[bin]]
 name = "ac-verifier-grok"
 path = "src/bin/ac_verifier_grok.rs"
+
+[[bin]]
+name = "ship"
+path = "src/bin/ship.rs"
 
 [lints]
 workspace = true
