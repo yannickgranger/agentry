@@ -26,6 +26,11 @@ use redis::AsyncCommands;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+/// Redis set tracking briefs currently in flight. The dashboard reads this
+/// via `DashboardStore::active_briefs` instead of XREVRANGE-ing the briefs
+/// stream and filtering against verdicts.
+const ACTIVE_BRIEFS_SET: &str = "agentry:active_briefs";
+
 /// Run the daemon loop forever using the given `Config`.
 pub async fn run(cfg: &crate::Config) -> Result<()> {
     let mut conn = redis_io::connect(&cfg.redis.url).await?;
@@ -76,6 +81,12 @@ pub async fn run(cfg: &crate::Config) -> Result<()> {
             Ok(Some((sid, brief))) => {
                 last_id = sid;
                 tracing::info!(brief = %brief.id, "received brief");
+                if let Err(e) = conn
+                    .sadd::<_, _, ()>(ACTIVE_BRIEFS_SET, brief.id.0.as_str())
+                    .await
+                {
+                    tracing::warn!(brief = %brief.id, error = %e, "active_briefs SADD failed");
+                }
                 let conn_clone = conn.clone();
                 let signing_clone = signing_key.clone();
                 let verifying_clone = verifying_key.clone();
@@ -109,6 +120,12 @@ pub async fn run(cfg: &crate::Config) -> Result<()> {
                                 .await
                                 .ok();
                         }
+                    }
+                    if let Err(e) = conn_for_brief
+                        .srem::<_, _, ()>(ACTIVE_BRIEFS_SET, brief_id.0.as_str())
+                        .await
+                    {
+                        tracing::warn!(brief = %brief_id, error = %e, "active_briefs SREM failed");
                     }
                 });
             }
