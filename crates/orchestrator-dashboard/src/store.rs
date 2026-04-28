@@ -37,6 +37,11 @@ use tokio::sync::broadcast;
 /// without exposing the `ConnectionManager` to handlers.
 struct Inner {
     conn: ConnectionManager,
+    /// Redis URL — kept so tail loops can open their OWN connection
+    /// (issue #167 probe: `ConnectionManager.clone()` shares the
+    /// multiplexed pipe; tail's blocking XREAD parks the pipe and
+    /// serialises every other clone's commands).
+    redis_url: String,
     fanouts: Mutex<HashMap<String, broadcast::Sender<String>>>,
     /// XREAD block timeout per iteration. Configurable so the eviction
     /// unit test can drive the loop fast.
@@ -80,6 +85,7 @@ impl DashboardStore {
         let store = Self {
             inner: Arc::new(Inner {
                 conn,
+                redis_url: url.to_string(),
                 fanouts: Mutex::new(HashMap::new()),
                 block_ms,
                 eviction_grace,
@@ -258,9 +264,24 @@ impl DashboardStore {
         let (tx, rx) = broadcast::channel::<String>(TRACE_FANOUT_CAPACITY);
         map.insert(stream.clone(), tx.clone());
         drop(map);
-        let conn = self.inner.conn.clone();
         let inner = self.inner.clone();
-        tokio::spawn(tail_stream(inner, conn, stream, field, tx));
+        let url = self.inner.redis_url.clone();
+        let stream_for_log = stream.clone();
+        tokio::spawn(async move {
+            // Tail loops MUST own their own TCP connection (issue #167):
+            // `ConnectionManager.clone()` shares the multiplexed pipe, and
+            // a parked `XREAD … BLOCK` serialises every other clone's
+            // commands. A fresh connect here gives the tail its own pipe
+            // so handler reads stay responsive.
+            match redis_io::connect(&url).await {
+                Ok(conn) => tail_stream(inner, conn, stream, field, tx).await,
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    stream = %stream_for_log,
+                    "tail_stream redis connect failed; subscribers will receive no events"
+                ),
+            }
+        });
         rx
     }
 
