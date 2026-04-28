@@ -168,3 +168,37 @@ maintain the same index. The set `agentry:active_briefs` (maintained by
 the daemon via SADD on intake and SREM after handle_brief) is the source
 of truth for "briefs in flight" — `active_briefs` reads the set and
 MGETs the matching `agentry:brief:<id>:body` keys in one round-trip.
+
+**Index backfill (startup migration).** `DashboardStore::new` runs a
+one-shot SCAN of `agentry:role:*`, `agentry:team:*`, and
+`agentry:project:*` and ZADDs every record key (skipping the `_index`
+ZSETs themselves and the `:_v` version counters) into the corresponding
+`agentry:{kind}:_index`. ZADD is idempotent for the same `(key, score)`
+pair, so re-runs are safe. The score is the parsed `:v{n}` suffix when
+present, else 1. Without this step records that pre-date the index —
+every role, team, and project already in the dogfood Redis — would
+silently drop out of the listings the moment the new code rolled out.
+SCAN is forbidden from runtime read paths inside
+`crates/orchestrator-dashboard/`; this startup migration is the one
+exception, called once and only once from `new`.
+
+**Project key shape.** Roles and teams are stored at
+`agentry:role:{name}:v{version}` and `agentry:team:{name}:v{version}` —
+the legacy versioned shape. Projects are stored at
+`agentry:project:{slug}` (unversioned), which is also the legacy shape
+and the shape `redis_io::fetch_project` reads from. The `save` method
+special-cases the project kind to honor that shape; swapping projects
+to a versioned key would orphan every existing project record in the
+dogfood instance and break the daemon's project fetch path.
+
+**Fanout eviction.** Every fanout entry is reaped by its own tail loop.
+Between XREAD iterations the loop checks `tx.receiver_count()`; if it
+is zero for at least `eviction_grace` (30s default), the loop acquires
+the fanout map lock, re-checks the count under the lock, removes the
+entry if still zero, and returns. The `ConnectionManager` clone the
+loop owned is dropped with the task. A new subscriber for the same
+stream simply re-enters `subscribe_stream`, finds no entry, creates a
+fresh `Sender`, and spawns a new tail loop. The grace period exists so
+a burst of viewers reconnecting (page refresh, transient network
+hiccup) doesn't cause loop teardown-then-respawn churn — the original
+anti-pattern this fanout was introduced to fix.
