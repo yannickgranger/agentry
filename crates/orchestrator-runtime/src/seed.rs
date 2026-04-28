@@ -1699,9 +1699,10 @@ fn build_ac_verifier_claude_agentry_role(home: &str, claude_settings_path: &str)
 /// Build the ac-verifier-gemini-agentry role. Sibling of
 /// `ac-verifier-claude-agentry` (brief 2 of #134). Same shape: reads the
 /// brief's `acceptance_criteria` + the coder's git diff, asks Gemini for a
-/// per-AC verdict, emits one blocker `Finding` per failed AC. Registered in
-/// Redis but NOT yet wired into `agentry-self-host-v0` — brief 5 introduces
-/// the parallel-pipeline mode that fans out to all three providers.
+/// per-AC verdict, emits one blocker `Finding` per failed AC. Brief 5 of #134
+/// wired this role into `agentry-self-host-v0` as a parallel sibling of the
+/// claude variant; coder fans out to all three providers and any verifier
+/// emitting failed rewinds to the coder before reviewers spawn.
 fn build_ac_verifier_gemini_agentry_role(home: &str) -> AgentRole {
     AgentRole {
         name: RoleName("ac-verifier-gemini-agentry".into()),
@@ -1737,10 +1738,10 @@ fn build_ac_verifier_gemini_agentry_role(home: &str) -> AgentRole {
 }
 
 /// Build the ac-verifier-grok-agentry role. Sibling of the claude variant
-/// (brief 4 of #134). Registered in Redis but NOT yet wired into
-/// `agentry-self-host-v0`; brief 5 enables parallel mode. Same degradation
-/// envelope: missing/empty AC list, missing binary, or invalid grok JSON
-/// degrades to `done shipped`.
+/// (brief 4 of #134). Brief 5 of #134 enabled parallel mode by wiring grok
+/// alongside claude and gemini in the `agentry-self-host-v0` DAG. Same
+/// degradation envelope: missing/empty AC list, missing binary, or invalid
+/// grok JSON degrades to `done shipped`.
 fn build_ac_verifier_grok_agentry_role(home: &str) -> AgentRole {
     AgentRole {
         name: RoleName("ac-verifier-grok-agentry".into()),
@@ -3003,6 +3004,8 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         roles: vec![
             coder_claude_agentry.name.clone(),
             ac_verifier_claude_agentry.name.clone(),
+            ac_verifier_gemini_agentry.name.clone(),
+            ac_verifier_grok_agentry.name.clone(),
             reviewer_mechanical_agentry.name.clone(),
             reviewer_claude_agentry.name.clone(),
             shipper_agentry.name.clone(),
@@ -3012,9 +3015,9 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         // fix findings emitted by the reviewer before the team resolves Failed.
         message_graph: vec![
             // ORDERING INVARIANT: coder→reviewer edges are listed BEFORE
-            // ac-verifier→reviewer edges so the daemon's
+            // ac-verifier-{claude,gemini,grok}→reviewer edges so the daemon's
             // `team.incoming(reviewer).first()` rework lookup rewinds to the
-            // coder, not to the (non-corrective) ac-verifier. Do not reorder.
+            // coder, not to a (non-corrective) ac-verifier. Do not reorder.
             MessageEdge {
                 from: coder_claude_agentry.name.clone(),
                 to: reviewer_mechanical_agentry.name.clone(),
@@ -3041,6 +3044,39 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
             },
             MessageEdge {
                 from: ac_verifier_claude_agentry.name.clone(),
+                to: reviewer_claude_agentry.name.clone(),
+                permit_overrides_from: None,
+            },
+            // Parallel ac-verifier siblings: gemini + grok fan out from the
+            // coder and signal both reviewers. Any verifier emitting failed
+            // rewinds to the coder before reviewers spawn (fail-closed).
+            MessageEdge {
+                from: coder_claude_agentry.name.clone(),
+                to: ac_verifier_gemini_agentry.name.clone(),
+                permit_overrides_from: None,
+            },
+            MessageEdge {
+                from: coder_claude_agentry.name.clone(),
+                to: ac_verifier_grok_agentry.name.clone(),
+                permit_overrides_from: None,
+            },
+            MessageEdge {
+                from: ac_verifier_gemini_agentry.name.clone(),
+                to: reviewer_mechanical_agentry.name.clone(),
+                permit_overrides_from: None,
+            },
+            MessageEdge {
+                from: ac_verifier_gemini_agentry.name.clone(),
+                to: reviewer_claude_agentry.name.clone(),
+                permit_overrides_from: None,
+            },
+            MessageEdge {
+                from: ac_verifier_grok_agentry.name.clone(),
+                to: reviewer_mechanical_agentry.name.clone(),
+                permit_overrides_from: None,
+            },
+            MessageEdge {
+                from: ac_verifier_grok_agentry.name.clone(),
                 to: reviewer_claude_agentry.name.clone(),
                 permit_overrides_from: None,
             },
@@ -3678,6 +3714,8 @@ mod tests {
         // touching Redis. Keep in sync with seed_m0.
         let coder = build_coder_claude_agentry_role("/h", "/c");
         let ac_verifier = build_ac_verifier_claude_agentry_role("/h", "/c");
+        let ac_verifier_gemini = build_ac_verifier_gemini_agentry_role("/h");
+        let ac_verifier_grok = build_ac_verifier_grok_agentry_role("/h");
         let reviewer_claude = build_reviewer_claude_agentry_role("/h", "/c");
         // Synthesize the names — mechanical reviewer + shipper + ci-watcher
         // are inline AgentRole literals in seed_m0; we only need their names
@@ -3692,6 +3730,8 @@ mod tests {
             roles: vec![
                 coder.name.clone(),
                 ac_verifier.name.clone(),
+                ac_verifier_gemini.name.clone(),
+                ac_verifier_grok.name.clone(),
                 reviewer_mechanical.clone(),
                 reviewer_claude.name.clone(),
                 shipper.clone(),
@@ -3720,6 +3760,36 @@ mod tests {
                 },
                 MessageEdge {
                     from: ac_verifier.name.clone(),
+                    to: reviewer_claude.name.clone(),
+                    permit_overrides_from: None,
+                },
+                MessageEdge {
+                    from: coder.name.clone(),
+                    to: ac_verifier_gemini.name.clone(),
+                    permit_overrides_from: None,
+                },
+                MessageEdge {
+                    from: coder.name.clone(),
+                    to: ac_verifier_grok.name.clone(),
+                    permit_overrides_from: None,
+                },
+                MessageEdge {
+                    from: ac_verifier_gemini.name.clone(),
+                    to: reviewer_mechanical.clone(),
+                    permit_overrides_from: None,
+                },
+                MessageEdge {
+                    from: ac_verifier_gemini.name.clone(),
+                    to: reviewer_claude.name.clone(),
+                    permit_overrides_from: None,
+                },
+                MessageEdge {
+                    from: ac_verifier_grok.name.clone(),
+                    to: reviewer_mechanical.clone(),
+                    permit_overrides_from: None,
+                },
+                MessageEdge {
+                    from: ac_verifier_grok.name.clone(),
                     to: reviewer_claude.name.clone(),
                     permit_overrides_from: None,
                 },
@@ -3759,6 +3829,7 @@ mod tests {
         let acv_to_rev_mech = edge_idx(&ac_verifier.name, &reviewer_mechanical);
         let acv_to_rev_claude = edge_idx(&ac_verifier.name, &reviewer_claude.name);
         let coder_to_rev_mech = edge_idx(&coder.name, &reviewer_mechanical);
+        let coder_to_rev_claude = edge_idx(&coder.name, &reviewer_claude.name);
 
         assert!(coder_to_acv.is_some(), "coder→ac-verifier edge must exist");
         assert!(
@@ -3774,6 +3845,48 @@ mod tests {
             "coder→reviewer-mechanical edge must exist (rework target)"
         );
 
+        // Brief 5 of #134: gemini + grok wired as parallel siblings.
+        assert!(
+            topology.roles.contains(&ac_verifier_gemini.name),
+            "ac-verifier-gemini-agentry must be in roles"
+        );
+        assert!(
+            topology.roles.contains(&ac_verifier_grok.name),
+            "ac-verifier-grok-agentry must be in roles"
+        );
+
+        let coder_to_acv_gemini = edge_idx(&coder.name, &ac_verifier_gemini.name);
+        let coder_to_acv_grok = edge_idx(&coder.name, &ac_verifier_grok.name);
+        let acv_gemini_to_rev_mech = edge_idx(&ac_verifier_gemini.name, &reviewer_mechanical);
+        let acv_gemini_to_rev_claude = edge_idx(&ac_verifier_gemini.name, &reviewer_claude.name);
+        let acv_grok_to_rev_mech = edge_idx(&ac_verifier_grok.name, &reviewer_mechanical);
+        let acv_grok_to_rev_claude = edge_idx(&ac_verifier_grok.name, &reviewer_claude.name);
+
+        assert!(
+            coder_to_acv_gemini.is_some(),
+            "coder→ac-verifier-gemini edge must exist"
+        );
+        assert!(
+            coder_to_acv_grok.is_some(),
+            "coder→ac-verifier-grok edge must exist"
+        );
+        assert!(
+            acv_gemini_to_rev_mech.is_some(),
+            "ac-verifier-gemini→reviewer-mechanical edge must exist"
+        );
+        assert!(
+            acv_gemini_to_rev_claude.is_some(),
+            "ac-verifier-gemini→reviewer-claude edge must exist"
+        );
+        assert!(
+            acv_grok_to_rev_mech.is_some(),
+            "ac-verifier-grok→reviewer-mechanical edge must exist"
+        );
+        assert!(
+            acv_grok_to_rev_claude.is_some(),
+            "ac-verifier-grok→reviewer-claude edge must exist"
+        );
+
         // Dual-inbound ordering invariant: coder→reviewer-mechanical MUST
         // appear BEFORE ac-verifier→reviewer-mechanical so the daemon's
         // `team.incoming(reviewer).first()` rework lookup rewinds to the
@@ -3785,6 +3898,183 @@ mod tests {
         assert!(
             coder_pos < acv_pos,
             "coder→reviewer-mechanical must appear before ac-verifier→reviewer-mechanical (rework rewinds to coder, not ac-verifier)"
+        );
+
+        // Extended ordering invariant across all three verifier variants:
+        // every coder→reviewer edge index must be less than every
+        // ac-verifier-*→reviewer edge index.
+        let coder_to_reviewer_indices: Vec<usize> = [coder_to_rev_mech, coder_to_rev_claude]
+            .iter()
+            .map(|opt| opt.expect("coder→reviewer edge already asserted present"))
+            .collect();
+        let acv_to_reviewer_indices: Vec<usize> = [
+            acv_to_rev_mech,
+            acv_to_rev_claude,
+            acv_gemini_to_rev_mech,
+            acv_gemini_to_rev_claude,
+            acv_grok_to_rev_mech,
+            acv_grok_to_rev_claude,
+        ]
+        .iter()
+        .map(|opt| opt.expect("ac-verifier→reviewer edge already asserted present"))
+        .collect();
+        for c_idx in &coder_to_reviewer_indices {
+            for a_idx in &acv_to_reviewer_indices {
+                assert!(
+                    c_idx < a_idx,
+                    "coder→reviewer edge at {c_idx} must precede ac-verifier→reviewer edge at {a_idx}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn agentry_self_host_v0_topology_has_all_three_ac_verifiers_wired_in_parallel() {
+        // Mirror of the agentry-self-host-v0 topology block in seed_m0 — built
+        // here so the parallel-verifier wiring is covered without touching
+        // Redis. Keep in sync with seed_m0.
+        let coder = build_coder_claude_agentry_role("/h", "/c");
+        let ac_verifier_claude = build_ac_verifier_claude_agentry_role("/h", "/c");
+        let ac_verifier_gemini = build_ac_verifier_gemini_agentry_role("/h");
+        let ac_verifier_grok = build_ac_verifier_grok_agentry_role("/h");
+        let reviewer_claude = build_reviewer_claude_agentry_role("/h", "/c");
+        let reviewer_mechanical = RoleName("reviewer-mechanical-agentry".into());
+        let shipper = RoleName("shipper-agentry".into());
+        let ci_watcher = RoleName("ci-watcher-agentry".into());
+
+        let topology = TeamTopology {
+            name: TeamName("agentry-self-host-v0".into()),
+            version: 1,
+            roles: vec![
+                coder.name.clone(),
+                ac_verifier_claude.name.clone(),
+                ac_verifier_gemini.name.clone(),
+                ac_verifier_grok.name.clone(),
+                reviewer_mechanical.clone(),
+                reviewer_claude.name.clone(),
+                shipper.clone(),
+                ci_watcher.clone(),
+            ],
+            message_graph: vec![
+                MessageEdge {
+                    from: coder.name.clone(),
+                    to: reviewer_mechanical.clone(),
+                    permit_overrides_from: None,
+                },
+                MessageEdge {
+                    from: coder.name.clone(),
+                    to: reviewer_claude.name.clone(),
+                    permit_overrides_from: None,
+                },
+                MessageEdge {
+                    from: coder.name.clone(),
+                    to: ac_verifier_claude.name.clone(),
+                    permit_overrides_from: None,
+                },
+                MessageEdge {
+                    from: ac_verifier_claude.name.clone(),
+                    to: reviewer_mechanical.clone(),
+                    permit_overrides_from: None,
+                },
+                MessageEdge {
+                    from: ac_verifier_claude.name.clone(),
+                    to: reviewer_claude.name.clone(),
+                    permit_overrides_from: None,
+                },
+                MessageEdge {
+                    from: coder.name.clone(),
+                    to: ac_verifier_gemini.name.clone(),
+                    permit_overrides_from: None,
+                },
+                MessageEdge {
+                    from: coder.name.clone(),
+                    to: ac_verifier_grok.name.clone(),
+                    permit_overrides_from: None,
+                },
+                MessageEdge {
+                    from: ac_verifier_gemini.name.clone(),
+                    to: reviewer_mechanical.clone(),
+                    permit_overrides_from: None,
+                },
+                MessageEdge {
+                    from: ac_verifier_gemini.name.clone(),
+                    to: reviewer_claude.name.clone(),
+                    permit_overrides_from: None,
+                },
+                MessageEdge {
+                    from: ac_verifier_grok.name.clone(),
+                    to: reviewer_mechanical.clone(),
+                    permit_overrides_from: None,
+                },
+                MessageEdge {
+                    from: ac_verifier_grok.name.clone(),
+                    to: reviewer_claude.name.clone(),
+                    permit_overrides_from: None,
+                },
+                MessageEdge {
+                    from: reviewer_mechanical.clone(),
+                    to: shipper.clone(),
+                    permit_overrides_from: None,
+                },
+                MessageEdge {
+                    from: reviewer_claude.name.clone(),
+                    to: shipper.clone(),
+                    permit_overrides_from: None,
+                },
+                MessageEdge {
+                    from: shipper.clone(),
+                    to: ci_watcher.clone(),
+                    permit_overrides_from: None,
+                },
+            ],
+            terminal_role: ci_watcher.clone(),
+            max_retries: 2,
+        };
+
+        // (a) all three verifier role names present.
+        assert!(
+            topology.roles.contains(&ac_verifier_claude.name),
+            "ac-verifier-claude-agentry must be in roles"
+        );
+        assert!(
+            topology.roles.contains(&ac_verifier_gemini.name),
+            "ac-verifier-gemini-agentry must be in roles"
+        );
+        assert!(
+            topology.roles.contains(&ac_verifier_grok.name),
+            "ac-verifier-grok-agentry must be in roles"
+        );
+
+        // (b) coder fans out to all three verifiers.
+        let coder_to_verifier_count = topology
+            .message_graph
+            .iter()
+            .filter(|e| {
+                e.from == coder.name
+                    && (e.to == ac_verifier_claude.name
+                        || e.to == ac_verifier_gemini.name
+                        || e.to == ac_verifier_grok.name)
+            })
+            .count();
+        assert_eq!(
+            coder_to_verifier_count, 3,
+            "coder must fan out to all three ac-verifier variants (claude, gemini, grok)"
+        );
+
+        // (c) each verifier signals both reviewers (six edges total).
+        let verifier_to_reviewer_count = topology
+            .message_graph
+            .iter()
+            .filter(|e| {
+                (e.from == ac_verifier_claude.name
+                    || e.from == ac_verifier_gemini.name
+                    || e.from == ac_verifier_grok.name)
+                    && (e.to == reviewer_mechanical || e.to == reviewer_claude.name)
+            })
+            .count();
+        assert_eq!(
+            verifier_to_reviewer_count, 6,
+            "each ac-verifier variant must signal both reviewers (3 verifiers × 2 reviewers = 6)"
         );
     }
 
