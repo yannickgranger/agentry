@@ -318,6 +318,13 @@ impl Spawner for PodmanSpawner {
                 }
             }
         }
+        // Universal brief context: every role spawn carries the brief id,
+        // kind (snake_case), and base branch on its env. The coder's
+        // `/usr/local/bin/ship` reads these to drive the validator pipeline;
+        // other roles may consume them for diagnostics.
+        for kv in brief_env_args(brief) {
+            cmd.arg("--env").arg(kv);
+        }
         // Bind mounts: `-v source:target[:ro]`. When mounts are declared,
         // disable SELinux label translation — otherwise rootless podman on
         // Fedora/Silverblue can't read host-owned files (EACCES). `:z`/`:Z`
@@ -686,6 +693,34 @@ async fn append_audit(
     Ok(())
 }
 
+/// Build the `KEY=VALUE` strings injected as universal brief context env
+/// vars on every role spawn. Kept as a free function so the snake_case
+/// kind serialization round-trip with `BriefKind`'s serde tag is unit-testable
+/// without spawning podman.
+///
+/// Order: `AGENTRY_BRIEF_ID`, `AGENTRY_BRIEF_KIND`, `AGENTRY_BASE_BRANCH`.
+/// `kind` falls back to `new_feature` (the safe default — fullest pipeline)
+/// when the brief omits it. `base_branch` is read from the JSON payload
+/// (`brief.payload.base_branch`) and falls back to `develop`.
+fn brief_env_args(brief: &Brief) -> Vec<String> {
+    let kind_str = brief
+        .kind
+        .as_ref()
+        .and_then(|k| serde_json::to_value(k).ok())
+        .and_then(|v| v.as_str().map(String::from))
+        .unwrap_or_else(|| "new_feature".to_string());
+    let base = brief
+        .payload
+        .get("base_branch")
+        .and_then(|v| v.as_str())
+        .unwrap_or("develop");
+    vec![
+        format!("AGENTRY_BRIEF_ID={}", brief.id.0),
+        format!("AGENTRY_BRIEF_KIND={kind_str}"),
+        format!("AGENTRY_BASE_BRANCH={base}"),
+    ]
+}
+
 /// Roles whose coder-tooling bind-mounts (ra-query, dead-pub-check, ship) may
 /// be silently skipped when the host binary is missing. The reviewer pre-pass,
 /// the coder's pre-commit dead-pub gate, and (since brief 1 of #134) the
@@ -1023,6 +1058,69 @@ mod tests {
         assert!(!is_coder_tool_mount_target("/usr/local/bin/claude"));
         assert!(!is_coder_tool_mount_target("/transcripts"));
         assert!(!is_coder_tool_mount_target(""));
+    }
+
+    fn brief_with_kind(kind: Option<orchestrator_types::BriefKind>) -> Brief {
+        let mut b = Brief::new(
+            "tester",
+            orchestrator_types::VersionedRef::new("echo-team", 1),
+            serde_json::json!({"base_branch": "develop"}),
+        );
+        b.id = BriefId("brf_envtest".into());
+        b.kind = kind;
+        b
+    }
+
+    #[test]
+    fn brief_env_args_serializes_refactor_as_snake_case() {
+        let b = brief_with_kind(Some(orchestrator_types::BriefKind::Refactor));
+        let kvs = brief_env_args(&b);
+        assert!(
+            kvs.iter().any(|s| s == "AGENTRY_BRIEF_KIND=refactor"),
+            "expected refactor env var, got {kvs:?}"
+        );
+    }
+
+    #[test]
+    fn brief_env_args_serializes_new_feature_as_snake_case() {
+        // Critical: Debug-trait formatting would render `NewFeature` as
+        // `newfeature`, which fails `from_value::<BriefKind>` round-trip.
+        let b = brief_with_kind(Some(orchestrator_types::BriefKind::NewFeature));
+        let kvs = brief_env_args(&b);
+        assert!(
+            kvs.iter().any(|s| s == "AGENTRY_BRIEF_KIND=new_feature"),
+            "expected new_feature env var, got {kvs:?}"
+        );
+    }
+
+    #[test]
+    fn brief_env_args_defaults_kind_to_new_feature_when_absent() {
+        let b = brief_with_kind(None);
+        let kvs = brief_env_args(&b);
+        assert!(
+            kvs.iter().any(|s| s == "AGENTRY_BRIEF_KIND=new_feature"),
+            "expected new_feature default, got {kvs:?}"
+        );
+    }
+
+    #[test]
+    fn brief_env_args_includes_id_and_base_branch() {
+        let b = brief_with_kind(Some(orchestrator_types::BriefKind::Mechanical));
+        let kvs = brief_env_args(&b);
+        assert!(kvs.iter().any(|s| s == "AGENTRY_BRIEF_ID=brf_envtest"));
+        assert!(kvs.iter().any(|s| s == "AGENTRY_BASE_BRANCH=develop"));
+    }
+
+    #[test]
+    fn brief_env_args_base_branch_falls_back_when_payload_lacks_it() {
+        let mut b = Brief::new(
+            "tester",
+            orchestrator_types::VersionedRef::new("echo-team", 1),
+            serde_json::json!({}),
+        );
+        b.id = BriefId("brf_envtest".into());
+        let kvs = brief_env_args(&b);
+        assert!(kvs.iter().any(|s| s == "AGENTRY_BASE_BRANCH=develop"));
     }
 
     #[test]

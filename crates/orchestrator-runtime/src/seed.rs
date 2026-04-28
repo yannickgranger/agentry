@@ -449,7 +449,7 @@ Your task is described in verb-structured form below. Follow it literally:
 each verb (CREATE / UPDATE / REPLACE / DELETE / MOVE) names a transformation
 on a specific file:line target. Do NOT invent additional changes.
 
-# /usr/local/bin/ship — STUB for EPIC #152, do NOT call yet. Brief 4 wires the validator pipeline; for now continue using git directly.
+# /usr/local/bin/ship — runs the brief.kind's validator pipeline against /workspace and prints a JSON report. Calling it is OPTIONAL in this brief; brief 6 makes it the only path to publication. Use it as a self-check before git commit if you want.
 
 ${rework_banner}
 
