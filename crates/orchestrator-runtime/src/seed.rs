@@ -2314,6 +2314,59 @@ fn build_verifier_claude_agentry_role() -> AgentRole {
     }
 }
 
+/// Build the `git-operator` role. Ephemeral substrate-side worker that runs
+/// `git add`/`commit`/`push` against /workspace and opens a PR via the gitea
+/// REST API. The role's entrypoint is a one-line shell exec into the
+/// bind-mounted Rust binary at `/usr/local/bin/git-operator` — acceptable
+/// bootstrap glue per the refined EPIC #161 rule (no bash logic).
+///
+/// Bind-mounts `~/.local/bin/git-operator` from the host (built via
+/// `just git-operator-binary`). Workspace mount is writable because git
+/// updates `.git/{HEAD,refs,reflog}` during commit and push.
+///
+/// Registered in the seed but NOT wired into any topology — brief 6 of
+/// EPIC #152 cuts agentry-self-host-v0 over from `shipper-agentry`.
+fn build_git_operator_role(home: &str) -> AgentRole {
+    AgentRole {
+        name: RoleName("git-operator".into()),
+        version: 1,
+        model: None,
+        system_prompt: None,
+        image: ALPINE.into(),
+        substrate_class: SubstrateClass::Podman,
+        package_manager: PackageManager::Apk,
+        // Bootstrap glue only: exec the bind-mounted Rust binary. All git +
+        // forge logic lives in the binary, not in this script.
+        entrypoint_script: "#!/bin/sh\nexec /usr/local/bin/git-operator\n".into(),
+        exitpoint_script: None,
+        // alpine + git + ca-certificates is enough — reqwest links rustls and
+        // talks to the gitea API directly, so curl is not needed.
+        binaries: vec!["git".into(), "ca-certificates".into()],
+        mcp_servers: vec![],
+        tool_allowlist: ToolAllowlist(vec!["git".into()]),
+        permit_scope: PermitScope(vec![
+            "fs:read:/workspace/**".into(),
+            "fs:write:/workspace/**".into(),
+            "net:allow:agency.lab".into(),
+            "forge:write:yg/*".into(),
+        ]),
+        passthru_env: vec!["GITEA_TOKEN".into()],
+        extra_bootstrap: vec![],
+        mounts: vec![Mount {
+            source: format!("{home}/.local/bin/git-operator"),
+            target: "/usr/local/bin/git-operator".into(),
+            readonly: true,
+        }],
+        // git push writes to /workspace/.git/{HEAD,refs,reflog,FETCH_HEAD};
+        // workspace mount must be writable.
+        workspace_mount: Some(WorkspaceMount {
+            container_path: "/workspace".into(),
+            readonly: false,
+        }),
+        sccache: false,
+    }
+}
+
 const SHIPPER_SCRIPT: &str = r#"#!/usr/bin/env bash
 # Reads {repo, branch, file, content, commit_msg, pr_title, pr_body, base,
 # forge_host} from brief.payload. Clones forge repo with GITEA_TOKEN,
@@ -3175,6 +3228,10 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         max_retries: 0,
     };
 
+    // EPIC #152 brief 5: git-operator role registered but NOT wired into any
+    // topology. Brief 6 cuts agentry-self-host-v0 over from shipper-agentry.
+    let git_operator = build_git_operator_role(&home);
+
     // ---- persist everything ----
     redis_io::save_role(&mut conn, &echo).await?;
     redis_io::save_team(&mut conn, &echo_team).await?;
@@ -3219,9 +3276,10 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
     redis_io::save_team(&mut conn, &agentry_planner_v0).await?;
     redis_io::save_role(&mut conn, &verifier_claude_agentry).await?;
     redis_io::save_team(&mut conn, &agentry_verify_v0).await?;
+    redis_io::save_role(&mut conn, &git_operator).await?;
 
     tracing::info!(
-        "seeded: roles [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker, listener, grok-echo, claude-echo, synthesizer, narrowed-coder, shipper, coder-claude-agentry, ac-verifier-claude-agentry, ac-verifier-gemini-agentry, ac-verifier-grok-agentry, reviewer-mechanical-agentry, shipper-agentry, ci-watcher-agentry, reviewer-claude-agentry, null-agent-agentry, archaeologist-claude-agentry, planner-claude-agentry, verifier-claude-agentry] (inline entrypoint scripts); teams [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker-listener, grok-echo, claude-echo, narrowed-team, shipper-solo-team, agentry-self-host-v0, agentry-null-v0, agentry-discovery-v0, agentry-planner-v0, agentry-verify-v0]"
+        "seeded: roles [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker, listener, grok-echo, claude-echo, synthesizer, narrowed-coder, shipper, coder-claude-agentry, ac-verifier-claude-agentry, ac-verifier-gemini-agentry, ac-verifier-grok-agentry, reviewer-mechanical-agentry, shipper-agentry, ci-watcher-agentry, reviewer-claude-agentry, auditor-claude-agentry, null-agent-agentry, archaeologist-claude-agentry, planner-claude-agentry, verifier-claude-agentry, git-operator] (inline entrypoint scripts); teams [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker-listener, grok-echo, claude-echo, narrowed-team, shipper-solo-team, agentry-self-host-v0, agentry-null-v0, agentry-discovery-v0, agentry-planner-v0, agentry-verify-v0]"
     );
     Ok(())
 }
@@ -3234,6 +3292,48 @@ mod tests {
     fn claude_p_timeout_is_env_overridable_in_bash_prelude() {
         assert!(BASH_PRELUDE.contains("CLAUDE_P_TIMEOUT=\"${CLAUDE_P_TIMEOUT:-1200}\""));
         assert!(!BASH_PRELUDE.contains("timeout 600"));
+    }
+
+    #[test]
+    fn git_operator_role_has_workspace_mount_and_token_passthru() {
+        let role = build_git_operator_role("/h");
+        assert_eq!(role.name.0, "git-operator");
+        assert!(
+            role.workspace_mount.is_some(),
+            "git-operator must have a workspace_mount (writable for git push)"
+        );
+        let ws = role.workspace_mount.as_ref().expect("workspace_mount");
+        assert_eq!(ws.container_path, "/workspace");
+        assert!(
+            !ws.readonly,
+            "workspace mount must be writable — git push updates .git/{{HEAD,refs,reflog}}"
+        );
+        assert!(
+            role.passthru_env.iter().any(|e| e == "GITEA_TOKEN"),
+            "git-operator must passthru GITEA_TOKEN for the gitea API auth header"
+        );
+        assert!(
+            role.permit_scope
+                .0
+                .iter()
+                .any(|s| s == "net:allow:agency.lab"),
+            "git-operator permit_scope must allow net:allow:agency.lab for the gitea API call"
+        );
+        assert!(
+            role.mounts
+                .iter()
+                .any(|m| m.target == "/usr/local/bin/git-operator" && m.readonly),
+            "git-operator must bind-mount the host binary read-only at /usr/local/bin/git-operator"
+        );
+        assert!(
+            role.entrypoint_script
+                .contains("exec /usr/local/bin/git-operator"),
+            "git-operator entrypoint must be the one-line shell exec into the Rust binary"
+        );
+        assert!(
+            !role.entrypoint_script.contains("jq") && !role.entrypoint_script.contains("curl"),
+            "git-operator entrypoint must not embed bash logic — all logic is in the Rust binary"
+        );
     }
 
     #[test]
