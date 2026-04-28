@@ -439,6 +439,7 @@ printf 'export issue_title=%q\n' "$issue_title"  >> /tmp/brief_vars.sh
 printf 'export issue_body=%q\n' "$issue_body"    >> /tmp/brief_vars.sh
 printf 'export acceptance=%q\n' "$acceptance"    >> /tmp/brief_vars.sh
 printf 'export branch=%q\n' "$branch"            >> /tmp/brief_vars.sh
+printf 'export topology_name=%q\n' "$(jq -r '.brief.topology.name // ""' <<<"$bundle")" >> /tmp/brief_vars.sh
 
 cat > /tmp/prompt.txt <<PROMPT
 You are the coder role inside the agentry autonomous team, operating in the
@@ -466,6 +467,7 @@ Constraints:
     $acceptance
 - Do not commit or push. The orchestrator handles commit and push on your
   behalf after you exit.
+- The orchestrator may be running you in \`agentry-self-host-v1\` topology (or a later v1+). In that case: do not commit, do not push. The \`/usr/local/bin/ship\` tool (when called) runs the validator pipeline against your changes; if it returns ok, exit and the orchestrator's git-operator role takes over. Topology name is in \$topology_name.
 
 When the transformations are complete and the acceptance passes, simply
 report success and exit.
@@ -482,6 +484,14 @@ const CODER_CLAUDE_AGENTRY_EXITPOINT: &str = r##"#!/usr/bin/env bash
 set -euo pipefail
 . /tmp/brief_vars.sh
 cd /workspace
+
+# If running under a v1+ topology, the orchestrator's git-operator role
+# handles commit + push. Coder's exitpoint just runs baseline fmt and exits.
+if [[ "${topology_name}" =~ -v[1-9][0-9]*$ ]]; then
+    emit_event '{"msg":"v1+ topology — skipping coder-side commit/push (git-operator role does it)"}'
+    cargo fmt --all 2>/dev/null || true
+    emit_done "shipped"; exit 0
+fi
 
 # Baseline fmt — always run, no install dependency. rustfmt ships with
 # rustup and is already provisioned via extra_bootstrap. Protects against
@@ -3164,6 +3174,46 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         max_retries: 2,
     };
 
+    // EPIC #152 brief 5: git-operator role registered. Brief 6 (this brief)
+    // wires it into the new agentry-self-host-v1 topology below.
+    let git_operator = build_git_operator_role(&home);
+
+    // EPIC #152 brief 6: agentry-self-host-v1 — new topology shape.
+    // Validators inside the coder's `/usr/local/bin/ship` tool absorb
+    // reviewer-mechanical + ac-verifier roles. `git-operator` absorbs
+    // shipper-agentry. `reviewer-claude` stays as design-review.
+    //
+    // v0 stays unchanged so in-flight v0 briefs continue to ship clean.
+    let agentry_self_host_v1 = TeamTopology {
+        name: TeamName("agentry-self-host-v1".into()),
+        version: 1,
+        roles: vec![
+            coder_claude_agentry.name.clone(),
+            reviewer_claude_agentry.name.clone(),
+            git_operator.name.clone(),
+            ci_watcher_agentry.name.clone(),
+        ],
+        message_graph: vec![
+            MessageEdge {
+                from: coder_claude_agentry.name.clone(),
+                to: reviewer_claude_agentry.name.clone(),
+                permit_overrides_from: None,
+            },
+            MessageEdge {
+                from: reviewer_claude_agentry.name.clone(),
+                to: git_operator.name.clone(),
+                permit_overrides_from: None,
+            },
+            MessageEdge {
+                from: git_operator.name.clone(),
+                to: ci_watcher_agentry.name.clone(),
+                permit_overrides_from: None,
+            },
+        ],
+        terminal_role: ci_watcher_agentry.name.clone(),
+        max_retries: 2,
+    };
+
     let agentry_bugfix_v0 = TeamTopology {
         name: TeamName("agentry-bugfix-v0".into()),
         version: 1,
@@ -3228,10 +3278,6 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         max_retries: 0,
     };
 
-    // EPIC #152 brief 5: git-operator role registered but NOT wired into any
-    // topology. Brief 6 cuts agentry-self-host-v0 over from shipper-agentry.
-    let git_operator = build_git_operator_role(&home);
-
     // ---- persist everything ----
     redis_io::save_role(&mut conn, &echo).await?;
     redis_io::save_team(&mut conn, &echo_team).await?;
@@ -3264,6 +3310,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
     redis_io::save_role(&mut conn, &shipper_agentry).await?;
     redis_io::save_role(&mut conn, &ci_watcher_agentry).await?;
     redis_io::save_team(&mut conn, &agentry_self_host_v0).await?;
+    redis_io::save_team(&mut conn, &agentry_self_host_v1).await?;
     redis_io::save_team(&mut conn, &agentry_bugfix_v0).await?;
     redis_io::save_team(&mut conn, &agentry_spec_edit_v0).await?;
     redis_io::save_role(&mut conn, &auditor_claude_agentry).await?;
@@ -3279,7 +3326,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
     redis_io::save_role(&mut conn, &git_operator).await?;
 
     tracing::info!(
-        "seeded: roles [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker, listener, grok-echo, claude-echo, synthesizer, narrowed-coder, shipper, coder-claude-agentry, ac-verifier-claude-agentry, ac-verifier-gemini-agentry, ac-verifier-grok-agentry, reviewer-mechanical-agentry, shipper-agentry, ci-watcher-agentry, reviewer-claude-agentry, auditor-claude-agentry, null-agent-agentry, archaeologist-claude-agentry, planner-claude-agentry, verifier-claude-agentry, git-operator] (inline entrypoint scripts); teams [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker-listener, grok-echo, claude-echo, narrowed-team, shipper-solo-team, agentry-self-host-v0, agentry-null-v0, agentry-discovery-v0, agentry-planner-v0, agentry-verify-v0]"
+        "seeded: roles [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker, listener, grok-echo, claude-echo, synthesizer, narrowed-coder, shipper, coder-claude-agentry, ac-verifier-claude-agentry, ac-verifier-gemini-agentry, ac-verifier-grok-agentry, reviewer-mechanical-agentry, shipper-agentry, ci-watcher-agentry, reviewer-claude-agentry, auditor-claude-agentry, null-agent-agentry, archaeologist-claude-agentry, planner-claude-agentry, verifier-claude-agentry, git-operator] (inline entrypoint scripts); teams [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker-listener, grok-echo, claude-echo, narrowed-team, shipper-solo-team, agentry-self-host-v0, agentry-self-host-v1, agentry-self-audit-v0, agentry-null-v0, agentry-discovery-v0, agentry-planner-v0, agentry-verify-v0]"
     );
     Ok(())
 }
@@ -4201,6 +4248,139 @@ mod tests {
         assert_eq!(
             verifier_to_reviewer_count, 6,
             "each ac-verifier variant must signal both reviewers (3 verifiers × 2 reviewers = 6)"
+        );
+    }
+
+    #[test]
+    fn agentry_self_host_v1_topology_has_expected_shape() {
+        // EPIC #152 brief 6: mirror of the agentry-self-host-v1 topology block
+        // in seed_m0 — built here so the topology shape is covered without
+        // touching Redis. Keep in sync with seed_m0.
+        let coder = build_coder_claude_agentry_role("/h", "/c");
+        let reviewer_claude = build_reviewer_claude_agentry_role("/h", "/c");
+        let git_operator = build_git_operator_role("/h");
+        let ci_watcher = RoleName("ci-watcher-agentry".into());
+
+        let topology = TeamTopology {
+            name: TeamName("agentry-self-host-v1".into()),
+            version: 1,
+            roles: vec![
+                coder.name.clone(),
+                reviewer_claude.name.clone(),
+                git_operator.name.clone(),
+                ci_watcher.clone(),
+            ],
+            message_graph: vec![
+                MessageEdge {
+                    from: coder.name.clone(),
+                    to: reviewer_claude.name.clone(),
+                    permit_overrides_from: None,
+                },
+                MessageEdge {
+                    from: reviewer_claude.name.clone(),
+                    to: git_operator.name.clone(),
+                    permit_overrides_from: None,
+                },
+                MessageEdge {
+                    from: git_operator.name.clone(),
+                    to: ci_watcher.clone(),
+                    permit_overrides_from: None,
+                },
+            ],
+            terminal_role: ci_watcher.clone(),
+            max_retries: 2,
+        };
+
+        assert_eq!(
+            topology.roles.len(),
+            4,
+            "v1 topology must have exactly 4 roles (coder, reviewer-claude, git-operator, ci-watcher) — not 8 like v0"
+        );
+        assert!(topology.roles.contains(&coder.name));
+        assert!(topology.roles.contains(&reviewer_claude.name));
+        assert!(topology.roles.contains(&git_operator.name));
+        assert!(topology.roles.contains(&ci_watcher));
+
+        assert_eq!(
+            topology.terminal_role, ci_watcher,
+            "v1 terminal role must be ci-watcher-agentry"
+        );
+        assert_eq!(topology.max_retries, 2, "v1 max_retries must be 2");
+
+        assert_eq!(
+            topology.message_graph.len(),
+            3,
+            "v1 must have exactly 3 edges (coder→reviewer-claude, reviewer-claude→git-operator, git-operator→ci-watcher)"
+        );
+        let has_edge = |from: &RoleName, to: &RoleName| -> bool {
+            topology
+                .message_graph
+                .iter()
+                .any(|e| e.from == *from && e.to == *to)
+        };
+        assert!(
+            has_edge(&coder.name, &reviewer_claude.name),
+            "v1 must have edge coder→reviewer-claude"
+        );
+        assert!(
+            has_edge(&reviewer_claude.name, &git_operator.name),
+            "v1 must have edge reviewer-claude→git-operator"
+        );
+        assert!(
+            has_edge(&git_operator.name, &ci_watcher),
+            "v1 must have edge git-operator→ci-watcher"
+        );
+    }
+
+    #[test]
+    fn coder_exitpoint_skips_git_under_v1() {
+        // EPIC #152 brief 6: when topology_name matches `-v[1-9]+$` (v1, v2, …),
+        // the coder exitpoint must short-circuit out of the commit/push path
+        // because the orchestrator's git-operator role takes over. Validate the
+        // literal `topology_name … -v[1-9]` regex appears in the same line.
+        let s = CODER_CLAUDE_AGENTRY_EXITPOINT;
+        let line_with_pattern = s
+            .lines()
+            .find(|l| l.contains("topology_name") && l.contains("=~") && l.contains("-v[1-9]"));
+        assert!(
+            line_with_pattern.is_some(),
+            "exitpoint must contain a `[[ \"${{topology_name}}\" =~ -v[1-9]… ]]` short-circuit guard"
+        );
+        assert!(
+            s.contains("v1+ topology"),
+            "exitpoint must announce the v1+ topology branch via emit_event"
+        );
+        assert!(
+            s.contains("git-operator role does it"),
+            "exitpoint must explain that git-operator handles commit/push"
+        );
+        assert!(
+            s.contains("emit_done \"shipped\"; exit 0"),
+            "exitpoint must terminate with emit_done shipped and exit 0 in the v1+ branch"
+        );
+    }
+
+    #[test]
+    fn coder_script_exports_topology_name() {
+        // EPIC #152 brief 6: the coder script must derive topology_name from
+        // the bundle and write it to /tmp/brief_vars.sh so the exitpoint can
+        // branch on it.
+        let s = CODER_CLAUDE_AGENTRY_SCRIPT;
+        assert!(
+            s.contains("topology_name"),
+            "coder script must reference topology_name"
+        );
+        assert!(
+            s.contains(".brief.topology.name"),
+            "coder script must read .brief.topology.name from the bundle"
+        );
+        assert!(
+            s.contains("/tmp/brief_vars.sh"),
+            "coder script must write to /tmp/brief_vars.sh"
+        );
+        assert!(
+            s.contains("export topology_name="),
+            "coder script must export topology_name into brief_vars.sh"
         );
     }
 
