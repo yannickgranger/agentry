@@ -25,6 +25,7 @@ use redis::aio::ConnectionManager;
 use redis::AsyncCommands;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use tokio::sync::Semaphore;
 
 /// Redis set tracking briefs currently in flight. The dashboard reads this
 /// via `DashboardStore::active_briefs` instead of XREVRANGE-ing the briefs
@@ -84,6 +85,7 @@ pub async fn run(cfg: &crate::Config) -> Result<()> {
 
     let spawner = PodmanSpawner::new();
     let mut last_id = "$".to_string(); // only new briefs
+    let mut project_semaphores: HashMap<String, Arc<Semaphore>> = HashMap::new();
 
     loop {
         match redis_io::read_next_brief(&mut conn, &last_id, 5_000).await {
@@ -101,7 +103,37 @@ pub async fn run(cfg: &crate::Config) -> Result<()> {
                 let verifying_clone = verifying_key.clone();
                 let spawner_clone = spawner.clone();
                 let brief_id = brief.id.clone();
+                let slug = brief.project.as_deref().unwrap_or("_global").to_string();
+                let cap: u32 = if let Some(s) = brief.project.as_deref() {
+                    match redis_io::fetch_project(&mut conn, s).await {
+                        Ok(p) => p.max_concurrent_briefs.unwrap_or(cfg.max_concurrent_briefs),
+                        Err(Error::NotFound { .. }) => cfg.max_concurrent_briefs,
+                        Err(e) => {
+                            tracing::warn!(brief = %brief.id, error = %e, "fetch_project failed; using global cap");
+                            cfg.max_concurrent_briefs
+                        }
+                    }
+                } else {
+                    cfg.max_concurrent_briefs
+                };
+                let sem = project_semaphores
+                    .entry(slug.clone())
+                    .or_insert_with(|| Arc::new(Semaphore::new(cap as usize)))
+                    .clone();
+                let started = std::time::Instant::now();
+                let permit = match sem.acquire_owned().await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::error!(brief = %brief.id, error = %e, "semaphore closed; skipping brief");
+                        continue;
+                    }
+                };
+                let waited = started.elapsed();
+                if waited > std::time::Duration::from_secs(1) {
+                    tracing::info!(brief = %brief.id, project = %slug, cap = cap, waited_ms = waited.as_millis() as u64, "brief waited for project concurrency slot");
+                }
                 tokio::spawn(async move {
+                    let _permit = permit; // released on drop, after SREM
                     let mut conn_for_brief = conn_clone;
                     match handle_brief(
                         &mut conn_for_brief,

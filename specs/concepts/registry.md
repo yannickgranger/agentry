@@ -126,6 +126,8 @@ The `ac-verifier-claude-agentry` role is an instance of `AgentRole` slotted betw
 
 The `ac-verifier-grok-agentry` role is the Grok-backed sibling of the claude variant in the AC verifier role family (brief 4 of #134). Same bash shape (read bundle, short-circuit on empty AC list, fetch base_branch + diff HEAD, build binary stdin JSON, pre-flight `command -v ac-verifier-grok`, degrade to `done shipped` on any failure), but the bind-mounted binary is `ac-verifier-grok` and it talks to the xAI API via `XAI_API_KEY` instead of the host `claude` CLI. Permit scope grants `net:allow:api.x.ai`; `XAI_API_KEY` is in `passthru_env`. Registered in seed but NOT yet wired into a team — brief 5 enables parallel mode (the claude variant alone runs in `agentry-self-host-v0` until then).
 
+A project may also carry `max_concurrent_briefs: Option<u32>`. When set, this caps the number of briefs from this project that the dispatcher will run concurrently; falls back to the global `Config.max_concurrent_briefs` (default 4) when `None`. The cap is enforced at dispatch time via a per-project semaphore; FIFO ordering of the brief stream is preserved. Briefs without a project share a global `_global` pool.
+
 ## AcVerifierProvider
 
 Trait implemented by every LLM backend the ac-verifier binary can call. Single method `verify(system, user) -> io::Result<String>` returns the provider's raw response; the verifier core parses the JSON. Brief 2 ships `ClaudeProvider` only; briefs 3 (Gemini) and 4 (Grok) add per-file siblings as text-only adds. Tests use `MockProvider` to drive the core logic without spawning a real LLM.

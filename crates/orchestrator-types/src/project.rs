@@ -61,6 +61,8 @@ pub struct Project {
     /// ref the bare clone tracks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrent_briefs: Option<u32>,
 }
 
 #[cfg(test)]
@@ -84,6 +86,7 @@ mod tests {
             },
             repo_url: None,
             base_branch: None,
+            max_concurrent_briefs: None,
         };
         let s = serde_json::to_string(&p).expect("ser");
         let back: Project = serde_json::from_str(&s).expect("de");
@@ -101,6 +104,25 @@ mod tests {
             standing_orders: StandingOrders::default(),
             repo_url: Some("https://agency.lab:3000/yg/agentry.git".into()),
             base_branch: Some("develop".into()),
+            max_concurrent_briefs: None,
+        };
+        let s = serde_json::to_string(&p).expect("ser");
+        let back: Project = serde_json::from_str(&s).expect("de");
+        assert_eq!(p, back);
+    }
+
+    #[test]
+    fn project_roundtrips_with_max_concurrent_briefs() {
+        let p = Project {
+            slug: ProjectSlug("agentry".into()),
+            name: "agentry".into(),
+            forges: vec!["agency:yg/agentry".into()],
+            default_topology: None,
+            steward_topology: None,
+            standing_orders: StandingOrders::default(),
+            repo_url: None,
+            base_branch: None,
+            max_concurrent_briefs: Some(2),
         };
         let s = serde_json::to_string(&p).expect("ser");
         let back: Project = serde_json::from_str(&s).expect("de");
