@@ -79,6 +79,16 @@ async fn main() -> ExitCode {
 }
 
 async fn run() -> Result<()> {
+    // Construct the Drop guard FIRST, before any fallible step (stdin read,
+    // JSON parse, env lookup). The brief_id is "unknown" until we successfully
+    // parse the bundle; a parse failure still drops the guard and emits a
+    // terminal `done failed` carrying that placeholder. Per the #160
+    // mitigation contract, every exit path emits a `done` shape.
+    let mut guard = DoneGuard {
+        emitted: false,
+        brief_id: "unknown".to_string(),
+    };
+
     let mut bundle_str = String::new();
     use std::io::Read;
     std::io::stdin()
@@ -86,10 +96,9 @@ async fn run() -> Result<()> {
         .context("reading stdin bundle")?;
     let bundle: Bundle = serde_json::from_str(&bundle_str).context("parsing bundle JSON")?;
     let brief_id = bundle.brief.id.clone();
-    let mut guard = DoneGuard {
-        emitted: false,
-        brief_id: brief_id.clone(),
-    };
+    // Now that the bundle parsed, the guard can carry the real brief id so a
+    // later-step failure attributes the `done failed` to the correct brief.
+    guard.brief_id = brief_id.clone();
 
     let token = std::env::var("GITEA_TOKEN").context("GITEA_TOKEN env not set")?;
     let forge_host = bundle

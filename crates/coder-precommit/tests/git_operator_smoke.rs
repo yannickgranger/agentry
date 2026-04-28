@@ -67,6 +67,26 @@ fn binary_emits_failed_done_when_no_changes() {
 }
 
 #[test]
+fn binary_emits_failed_done_when_bundle_json_is_malformed() {
+    // Reviewer-mandated regression test for the #160 silent-exit class:
+    // even when the JSON parse fails BEFORE any state is set up, the
+    // DoneGuard must still emit a terminal `done failed` event so the
+    // orchestrator never observes a silent exit.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let out = run_git_operator(tmp.path(), "this is not json {{{");
+    assert!(
+        !out.status.success(),
+        "git-operator must exit non-zero on malformed bundle JSON"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stdout.contains("\"done\"") && stdout.contains("\"verdict\":\"failed\""),
+        "stdout must contain a done failed event even when JSON parse fails. stdout={stdout}\nstderr={stderr}"
+    );
+}
+
+#[test]
 #[ignore = "requires a live gitea (or a mock) to exercise the PR-open path"]
 fn binary_opens_pr_against_live_gitea() {
     // Placeholder: an integration harness with a gitea container would
