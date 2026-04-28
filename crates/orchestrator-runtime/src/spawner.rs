@@ -686,8 +686,8 @@ async fn append_audit(
     Ok(())
 }
 
-/// Roles whose coder-tooling bind-mounts (ra-query, dead-pub-check) may be
-/// silently skipped when the host binary is missing. The reviewer pre-pass,
+/// Roles whose coder-tooling bind-mounts (ra-query, dead-pub-check, ship) may
+/// be silently skipped when the host binary is missing. The reviewer pre-pass,
 /// the coder's pre-commit dead-pub gate, and (since brief 1 of #134) the
 /// dead-pub-check binary itself all degrade gracefully via `command -v`;
 /// for other roles a missing source must surface as a spawn error.
@@ -704,7 +704,7 @@ fn coder_tool_mount_role_can_warn_skip(role_name: &str) -> bool {
 fn is_coder_tool_mount_target(target: &str) -> bool {
     matches!(
         target,
-        "/usr/local/bin/ra-query" | "/usr/local/bin/dead-pub-check"
+        "/usr/local/bin/ra-query" | "/usr/local/bin/dead-pub-check" | "/usr/local/bin/ship"
     )
 }
 
@@ -1023,6 +1023,22 @@ mod tests {
         assert!(!is_coder_tool_mount_target("/usr/local/bin/claude"));
         assert!(!is_coder_tool_mount_target("/transcripts"));
         assert!(!is_coder_tool_mount_target(""));
+    }
+
+    #[test]
+    fn coder_tool_mount_warn_skip_handles_missing_ship_binary() {
+        // EPIC #152 brief 1: a missing ~/.local/bin/ship must NOT block the
+        // coder-claude-agentry spawn — the mount-skip table treats `ship` as
+        // a sibling of `ra-query` / `dead-pub-check`, with the warn-level
+        // tracing log naming the tool so operators can run `just ship-binary`.
+        assert!(
+            is_coder_tool_mount_target("/usr/local/bin/ship"),
+            "ship target must be in the warn-skip table"
+        );
+        assert!(
+            coder_tool_mount_role_can_warn_skip("coder-claude-agentry"),
+            "coder-claude-agentry must be permitted to warn-skip a missing tool mount"
+        );
     }
 
     #[test]

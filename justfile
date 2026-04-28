@@ -72,6 +72,15 @@ ac-verifier-grok-binary:
     test -x ~/.local/bin/ac-verifier-grok
     echo "ac-verifier-grok installed at ~/.local/bin/ac-verifier-grok"
 
+# Build ship into ~/.local/bin/ship for the coder-claude-agentry bind-mount.
+# Operator-invoked; idempotent. EPIC #152 brief 1 — stub binary.
+ship-binary:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo install --path crates/coder-precommit --bin ship --root ~/.local --locked --quiet
+    test -x ~/.local/bin/ship
+    echo "ship installed at ~/.local/bin/ship"
+
 # Build everything
 build:
     cargo build --workspace --release

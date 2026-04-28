@@ -449,6 +449,8 @@ Your task is described in verb-structured form below. Follow it literally:
 each verb (CREATE / UPDATE / REPLACE / DELETE / MOVE) names a transformation
 on a specific file:line target. Do NOT invent additional changes.
 
+# /usr/local/bin/ship — STUB for EPIC #152, do NOT call yet. Brief 4 wires the validator pipeline; for now continue using git directly.
+
 ${rework_banner}
 
 Task title: $issue_title
@@ -1841,6 +1843,11 @@ fn build_coder_claude_agentry_role(home: &str, claude_settings_path: &str) -> Ag
             Mount {
                 source: format!("{home}/.local/bin/dead-pub-check"),
                 target: "/usr/local/bin/dead-pub-check".into(),
+                readonly: true,
+            },
+            Mount {
+                source: format!("{home}/.local/bin/ship"),
+                target: "/usr/local/bin/ship".into(),
                 readonly: true,
             },
         ],
@@ -3547,6 +3554,25 @@ mod tests {
                 .iter()
                 .any(|m| m.target == "/usr/local/bin/dead-pub-check" && m.readonly),
             "coder-claude must bind-mount dead-pub-check read-only at /usr/local/bin/dead-pub-check"
+        );
+    }
+
+    #[test]
+    fn coder_claude_agentry_role_has_ship_mount() {
+        // EPIC #152 brief 1: stub `ship` binary must be bind-mounted at
+        // /usr/local/bin/ship so future briefs (4 wires the validator
+        // pipeline; 6 makes it the only path to publication) have the
+        // delivery surface in place. Stub: prompt mentions but does NOT
+        // call it yet.
+        let role = build_coder_claude_agentry_role(
+            "/var/home/test",
+            "/var/home/test/.config/agentry/claude-container-settings.json",
+        );
+        assert!(
+            role.mounts
+                .iter()
+                .any(|m| m.target == "/usr/local/bin/ship" && m.readonly),
+            "coder-claude must bind-mount ship read-only at /usr/local/bin/ship"
         );
     }
 
