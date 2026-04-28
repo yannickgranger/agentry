@@ -13,6 +13,7 @@ repository.workspace = true
 anyhow = "1"
 clap = { workspace = true }
 orchestrator-types = { path = "../orchestrator-types" }
+reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
@@ -40,6 +41,10 @@ path = "src/bin/ac_verifier_grok.rs"
 [[bin]]
 name = "ship"
 path = "src/bin/ship.rs"
+
+[[bin]]
+name = "git-operator"
+path = "src/bin/git_operator.rs"
 
 [lints]
 workspace = true

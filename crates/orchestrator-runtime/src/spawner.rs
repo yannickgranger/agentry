@@ -726,10 +726,14 @@ fn brief_env_args(brief: &Brief) -> Vec<String> {
 /// the coder's pre-commit dead-pub gate, and (since brief 1 of #134) the
 /// dead-pub-check binary itself all degrade gracefully via `command -v`;
 /// for other roles a missing source must surface as a spawn error.
+///
+/// `git-operator` (EPIC #152 brief 5) is also warn-skip eligible: the role's
+/// only mount is `/usr/local/bin/git-operator`. A missing host binary surfaces
+/// as a structured warn event so the operator can run `just git-operator-binary`.
 fn coder_tool_mount_role_can_warn_skip(role_name: &str) -> bool {
     matches!(
         role_name,
-        "reviewer-claude-agentry" | "coder-claude-agentry"
+        "reviewer-claude-agentry" | "coder-claude-agentry" | "git-operator"
     )
 }
 
@@ -739,7 +743,10 @@ fn coder_tool_mount_role_can_warn_skip(role_name: &str) -> bool {
 fn is_coder_tool_mount_target(target: &str) -> bool {
     matches!(
         target,
-        "/usr/local/bin/ra-query" | "/usr/local/bin/dead-pub-check" | "/usr/local/bin/ship"
+        "/usr/local/bin/ra-query"
+            | "/usr/local/bin/dead-pub-check"
+            | "/usr/local/bin/ship"
+            | "/usr/local/bin/git-operator"
     )
 }
 
@@ -1136,6 +1143,22 @@ mod tests {
         assert!(
             coder_tool_mount_role_can_warn_skip("coder-claude-agentry"),
             "coder-claude-agentry must be permitted to warn-skip a missing tool mount"
+        );
+    }
+
+    #[test]
+    fn coder_tool_mount_warn_skip_handles_missing_git_operator_binary() {
+        // EPIC #152 brief 5: a missing ~/.local/bin/git-operator must NOT
+        // block the git-operator spawn — the mount-skip table treats it as
+        // a sibling of ship/ra-query/dead-pub-check, with a warn-level
+        // tracing log so operators can run `just git-operator-binary`.
+        assert!(
+            is_coder_tool_mount_target("/usr/local/bin/git-operator"),
+            "git-operator target must be in the warn-skip table"
+        );
+        assert!(
+            coder_tool_mount_role_can_warn_skip("git-operator"),
+            "git-operator role must be permitted to warn-skip a missing tool mount"
         );
     }
 

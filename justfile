@@ -81,6 +81,15 @@ ship-binary:
     test -x ~/.local/bin/ship
     echo "ship installed at ~/.local/bin/ship"
 
+# Build git-operator into ~/.local/bin/git-operator for the git-operator
+# role's bind-mount. Operator-invoked; idempotent. EPIC #152 brief 5.
+git-operator-binary:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo install --path crates/coder-precommit --bin git-operator --root ~/.local --locked --quiet
+    test -x ~/.local/bin/git-operator
+    echo "git-operator installed at ~/.local/bin/git-operator"
+
 # Build everything
 build:
     cargo build --workspace --release

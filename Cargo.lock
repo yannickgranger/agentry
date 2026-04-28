@@ -330,6 +330,7 @@ dependencies = [
  "anyhow",
  "clap",
  "orchestrator-types",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",
