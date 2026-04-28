@@ -1,10 +1,11 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/orchestrator-types",
-    "crates/orchestrator-runtime",
-    "crates/orchestrator-dashboard",
     "crates/coder-precommit",
+    "crates/orchestrator-dashboard",
+    "crates/orchestrator-runtime",
+    "crates/orchestrator-types",
+    "crates/validators",
 ]
 
 [workspace.package]

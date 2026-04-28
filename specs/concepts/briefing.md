@@ -12,6 +12,17 @@ Opaque identifier for a single brief. Prefixed (`brf_…`) so it is
 distinguishable at a glance from agent ids (`agt_…`) and permit ids
 (`prm_…`). Unique across the lifetime of the orchestrator.
 
+## BriefKind
+
+The logical kind of a brief — selects which validator pipeline runs against
+the candidate diff before the daemon accepts it. Variants name the work
+shape, not the team or topology: `Refactor`, `Debug`, `Mechanical`,
+`NewFeature`, `Substrate`, `Audit`, `Doc`. Optional on `Brief` for
+backwards compatibility — briefs submitted before the field existed
+deserialize with `kind: None`. The `validators::registry_for` function
+maps each variant to a concrete validator pipeline; nothing else
+interprets the field.
+
 ## EscalationMode
 
 Declares what the agent team is allowed to do when blocked: stay autonomous,

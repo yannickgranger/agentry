@@ -651,6 +651,7 @@ async fn on_all_children_resolved(conn: &mut ConnectionManager, meta_id: &str) -
             project: meta_brief.project.clone(),
             topology: VersionedRef::new(DOL_VERIFIER_TOPOLOGY, 1),
             payload: serde_json::Value::Object(payload_obj),
+            kind: None,
             budget: Budget {
                 max_tokens: None,
                 max_wall_seconds: Some(600),
