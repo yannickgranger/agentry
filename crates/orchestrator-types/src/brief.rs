@@ -7,6 +7,23 @@ use crate::{now, Ts, VersionedRef};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+/// Logical kind of a brief — selects the validator pipeline.
+///
+/// Optional on `Brief`: existing payloads that don't set it deserialize to
+/// `None`. Brief 4 wires the ship tool to dispatch validators per-kind via
+/// `validators::registry_for`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BriefKind {
+    Refactor,
+    Debug,
+    Mechanical,
+    NewFeature,
+    Substrate,
+    Audit,
+    Doc,
+}
+
 /// Brief identifier: `brf_<uuidv7>`. Sortable by creation time.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -62,6 +79,10 @@ pub struct Brief {
     pub topology: VersionedRef,
     /// Opaque payload — the team interprets it.
     pub payload: Payload,
+    /// Logical kind of brief — dispatches the validator pipeline. Optional
+    /// for backwards compatibility; existing payloads deserialize to `None`.
+    #[serde(default)]
+    pub kind: Option<BriefKind>,
     /// Hard budget; runtime enforces.
     #[serde(default)]
     pub budget: Budget,
@@ -92,6 +113,7 @@ impl Brief {
             project: None,
             topology,
             payload,
+            kind: None,
             budget: Budget::default(),
             escalation: EscalationMode::default(),
             parent_brief: None,
@@ -155,5 +177,54 @@ mod tests {
     #[test]
     fn default_escalation_is_supervised() {
         assert_eq!(EscalationMode::default(), EscalationMode::Supervised);
+    }
+
+    #[test]
+    fn brief_kind_roundtrip_serializes_snake_case() {
+        let mut b = Brief::new(
+            "user@example.com",
+            VersionedRef::new("echo-team", 1),
+            json!({"msg": "hi"}),
+        );
+        b.kind = Some(BriefKind::Refactor);
+        let s = serde_json::to_string(&b).expect("serialize");
+        assert!(
+            s.contains("\"kind\":\"refactor\""),
+            "expected snake_case kind in {s}"
+        );
+        let back: Brief = serde_json::from_str(&s).expect("deserialize");
+        assert_eq!(back.kind, Some(BriefKind::Refactor));
+    }
+
+    #[test]
+    fn brief_without_kind_field_deserializes_to_none() {
+        let raw = json!({
+            "id": "brf_test",
+            "project": null,
+            "topology": { "name": "echo-team", "version": 1 },
+            "payload": { "msg": "hi" },
+            "submitted_by": "tester",
+            "submitted_at": now(),
+        });
+        let s = serde_json::to_string(&raw).expect("serialize value");
+        let b: Brief = serde_json::from_str(&s).expect("deserialize");
+        assert_eq!(b.kind, None);
+    }
+
+    #[test]
+    fn brief_kind_variants_serialize_snake_case() {
+        let cases = [
+            (BriefKind::Refactor, "\"refactor\""),
+            (BriefKind::Debug, "\"debug\""),
+            (BriefKind::Mechanical, "\"mechanical\""),
+            (BriefKind::NewFeature, "\"new_feature\""),
+            (BriefKind::Substrate, "\"substrate\""),
+            (BriefKind::Audit, "\"audit\""),
+            (BriefKind::Doc, "\"doc\""),
+        ];
+        for (k, want) in cases {
+            let s = serde_json::to_string(&k).expect("serialize");
+            assert_eq!(s, want, "variant {k:?}");
+        }
     }
 }
