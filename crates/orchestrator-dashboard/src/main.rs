@@ -842,6 +842,7 @@ async fn project_create(
         },
         repo_url: None,
         base_branch: None,
+        max_concurrent_briefs: None,
     };
     state
         .store

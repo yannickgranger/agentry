@@ -17,6 +17,10 @@ use figment::Figment;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+fn default_max_concurrent_briefs() -> u32 {
+    4
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub redis: RedisConfig,
@@ -24,6 +28,8 @@ pub struct Config {
     pub signing: SigningConfig,
     #[serde(default)]
     pub webhook: WebhookConfig,
+    #[serde(default = "default_max_concurrent_briefs")]
+    pub max_concurrent_briefs: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,6 +72,7 @@ impl Default for Config {
                 key_path: PathBuf::from(format!("{home}/.config/agentry/signing.key")),
             },
             webhook: WebhookConfig::default(),
+            max_concurrent_briefs: 4,
         }
     }
 }
@@ -123,5 +130,10 @@ mod tests {
     #[test]
     fn default_dashboard_port_is_7800() {
         assert_eq!(Config::default().dashboard.port, 7800);
+    }
+
+    #[test]
+    fn default_max_concurrent_briefs_is_4() {
+        assert_eq!(Config::default().max_concurrent_briefs, 4);
     }
 }
