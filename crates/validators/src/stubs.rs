@@ -1,7 +1,10 @@
 //! No-op stub Validator implementations.
 //!
-//! Every `run` impl returns `ValidatorReport::pass(self.name())`. Brief 3
-//! ports the existing reviewer-mechanical logic into real implementations.
+//! Brief 3 of EPIC #152 ported the six reviewer-mechanical validators
+//! (`fmt_check`, `clippy_scoped`, `clippy_workspace`, `test_workspace`,
+//! `arch_check`, `dead_pub_check`) into real impls in [`crate::impls`].
+//! The validators that remain in this module are still no-op stubs; later
+//! briefs port their logic.
 
 use async_trait::async_trait;
 
@@ -24,12 +27,6 @@ macro_rules! stub_validator {
     };
 }
 
-stub_validator!(FmtCheck, FMT_CHECK, "fmt_check");
-stub_validator!(ClippyScoped, CLIPPY_SCOPED, "clippy_scoped");
-stub_validator!(ClippyWorkspace, CLIPPY_WORKSPACE, "clippy_workspace");
-stub_validator!(TestWorkspace, TEST_WORKSPACE, "test_workspace");
-stub_validator!(ArchCheck, ARCH_CHECK, "arch_check");
-stub_validator!(DeadPubCheck, DEAD_PUB_CHECK, "dead_pub_check");
 stub_validator!(
     ComplexityNoRegression,
     COMPLEXITY_NO_REGRESSION,

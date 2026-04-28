@@ -11,6 +11,7 @@ use async_trait::async_trait;
 use orchestrator_types::BriefKind;
 use std::path::PathBuf;
 
+pub mod impls;
 pub mod stubs;
 
 /// Per-brief context handed to every [`Validator`].
@@ -82,10 +83,10 @@ pub trait Validator: Send + Sync {
 /// to run them in parallel via `JoinSet` — order here is informational).
 #[must_use]
 pub fn registry_for(kind: BriefKind) -> Vec<&'static dyn Validator> {
+    use impls::{ARCH_CHECK, CLIPPY_SCOPED, CLIPPY_WORKSPACE, FMT_CHECK, TEST_WORKSPACE};
     use stubs::{
-        ARCH_CHECK, BDD_REAL_INFRA, CLIPPY_SCOPED, CLIPPY_WORKSPACE, COMPLEXITY_NO_REGRESSION,
-        FMT_CHECK, MARKDOWN_LINT, NO_BEHAVIOR_CHANGE, NO_NEW_PUB, REGRESSION_TEST, REPORT_ONLY,
-        SELF_HOST_SMOKE, SPECS_ARCH_CHECK, TEST_WORKSPACE,
+        BDD_REAL_INFRA, COMPLEXITY_NO_REGRESSION, MARKDOWN_LINT, NO_BEHAVIOR_CHANGE, NO_NEW_PUB,
+        REGRESSION_TEST, REPORT_ONLY, SELF_HOST_SMOKE, SPECS_ARCH_CHECK,
     };
     match kind {
         BriefKind::Mechanical => vec![&FMT_CHECK, &CLIPPY_SCOPED, &NO_BEHAVIOR_CHANGE, &ARCH_CHECK],
@@ -234,7 +235,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_stub_validators_pass() {
-        let v: &'static dyn Validator = &stubs::FMT_CHECK;
+        let v: &'static dyn Validator = &stubs::REPORT_ONLY;
         let ctx = BriefCtx {
             workspace_path: PathBuf::from("/tmp/does-not-matter"),
             brief_id: "brf_test".into(),
@@ -243,6 +244,6 @@ mod tests {
         let report = v.run(&ctx).await.expect("stub run is infallible");
         assert!(report.passed);
         assert!(report.findings.is_empty());
-        assert_eq!(report.validator_name, "fmt_check");
+        assert_eq!(report.validator_name, "report_only");
     }
 }
