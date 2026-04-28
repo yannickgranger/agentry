@@ -1,0 +1,56 @@
+agentry-dev-redis Up 15 hours
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.11s
+     Running unittests src/lib.rs (target/debug/deps/orchestrator_dashboard-46da0980be0a21bc)
+
+running 13 tests
+test routes::validate::tests::brief_id_accepts_valid ... ok
+test routes::validate::tests::brief_id_rejects_traversal_chars ... ok
+test routes::validate::tests::brief_id_rejects_overlong ... ok
+test store::tests::fanout_auto_evicts_after_idle_grace ... ignored, requires live Redis (AGENTRY_TEST_REDIS_URL)
+test store::tests::next_version_increments_atomically ... ignored, requires live Redis (AGENTRY_TEST_REDIS_URL)
+test store::tests::save_then_list_round_trips ... ignored, requires live Redis (AGENTRY_TEST_REDIS_URL)
+test store::tests::subscribe_trace_shares_one_tail_loop ... ignored, requires live Redis (AGENTRY_TEST_REDIS_URL)
+test routes::validate::tests::role_rejects_traversal ... ok
+test store::tests::record_key_versions_roles_and_teams_only ... ok
+test store::tests::parse_version_from_key_extracts_trailing_v_n ... ok
+test store::tests::fanout_entry_reaped_when_no_receivers ... ok
+test routes::validate::tests::within_root_rejects_symlink_escape ... ok
+test routes::validate::tests::within_root_accepts_descendant ... ok
+
+test result: ok. 9 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/orchestrator_dashboard-e818fef7d56de07d)
+
+running 1 test
+test tests::resolve_webhook_secret_passes_through_explicit_value ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/integration_pipe_sharing.rs (target/debug/deps/integration_pipe_sharing-a8035fb98afc1942)
+
+running 2 tests
+test fetch_blocked_behind_tail_loop_xread ... FAILED
+test list_blocked_behind_tail_loop_xread ... FAILED
+
+failures:
+
+---- fetch_blocked_behind_tail_loop_xread stdout ----
+
+thread 'fetch_blocked_behind_tail_loop_xread' (3068442) panicked at crates/orchestrator-dashboard/tests/integration_pipe_sharing.rs:58:5:
+regression: fetch_recent_verdicts took 824.547088ms while a tail loop was parked on XREAD BLOCK 800ms — pipe-sharing bug (issue #167)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- list_blocked_behind_tail_loop_xread stdout ----
+
+thread 'list_blocked_behind_tail_loop_xread' (3068443) panicked at crates/orchestrator-dashboard/tests/integration_pipe_sharing.rs:90:5:
+regression: list("role") took 1.631726895s while a tail loop was parked on XREAD BLOCK 800ms — pipe-sharing bug (issue #167)
+
+
+failures:
+    fetch_blocked_behind_tail_loop_xread
+    list_blocked_behind_tail_loop_xread
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.71s
+
+error: test failed, to rerun pass `-p orchestrator-dashboard --test integration_pipe_sharing`
