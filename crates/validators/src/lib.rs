@@ -9,6 +9,7 @@
 
 use async_trait::async_trait;
 use orchestrator_types::BriefKind;
+use serde::Serialize;
 use std::path::PathBuf;
 
 pub mod impls;
@@ -27,7 +28,8 @@ pub struct BriefCtx {
 }
 
 /// Severity of a [`Finding`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Severity {
     Blocker,
     Warning,
@@ -35,7 +37,7 @@ pub enum Severity {
 }
 
 /// A single observation produced by a validator.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Finding {
     pub file: Option<String>,
     pub line: Option<u32>,
@@ -44,7 +46,7 @@ pub struct Finding {
 }
 
 /// Outcome of a [`Validator`] run.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ValidatorReport {
     pub validator_name: String,
     pub passed: bool,
@@ -68,6 +70,20 @@ impl ValidatorReport {
             passed: false,
             findings,
         }
+    }
+
+    /// Append a Blocker [`Finding`] carrying `msg` and return self. Used by
+    /// the ship binary to surface dispatch / panic errors uniformly with
+    /// validator-reported failures.
+    #[must_use]
+    pub fn with_message(mut self, msg: String) -> Self {
+        self.findings.push(Finding {
+            file: None,
+            line: None,
+            severity: Severity::Blocker,
+            message: msg,
+        });
+        self
     }
 }
 
@@ -245,5 +261,32 @@ mod tests {
         assert!(report.passed);
         assert!(report.findings.is_empty());
         assert_eq!(report.validator_name, "report_only");
+    }
+
+    #[test]
+    fn with_message_pushes_blocker_finding() {
+        let r = ValidatorReport::fail("dispatch", vec![]).with_message("boom".to_string());
+        assert!(!r.passed);
+        assert_eq!(r.findings.len(), 1);
+        assert_eq!(r.findings[0].severity, Severity::Blocker);
+        assert_eq!(r.findings[0].message, "boom");
+    }
+
+    #[test]
+    fn report_serializes_to_json_with_expected_fields() {
+        let r = ValidatorReport::fail(
+            "x",
+            vec![Finding {
+                file: Some("a.rs".into()),
+                line: Some(3),
+                severity: Severity::Blocker,
+                message: "m".into(),
+            }],
+        );
+        let v = serde_json::to_value(&r).expect("serialize");
+        assert_eq!(v["validator_name"], "x");
+        assert_eq!(v["passed"], false);
+        assert_eq!(v["findings"][0]["severity"], "blocker");
+        assert_eq!(v["findings"][0]["message"], "m");
     }
 }
