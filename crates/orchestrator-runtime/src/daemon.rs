@@ -36,6 +36,15 @@ pub async fn run(cfg: &crate::Config) -> Result<()> {
     let mut conn = redis_io::connect(&cfg.redis.url).await?;
     tracing::info!(url = %cfg.redis.url.rsplit('@').next().unwrap_or("?"), "connected to Redis");
 
+    // Boot-time backfill: sweep orphan auto/* branches left behind by prior
+    // shipped briefs (pre-fix daemons did not delete the branch ref on
+    // teardown). Failure must not block boot — a stale branch only matters
+    // when its id collides with a future dispatch.
+    match workspace::sweep_orphan_branches(&BriefWorkspace::root()).await {
+        Ok(n) => tracing::info!(swept = n, "boot: orphan auto/* branch sweep complete"),
+        Err(e) => tracing::warn!(error = %e, "boot: orphan auto/* branch sweep failed (non-fatal)"),
+    }
+
     let state_path = std::env::var("AGENTRY_STATE_PATH").unwrap_or_else(|_| {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
         format!("{home}/.config/agentry/state.db")

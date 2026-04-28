@@ -481,6 +481,10 @@ pub async fn destroy(ws: &BriefWorkspace) -> Result<()> {
         .map(|m| m.is_file())
         .unwrap_or(false);
     if is_worktree {
+        // Resolve the bare-clone path BEFORE removing the worktree — once
+        // the worktree dir is gone, `git -C <ws.host_path>` can't query it.
+        let bare_path = bare_clone_path_for_worktree(&ws.host_path).await;
+
         let _ = tokio::process::Command::new("git")
             .arg("-C")
             .arg(&ws.host_path)
@@ -492,6 +496,59 @@ pub async fn destroy(ws: &BriefWorkspace) -> Result<()> {
             .await;
         // Even on `worktree remove` success, the dir itself is gone now.
         // On failure, fall through to rm -rf.
+
+        // Delete the per-brief branch ref from the bare clone. Without this,
+        // every shipped brief leaves an `auto/<brief_id>` ref accumulated in
+        // the bare clone; the next brief that collides on id fails dispatch
+        // with "branch already exists" — same dispatch-blocking class as the
+        // original worktree leak. Idempotent: tolerate "branch not found"
+        // (the brief may have errored mid-allocate before the branch was
+        // created), warn only on unexpected git errors.
+        if let Some(bare) = bare_path {
+            let branch = format!("auto/{}", ws.brief_id.0);
+            match tokio::process::Command::new("git")
+                .arg("-C")
+                .arg(&bare)
+                .arg("branch")
+                .arg("-D")
+                .arg(&branch)
+                .output()
+                .await
+            {
+                Ok(out) if out.status.success() => {
+                    tracing::debug!(
+                        bare = %bare.display(),
+                        branch = %branch,
+                        "deleted worktree branch ref from bare clone"
+                    );
+                }
+                Ok(out) => {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    if stderr.contains("not found") || stderr.contains("not a valid object") {
+                        tracing::debug!(
+                            bare = %bare.display(),
+                            branch = %branch,
+                            "branch ref already absent (idempotent)"
+                        );
+                    } else {
+                        tracing::warn!(
+                            bare = %bare.display(),
+                            branch = %branch,
+                            stderr = %stderr,
+                            "git branch -D failed unexpectedly"
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        bare = %bare.display(),
+                        branch = %branch,
+                        error = %e,
+                        "git branch -D spawn failed"
+                    );
+                }
+            }
+        }
     }
     if ws.host_path.exists() {
         tokio::fs::remove_dir_all(&ws.host_path)
@@ -501,6 +558,208 @@ pub async fn destroy(ws: &BriefWorkspace) -> Result<()> {
             })?;
     }
     Ok(())
+}
+
+/// Resolve the bare-clone path that owns `worktree` by querying
+/// `git rev-parse --git-common-dir`. Returns `None` if the dir is not a
+/// recognizable worktree.
+///
+/// `--git-common-dir` returns the shared gitdir of the worktree set. For a
+/// worktree of a bare clone, that's the bare clone itself; for a worktree of
+/// a non-bare repo, it's the repo's `.git` dir. Output may be:
+/// * `<bare>` — bare-clone case, no normalization needed
+/// * `<repo>/.git` — non-bare case, strip the `.git` component
+/// * `<bare>/worktrees/<name>` — defensive: some git versions or callers
+///   reach for `--git-dir` instead; strip the worktrees suffix
+///
+/// May be relative (when run inside the worktree without `-C`) or absolute
+/// (when run with an absolute `-C`). Both are normalized against `worktree`.
+async fn bare_clone_path_for_worktree(worktree: &Path) -> Option<PathBuf> {
+    let out = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .arg("rev-parse")
+        .arg("--git-common-dir")
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if raw.is_empty() {
+        return None;
+    }
+    let raw_path = Path::new(&raw);
+    let mut p = if raw_path.is_absolute() {
+        raw_path.to_path_buf()
+    } else {
+        worktree.join(raw_path)
+    };
+    // Defensive: strip a trailing `/worktrees/<name>` segment if present.
+    if let Some(parent) = p.parent() {
+        if parent.file_name().and_then(|n| n.to_str()) == Some("worktrees") {
+            if let Some(grandparent) = parent.parent() {
+                p = grandparent.to_path_buf();
+            }
+        }
+    }
+    // Strip a trailing `.git` segment (non-bare case).
+    if p.file_name().and_then(|n| n.to_str()) == Some(".git") {
+        if let Some(parent) = p.parent() {
+            p = parent.to_path_buf();
+        }
+    }
+    Some(p)
+}
+
+/// Sweep orphan `auto/*` branches from every bare clone under `<root>/.clones/`.
+///
+/// A branch is "orphan" iff its corresponding `<root>/briefs/<brief_id>` dir
+/// no longer exists on disk. Branches whose worktree IS still present are
+/// left alone — a brief may be in flight, or in `Preserve` disposition for
+/// forensics. We don't second-guess that.
+///
+/// Idempotent and safe to run on every daemon boot. Returns the count of
+/// branches deleted across all bare clones.
+pub async fn sweep_orphan_branches(root: &Path) -> Result<usize> {
+    let clones_dir = root.join(".clones");
+    let briefs_dir = root.join("briefs");
+    let mut total: usize = 0;
+
+    let Ok(mut org_iter) = tokio::fs::read_dir(&clones_dir).await else {
+        // No .clones dir yet (fresh root). Nothing to sweep.
+        tracing::info!(swept = 0usize, "sweep_orphan_branches: no .clones dir");
+        return Ok(0);
+    };
+    while let Ok(Some(org_entry)) = org_iter.next_entry().await {
+        let org_path = org_entry.path();
+        let Ok(meta) = org_entry.metadata().await else {
+            continue;
+        };
+        if !meta.is_dir() {
+            continue;
+        }
+        let Ok(mut repo_iter) = tokio::fs::read_dir(&org_path).await else {
+            continue;
+        };
+        while let Ok(Some(repo_entry)) = repo_iter.next_entry().await {
+            let bare = repo_entry.path();
+            let Ok(meta) = repo_entry.metadata().await else {
+                continue;
+            };
+            if !meta.is_dir() {
+                continue;
+            }
+            // Confirm it's a populated bare clone (has HEAD).
+            if tokio::fs::metadata(bare.join("HEAD")).await.is_err() {
+                continue;
+            }
+            total += sweep_one_bare(&bare, &briefs_dir).await;
+        }
+    }
+    tracing::info!(
+        swept = total,
+        "sweep_orphan_branches: deleted N orphan auto/* branches"
+    );
+    Ok(total)
+}
+
+/// Worker: sweep one bare clone. Returns the deletion count; per-branch
+/// errors are logged and skipped so one bad branch can't abort the sweep.
+async fn sweep_one_bare(bare: &Path, briefs_dir: &Path) -> usize {
+    // Prune worktree admin entries whose worktree dir is gone (e.g. a legacy
+    // brief whose dir was removed by hand). Without this, `git branch -D`
+    // refuses to delete a branch still associated with a prunable worktree.
+    let _ = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(bare)
+        .arg("worktree")
+        .arg("prune")
+        .output()
+        .await;
+
+    let listing = match tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(bare)
+        .arg("for-each-ref")
+        .arg("--format=%(refname:short)")
+        .arg("refs/heads/auto/")
+        .output()
+        .await
+    {
+        Ok(o) if o.status.success() => o,
+        Ok(o) => {
+            tracing::warn!(
+                bare = %bare.display(),
+                stderr = %String::from_utf8_lossy(&o.stderr),
+                "for-each-ref failed; skipping bare"
+            );
+            return 0;
+        }
+        Err(e) => {
+            tracing::warn!(
+                bare = %bare.display(),
+                error = %e,
+                "for-each-ref spawn failed; skipping bare"
+            );
+            return 0;
+        }
+    };
+    let stdout = String::from_utf8_lossy(&listing.stdout);
+
+    let mut deleted: usize = 0;
+    for line in stdout.lines() {
+        let branch = line.trim();
+        let Some(brief_id) = branch.strip_prefix("auto/") else {
+            continue;
+        };
+        if brief_id.is_empty() {
+            continue;
+        }
+        // Worktree still present → in-flight or Preserve disposition. Leave.
+        if briefs_dir.join(brief_id).exists() {
+            continue;
+        }
+        let del = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(bare)
+            .arg("branch")
+            .arg("-D")
+            .arg(branch)
+            .output()
+            .await;
+        match del {
+            Ok(out) if out.status.success() => {
+                tracing::debug!(
+                    bare = %bare.display(),
+                    branch = %branch,
+                    "swept orphan auto/* branch"
+                );
+                deleted += 1;
+            }
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                if !(stderr.contains("not found") || stderr.contains("not a valid object")) {
+                    tracing::warn!(
+                        bare = %bare.display(),
+                        branch = %branch,
+                        stderr = %stderr,
+                        "branch -D failed during sweep"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    bare = %bare.display(),
+                    branch = %branch,
+                    error = %e,
+                    "branch -D spawn failed during sweep"
+                );
+            }
+        }
+    }
+    deleted
 }
 
 #[cfg(test)]
@@ -821,5 +1080,147 @@ mod tests {
                 ws.host_path.display()
             );
         }
+    }
+
+    /// Returns true iff `refs/heads/<branch>` exists in the bare clone at `bare`.
+    async fn branch_exists(bare: &Path, branch: &str) -> bool {
+        let out = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(bare)
+            .arg("show-ref")
+            .arg("--verify")
+            .arg("--quiet")
+            .arg(format!("refs/heads/{branch}"))
+            .output()
+            .await
+            .expect("git show-ref spawn");
+        out.status.success()
+    }
+
+    /// Pin: `destroy(&ws)` must delete the per-brief `auto/<brief_id>` branch
+    /// from the bare clone. Without this the bare accumulates stale refs that
+    /// eventually collide with future dispatches (production hit ~101 stale
+    /// branches; dispatch fails with "branch already exists").
+    #[tokio::test]
+    async fn destroy_deletes_branch_ref() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let url = setup_upstream(tmp.path()).await;
+        let bid = brief("test-brief-1");
+        let ws = allocate_at(&bid, Some((url.as_str(), "main")), tmp.path())
+            .await
+            .expect("alloc");
+
+        let (org, repo) = derive_org_repo(&url).expect("derive");
+        let bare = tmp.path().join(".clones").join(&org).join(&repo);
+
+        assert!(
+            branch_exists(&bare, "auto/test-brief-1").await,
+            "branch ref must exist before destroy"
+        );
+
+        destroy(&ws).await.expect("destroy");
+
+        assert!(
+            !branch_exists(&bare, "auto/test-brief-1").await,
+            "branch ref must be gone after destroy"
+        );
+    }
+
+    /// `bare_clone_path_for_worktree` MUST handle both forms of
+    /// `git rev-parse --git-common-dir` output: absolute (the common case
+    /// when `-C absolute_path` is passed) and relative (when the worktree
+    /// path or git's resolution yields a relative result).
+    #[tokio::test]
+    async fn bare_clone_path_for_worktree_resolves_both_output_forms() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let url = setup_upstream(tmp.path()).await;
+        let bid = brief("test-brf-resolve");
+        let ws = allocate_at(&bid, Some((url.as_str(), "main")), tmp.path())
+            .await
+            .expect("alloc");
+
+        let (org, repo) = derive_org_repo(&url).expect("derive");
+        let expected_bare = tmp.path().join(".clones").join(&org).join(&repo);
+
+        // Absolute form: the production code path passes an absolute
+        // `host_path`, so the helper must resolve to the bare clone.
+        let resolved_abs = bare_clone_path_for_worktree(&ws.host_path)
+            .await
+            .expect("absolute form resolves");
+        assert_eq!(
+            resolved_abs.canonicalize().expect("canon abs"),
+            expected_bare.canonicalize().expect("canon expected"),
+        );
+
+        // Relative form: invoke the helper with a relative `worktree` arg
+        // resolved against CWD. The helper joins git's relative output
+        // against the worktree path the same way, so this exercises the
+        // relative branch in the helper's path-joining logic.
+        let cwd = std::env::current_dir().expect("cwd");
+        let rel = ws
+            .host_path
+            .strip_prefix(&cwd)
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|_| ws.host_path.clone());
+        let resolved_rel = bare_clone_path_for_worktree(&rel)
+            .await
+            .expect("relative form resolves");
+        assert_eq!(
+            resolved_rel.canonicalize().expect("canon rel"),
+            expected_bare.canonicalize().expect("canon expected"),
+        );
+    }
+
+    /// `sweep_orphan_branches` MUST delete only branches whose corresponding
+    /// `briefs/<brief_id>` dir is missing, leaving in-flight worktrees alone.
+    #[tokio::test]
+    async fn sweep_orphan_branches_removes_only_orphans() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let url = setup_upstream(tmp.path()).await;
+
+        let keeper = brief("keeper");
+        let orphan = brief("orphan");
+        let _keeper_ws = allocate_at(&keeper, Some((url.as_str(), "main")), tmp.path())
+            .await
+            .expect("alloc keeper");
+        let orphan_ws = allocate_at(&orphan, Some((url.as_str(), "main")), tmp.path())
+            .await
+            .expect("alloc orphan");
+
+        // Simulate the legacy stale-branch-no-worktree state: the briefs dir
+        // is gone but the bare-clone branch ref + worktree admin entry
+        // remain. The sweep must reconcile via `git worktree prune` then
+        // delete the now-truly-orphan ref.
+        tokio::fs::remove_dir_all(&orphan_ws.host_path)
+            .await
+            .expect("remove orphan briefs dir");
+
+        let (org, repo) = derive_org_repo(&url).expect("derive");
+        let bare = tmp.path().join(".clones").join(&org).join(&repo);
+        assert!(branch_exists(&bare, "auto/keeper").await);
+        assert!(branch_exists(&bare, "auto/orphan").await);
+
+        let count = sweep_orphan_branches(tmp.path()).await.expect("sweep");
+        assert_eq!(count, 1, "exactly one orphan branch deleted");
+
+        assert!(
+            branch_exists(&bare, "auto/keeper").await,
+            "keeper branch must survive (its worktree dir is still on disk)"
+        );
+        assert!(
+            !branch_exists(&bare, "auto/orphan").await,
+            "orphan branch must be gone"
+        );
+    }
+
+    /// Sweep must be a no-op (and not error) when the root has no `.clones`
+    /// dir yet — relevant on a freshly-deployed daemon's first boot.
+    #[tokio::test]
+    async fn sweep_orphan_branches_handles_missing_clones_dir() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let count = sweep_orphan_branches(tmp.path())
+            .await
+            .expect("sweep on empty root");
+        assert_eq!(count, 0);
     }
 }
