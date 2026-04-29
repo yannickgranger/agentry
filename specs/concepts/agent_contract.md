@@ -60,6 +60,30 @@ The `BASH_PRELUDE` `EXIT` trap (legacy bash heredoc roles) does the same
 job for roles that haven't migrated yet; both patterns coexist until EPIC
 \#161 ports every role to Rust.
 
+## StreamErr
+
+Failure type returned by the `stream_claude` lib helper that Rust role
+binaries use to invoke `claude -p --output-format stream-json --verbose`.
+Distinguishes the two failure modes the daemon's projector parses
+differently:
+
+- `ClaudeFailed { exit_code, detail }` — `timeout(1) claude -p ...`
+  exited non-zero (or the spawn itself failed). `exit_code` is `124` for
+  wall-clock timeouts, `127` for command-not-found, the child's actual
+  code otherwise; `-1` reserved for spawn / wait failures. `detail`
+  carries the tail of stderr (≤4 KiB).
+- `TranscriptEmpty { path }` — the child reported success, but the
+  transcript bind-mount could not be written (rootless podman subuid
+  mismatch on `/transcripts` is the dominant cause). Surfaced explicitly
+  so the operator sees the real failure mode rather than a downstream
+  parse error.
+
+Both variants are wire-compatible with the bash `stream_claude` helper's
+emit shape. Roles that catch a `StreamErr` emit a degradation event and
+either `done failed` (hard error) or — for soft-fail call sites like the
+coder exitpoint's self-review — degrade to a permissive default and
+proceed.
+
 ## Event
 
 A timestamped event: `Ts` + `EventKind`. The unit that the spawner reads
