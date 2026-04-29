@@ -91,6 +91,10 @@ Do not invent new primitives, add new crates, or re-open deferred features. If t
 
 `docs/PROPOSAL.md` contains the 2026-04-23 archaeology proposal that seeded this project. It describes a roadmap in M0-M9 milestones. That framing is retired: the project now plans in GitHub-issue-sized transformations with explicit verbs + file:line targets, not in milestones. The proposal is kept for the motivation + context it encodes, not for its roadmap.
 
+## Recent milestones
+
+- 2026-04-29: EPIC #182 sub-issue #190 closed. Substrate now runs Commandant-authored workflows via `orchestrator team register`. agentry-self-host-v2 (coder → git-op-commit → reviewer → git-op-push → ci-watcher) replaces the empty_diff-broken v1.
+
 ## Last updated
 
 See `git log -1 AGENTRY_RESUME.md`. If this document drifts from the code, the code is right and this document is a bug to fix via a brief.
