@@ -39,7 +39,9 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 use agentry_role_runtime::{
-    emit_done, emit_event, emit_finding, read_bundle_value, stream_claude, DoneGuard, StreamErr,
+    emit_done, emit_event, emit_finding, head_bytes, mech_finding, pointer_str, pointer_str_or,
+    read_bundle_value, stream_claude, string_array_field, strip_fences, tail_bytes, tail_lines,
+    DoneGuard, StreamErr,
 };
 use orchestrator_types::{DoneReason, EventVerdict, FindingOrigin, ReviewFinding, Severity};
 use serde_json::{json, Value};
@@ -233,19 +235,6 @@ fn parse_brief_context(bundle: &Value) -> BriefContext {
     }
 }
 
-fn pointer_str<'a>(bundle: &'a Value, ptr: &str) -> &'a str {
-    bundle.pointer(ptr).and_then(Value::as_str).unwrap_or("")
-}
-
-fn pointer_str_or(bundle: &Value, ptr: &str, default: &str) -> String {
-    let s = pointer_str(bundle, ptr);
-    if s.is_empty() {
-        default.to_string()
-    } else {
-        s.to_string()
-    }
-}
-
 fn collect_blocker_findings(bundle: &Value) -> Vec<PriorFinding> {
     let messages = bundle
         .pointer("/team_context/messages")
@@ -273,17 +262,6 @@ fn collect_blocker_findings(bundle: &Value) -> Vec<PriorFinding> {
         }
     }
     out
-}
-
-fn string_array_field(v: &Value, key: &str) -> Vec<String> {
-    v.get(key)
-        .and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|x| x.as_str().map(|s| s.to_string()))
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 fn build_rework_banner(findings: &[PriorFinding]) -> String {
@@ -809,22 +787,6 @@ fn slice_json_object(text: &str) -> Option<&str> {
     Some(&text[start..=end])
 }
 
-fn strip_fences(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len());
-    for line in raw.lines() {
-        let trimmed = line.trim_end_matches('\r');
-        if trimmed == "```" || trimmed == "```json" {
-            continue;
-        }
-        if trimmed.is_empty() {
-            continue;
-        }
-        out.push_str(trimmed);
-        out.push('\n');
-    }
-    out
-}
-
 /// Run the self-review claude call. Returns `Ok(())` to continue the
 /// pipeline (verbs all applied OR malformed reply tolerated). Returns
 /// `Err(())` when the call surfaced unapplied verbs and the role-local
@@ -995,23 +957,6 @@ fn run_dead_pub_check_phase() {
 // Emit helpers + small string helpers
 // ---------------------------------------------------------------------------
 
-fn mech_finding(tool: &str, category: &str, message: &str) -> ReviewFinding {
-    ReviewFinding {
-        file: None,
-        line: None,
-        severity: Severity::Blocker,
-        origin: FindingOrigin::Mechanical {
-            tool: tool.into(),
-            rule: None,
-        },
-        category: category.into(),
-        message: message.into(),
-        suggested_fix: None,
-        prohibitions: Vec::new(),
-        requirements: Vec::new(),
-    }
-}
-
 fn mech_finding_warn(tool: &str, category: &str, message: &str) -> ReviewFinding {
     ReviewFinding {
         file: None,
@@ -1029,41 +974,10 @@ fn mech_finding_warn(tool: &str, category: &str, message: &str) -> ReviewFinding
     }
 }
 
-fn head_bytes(s: &str, budget: usize) -> String {
-    if s.len() <= budget {
-        return s.to_string();
-    }
-    let mut cut = budget;
-    while !s.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    s[..cut].to_string()
-}
-
-fn tail_lines(buf: &[u8], n: usize) -> String {
-    let s = String::from_utf8_lossy(buf);
-    let lines: Vec<&str> = s.lines().collect();
-    let start = lines.len().saturating_sub(n);
-    lines[start..].join("\n")
-}
-
-fn tail_bytes(buf: &[u8], n: usize) -> String {
-    let start = buf.len().saturating_sub(n);
-    String::from_utf8_lossy(&buf[start..]).into_owned()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
-
-    #[test]
-    fn pointer_str_or_uses_default_when_missing_or_empty() {
-        let v = json!({"a": "value", "b": ""});
-        assert_eq!(pointer_str_or(&v, "/missing", "default"), "default");
-        assert_eq!(pointer_str_or(&v, "/a", "default"), "value");
-        assert_eq!(pointer_str_or(&v, "/b", "default"), "default");
-    }
 
     #[test]
     fn collect_blocker_findings_filters_by_severity() {
@@ -1229,42 +1143,10 @@ mod tests {
     }
 
     #[test]
-    fn strip_fences_drops_json_and_plain() {
-        assert_eq!(strip_fences("```json\n{\"x\":1}\n```\n"), "{\"x\":1}\n");
-    }
-
-    #[test]
-    fn mech_finding_uses_blocker_severity() {
-        let f = mech_finding("cargo-fmt", "fmt", "boom");
-        assert!(matches!(f.severity, Severity::Blocker));
-        match &f.origin {
-            FindingOrigin::Mechanical { tool, rule } => {
-                assert_eq!(tool, "cargo-fmt");
-                assert!(rule.is_none());
-            }
-            _ => panic!("expected mechanical origin"),
-        }
-        assert_eq!(f.category, "fmt");
-        assert_eq!(f.message, "boom");
-    }
-
-    #[test]
     fn mech_finding_warn_uses_warn_severity() {
         let f = mech_finding_warn("ra-query", "dead-pub", "x is unused");
         assert!(matches!(f.severity, Severity::Warn));
         assert_eq!(f.category, "dead-pub");
-    }
-
-    #[test]
-    fn head_bytes_respects_char_boundary() {
-        let s = "🚀x";
-        let h = head_bytes(s, 4);
-        assert!(h.is_empty() || h == "🚀");
-    }
-
-    #[test]
-    fn tail_lines_returns_last_n() {
-        assert_eq!(tail_lines(b"a\nb\nc\nd\ne", 3), "c\nd\ne");
     }
 
     #[test]

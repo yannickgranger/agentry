@@ -56,7 +56,9 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 use agentry_role_runtime::{
-    emit_done, emit_event, emit_finding, read_bundle_value, stream_claude, DoneGuard, StreamErr,
+    emit_done, emit_event, emit_finding, head_bytes, parse_severity, pointer_str,
+    read_bundle_value, stream_claude, string_array_field, strip_fences, tail_bytes, tail_lines,
+    workspace_is_git_repo, DoneGuard, StreamErr,
 };
 use orchestrator_types::{DoneReason, EventVerdict, FindingOrigin, ReviewFinding, Severity};
 use serde_json::{json, Value};
@@ -196,17 +198,6 @@ fn fail_reason(cause: &str, exit_code: Option<i32>) -> Option<DoneReason> {
         cause: cause.into(),
         exit_code,
     })
-}
-
-fn pointer_str<'a>(bundle: &'a Value, ptr: &str) -> &'a str {
-    bundle.pointer(ptr).and_then(Value::as_str).unwrap_or("")
-}
-
-fn workspace_is_git_repo(workspace: &str) -> bool {
-    // Mirrors `[ -d /workspace/.git ] || [ -f /workspace/.git ]`. Worktrees
-    // present as files; full clones present as directories.
-    let dot_git = Path::new(workspace).join(".git");
-    dot_git.is_dir() || dot_git.is_file()
 }
 
 fn git_diff_3dot(base_branch: &str) -> Result<String, String> {
@@ -492,22 +483,6 @@ pub(crate) fn parse_findings(response: &str, agent_id: &str) -> Vec<ReviewFindin
         .collect()
 }
 
-fn strip_fences(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len());
-    for line in raw.lines() {
-        let trimmed = line.trim_end_matches('\r');
-        if trimmed == "```" || trimmed == "```json" {
-            continue;
-        }
-        if trimmed.is_empty() {
-            continue;
-        }
-        out.push_str(trimmed);
-        out.push('\n');
-    }
-    out
-}
-
 fn slice_json_array(text: &str) -> Option<&str> {
     let start = text.find('[')?;
     let end = text.rfind(']')?;
@@ -572,47 +547,6 @@ fn convert_finding(v: &Value, agent_id: &str) -> ReviewFinding {
     }
 }
 
-fn parse_severity(s: Option<&str>) -> Severity {
-    match s.unwrap_or("warn") {
-        "blocker" => Severity::Blocker,
-        _ => Severity::Warn,
-    }
-}
-
-fn string_array_field(v: &Value, key: &str) -> Vec<String> {
-    v.get(key)
-        .and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|x| x.as_str().map(|s| s.to_string()))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn head_bytes(s: &str, budget: usize) -> String {
-    if s.len() <= budget {
-        return s.to_string();
-    }
-    let mut cut = budget;
-    while !s.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    s[..cut].to_string()
-}
-
-fn tail_lines(buf: &[u8], n: usize) -> String {
-    let s = String::from_utf8_lossy(buf);
-    let lines: Vec<&str> = s.lines().collect();
-    let start = lines.len().saturating_sub(n);
-    lines[start..].join("\n")
-}
-
-fn tail_bytes(buf: &[u8], n: usize) -> String {
-    let start = buf.len().saturating_sub(n);
-    String::from_utf8_lossy(&buf[start..]).into_owned()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -631,18 +565,6 @@ mod tests {
         assert_eq!(slice_json_array("no brackets here"), None);
         assert_eq!(slice_json_array("] only closing"), None);
         assert_eq!(slice_json_array("[ only opening"), None);
-    }
-
-    #[test]
-    fn strip_fences_drops_json_and_plain_fences() {
-        let raw = "```json\n[1,2]\n```\n";
-        assert_eq!(strip_fences(raw), "[1,2]\n");
-    }
-
-    #[test]
-    fn strip_fences_drops_blank_lines() {
-        let raw = "\n[1,2]\n\nmore\n";
-        assert_eq!(strip_fences(raw), "[1,2]\nmore\n");
     }
 
     #[test]
@@ -730,33 +652,6 @@ mod tests {
                     +b\n";
         let v = changed_rs_files(diff);
         assert_eq!(v, vec!["src/lib.rs"]);
-    }
-
-    #[test]
-    fn parse_severity_known_blocker() {
-        assert_eq!(parse_severity(Some("blocker")), Severity::Blocker);
-    }
-
-    #[test]
-    fn parse_severity_unknown_defaults_to_warn() {
-        assert_eq!(parse_severity(Some("warn")), Severity::Warn);
-        assert_eq!(parse_severity(Some("info")), Severity::Warn);
-        assert_eq!(parse_severity(None), Severity::Warn);
-    }
-
-    #[test]
-    fn head_bytes_respects_char_boundary() {
-        // Emoji is 4 bytes in UTF-8. Budget 5 should clamp to 4 (after the
-        // emoji) or 0 (before), never split it.
-        let s = "🚀x"; // 4 bytes + 1 byte = 5 bytes
-        let h = head_bytes(s, 4);
-        assert!(h.is_empty() || h == "🚀");
-    }
-
-    #[test]
-    fn tail_lines_returns_last_n() {
-        let buf = b"a\nb\nc\nd\ne";
-        assert_eq!(tail_lines(buf, 3), "c\nd\ne");
     }
 
     #[test]

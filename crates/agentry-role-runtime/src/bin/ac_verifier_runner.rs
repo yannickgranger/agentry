@@ -27,11 +27,14 @@
 //! reaching one of the explicit `emit_done` calls (panic, abrupt return) —
 //! the daemon always sees a terminal `done` event. EPIC #161 B0 invariant.
 
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::process::{Command, Stdio};
 
-use agentry_role_runtime::{emit_done, emit_event, emit_finding, DoneGuard};
-use orchestrator_types::{EventVerdict, FindingOrigin, ReviewFinding, Severity};
+use agentry_role_runtime::{
+    emit_done, emit_event, emit_finding, parse_severity, read_bundle_value, tail_bytes, tail_lines,
+    workspace_is_git_repo, DoneGuard,
+};
+use orchestrator_types::{EventVerdict, FindingOrigin, ReviewFinding};
 use serde_json::{json, Value};
 
 /// Which AC verifier provider this invocation runs.
@@ -223,21 +226,6 @@ fn parse_provider_arg() -> Result<Provider, String> {
     provider.ok_or_else(|| "--provider <claude|gemini|grok> is required".to_string())
 }
 
-fn read_bundle_value() -> anyhow::Result<Value> {
-    let mut buf = String::new();
-    io::stdin()
-        .read_to_string(&mut buf)
-        .map_err(|e| anyhow::anyhow!("read stdin: {e}"))?;
-    serde_json::from_str(&buf).map_err(|e| anyhow::anyhow!("parse bundle: {e}"))
-}
-
-fn workspace_is_git_repo(workspace: &str) -> bool {
-    // Mirrors `[ -d /workspace/.git ] || [ -f /workspace/.git ]`. Worktrees
-    // present as files; full clones present as directories.
-    let dot_git = std::path::Path::new(workspace).join(".git");
-    dot_git.is_dir() || dot_git.is_file()
-}
-
 fn git_fetch_origin(base_branch: &str) -> Result<(), String> {
     let out = Command::new("git")
         .arg("fetch")
@@ -407,30 +395,6 @@ fn dispatch_outcome(provider: Provider, agent_id: &str, outcome_text: &str) {
     emit_done(EventVerdict::ReworkNeeded, None);
 }
 
-fn parse_severity(s: Option<&str>) -> Severity {
-    // Bash forwarded raw strings to `emit_finding_model` which wrote them as
-    // JSON. The daemon-side `Severity` only accepts blocker|warn (anything
-    // else fails to deserialize). Default to Warn for unknown strings to
-    // preserve forward-compat — same effect as the daemon would have if it
-    // saw an unknown severity at parse time.
-    match s.unwrap_or("warn") {
-        "blocker" => Severity::Blocker,
-        _ => Severity::Warn,
-    }
-}
-
-fn tail_lines(buf: &[u8], n: usize) -> String {
-    let s = String::from_utf8_lossy(buf);
-    let lines: Vec<&str> = s.lines().collect();
-    let start = lines.len().saturating_sub(n);
-    lines[start..].join("\n")
-}
-
-fn tail_bytes(buf: &[u8], n: usize) -> String {
-    let start = buf.len().saturating_sub(n);
-    String::from_utf8_lossy(&buf[start..]).into_owned()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -456,32 +420,5 @@ mod tests {
         assert_eq!(Provider::Claude.binary_name(), "ac-verifier");
         assert_eq!(Provider::Gemini.binary_name(), "ac-verifier-gemini");
         assert_eq!(Provider::Grok.binary_name(), "ac-verifier-grok");
-    }
-
-    #[test]
-    fn parse_severity_known_blocker() {
-        assert_eq!(parse_severity(Some("blocker")), Severity::Blocker);
-    }
-
-    #[test]
-    fn parse_severity_unknown_defaults_to_warn() {
-        assert_eq!(parse_severity(Some("warn")), Severity::Warn);
-        assert_eq!(parse_severity(Some("info")), Severity::Warn);
-        assert_eq!(parse_severity(None), Severity::Warn);
-    }
-
-    #[test]
-    fn tail_lines_returns_last_n() {
-        let buf = b"a\nb\nc\nd\ne";
-        assert_eq!(tail_lines(buf, 3), "c\nd\ne");
-        assert_eq!(tail_lines(buf, 100), "a\nb\nc\nd\ne");
-        assert_eq!(tail_lines(b"", 5), "");
-    }
-
-    #[test]
-    fn tail_bytes_returns_last_n() {
-        let buf = b"abcdefgh";
-        assert_eq!(tail_bytes(buf, 3), "fgh");
-        assert_eq!(tail_bytes(buf, 100), "abcdefgh");
     }
 }

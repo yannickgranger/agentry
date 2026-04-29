@@ -33,7 +33,7 @@ use chrono::Utc;
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::{json, Value};
 
-use orchestrator_types::{DoneReason, EventVerdict, ReviewFinding};
+use orchestrator_types::{DoneReason, EventVerdict, FindingOrigin, ReviewFinding, Severity};
 
 /// Set by `emit_done`. Read by `DoneGuard::drop`. Static so it works across
 /// any task structure inside the role binary.
@@ -175,9 +175,126 @@ fn emit_typed_payload<T: Serialize>(value: &T) -> Option<Value> {
     serde_json::to_value(value).ok()
 }
 
+// ---------- shared helpers (consolidated from runner binaries, brief #213) ----------
+
+/// Last `n` lines of `buf` joined with `\n`. UTF-8 lossy.
+pub fn tail_lines(buf: &[u8], n: usize) -> String {
+    let s = String::from_utf8_lossy(buf);
+    let lines: Vec<&str> = s.lines().collect();
+    let start = lines.len().saturating_sub(n);
+    lines[start..].join("\n")
+}
+
+/// Last `n` bytes of `buf` as a lossy UTF-8 string.
+pub fn tail_bytes(buf: &[u8], n: usize) -> String {
+    let start = buf.len().saturating_sub(n);
+    String::from_utf8_lossy(&buf[start..]).into_owned()
+}
+
+/// Head of `s` clamped to `n` bytes, snapped down to the nearest UTF-8
+/// char boundary so multi-byte chars don't get split.
+pub fn head_bytes(s: &str, n: usize) -> String {
+    if s.len() <= n {
+        return s.to_string();
+    }
+    let mut cut = n;
+    while !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    s[..cut].to_string()
+}
+
+/// Read `v.pointer(ptr).as_str()` or `""` when missing/non-string.
+pub fn pointer_str<'a>(v: &'a Value, ptr: &str) -> &'a str {
+    v.pointer(ptr).and_then(Value::as_str).unwrap_or("")
+}
+
+/// Like [`pointer_str`] but returns `default` when the field is missing or empty.
+pub fn pointer_str_or(v: &Value, ptr: &str, default: &str) -> String {
+    let s = pointer_str(v, ptr);
+    if s.is_empty() {
+        default.to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+/// Map a textual severity (`"blocker"`/`"warn"`/...) to [`Severity`].
+/// Unknown strings (and `None`) default to `Severity::Warn` to match the
+/// daemon-side fallback behaviour.
+pub fn parse_severity(opt: Option<&str>) -> Severity {
+    match opt.unwrap_or("warn") {
+        "blocker" => Severity::Blocker,
+        _ => Severity::Warn,
+    }
+}
+
+/// Read an array-of-strings field on `v`. Missing / non-array / non-string
+/// entries are silently dropped.
+pub fn string_array_field(v: &Value, key: &str) -> Vec<String> {
+    v.get(key)
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Strip ` ``` ` and ` ```json ` fence lines (and blank lines) from `raw`,
+/// preserving everything else. Used for parsing claude replies that wrap
+/// JSON in markdown code fences.
+pub fn strip_fences(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for line in raw.lines() {
+        let trimmed = line.trim_end_matches('\r');
+        if trimmed == "```" || trimmed == "```json" {
+            continue;
+        }
+        if trimmed.is_empty() {
+            continue;
+        }
+        out.push_str(trimmed);
+        out.push('\n');
+    }
+    out
+}
+
+/// True iff `<workspace>/.git` exists as a directory (full clone) or file
+/// (worktree).
+pub fn workspace_is_git_repo(workspace: &str) -> bool {
+    let dot_git = std::path::Path::new(workspace).join(".git");
+    dot_git.is_dir() || dot_git.is_file()
+}
+
+/// Build a mechanical-origin Blocker [`ReviewFinding`].
+///
+/// Promoted from `coder_claude_runner.rs` — the only binary with this
+/// helper today, so the lib signature mirrors that one verbatim:
+/// `(tool, category, message)` → Blocker mechanical finding with `rule`
+/// unset.
+pub fn mech_finding(tool: &str, category: &str, message: &str) -> ReviewFinding {
+    ReviewFinding {
+        file: None,
+        line: None,
+        severity: Severity::Blocker,
+        origin: FindingOrigin::Mechanical {
+            tool: tool.into(),
+            rule: None,
+        },
+        category: category.into(),
+        message: message.into(),
+        suggested_fix: None,
+        prohibitions: Vec::new(),
+        requirements: Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn verdict_to_str_matches_serde_snake_case() {
@@ -213,5 +330,81 @@ mod tests {
         // capture stdout in this unit test (would require thread-local
         // redirection); the integration test in tests/done_guard.rs does
         // that subprocess-level check.
+    }
+
+    #[test]
+    fn pointer_str_or_uses_default_when_missing_or_empty() {
+        let v = json!({"a": "value", "b": ""});
+        assert_eq!(pointer_str_or(&v, "/missing", "default"), "default");
+        assert_eq!(pointer_str_or(&v, "/a", "default"), "value");
+        assert_eq!(pointer_str_or(&v, "/b", "default"), "default");
+    }
+
+    #[test]
+    fn parse_severity_known_blocker() {
+        assert_eq!(parse_severity(Some("blocker")), Severity::Blocker);
+    }
+
+    #[test]
+    fn parse_severity_unknown_defaults_to_warn() {
+        assert_eq!(parse_severity(Some("warn")), Severity::Warn);
+        assert_eq!(parse_severity(Some("info")), Severity::Warn);
+        assert_eq!(parse_severity(None), Severity::Warn);
+    }
+
+    #[test]
+    fn head_bytes_respects_char_boundary() {
+        // Emoji is 4 bytes in UTF-8. Budget 5 should clamp to 4 (after the
+        // emoji) or 0 (before), never split it.
+        let s = "🚀x"; // 4 bytes + 1 byte = 5 bytes
+        let h = head_bytes(s, 4);
+        assert!(h.is_empty() || h == "🚀");
+    }
+
+    #[test]
+    fn tail_lines_returns_last_n() {
+        let buf = b"a\nb\nc\nd\ne";
+        assert_eq!(tail_lines(buf, 3), "c\nd\ne");
+        assert_eq!(tail_lines(buf, 100), "a\nb\nc\nd\ne");
+        assert_eq!(tail_lines(b"", 5), "");
+    }
+
+    #[test]
+    fn tail_bytes_returns_last_n() {
+        let buf = b"abcdefgh";
+        assert_eq!(tail_bytes(buf, 3), "fgh");
+        assert_eq!(tail_bytes(buf, 100), "abcdefgh");
+    }
+
+    #[test]
+    fn strip_fences_drops_json_and_plain() {
+        assert_eq!(strip_fences("```json\n{\"x\":1}\n```\n"), "{\"x\":1}\n");
+    }
+
+    #[test]
+    fn strip_fences_drops_json_and_plain_fences() {
+        let raw = "```json\n[1,2]\n```\n";
+        assert_eq!(strip_fences(raw), "[1,2]\n");
+    }
+
+    #[test]
+    fn strip_fences_drops_blank_lines() {
+        let raw = "\n[1,2]\n\nmore\n";
+        assert_eq!(strip_fences(raw), "[1,2]\nmore\n");
+    }
+
+    #[test]
+    fn mech_finding_uses_blocker_severity() {
+        let f = mech_finding("cargo-fmt", "fmt", "boom");
+        assert!(matches!(f.severity, Severity::Blocker));
+        match &f.origin {
+            FindingOrigin::Mechanical { tool, rule } => {
+                assert_eq!(tool, "cargo-fmt");
+                assert!(rule.is_none());
+            }
+            _ => panic!("expected mechanical origin"),
+        }
+        assert_eq!(f.category, "fmt");
+        assert_eq!(f.message, "boom");
     }
 }
