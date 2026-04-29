@@ -62,11 +62,20 @@ impl Drop for DoneGuard {
 }
 
 pub fn emit_event(payload: &serde_json::Value) {
+    let mut value = payload.clone();
+    if let Some(obj) = value.as_object_mut() {
+        if !obj.contains_key("at") {
+            obj.insert(
+                "at".into(),
+                serde_json::Value::String(chrono::Utc::now().to_rfc3339()),
+            );
+        }
+    }
     #[cfg(test)]
     {
         let captured = EVENT_CAPTURE.with(|c| {
             if let Some(v) = c.borrow_mut().as_mut() {
-                v.push(payload.clone());
+                v.push(value.clone());
                 true
             } else {
                 false
@@ -76,7 +85,7 @@ pub fn emit_event(payload: &serde_json::Value) {
             return;
         }
     }
-    let line = serde_json::to_string(payload).unwrap_or_default();
+    let line = serde_json::to_string(&value).unwrap_or_default();
     println!("{line}");
 }
 
@@ -285,6 +294,41 @@ mod tests {
         assert!(
             events.is_empty(),
             "guard with emitted=true must not fire any extra event"
+        );
+    }
+
+    #[test]
+    fn emit_event_injects_at_when_absent() {
+        let events = capture_events(|| {
+            emit_event(&serde_json::json!({
+                "type": "progress",
+                "message": "no at field here",
+            }));
+        });
+        assert_eq!(events.len(), 1);
+        let at = events[0]
+            .get("at")
+            .and_then(|v| v.as_str())
+            .expect("emit_event must inject an `at` field when the payload lacks one");
+        chrono::DateTime::parse_from_rfc3339(at)
+            .expect("injected `at` value must be a valid RFC3339 timestamp");
+    }
+
+    #[test]
+    fn emit_event_preserves_existing_at() {
+        const PRESET: &str = "2026-04-29T00:00:00+00:00";
+        let events = capture_events(|| {
+            emit_event(&serde_json::json!({
+                "type": "progress",
+                "at": PRESET,
+                "message": "has its own at",
+            }));
+        });
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].get("at").and_then(|v| v.as_str()),
+            Some(PRESET),
+            "emit_event must NOT overwrite an existing `at` value"
         );
     }
 }

@@ -11,6 +11,22 @@ use orchestrator_types::{AgentRole, RoleName};
 use redis::aio::ConnectionManager;
 use std::path::Path;
 
+/// Expand `~/` and `${HOME}` substrings in a Mount.source path against the
+/// substrate-side `$HOME`. A bare `~` (no slash) is left unmodified to avoid
+/// surprise expansion of unrelated tilde-prefixed paths. Only the bracketed
+/// `${HOME}` form is expanded — full shell variable expansion is out of scope.
+fn expand_home_in_source(source: &str, home: &str) -> String {
+    let mut out = if let Some(rest) = source.strip_prefix("~/") {
+        format!("{home}/{rest}")
+    } else {
+        source.to_string()
+    };
+    if out.contains("${HOME}") {
+        out = out.replace("${HOME}", home);
+    }
+    out
+}
+
 /// Load every `*.json` role file in `dir` into Redis. Returns the list of
 /// names registered, in the order the files were processed (sorted by file
 /// name for determinism).
@@ -36,11 +52,25 @@ pub async fn load_roles_from_dir(
     }
     json_files.sort();
 
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/var/home/yg".into());
+
     let mut out: Vec<RoleName> = Vec::with_capacity(json_files.len());
     for path in json_files {
         let text = tokio::fs::read_to_string(&path).await?;
-        let role: AgentRole = serde_json::from_str(&text)
+        let mut role: AgentRole = serde_json::from_str(&text)
             .map_err(|e| Error::Config(format!("failed to parse {}: {}", path.display(), e)))?;
+        for mount in role.mounts.iter_mut() {
+            let expanded = expand_home_in_source(&mount.source, &home);
+            if expanded != mount.source {
+                tracing::info!(
+                    role_name = %role.name.0,
+                    original = %mount.source,
+                    expanded = %expanded,
+                    "expanded mount source",
+                );
+                mount.source = expanded;
+            }
+        }
         redis_io::save_role(conn, &role).await?;
         tracing::info!(
             role_name = %role.name.0,
@@ -56,9 +86,85 @@ pub async fn load_roles_from_dir(
 mod tests {
     use super::*;
     use orchestrator_types::{
-        AgentRole, PackageManager, PermitScope, RoleName, SubstrateClass, ToolAllowlist,
+        AgentRole, Mount, PackageManager, PermitScope, RoleName, SubstrateClass, ToolAllowlist,
     };
     use std::path::PathBuf;
+
+    #[test]
+    fn expands_tilde_in_mount_source() {
+        let s = expand_home_in_source("~/foo/bar", "/home/agent");
+        assert_eq!(s, "/home/agent/foo/bar");
+    }
+
+    #[test]
+    fn expands_braced_home_in_mount_source() {
+        let s = expand_home_in_source("${HOME}/foo/bar", "/home/agent");
+        assert_eq!(s, "/home/agent/foo/bar");
+    }
+
+    #[test]
+    fn leaves_absolute_paths_unchanged() {
+        let s = expand_home_in_source("/usr/local/bin/x", "/home/agent");
+        assert_eq!(s, "/usr/local/bin/x");
+    }
+
+    #[test]
+    fn leaves_bare_tilde_unchanged() {
+        // Just a tilde with no slash — leave as-is to avoid surprise.
+        let s = expand_home_in_source("~", "/home/agent");
+        assert_eq!(s, "~");
+    }
+
+    /// End-to-end-ish: build a role with a `~/...` mount, serialize it, parse
+    /// it back through the same logic the loader uses, and confirm the
+    /// expansion happens before the role would be persisted. Stops short of
+    /// the live Redis save (covered by ignored integration tests above).
+    #[test]
+    fn loader_expansion_rewrites_role_mounts_before_save() {
+        let mut role = AgentRole {
+            name: RoleName("rdl-mount-test".into()),
+            version: 1,
+            model: None,
+            system_prompt: None,
+            image: "alpine:3.21".into(),
+            substrate_class: SubstrateClass::Podman,
+            package_manager: PackageManager::Apk,
+            entrypoint_script: "#!/bin/sh\nexit 0\n".into(),
+            exitpoint_script: None,
+            binaries: vec![],
+            mcp_servers: vec![],
+            tool_allowlist: ToolAllowlist::default(),
+            permit_scope: PermitScope::default(),
+            passthru_env: vec![],
+            mounts: vec![
+                Mount {
+                    source: "~/foo/bar".into(),
+                    target: "/x/foo/bar".into(),
+                    readonly: true,
+                },
+                Mount {
+                    source: "${HOME}/baz".into(),
+                    target: "/x/baz".into(),
+                    readonly: false,
+                },
+                Mount {
+                    source: "/usr/local/bin/keep".into(),
+                    target: "/usr/local/bin/keep".into(),
+                    readonly: true,
+                },
+            ],
+            workspace_mount: None,
+            sccache: false,
+            extra_bootstrap: vec![],
+        };
+        let home = "/home/agent";
+        for mount in role.mounts.iter_mut() {
+            mount.source = expand_home_in_source(&mount.source, home);
+        }
+        assert_eq!(role.mounts[0].source, "/home/agent/foo/bar");
+        assert_eq!(role.mounts[1].source, "/home/agent/baz");
+        assert_eq!(role.mounts[2].source, "/usr/local/bin/keep");
+    }
 
     fn test_redis_url() -> Option<String> {
         std::env::var("AGENTRY_TEST_REDIS_URL").ok()

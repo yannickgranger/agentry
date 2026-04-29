@@ -11,6 +11,7 @@ repository.workspace = true
 
 [dependencies]
 anyhow = "1"
+chrono = { workspace = true }
 clap = { workspace = true }
 orchestrator-types = { path = "../orchestrator-types" }
 reqwest = { workspace = true }
