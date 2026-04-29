@@ -204,8 +204,7 @@ pub async fn list_teams(conn: &mut ConnectionManager) -> Result<Vec<(TeamName, u
 }
 
 /// Scan the role catalog and return every `(name, version)` pair currently
-/// registered, sorted by name then version ascending. Distinct from
-/// [`list_role_names`], which dedupes versions.
+/// registered, sorted by name then version ascending.
 pub async fn list_roles(conn: &mut ConnectionManager) -> Result<Vec<(RoleName, u32)>> {
     let mut out: Vec<(RoleName, u32)> = Vec::new();
     let mut cursor: u64 = 0;
@@ -230,33 +229,6 @@ pub async fn list_roles(conn: &mut ConnectionManager) -> Result<Vec<(RoleName, u
     }
     out.sort_by(|a, b| a.0 .0.cmp(&b.0 .0).then_with(|| a.1.cmp(&b.1)));
     Ok(out)
-}
-
-/// Scan the role catalog and return every distinct role name, regardless of
-/// version. Sorted ascending.
-pub async fn list_role_names(conn: &mut ConnectionManager) -> Result<Vec<RoleName>> {
-    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    let mut cursor: u64 = 0;
-    loop {
-        let (next, batch): (u64, Vec<String>) = redis::cmd("SCAN")
-            .arg(cursor)
-            .arg("MATCH")
-            .arg("agentry:role:*:v*")
-            .arg("COUNT")
-            .arg(100)
-            .query_async(conn)
-            .await?;
-        for key in batch {
-            if let Some((name, _version)) = parse_versioned_key(&key, "role") {
-                seen.insert(name);
-            }
-        }
-        cursor = next;
-        if cursor == 0 {
-            break;
-        }
-    }
-    Ok(seen.into_iter().map(RoleName).collect())
 }
 
 /// Parse `agentry:<kind>:<name>:v<version>`. Returns `None` if the key shape
@@ -315,7 +287,7 @@ fn _unused(_: TeamName) {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use orchestrator_types::RoleRef;
+    use orchestrator_types::{PackageManager, PermitScope, RoleRef, SubstrateClass, ToolAllowlist};
 
     #[test]
     fn parse_versioned_key_basic() {
@@ -471,29 +443,70 @@ mod tests {
         }
     }
 
+    /// `fetch_role(name, version)` must return the EXACT version requested.
+    /// Pre-184b the daemon probed v1..v5 in order and returned the first hit —
+    /// so a topology pinning v2 still got v1 if v1 existed. The migration to
+    /// RoleRef-keyed lookups makes the version pin load-bearing; this test
+    /// pins that semantic.
     #[tokio::test]
     #[ignore = "requires live Redis (AGENTRY_TEST_REDIS_URL)"]
-    async fn list_role_names_dedupes_versions() {
+    async fn fetch_role_resolves_exact_version() {
         let Some(url) = test_redis_url() else { return };
         let mut conn = connect(&url).await.expect("connect");
         let s = slug();
-        let role_name = format!("zz-rio-role-{s}");
-        // Seed two versions of the same role name. We construct the keys
-        // directly to avoid pulling AgentRole's full shape into this test.
-        let body = serde_json::json!({"_": "probe"}).to_string();
-        let k1 = format!("agentry:role:{role_name}:v1");
-        let k2 = format!("agentry:role:{role_name}:v2");
-        let _: () = conn.set(&k1, body.as_str()).await.expect("set v1");
-        let _: () = conn.set(&k2, body.as_str()).await.expect("set v2");
+        let role_name = RoleName(format!("zz-rio-fetch-{s}"));
 
-        let listed = list_role_names(&mut conn).await.expect("list");
-        let count = listed.iter().filter(|r| r.0 == role_name).count();
-        assert_eq!(
-            count, 1,
-            "list must dedupe across versions of the same role"
-        );
+        let v1 = AgentRole {
+            name: role_name.clone(),
+            version: 1,
+            model: None,
+            system_prompt: Some("v1 prompt".into()),
+            image: "alpine:3.21".into(),
+            substrate_class: SubstrateClass::default(),
+            package_manager: PackageManager::Apk,
+            entrypoint_script: "#!/usr/bin/env bash\nexit 0\n".into(),
+            exitpoint_script: None,
+            binaries: vec![],
+            mcp_servers: vec![],
+            tool_allowlist: ToolAllowlist::default(),
+            permit_scope: PermitScope::default(),
+            passthru_env: vec![],
+            mounts: vec![],
+            workspace_mount: None,
+            sccache: false,
+            extra_bootstrap: vec![],
+        };
+        let mut v2 = v1.clone();
+        v2.version = 2;
+        v2.system_prompt = Some("v2 prompt".into());
 
-        let _: () = conn.del(&k1).await.expect("cleanup v1");
-        let _: () = conn.del(&k2).await.expect("cleanup v2");
+        save_role(&mut conn, &v1).await.expect("save v1");
+        save_role(&mut conn, &v2).await.expect("save v2");
+
+        let got_v2 = fetch_role(&mut conn, &role_name, 2)
+            .await
+            .expect("fetch v2");
+        assert_eq!(got_v2.version, 2);
+        assert_eq!(got_v2.system_prompt.as_deref(), Some("v2 prompt"));
+
+        let got_v1 = fetch_role(&mut conn, &role_name, 1)
+            .await
+            .expect("fetch v1");
+        assert_eq!(got_v1.version, 1);
+        assert_eq!(got_v1.system_prompt.as_deref(), Some("v1 prompt"));
+
+        // Asking for a version that wasn't seeded must NotFound — no
+        // fall-through to a different version.
+        let missing = fetch_role(&mut conn, &role_name, 7).await;
+        assert!(matches!(missing, Err(Error::NotFound { .. })));
+
+        let _: () = conn
+            .del(format!("agentry:role:{}:v1", role_name.0))
+            .await
+            .expect("cleanup v1");
+        let _: () = conn
+            .del(format!("agentry:role:{}:v2", role_name.0))
+            .await
+            .expect("cleanup v2");
     }
 }
