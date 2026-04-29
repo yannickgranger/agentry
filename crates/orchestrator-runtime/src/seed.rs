@@ -367,118 +367,17 @@ sleep 300
 printf '{"at":"%s","type":"done","verdict":"shipped"}\n' "$(date -Iseconds)"
 "#;
 
-/// Coder role for the `agentry-self-host-v0` team. The workspace arrives
-/// pre-cloned (as a `git worktree` off a shared bare clone) at `/workspace`
-/// with branch `auto/<brief_id>` already checked out — the daemon's
-/// `workspace::allocate` did the work. The coder calls `claude -p` with a
-/// verb-structured prompt built from the brief payload, runs the acceptance
-/// command, and commits locally. Does NOT push — the shipper does that
-/// after the reviewer approves.
-const CODER_CLAUDE_AGENTRY_SCRIPT: &str = r##"#!/usr/bin/env bash
-set -euo pipefail
-bundle="$(cat)"
-
-brief_id=$(jq -r '.brief.id' <<<"$bundle")
-target_repo=$(jq -r '.brief.payload.target_repo // "yg/agentry"' <<<"$bundle")
-base_branch=$(jq -r '.brief.payload.base_branch // "develop"' <<<"$bundle")
-issue_title=$(jq -r '.brief.payload.issue_title // ""' <<<"$bundle")
-issue_body=$(jq -r '.brief.payload.issue_body // ""' <<<"$bundle")
-acceptance=$(jq -r '.brief.payload.acceptance // "true"' <<<"$bundle")
-forge_host=$(jq -r '.brief.payload.forge_host // "agency.lab:3000"' <<<"$bundle")
-
-prior_findings=$(jq -c '
-  [ .team_context.messages[]?.payload.findings[]?
-    | select(.severity == "blocker")
-    | { message, prohibitions: (.prohibitions // []), requirements: (.requirements // []) }
-  ]
-' <<<"$bundle")
-finding_count=$(jq 'length' <<<"$prior_findings")
-
-rework_banner=""
-if [ "$finding_count" -gt 0 ]; then
-    feedback_block=$(jq -r '.[] |
-        "- BLOCKER: \(.message)\n  Prohibitions: \(.prohibitions | join("; "))\n  Requirements: \(.requirements | join("; "))"
-    ' <<<"$prior_findings")
-    rework_banner=$(cat <<REWORK_EOF
-**This is a REWORK iteration.**
-
-A prior coder pass on this brief shipped a commit that is already on HEAD of this worktree. The reviewer flagged the following BLOCKER findings against that commit. Read the existing diff with \`git diff \${base_branch}...HEAD\`, identify the sites the findings name, and edit those sites to satisfy each requirement and avoid each prohibition. Do NOT replan from scratch and do NOT recreate files that already exist.
-
---- Prior reviewer findings ---
-${feedback_block}
---- End findings ---
-REWORK_EOF
-)
-    emit_event "$(jq -nc --argjson n "$finding_count" '{msg:"rework iteration — injecting prior findings into prompt",blocker_count:$n}')"
-fi
-
-if [ -z "${GITEA_TOKEN:-}" ]; then
-    emit_event '{"error":"GITEA_TOKEN not in env"}'
-    emit_done "failed"; exit 0
-fi
-
-mkdir -p /root/.claude
-export HOME=/root
-
-cd /workspace
-git config --global user.email "coder-claude-agentry@agentry.lab"
-git config --global user.name "coder-claude-agentry"
-git config --global http.sslVerify false
-
-branch="auto/${brief_id}"
-# Workspace is a git worktree allocated by the daemon; it is already on
-# branch auto/${brief_id}, forked from origin/${base_branch}.
-emit_event "$(jq -nc --arg b "$branch" '{msg:"workspace worktree ready",branch:$b}')"
-
-cat > /tmp/brief_vars.sh <<'VARS_EOF'
-#!/bin/bash
-VARS_EOF
-printf 'export brief_id=%q\n' "$brief_id"        >> /tmp/brief_vars.sh
-printf 'export base_branch=%q\n' "$base_branch"  >> /tmp/brief_vars.sh
-printf 'export issue_title=%q\n' "$issue_title"  >> /tmp/brief_vars.sh
-printf 'export issue_body=%q\n' "$issue_body"    >> /tmp/brief_vars.sh
-printf 'export acceptance=%q\n' "$acceptance"    >> /tmp/brief_vars.sh
-printf 'export branch=%q\n' "$branch"            >> /tmp/brief_vars.sh
-printf 'export topology_name=%q\n' "$(jq -r '.brief.topology.name // ""' <<<"$bundle")" >> /tmp/brief_vars.sh
-
-cat > /tmp/prompt.txt <<PROMPT
-You are the coder role inside the agentry autonomous team, operating in the
-container-local working directory /workspace. The repo is cloned at
-branch "$base_branch"; you are on a fresh branch "$branch".
-
-Your task is described in verb-structured form below. Follow it literally:
-each verb (CREATE / UPDATE / REPLACE / DELETE / MOVE) names a transformation
-on a specific file:line target. Do NOT invent additional changes.
-
-# /usr/local/bin/ship — runs the brief.kind's validator pipeline against /workspace and prints a JSON report. Calling it is OPTIONAL in this brief; brief 6 makes it the only path to publication. Use it as a self-check before git commit if you want.
-
-${rework_banner}
-
-Task title: $issue_title
-
-Task body:
-$issue_body
-
-Constraints:
-- Operate only inside /workspace. Never touch files outside it.
-- When you are done editing, the acceptance command below must pass. You
-  may run it yourself to check. The orchestrator will re-run it before
-  accepting the diff:
-    $acceptance
-- Do not commit or push. The orchestrator handles commit and push on your
-  behalf after you exit.
-- The orchestrator may be running you in \`agentry-self-host-v1\` topology (or a later v1+). In that case: do not commit, do not push. The \`/usr/local/bin/ship\` tool (when called) runs the validator pipeline against your changes; if it returns ok, exit and the orchestrator's git-operator role takes over. Topology name is in \$topology_name.
-
-When the transformations are complete and the acceptance passes, simply
-report success and exit.
-PROMPT
-
-emit_event "$(jq -nc --arg len "$(wc -c < /tmp/prompt.txt)" '{msg:"calling claude -p",prompt_bytes:$len}')"
-
-stream_claude reply ".coder" "$(cat /tmp/prompt.txt)"
-
-emit_event "$(jq -nc --arg len "${#reply}" '{msg:"claude reply received",bytes:$len}')"
-"##;
+// EPIC #161 Wave 1.2a: CODER_CLAUDE_AGENTRY_SCRIPT (entrypoint half) bash
+// heredoc that used to live here has been ported to a Rust runner —
+// `crates/agentry-role-runtime/src/bin/coder_claude_runner.rs`. The role's
+// entrypoint_script now just `exec /usr/local/bin/coder-claude-runner`.
+// The runner has its own unit-test coverage for blocker-finding extraction,
+// rework-banner construction, /tmp/brief_vars.sh writing, prompt
+// composition, and POSIX-safe shell quoting.
+//
+// CODER_CLAUDE_AGENTRY_EXITPOINT (the cargo fmt + quality-hygiene +
+// acceptance + self-review + dead-pub-check + git commit half) stays bash
+// for now; Wave 1.2b is its dedicated port.
 
 const CODER_CLAUDE_AGENTRY_EXITPOINT: &str = r##"#!/usr/bin/env bash
 set -euo pipefail
@@ -1630,7 +1529,14 @@ fn build_coder_claude_agentry_role(home: &str, claude_settings_path: &str) -> Ag
         image: "docker.io/library/rust:1.93".into(),
         substrate_class: SubstrateClass::Podman,
         package_manager: PackageManager::Apt,
-        entrypoint_script: format!("{BASH_PRELUDE}{CODER_CLAUDE_AGENTRY_SCRIPT}"),
+        // EPIC #161 Wave 1.2a — entrypoint ported to Rust runner. The
+        // runner reads the bundle, builds the verb-structured prompt
+        // (with prior-rework banner if applicable), writes
+        // `/tmp/brief_vars.sh` for the (still-bash) exitpoint to source,
+        // and streams claude. The exitpoint stays bash for now (Wave 1.2b
+        // is its dedicated port — cargo fmt + quality-hygiene + acceptance
+        // eval + self-review claude call + dead-pub-check + git commit).
+        entrypoint_script: "#!/bin/sh\nexec /usr/local/bin/coder-claude-runner\n".into(),
         exitpoint_script: Some(format!("{BASH_PRELUDE}{CODER_CLAUDE_AGENTRY_EXITPOINT}")),
         binaries: vec!["git".into(), "curl".into(), "ca-certificates".into()],
         mcp_servers: vec![],
@@ -1683,6 +1589,11 @@ fn build_coder_claude_agentry_role(home: &str, claude_settings_path: &str) -> Ag
             Mount {
                 source: format!("{home}/.local/bin/ship"),
                 target: "/usr/local/bin/ship".into(),
+                readonly: true,
+            },
+            Mount {
+                source: format!("{home}/.local/bin/coder-claude-runner"),
+                target: "/usr/local/bin/coder-claude-runner".into(),
                 readonly: true,
             },
         ],
@@ -3175,9 +3086,13 @@ mod tests {
         // `crates/agentry-role-runtime/src/bin/reviewer_claude_runner.rs`,
         // which uses `stream_claude` natively in Rust. The remaining bash
         // scripts must continue to use the bash `stream_claude` helper.
+        // EPIC #161 Wave 1.2a — CODER_CLAUDE_AGENTRY_SCRIPT (entrypoint
+        // half) was deleted and the role's claude invocation now lives in
+        // `crates/agentry-role-runtime/src/bin/coder_claude_runner.rs`,
+        // which uses Rust `stream_claude` natively. The remaining bash
+        // scripts must continue to use the bash `stream_claude` helper.
         for (name, s) in [
             ("CLAUDE_SCRIPT", CLAUDE_SCRIPT),
-            ("CODER_CLAUDE_AGENTRY_SCRIPT", CODER_CLAUDE_AGENTRY_SCRIPT),
             (
                 "ARCHAEOLOGIST_CLAUDE_AGENTRY_SCRIPT",
                 ARCHAEOLOGIST_CLAUDE_AGENTRY_SCRIPT,
@@ -3921,77 +3836,68 @@ mod tests {
         );
     }
 
+    // EPIC #161 Wave 1.2a — coder entrypoint behaviour assertions
+    // (topology_name export, team_context.messages walk, rework banner
+    // composition, blocker-severity filter) moved into the runner binary's
+    // `mod tests` next to the implementations:
+    //   - `collect_blocker_findings_*`
+    //   - `build_rework_banner_*`
+    //   - `write_brief_vars_emits_sourceable_script`
+    //   - `build_coder_prompt_*`
+
     #[test]
-    fn coder_script_exports_topology_name() {
-        // EPIC #152 brief 6: the coder script must derive topology_name from
-        // the bundle and write it to /tmp/brief_vars.sh so the exitpoint can
-        // branch on it.
-        let s = CODER_CLAUDE_AGENTRY_SCRIPT;
-        assert!(
-            s.contains("topology_name"),
-            "coder script must reference topology_name"
+    fn coder_role_entrypoint_invokes_runner() {
+        let role = build_coder_claude_agentry_role(
+            "/var/home/test",
+            "/var/home/test/.config/agentry/claude-container-settings.json",
         );
         assert!(
-            s.contains(".brief.topology.name"),
-            "coder script must read .brief.topology.name from the bundle"
+            role.entrypoint_script
+                .contains("exec /usr/local/bin/coder-claude-runner"),
+            "coder entrypoint must exec the runner: {}",
+            role.entrypoint_script
+        );
+        // Defensive: no bash heredoc carryover from the pre-port script.
+        for forbidden in ["set -euo pipefail", "stream_claude", "team_context"] {
+            assert!(
+                !role.entrypoint_script.contains(forbidden),
+                "coder entrypoint must not contain {} (legacy bash leftover)",
+                forbidden
+            );
+        }
+    }
+
+    #[test]
+    fn coder_role_bind_mounts_runner_binary() {
+        let role = build_coder_claude_agentry_role(
+            "/var/home/test",
+            "/var/home/test/.config/agentry/claude-container-settings.json",
         );
         assert!(
-            s.contains("/tmp/brief_vars.sh"),
-            "coder script must write to /tmp/brief_vars.sh"
-        );
-        assert!(
-            s.contains("export topology_name="),
-            "coder script must export topology_name into brief_vars.sh"
+            role.mounts
+                .iter()
+                .any(|m| m.target == "/usr/local/bin/coder-claude-runner" && m.readonly),
+            "coder must bind-mount the runner read-only at /usr/local/bin/coder-claude-runner"
         );
     }
 
     #[test]
-    fn coder_script_extracts_team_context_messages() {
-        let s = CODER_CLAUDE_AGENTRY_SCRIPT;
-        assert!(
-            s.contains("team_context.messages"),
-            "coder script must read findings from team_context.messages"
+    fn coder_role_keeps_bash_exitpoint_for_now() {
+        // EPIC #161 Wave 1.2a ports the entrypoint only; the exitpoint
+        // (cargo fmt + quality-hygiene + acceptance + self-review +
+        // dead-pub-check + git commit) stays bash until Wave 1.2b. Verify
+        // the exitpoint is still wired so tests for it remain meaningful.
+        let role = build_coder_claude_agentry_role(
+            "/var/home/test",
+            "/var/home/test/.config/agentry/claude-container-settings.json",
         );
+        let ep = role
+            .exitpoint_script
+            .as_ref()
+            .expect("coder role must have an exitpoint");
         assert!(
-            s.contains("prior_findings"),
-            "coder script must materialize a prior_findings variable"
-        );
-        assert!(
-            s.contains("finding_count"),
-            "coder script must compute a finding_count to gate the banner"
-        );
-    }
-
-    #[test]
-    fn coder_script_injects_rework_banner_when_findings_present() {
-        let s = CODER_CLAUDE_AGENTRY_SCRIPT;
-        assert!(
-            s.contains("This is a REWORK iteration"),
-            "coder script must announce rework iteration in the banner"
-        );
-        assert!(
-            s.contains("--- Prior reviewer findings ---"),
-            "coder script must wrap findings with a header delimiter"
-        );
-        assert!(
-            s.contains("--- End findings ---"),
-            "coder script must wrap findings with a footer delimiter"
-        );
-        assert!(
-            s.contains("${rework_banner}"),
-            "coder script prompt heredoc must interpolate the rework_banner shell variable"
-        );
-    }
-
-    #[test]
-    fn coder_script_filters_to_blocker_severity() {
-        // warns are informational and must NOT be injected — they would
-        // confuse Claude into addressing non-issues, and only blockers carry
-        // prohibitions+requirements that the rework prompt depends on.
-        let s = CODER_CLAUDE_AGENTRY_SCRIPT;
-        assert!(
-            s.contains(".severity == \"blocker\""),
-            "coder script must filter findings to blocker severity"
+            ep.contains("cargo fmt --all"),
+            "exitpoint must still run cargo fmt --all (Wave 1.2b will port this)"
         );
     }
 
