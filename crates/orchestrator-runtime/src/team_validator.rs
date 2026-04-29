@@ -9,7 +9,7 @@
 //! structurally by `#[serde(deny_unknown_fields)]` on the workflow types; it
 //! is not a runtime check here.
 
-use orchestrator_types::{RoleName, TeamTopology};
+use orchestrator_types::{RoleName, RoleRef, TeamTopology};
 use std::collections::{HashMap, HashSet};
 
 /// One violation surfaced by [`validate`]. The `path` names the offending
@@ -41,7 +41,7 @@ pub enum ViolationKind {
 #[must_use]
 pub fn validate(
     topology: &TeamTopology,
-    registered_roles: &[RoleName],
+    registered_roles: &[(RoleName, u32)],
 ) -> Vec<TeamValidationViolation> {
     let mut out = Vec::new();
     check_type_integrity(topology, &mut out);
@@ -74,7 +74,7 @@ fn check_type_integrity(topology: &TeamTopology, out: &mut Vec<TeamValidationVio
             detail: "roles[] must be non-empty".into(),
         });
     }
-    if topology.terminal_role.0.is_empty() {
+    if topology.terminal_role.name.0.is_empty() {
         out.push(TeamValidationViolation {
             path: "terminal_role".into(),
             kind: ViolationKind::Type,
@@ -85,33 +85,43 @@ fn check_type_integrity(topology: &TeamTopology, out: &mut Vec<TeamValidationVio
 
 fn check_reference_integrity(
     topology: &TeamTopology,
-    registered: &[RoleName],
+    registered: &[(RoleName, u32)],
     out: &mut Vec<TeamValidationViolation>,
 ) {
-    let registered_set: HashSet<&RoleName> = registered.iter().collect();
+    let registered_set: HashSet<(&RoleName, u32)> =
+        registered.iter().map(|(n, v)| (n, *v)).collect();
     for (i, role) in topology.roles.iter().enumerate() {
-        if !registered_set.contains(role) {
+        if !registered_set.contains(&(&role.name, role.version)) {
             out.push(TeamValidationViolation {
                 path: format!("roles[{i}]"),
                 kind: ViolationKind::Reference,
-                detail: format!("role '{}' is not in registered_roles", role.0),
+                detail: format!(
+                    "role '{}' v{} is not in registered_roles",
+                    role.name.0, role.version
+                ),
             });
         }
     }
-    let role_set: HashSet<&RoleName> = topology.roles.iter().collect();
+    let role_set: HashSet<&RoleRef> = topology.roles.iter().collect();
     for (i, edge) in topology.message_graph.iter().enumerate() {
         if !role_set.contains(&edge.from) {
             out.push(TeamValidationViolation {
                 path: format!("message_graph[{i}].from"),
                 kind: ViolationKind::Reference,
-                detail: format!("from '{}' is not in topology.roles", edge.from.0),
+                detail: format!(
+                    "from '{}' v{} is not in topology.roles",
+                    edge.from.name.0, edge.from.version
+                ),
             });
         }
         if !role_set.contains(&edge.to) {
             out.push(TeamValidationViolation {
                 path: format!("message_graph[{i}].to"),
                 kind: ViolationKind::Reference,
-                detail: format!("to '{}' is not in topology.roles", edge.to.0),
+                detail: format!(
+                    "to '{}' v{} is not in topology.roles",
+                    edge.to.name.0, edge.to.version
+                ),
             });
         }
     }
@@ -120,16 +130,16 @@ fn check_reference_integrity(
             path: "terminal_role".into(),
             kind: ViolationKind::Reference,
             detail: format!(
-                "terminal_role '{}' is not in topology.roles",
-                topology.terminal_role.0
+                "terminal_role '{}' v{} is not in topology.roles",
+                topology.terminal_role.name.0, topology.terminal_role.version
             ),
         });
     }
 }
 
-fn build_outbound_adjacency(topology: &TeamTopology) -> HashMap<&RoleName, Vec<&RoleName>> {
-    let role_set: HashSet<&RoleName> = topology.roles.iter().collect();
-    let mut adj: HashMap<&RoleName, Vec<&RoleName>> = HashMap::new();
+fn build_outbound_adjacency(topology: &TeamTopology) -> HashMap<&RoleRef, Vec<&RoleRef>> {
+    let role_set: HashSet<&RoleRef> = topology.roles.iter().collect();
+    let mut adj: HashMap<&RoleRef, Vec<&RoleRef>> = HashMap::new();
     for edge in &topology.message_graph {
         if role_set.contains(&edge.from) && role_set.contains(&edge.to) {
             adj.entry(&edge.from).or_default().push(&edge.to);
@@ -138,9 +148,9 @@ fn build_outbound_adjacency(topology: &TeamTopology) -> HashMap<&RoleName, Vec<&
     adj
 }
 
-fn entry_roles(topology: &TeamTopology) -> Vec<&RoleName> {
-    let role_set: HashSet<&RoleName> = topology.roles.iter().collect();
-    let mut has_inbound: HashSet<&RoleName> = HashSet::new();
+fn entry_roles(topology: &TeamTopology) -> Vec<&RoleRef> {
+    let role_set: HashSet<&RoleRef> = topology.roles.iter().collect();
+    let mut has_inbound: HashSet<&RoleRef> = HashSet::new();
     for edge in &topology.message_graph {
         if role_set.contains(&edge.to) {
             has_inbound.insert(&edge.to);
@@ -154,11 +164,11 @@ fn entry_roles(topology: &TeamTopology) -> Vec<&RoleName> {
 }
 
 fn reachable_from<'a>(
-    seeds: &[&'a RoleName],
-    adj: &HashMap<&'a RoleName, Vec<&'a RoleName>>,
-) -> HashSet<&'a RoleName> {
-    let mut reachable: HashSet<&'a RoleName> = HashSet::new();
-    let mut stack: Vec<&'a RoleName> = seeds.to_vec();
+    seeds: &[&'a RoleRef],
+    adj: &HashMap<&'a RoleRef, Vec<&'a RoleRef>>,
+) -> HashSet<&'a RoleRef> {
+    let mut reachable: HashSet<&'a RoleRef> = HashSet::new();
+    let mut stack: Vec<&'a RoleRef> = seeds.to_vec();
     while let Some(node) = stack.pop() {
         if reachable.insert(node) {
             if let Some(neighbors) = adj.get(node) {
@@ -187,14 +197,14 @@ fn check_topological_integrity(topology: &TeamTopology, out: &mut Vec<TeamValida
     let adj = build_outbound_adjacency(topology);
     let reachable = reachable_from(&entries, &adj);
 
-    let role_set: HashSet<&RoleName> = topology.roles.iter().collect();
+    let role_set: HashSet<&RoleRef> = topology.roles.iter().collect();
     if role_set.contains(&topology.terminal_role) && !reachable.contains(&topology.terminal_role) {
         out.push(TeamValidationViolation {
             path: "terminal_role".into(),
             kind: ViolationKind::Topological,
             detail: format!(
-                "terminal_role '{}' is not reachable from any entry",
-                topology.terminal_role.0
+                "terminal_role '{}' v{} is not reachable from any entry",
+                topology.terminal_role.name.0, topology.terminal_role.version
             ),
         });
     }
@@ -208,8 +218,8 @@ fn flag_orphans(topology: &TeamTopology, out: &mut Vec<TeamValidationViolation>)
     if topology.roles.len() <= 1 {
         return;
     }
-    let role_set: HashSet<&RoleName> = topology.roles.iter().collect();
-    let mut referenced: HashSet<&RoleName> = HashSet::new();
+    let role_set: HashSet<&RoleRef> = topology.roles.iter().collect();
+    let mut referenced: HashSet<&RoleRef> = HashSet::new();
     for edge in &topology.message_graph {
         if role_set.contains(&edge.from) {
             referenced.insert(&edge.from);
@@ -224,8 +234,8 @@ fn flag_orphans(topology: &TeamTopology, out: &mut Vec<TeamValidationViolation>)
                 path: format!("roles[{i}]"),
                 kind: ViolationKind::Topological,
                 detail: format!(
-                    "role '{}' is orphaned: never referenced by any edge",
-                    role.0
+                    "role '{}' v{} is orphaned: never referenced by any edge",
+                    role.name.0, role.version
                 ),
             });
         }
@@ -233,10 +243,10 @@ fn flag_orphans(topology: &TeamTopology, out: &mut Vec<TeamValidationViolation>)
 }
 
 fn dfs_has_cycle<'a>(
-    node: &'a RoleName,
-    adj: &HashMap<&'a RoleName, Vec<&'a RoleName>>,
-    visited: &mut HashSet<&'a RoleName>,
-    on_stack: &mut HashSet<&'a RoleName>,
+    node: &'a RoleRef,
+    adj: &HashMap<&'a RoleRef, Vec<&'a RoleRef>>,
+    visited: &mut HashSet<&'a RoleRef>,
+    on_stack: &mut HashSet<&'a RoleRef>,
 ) -> bool {
     if on_stack.contains(node) {
         return true;
@@ -258,8 +268,8 @@ fn dfs_has_cycle<'a>(
 
 fn check_acyclic(topology: &TeamTopology, out: &mut Vec<TeamValidationViolation>) {
     let adj = build_outbound_adjacency(topology);
-    let mut visited: HashSet<&RoleName> = HashSet::new();
-    let mut on_stack: HashSet<&RoleName> = HashSet::new();
+    let mut visited: HashSet<&RoleRef> = HashSet::new();
+    let mut on_stack: HashSet<&RoleRef> = HashSet::new();
     for role in &topology.roles {
         if dfs_has_cycle(role, &adj, &mut visited, &mut on_stack) {
             out.push(TeamValidationViolation {
@@ -276,20 +286,23 @@ fn check_single_terminal(topology: &TeamTopology, out: &mut Vec<TeamValidationVi
     if topology.roles.is_empty() {
         return;
     }
-    let role_set: HashSet<&RoleName> = topology.roles.iter().collect();
-    let mut has_outbound: HashSet<&RoleName> = HashSet::new();
+    let role_set: HashSet<&RoleRef> = topology.roles.iter().collect();
+    let mut has_outbound: HashSet<&RoleRef> = HashSet::new();
     for edge in &topology.message_graph {
         if role_set.contains(&edge.from) {
             has_outbound.insert(&edge.from);
         }
     }
-    let sinks: Vec<&RoleName> = topology
+    let sinks: Vec<&RoleRef> = topology
         .roles
         .iter()
         .filter(|r| !has_outbound.contains(r))
         .collect();
     if sinks.len() > 1 {
-        let names: Vec<&str> = sinks.iter().map(|r| r.0.as_str()).collect();
+        let names: Vec<String> = sinks
+            .iter()
+            .map(|r| format!("{} v{}", r.name.0, r.version))
+            .collect();
         out.push(TeamValidationViolation {
             path: "message_graph".into(),
             kind: ViolationKind::MultipleTerminals,
@@ -300,8 +313,11 @@ fn check_single_terminal(topology: &TeamTopology, out: &mut Vec<TeamValidationVi
             path: "terminal_role".into(),
             kind: ViolationKind::MultipleTerminals,
             detail: format!(
-                "the unique sink role '{}' is not the declared terminal_role '{}'",
-                sinks[0].0, topology.terminal_role.0
+                "the unique sink role '{}' v{} is not the declared terminal_role '{}' v{}",
+                sinks[0].name.0,
+                sinks[0].version,
+                topology.terminal_role.name.0,
+                topology.terminal_role.version
             ),
         });
     }
@@ -313,36 +329,45 @@ mod tests {
     use super::*;
     use orchestrator_types::{MessageEdge, TeamName, TeamTopology};
 
-    fn rn(s: &str) -> RoleName {
-        RoleName(s.into())
+    type RoleSpec<'a> = (&'a str, u32);
+    type EdgeSpec<'a> = (RoleSpec<'a>, RoleSpec<'a>);
+
+    fn rr(s: &str, v: u32) -> RoleRef {
+        RoleRef {
+            name: RoleName(s.into()),
+            version: v,
+        }
     }
 
     fn topo(
         name: &str,
-        roles: &[&str],
-        edges: &[(&str, &str)],
-        terminal: &str,
+        roles: &[RoleSpec<'_>],
+        edges: &[EdgeSpec<'_>],
+        terminal: RoleSpec<'_>,
         version: u32,
     ) -> TeamTopology {
         TeamTopology {
             name: TeamName(name.into()),
             version,
-            roles: roles.iter().map(|s| rn(s)).collect(),
+            roles: roles.iter().map(|(s, v)| rr(s, *v)).collect(),
             message_graph: edges
                 .iter()
-                .map(|(f, t)| MessageEdge {
-                    from: rn(f),
-                    to: rn(t),
+                .map(|((f, fv), (t, tv))| MessageEdge {
+                    from: rr(f, *fv),
+                    to: rr(t, *tv),
                     permit_overrides_from: None,
                 })
                 .collect(),
-            terminal_role: rn(terminal),
+            terminal_role: rr(terminal.0, terminal.1),
             max_retries: 0,
         }
     }
 
-    fn registry(roles: &[&str]) -> Vec<RoleName> {
-        roles.iter().map(|s| rn(s)).collect()
+    fn registry(roles: &[(&str, u32)]) -> Vec<(RoleName, u32)> {
+        roles
+            .iter()
+            .map(|(s, v)| (RoleName((*s).into()), *v))
+            .collect()
     }
 
     #[test]
@@ -352,24 +377,24 @@ mod tests {
         let t = topo(
             "agentry-self-host-v1",
             &[
-                "coder-claude-agentry",
-                "reviewer-claude-agentry",
-                "git-operator",
-                "ci-watcher-agentry",
+                ("coder-claude-agentry", 1),
+                ("reviewer-claude-agentry", 1),
+                ("git-operator", 1),
+                ("ci-watcher-agentry", 1),
             ],
             &[
-                ("coder-claude-agentry", "reviewer-claude-agentry"),
-                ("reviewer-claude-agentry", "git-operator"),
-                ("git-operator", "ci-watcher-agentry"),
+                (("coder-claude-agentry", 1), ("reviewer-claude-agentry", 1)),
+                (("reviewer-claude-agentry", 1), ("git-operator", 1)),
+                (("git-operator", 1), ("ci-watcher-agentry", 1)),
             ],
-            "ci-watcher-agentry",
+            ("ci-watcher-agentry", 1),
             1,
         );
         let reg = registry(&[
-            "coder-claude-agentry",
-            "reviewer-claude-agentry",
-            "git-operator",
-            "ci-watcher-agentry",
+            ("coder-claude-agentry", 1),
+            ("reviewer-claude-agentry", 1),
+            ("git-operator", 1),
+            ("ci-watcher-agentry", 1),
         ]);
         let v = validate(&t, &reg);
         assert!(v.is_empty(), "expected zero violations, got: {v:?}");
@@ -377,7 +402,7 @@ mod tests {
 
     #[test]
     fn rejects_unknown_field_in_messageedge() {
-        let json = r#"{"from":"a","to":"b","bogus":1}"#;
+        let json = r#"{"from":{"name":"a","version":1},"to":{"name":"b","version":1},"bogus":1}"#;
         let r: Result<MessageEdge, _> = serde_json::from_str(json);
         assert!(r.is_err(), "expected unknown-field rejection, got: {r:?}");
     }
@@ -387,9 +412,9 @@ mod tests {
         let json = r#"{
             "name":"t",
             "version":1,
-            "roles":["a"],
+            "roles":[{"name":"a","version":1}],
             "message_graph":[],
-            "terminal_role":"a",
+            "terminal_role":{"name":"a","version":1},
             "extra_top":42
         }"#;
         let r: Result<TeamTopology, _> = serde_json::from_str(json);
@@ -398,8 +423,8 @@ mod tests {
 
     #[test]
     fn detects_zero_version() {
-        let t = topo("t", &["a"], &[], "a", 0);
-        let v = validate(&t, &registry(&["a"]));
+        let t = topo("t", &[("a", 1)], &[], ("a", 1), 0);
+        let v = validate(&t, &registry(&[("a", 1)]));
         assert!(
             v.iter()
                 .any(|x| x.kind == ViolationKind::Type && x.path == "version"),
@@ -409,8 +434,8 @@ mod tests {
 
     #[test]
     fn detects_empty_name() {
-        let t = topo("", &["a"], &[], "a", 1);
-        let v = validate(&t, &registry(&["a"]));
+        let t = topo("", &[("a", 1)], &[], ("a", 1), 1);
+        let v = validate(&t, &registry(&[("a", 1)]));
         assert!(
             v.iter()
                 .any(|x| x.kind == ViolationKind::Type && x.path == "name"),
@@ -420,7 +445,7 @@ mod tests {
 
     #[test]
     fn detects_unregistered_role() {
-        let t = topo("t", &["missing-role"], &[], "missing-role", 1);
+        let t = topo("t", &[("missing-role", 1)], &[], ("missing-role", 1), 1);
         let v = validate(&t, &[]);
         assert!(
             v.iter()
@@ -430,10 +455,40 @@ mod tests {
     }
 
     #[test]
+    fn rejects_unregistered_version() {
+        // Register only X v1; the topology references X v2 — must surface a
+        // Reference violation. Versioned references mean a known name with an
+        // unknown version is just as invalid as a missing name.
+        let t = topo("t", &[("x", 2)], &[], ("x", 2), 1);
+        let v = validate(&t, &registry(&[("x", 1)]));
+        assert!(
+            v.iter()
+                .any(|x| x.kind == ViolationKind::Reference && x.path.starts_with("roles[")),
+            "expected Reference violation for x v2 (only v1 registered), got: {v:?}"
+        );
+    }
+
+    #[test]
+    fn accepts_distinct_versions() {
+        // Both X v1 AND X v2 are registered; the topology references both as
+        // independent roles. Distinct (name, version) pairs must validate
+        // cleanly — no Reference violations and no orphans.
+        let t = topo(
+            "t",
+            &[("x", 1), ("x", 2)],
+            &[(("x", 1), ("x", 2))],
+            ("x", 2),
+            1,
+        );
+        let v = validate(&t, &registry(&[("x", 1), ("x", 2)]));
+        assert!(v.is_empty(), "expected zero violations, got: {v:?}");
+    }
+
+    #[test]
     fn detects_edge_to_unlisted_role() {
         // Edge from=A to=B, but only A is in roles[].
-        let t = topo("t", &["a"], &[("a", "b")], "a", 1);
-        let v = validate(&t, &registry(&["a", "b"]));
+        let t = topo("t", &[("a", 1)], &[(("a", 1), ("b", 1))], ("a", 1), 1);
+        let v = validate(&t, &registry(&[("a", 1), ("b", 1)]));
         assert!(
             v.iter()
                 .any(|x| x.kind == ViolationKind::Reference && x.path == "message_graph[0].to"),
@@ -445,8 +500,14 @@ mod tests {
     fn detects_no_entry() {
         // Every role has an inbound edge: a→b, b→a (also a cycle, but we
         // assert the Topological "no entry" violation specifically).
-        let t = topo("t", &["a", "b"], &[("a", "b"), ("b", "a")], "b", 1);
-        let v = validate(&t, &registry(&["a", "b"]));
+        let t = topo(
+            "t",
+            &[("a", 1), ("b", 1)],
+            &[(("a", 1), ("b", 1)), (("b", 1), ("a", 1))],
+            ("b", 1),
+            1,
+        );
+        let v = validate(&t, &registry(&[("a", 1), ("b", 1)]));
         assert!(
             v.iter()
                 .any(|x| x.kind == ViolationKind::Topological && x.detail.contains("no entry")),
@@ -464,12 +525,16 @@ mod tests {
         // Topological violation.)
         let t = topo(
             "t",
-            &["a", "b", "c", "d"],
-            &[("a", "b"), ("c", "d"), ("d", "c")],
-            "d",
+            &[("a", 1), ("b", 1), ("c", 1), ("d", 1)],
+            &[
+                (("a", 1), ("b", 1)),
+                (("c", 1), ("d", 1)),
+                (("d", 1), ("c", 1)),
+            ],
+            ("d", 1),
             1,
         );
-        let v = validate(&t, &registry(&["a", "b", "c", "d"]));
+        let v = validate(&t, &registry(&[("a", 1), ("b", 1), ("c", 1), ("d", 1)]));
         assert!(
             v.iter().any(|x| x.kind == ViolationKind::Topological
                 && x.path == "terminal_role"
@@ -481,8 +546,14 @@ mod tests {
     #[test]
     fn detects_orphaned_role() {
         // a→b is the live pipeline (b terminal); c is in roles[] but never referenced.
-        let t = topo("t", &["a", "b", "c"], &[("a", "b")], "b", 1);
-        let v = validate(&t, &registry(&["a", "b", "c"]));
+        let t = topo(
+            "t",
+            &[("a", 1), ("b", 1), ("c", 1)],
+            &[(("a", 1), ("b", 1))],
+            ("b", 1),
+            1,
+        );
+        let v = validate(&t, &registry(&[("a", 1), ("b", 1), ("c", 1)]));
         assert!(
             v.iter()
                 .any(|x| x.kind == ViolationKind::Topological && x.detail.contains("orphaned")),
@@ -495,12 +566,16 @@ mod tests {
         // a→b, b→c, c→a — cycle. Also no entry; we assert specifically on Acyclic.
         let t = topo(
             "t",
-            &["a", "b", "c"],
-            &[("a", "b"), ("b", "c"), ("c", "a")],
-            "c",
+            &[("a", 1), ("b", 1), ("c", 1)],
+            &[
+                (("a", 1), ("b", 1)),
+                (("b", 1), ("c", 1)),
+                (("c", 1), ("a", 1)),
+            ],
+            ("c", 1),
             1,
         );
-        let v = validate(&t, &registry(&["a", "b", "c"]));
+        let v = validate(&t, &registry(&[("a", 1), ("b", 1), ("c", 1)]));
         assert!(
             v.iter().any(|x| x.kind == ViolationKind::Acyclic),
             "expected Acyclic violation, got: {v:?}"
@@ -510,8 +585,14 @@ mod tests {
     #[test]
     fn detects_multiple_terminals() {
         // a→b and a→c: both b and c have no outbound. Terminal=b.
-        let t = topo("t", &["a", "b", "c"], &[("a", "b"), ("a", "c")], "b", 1);
-        let v = validate(&t, &registry(&["a", "b", "c"]));
+        let t = topo(
+            "t",
+            &[("a", 1), ("b", 1), ("c", 1)],
+            &[(("a", 1), ("b", 1)), (("a", 1), ("c", 1))],
+            ("b", 1),
+            1,
+        );
+        let v = validate(&t, &registry(&[("a", 1), ("b", 1), ("c", 1)]));
         assert!(
             v.iter().any(|x| x.kind == ViolationKind::MultipleTerminals),
             "expected MultipleTerminals violation, got: {v:?}"
@@ -521,7 +602,7 @@ mod tests {
     #[test]
     fn collects_multiple_violations() {
         // version=0 (Type) AND unregistered role (Reference) AND empty name (Type).
-        let t = topo("", &["nope"], &[], "nope", 0);
+        let t = topo("", &[("nope", 1)], &[], ("nope", 1), 0);
         let v = validate(&t, &[]);
         let kinds: HashSet<ViolationKind> = v.iter().map(|x| x.kind).collect();
         assert!(

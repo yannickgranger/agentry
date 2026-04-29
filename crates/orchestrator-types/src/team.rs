@@ -5,7 +5,7 @@
 //! messages. The orchestrator runs the graph; the team's composition *is*
 //! the methodology.
 
-use crate::role::RoleName;
+use crate::role::RoleRef;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -26,8 +26,8 @@ impl fmt::Display for TeamName {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct MessageEdge {
-    pub from: RoleName,
-    pub to: RoleName,
+    pub from: RoleRef,
+    pub to: RoleRef,
     /// If set, when `from` emits a message whose payload contains this key, its
     /// value (a `PermitOverrides`) is applied to `to`'s permit at spawn time.
     /// Example: synthesizer emits `{"permit_overrides": {"fs_write": ["src/a.rs"]}}`;
@@ -60,13 +60,14 @@ pub struct PermitOverrides {
 pub struct TeamTopology {
     pub name: TeamName,
     pub version: u32,
-    /// The roles that compose the team. Each name must resolve to an `AgentRole` record.
-    pub roles: Vec<RoleName>,
+    /// The roles that compose the team. Each `RoleRef` must resolve to an
+    /// `AgentRole` record at the pinned `(name, version)`.
+    pub roles: Vec<RoleRef>,
     /// Directed edges between roles.
     pub message_graph: Vec<MessageEdge>,
     /// The terminal role — when this role emits `done` with a shipped verdict,
     /// the team is considered complete and all containers are torn down.
-    pub terminal_role: RoleName,
+    pub terminal_role: RoleRef,
     /// Max retries on failure before the team verdict becomes `failed`. 0 = no retry.
     #[serde(default)]
     pub max_retries: u32,
@@ -75,7 +76,7 @@ pub struct TeamTopology {
 impl TeamTopology {
     /// Edges whose `from` is the given role — i.e. where its outputs go.
     #[must_use]
-    pub fn outgoing(&self, role: &RoleName) -> Vec<&MessageEdge> {
+    pub fn outgoing(&self, role: &RoleRef) -> Vec<&MessageEdge> {
         self.message_graph
             .iter()
             .filter(|e| e.from == *role)
@@ -84,19 +85,19 @@ impl TeamTopology {
 
     /// Edges whose `to` is the given role — i.e. where its inputs come from.
     #[must_use]
-    pub fn incoming(&self, role: &RoleName) -> Vec<&MessageEdge> {
+    pub fn incoming(&self, role: &RoleRef) -> Vec<&MessageEdge> {
         self.message_graph
             .iter()
             .filter(|e| e.to == *role)
             .collect()
     }
 
-    /// Distinct upstream role names that feed this role (deduplicated `from`
+    /// Distinct upstream role refs that feed this role (deduplicated `from`
     /// of `incoming(role)`). Used by the DAG walker to decide when a role's
     /// inbound joins are satisfied.
     #[must_use]
-    pub fn inbound_roles(&self, role: &RoleName) -> Vec<&RoleName> {
-        let mut out: Vec<&RoleName> = Vec::new();
+    pub fn inbound_roles(&self, role: &RoleRef) -> Vec<&RoleRef> {
+        let mut out: Vec<&RoleRef> = Vec::new();
         for edge in self.incoming(role) {
             if !out.iter().any(|r| **r == edge.from) {
                 out.push(&edge.from);
@@ -109,9 +110,13 @@ impl TeamTopology {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::role::RoleName;
 
-    fn rn(s: &str) -> RoleName {
-        RoleName(s.into())
+    fn rr(s: &str) -> RoleRef {
+        RoleRef {
+            name: RoleName(s.into()),
+            version: 1,
+        }
     }
 
     #[test]
@@ -120,35 +125,35 @@ mod tests {
             name: TeamName("qbot-issue-team".into()),
             version: 1,
             roles: vec![
-                rn("archaeologist"),
-                rn("prescriber"),
-                rn("coder-rust"),
-                rn("reviewer"),
-                rn("shipper"),
+                rr("archaeologist"),
+                rr("prescriber"),
+                rr("coder-rust"),
+                rr("reviewer"),
+                rr("shipper"),
             ],
             message_graph: vec![
                 MessageEdge {
-                    from: rn("archaeologist"),
-                    to: rn("prescriber"),
+                    from: rr("archaeologist"),
+                    to: rr("prescriber"),
                     permit_overrides_from: None,
                 },
                 MessageEdge {
-                    from: rn("prescriber"),
-                    to: rn("coder-rust"),
+                    from: rr("prescriber"),
+                    to: rr("coder-rust"),
                     permit_overrides_from: Some("permit_overrides".into()),
                 },
                 MessageEdge {
-                    from: rn("coder-rust"),
-                    to: rn("reviewer"),
+                    from: rr("coder-rust"),
+                    to: rr("reviewer"),
                     permit_overrides_from: None,
                 },
                 MessageEdge {
-                    from: rn("reviewer"),
-                    to: rn("shipper"),
+                    from: rr("reviewer"),
+                    to: rr("shipper"),
                     permit_overrides_from: None,
                 },
             ],
-            terminal_role: rn("shipper"),
+            terminal_role: rr("shipper"),
             max_retries: 2,
         };
         let s = serde_json::to_string_pretty(&t).expect("ser");
@@ -162,13 +167,13 @@ mod tests {
         let t = TeamTopology {
             name: TeamName("echo-team".into()),
             version: 1,
-            roles: vec![rn("echo-agent")],
+            roles: vec![rr("echo-agent")],
             message_graph: vec![],
-            terminal_role: rn("echo-agent"),
+            terminal_role: rr("echo-agent"),
             max_retries: 0,
         };
-        assert!(t.outgoing(&rn("echo-agent")).is_empty());
-        assert!(t.incoming(&rn("echo-agent")).is_empty());
+        assert!(t.outgoing(&rr("echo-agent")).is_empty());
+        assert!(t.incoming(&rr("echo-agent")).is_empty());
     }
 
     #[test]
@@ -178,32 +183,32 @@ mod tests {
         let t = TeamTopology {
             name: TeamName("t".into()),
             version: 1,
-            roles: vec![rn("a"), rn("b"), rn("c")],
+            roles: vec![rr("a"), rr("b"), rr("c")],
             message_graph: vec![
                 MessageEdge {
-                    from: rn("a"),
-                    to: rn("c"),
+                    from: rr("a"),
+                    to: rr("c"),
                     permit_overrides_from: None,
                 },
                 MessageEdge {
-                    from: rn("b"),
-                    to: rn("c"),
+                    from: rr("b"),
+                    to: rr("c"),
                     permit_overrides_from: None,
                 },
                 MessageEdge {
-                    from: rn("a"),
-                    to: rn("c"),
+                    from: rr("a"),
+                    to: rr("c"),
                     permit_overrides_from: Some("k".into()),
                 },
             ],
-            terminal_role: rn("c"),
+            terminal_role: rr("c"),
             max_retries: 0,
         };
-        let upstreams = t.inbound_roles(&rn("c"));
+        let upstreams = t.inbound_roles(&rr("c"));
         assert_eq!(upstreams.len(), 2);
-        assert_eq!(upstreams[0], &rn("a"));
-        assert_eq!(upstreams[1], &rn("b"));
-        assert!(t.inbound_roles(&rn("a")).is_empty());
+        assert_eq!(upstreams[0], &rr("a"));
+        assert_eq!(upstreams[1], &rr("b"));
+        assert!(t.inbound_roles(&rr("a")).is_empty());
     }
 
     #[test]

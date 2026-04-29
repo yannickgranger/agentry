@@ -52,7 +52,7 @@ pub async fn register(conn: &mut ConnectionManager, file: &Path) -> Result<()> {
         }
     };
 
-    let registered_roles = redis_io::list_role_names(conn).await?;
+    let registered_roles = redis_io::list_roles(conn).await?;
     let violations = team_validator::validate(&team, &registered_roles);
     if !violations.is_empty() {
         let arr: Vec<_> = violations.iter().map(violation_to_json).collect();
@@ -121,7 +121,7 @@ pub async fn validate(conn: &mut ConnectionManager, file: &Path) -> Result<()> {
         }
     };
 
-    let registered_roles = redis_io::list_role_names(conn).await?;
+    let registered_roles = redis_io::list_roles(conn).await?;
     let violations = team_validator::validate(&team, &registered_roles);
     let arr: Vec<_> = violations.iter().map(violation_to_json).collect();
     print_validity_raw(violations.is_empty(), &arr);
@@ -172,7 +172,7 @@ fn print_validity_raw(valid: bool, violations: &[serde_json::Value]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use orchestrator_types::{MessageEdge, RoleName, TeamName};
+    use orchestrator_types::{MessageEdge, RoleName, RoleRef, TeamName};
     use redis::AsyncCommands;
     use std::io::Write;
 
@@ -201,13 +201,20 @@ mod tests {
         RoleName(s.into())
     }
 
+    fn rr(s: &str) -> RoleRef {
+        RoleRef {
+            name: rn(s),
+            version: 1,
+        }
+    }
+
     fn topo(name: &str, version: u32, role: &str) -> TeamTopology {
         TeamTopology {
             name: TeamName(name.into()),
             version,
-            roles: vec![rn(role)],
+            roles: vec![rr(role)],
             message_graph: vec![],
-            terminal_role: rn(role),
+            terminal_role: rr(role),
             max_retries: 0,
         }
     }
@@ -290,20 +297,20 @@ mod tests {
         let t = TeamTopology {
             name: TeamName(team_name.clone()),
             version: 1,
-            roles: vec![rn(&role_a), rn(&role_b)],
+            roles: vec![rr(&role_a), rr(&role_b)],
             message_graph: vec![
                 MessageEdge {
-                    from: rn(&role_a),
-                    to: rn(&role_b),
+                    from: rr(&role_a),
+                    to: rr(&role_b),
                     permit_overrides_from: None,
                 },
                 MessageEdge {
-                    from: rn(&role_b),
-                    to: rn(&role_a),
+                    from: rr(&role_b),
+                    to: rr(&role_a),
                     permit_overrides_from: None,
                 },
             ],
-            terminal_role: rn(&role_b),
+            terminal_role: rr(&role_b),
             max_retries: 0,
         };
         let f = write_topology(&t);
