@@ -430,7 +430,7 @@ async fn handle_brief(
         // once the upstream re-ships.
         let mut rewound_subdags: HashSet<RoleRef> = HashSet::new();
         for (from_ref, findings) in reworks {
-            let upstream = team.incoming(&from_ref).first().map(|e| e.from.clone());
+            let upstream = resolve_rework_target(&from_ref, &team);
             match upstream {
                 Some(up) if reworks_used < team.max_retries => {
                     all_messages.push(RoutedMessage {
@@ -440,6 +440,15 @@ async fn handle_brief(
                         at: now(),
                     });
                     reworks_used += 1;
+                    let route_kind = if team
+                        .incoming(&from_ref)
+                        .iter()
+                        .any(|e| e.rework_target.is_some())
+                    {
+                        "rework_target"
+                    } else {
+                        "fallback_upstream"
+                    };
                     tracing::info!(
                         brief = %brief.id,
                         from = %from_ref.name,
@@ -447,6 +456,7 @@ async fn handle_brief(
                         findings_count = findings.len(),
                         reworks_used,
                         max_retries = team.max_retries,
+                        route_kind = %route_kind,
                         "rework requested — resetting upstream sub-DAG"
                     );
                     state.insert(up.clone(), RoleState::Pending);
@@ -928,6 +938,27 @@ fn downstream_subdag(role: &RoleRef, team: &TeamTopology) -> HashSet<RoleRef> {
     out
 }
 
+/// Pick the role to rewind to when `from_ref` emitted ReworkNeeded.
+///
+/// Priority order:
+///   1. If ANY incoming edge to `from_ref` has `rework_target: Some(target)`,
+///      return that target. (If multiple incoming edges set different targets,
+///      pick the FIRST one in `team.message_graph[]` order — deterministic
+///      and operator-debuggable. Workflow authors should not normally set
+///      conflicting targets; the validator does not enforce uniqueness in
+///      this brief, see follow-up note.)
+///   2. Otherwise fall back to the immediate upstream (`incoming.first().from`).
+///   3. Returns None if `from_ref` has no incoming edges at all.
+fn resolve_rework_target(from_ref: &RoleRef, team: &TeamTopology) -> Option<RoleRef> {
+    let incoming = team.incoming(from_ref);
+    for edge in &incoming {
+        if let Some(target) = &edge.rework_target {
+            return Some(target.clone());
+        }
+    }
+    incoming.first().map(|e| e.from.clone())
+}
+
 /// Mint an unsigned permit from the brief's budget and the role's declared
 /// scope. The caller signs it via `permit::sign` before handing it to the
 /// spawner.
@@ -1149,6 +1180,114 @@ mod tests {
         let t = diamond_team();
         let sub = downstream_subdag(&rr("shipper"), &t);
         assert!(sub.is_empty());
+    }
+
+    #[test]
+    fn resolve_rework_target_falls_back_to_upstream() {
+        // Diamond's `mech` has exactly one incoming edge (coder → mech) with
+        // rework_target: None. Resolution must fall back to that edge's `from`.
+        let t = diamond_team();
+        let resolved = resolve_rework_target(&rr("mech"), &t);
+        assert_eq!(resolved, Some(rr("coder")));
+    }
+
+    #[test]
+    fn resolve_rework_target_honors_explicit() {
+        // Topology: scribe → coder → reviewer, with the coder→reviewer edge
+        // setting rework_target: Some(coder). When reviewer reworks, we must
+        // route to coder (which equals `from` here, but the test confirms the
+        // explicit-target branch wins regardless).
+        let t = TeamTopology {
+            name: TeamName("test-explicit".into()),
+            version: 1,
+            roles: vec![rr("scribe"), rr("coder"), rr("reviewer")],
+            message_graph: vec![
+                MessageEdge {
+                    from: rr("scribe"),
+                    to: rr("coder"),
+                    permit_overrides_from: None,
+                    rework_target: None,
+                },
+                MessageEdge {
+                    from: rr("scribe"),
+                    to: rr("reviewer"),
+                    permit_overrides_from: None,
+                    rework_target: Some(rr("coder")),
+                },
+            ],
+            terminal_role: rr("reviewer"),
+            max_retries: 2,
+        };
+        // reviewer's only incoming edge is from `scribe` but its rework_target
+        // is `coder`. Honoring the explicit target means we get `coder`, NOT
+        // the immediate upstream `scribe`.
+        let resolved = resolve_rework_target(&rr("reviewer"), &t);
+        assert_eq!(resolved, Some(rr("coder")));
+    }
+
+    #[test]
+    fn resolve_rework_target_picks_first_when_multiple_incoming() {
+        // Topology where `shipper` has two incoming edges:
+        //   1st: mech → shipper, rework_target: None
+        //   2nd: claude → shipper, rework_target: Some(coder)
+        // The "any incoming with target wins over fallback" rule means the
+        // resolved target is `coder` (from the second edge), NOT `mech` (the
+        // first edge's `from`).
+        let t = TeamTopology {
+            name: TeamName("test-mixed".into()),
+            version: 1,
+            roles: vec![
+                rr("scribe"),
+                rr("coder"),
+                rr("mech"),
+                rr("claude"),
+                rr("shipper"),
+            ],
+            message_graph: vec![
+                MessageEdge {
+                    from: rr("scribe"),
+                    to: rr("coder"),
+                    permit_overrides_from: None,
+                    rework_target: None,
+                },
+                MessageEdge {
+                    from: rr("coder"),
+                    to: rr("mech"),
+                    permit_overrides_from: None,
+                    rework_target: None,
+                },
+                MessageEdge {
+                    from: rr("coder"),
+                    to: rr("claude"),
+                    permit_overrides_from: None,
+                    rework_target: None,
+                },
+                MessageEdge {
+                    from: rr("mech"),
+                    to: rr("shipper"),
+                    permit_overrides_from: None,
+                    rework_target: None,
+                },
+                MessageEdge {
+                    from: rr("claude"),
+                    to: rr("shipper"),
+                    permit_overrides_from: None,
+                    rework_target: Some(rr("coder")),
+                },
+            ],
+            terminal_role: rr("shipper"),
+            max_retries: 2,
+        };
+        let resolved = resolve_rework_target(&rr("shipper"), &t);
+        assert_eq!(resolved, Some(rr("coder")));
+    }
+
+    #[test]
+    fn resolve_rework_target_returns_none_for_root_role() {
+        // `scribe` has zero incoming edges in the diamond → None.
+        let t = diamond_team();
+        let resolved = resolve_rework_target(&rr("scribe"), &t);
+        assert_eq!(resolved, None);
     }
 
     fn make_child_brief(id: &str) -> Brief {
