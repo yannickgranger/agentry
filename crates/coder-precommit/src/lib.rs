@@ -1,6 +1,7 @@
 //! Pre-commit gates and AC verification binaries used by the coder role.
 
 pub mod ac_verifier;
+pub mod git_operator;
 pub mod providers;
 
 pub fn version() -> &'static str {

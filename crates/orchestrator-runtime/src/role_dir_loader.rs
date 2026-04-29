@@ -194,6 +194,57 @@ mod tests {
             .expect("cleanup");
     }
 
+    /// Brief 190b of #182: the seed/roles directory at the workspace root
+    /// must contain JSON role files that deserialize cleanly as `AgentRole`.
+    /// Pure parse check — no Redis required, no `load_roles_from_dir` call.
+    /// CI's `orchestrator seed` does the live end-to-end load.
+    #[test]
+    fn loads_seed_roles_dir_at_workspace_root() {
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let workspace_root = manifest
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("workspace root from CARGO_MANIFEST_DIR");
+        let seed_roles = workspace_root.join("seed").join("roles");
+
+        let commit_json = seed_roles.join("git-op-commit-v1.json");
+        let push_json = seed_roles.join("git-op-push-v1.json");
+        assert!(
+            commit_json.exists(),
+            "git-op-commit-v1.json missing at {}",
+            commit_json.display()
+        );
+        assert!(
+            push_json.exists(),
+            "git-op-push-v1.json missing at {}",
+            push_json.display()
+        );
+
+        let commit_text = std::fs::read_to_string(&commit_json).expect("read commit JSON");
+        let commit_role: AgentRole =
+            serde_json::from_str(&commit_text).expect("git-op-commit-v1.json deserialize");
+        assert_eq!(commit_role.name.0, "git-op-commit");
+        assert_eq!(commit_role.version, 1);
+        assert!(
+            commit_role
+                .entrypoint_script
+                .contains("exec /usr/local/bin/git-op-commit"),
+            "commit role entrypoint must exec the git-op-commit binary"
+        );
+
+        let push_text = std::fs::read_to_string(&push_json).expect("read push JSON");
+        let push_role: AgentRole =
+            serde_json::from_str(&push_text).expect("git-op-push-v1.json deserialize");
+        assert_eq!(push_role.name.0, "git-op-push");
+        assert_eq!(push_role.version, 1);
+        assert!(
+            push_role
+                .entrypoint_script
+                .contains("exec /usr/local/bin/git-op-push"),
+            "push role entrypoint must exec the git-op-push binary"
+        );
+    }
+
     #[tokio::test]
     #[ignore = "requires live Redis (AGENTRY_TEST_REDIS_URL)"]
     async fn loads_in_alphabetical_order() {

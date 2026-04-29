@@ -1,17 +1,14 @@
-//! git-operator — substrate-side combined commit + push (legacy cohabitation).
+//! git-op-push — substrate-side push + PR-open phase.
 //!
-//! Brief 190b split this binary's logic into the `git-op-commit` and
-//! `git-op-push` siblings. This thin entrypoint stays in place for the v0
-//! self-host topology (and any other workflow still wired to the combined
-//! `git-operator` role) until #188 retires it. Internal plumbing now lives
-//! in `coder_precommit::git_operator`; external behavior — the NDJSON event
-//! shape and the always-emit-done guarantee — is identical to the pre-split
-//! binary.
+//! Reads the brief bundle on stdin, pushes the auto-branch (assumed already
+//! committed by an upstream `git-op-commit` step), and opens a PR via the
+//! gitea REST API. Emits a terminal `done shipped` NDJSON event carrying
+//! `{pushed, pr_number, pr_url}`. Counterpart to `git-op-commit`.
 
 use anyhow::{Context, Result};
 use coder_precommit::git_operator::{
-    auto_branch, emit_event, git_config_idempotent, open_pull_request, push_branch,
-    read_bundle_from_stdin, stage_and_commit, workspace_path, DoneGuard,
+    auto_branch, emit_event, open_pull_request, push_branch, read_bundle_from_stdin,
+    workspace_path, DoneGuard,
 };
 use std::process::ExitCode;
 
@@ -48,24 +45,11 @@ async fn run() -> Result<()> {
         .unwrap_or_else(|| "agency.lab:3000".into());
     let target_repo = bundle.brief.payload.target_repo.clone();
     let base_branch = bundle.brief.payload.base_branch.clone();
-    let commit_message = bundle.brief.payload.commit_message.clone();
     let pr_title = bundle.brief.payload.pr_title.clone();
     let pr_body = bundle.brief.payload.pr_body.clone();
     let branch = auto_branch(&brief_id);
 
-    git_config_idempotent(&workspace).await?;
-    let sha = stage_and_commit(&workspace, &commit_message).await?;
-    emit_event(&serde_json::json!({
-        "type": "event",
-        "payload": {"msg": "committed", "sha": sha, "branch": &branch}
-    }));
-
     push_branch(&workspace, &branch).await?;
-    emit_event(&serde_json::json!({
-        "type": "event",
-        "payload": {"msg": "pushed", "branch": &branch}
-    }));
-
     let pr = open_pull_request(
         &forge_host,
         &target_repo,
@@ -76,17 +60,13 @@ async fn run() -> Result<()> {
         &token,
     )
     .await?;
-    emit_event(&serde_json::json!({
-        "type": "event",
-        "payload": {"msg": "pr_opened", "pr_number": pr.pr_number, "pr_url": pr.pr_url}
-    }));
 
     emit_event(&serde_json::json!({
         "type": "done",
         "verdict": "shipped",
+        "pushed": true,
         "pr_number": pr.pr_number,
-        "pr_url": pr.pr_url,
-        "sha": sha
+        "pr_url": pr.pr_url
     }));
     guard.emitted = true;
     Ok(())

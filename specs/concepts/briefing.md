@@ -53,3 +53,13 @@ propagated to every agent the brief spawns. Set by the dispatching authority
 interpret them. Monitoring selectors use cohort labels to address subsets of
 the agent fleet — "every coder in the self-host topology", "every agent in
 phase X" — without the orchestrator having to know what those subsets mean.
+
+## Bundle
+
+Stdin envelope a Rust role binary reads when the orchestrator dispatches a
+brief to it. Single-field wrapper around `Brief` — the binary parses
+`{"brief": { ... }}` so the on-wire shape stays stable when future fields
+(e.g. team-level overrides) join the bundle. Used today by the
+git-operator family (`git-op-commit`, `git-op-push`, the legacy combined
+`git-operator`); other Rust ports will adopt the same envelope as they
+land under EPIC #161.

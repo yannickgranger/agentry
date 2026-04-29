@@ -137,6 +137,26 @@ git-operator-binary:
     test -x ~/.local/bin/git-operator
     echo "git-operator installed at ~/.local/bin/git-operator"
 
+# Build git-op-commit into ~/.local/bin/git-op-commit for the git-op-commit
+# role's bind-mount. Operator-invoked; idempotent. Brief 190b of #182 — the
+# commit half of the git-operator split.
+git-op-commit-binary:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo install --path crates/coder-precommit --bin git-op-commit --root ~/.local --locked --quiet
+    test -x ~/.local/bin/git-op-commit
+    echo "git-op-commit installed at ~/.local/bin/git-op-commit"
+
+# Build git-op-push into ~/.local/bin/git-op-push for the git-op-push role's
+# bind-mount. Operator-invoked; idempotent. Brief 190b of #182 — the push
+# half of the git-operator split.
+git-op-push-binary:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo install --path crates/coder-precommit --bin git-op-push --root ~/.local --locked --quiet
+    test -x ~/.local/bin/git-op-push
+    echo "git-op-push installed at ~/.local/bin/git-op-push"
+
 # Build everything
 build:
     cargo build --workspace --release
