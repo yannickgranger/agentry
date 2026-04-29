@@ -51,5 +51,9 @@ path = "src/bin/git_op_commit.rs"
 name = "git-op-push"
 path = "src/bin/git_op_push.rs"
 
+[[bin]]
+name = "git-op-rebase"
+path = "src/bin/git_op_rebase.rs"
+
 [lints]
 workspace = true
