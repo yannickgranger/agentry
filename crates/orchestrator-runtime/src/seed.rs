@@ -1811,9 +1811,9 @@ fn build_git_operator_role(home: &str) -> AgentRole {
         version: 1,
         model: None,
         system_prompt: None,
-        image: ALPINE.into(),
+        image: RUNNER_HOST_IMAGE.into(),
         substrate_class: SubstrateClass::Podman,
-        package_manager: PackageManager::Apk,
+        package_manager: PackageManager::Apt,
         // Bootstrap glue only: exec the bind-mounted Rust binary. All git +
         // forge logic lives in the binary, not in this script.
         entrypoint_script: "#!/bin/sh\nexec /usr/local/bin/git-operator\n".into(),
@@ -4321,31 +4321,36 @@ mod tests {
         // ever runs — `DoneGuard` never registers, no events emit, and the
         // role's verdict is synthesised from a bare exit code.
         //
-        // This test pins the four affected roles to `RUNNER_HOST_IMAGE`
+        // This test pins the affected roles to `RUNNER_HOST_IMAGE`
         // (currently `debian:trixie-slim`, glibc 2.41). Future regressions
         // — e.g. someone copy-pasting `bookworm-slim` into a new role spec
         // — surface here at `cargo test` rather than in production at the
-        // first reviewer dispatch.
+        // first reviewer dispatch. `git-operator` joined the set per #200:
+        // its host-built binary has the same glibc dependency.
         let reviewer = build_reviewer_claude_agentry_role("/h", "/h/.claude/settings.json");
         let acv_claude = build_ac_verifier_claude_agentry_role("/h", "/h/.claude/settings.json");
         let acv_gemini = build_ac_verifier_gemini_agentry_role("/h");
         let acv_grok = build_ac_verifier_grok_agentry_role("/h");
+        let git_operator = build_git_operator_role("/h");
 
-        for role in &[reviewer, acv_claude, acv_gemini, acv_grok] {
+        for role in &[reviewer, acv_claude, acv_gemini, acv_grok, git_operator] {
             assert_eq!(
                 role.image, RUNNER_HOST_IMAGE,
                 "role '{}' must use RUNNER_HOST_IMAGE — see #175 \
                  (host-built runner binary fails to load on bookworm-slim glibc 2.36)",
                 role.name
             );
-            // Sanity: the role exec's a runner binary, which is what makes
-            // glibc compatibility load-bearing here. If a future refactor
-            // moves the entrypoint back to inline bash this test is no
-            // longer load-bearing — but until then the assertion holds.
+            // Sanity: the role exec's a host-built binary, which is what
+            // makes glibc compatibility load-bearing. Accepts either a
+            // `*-runner` binary (reviewer, ac-verifier family) or the
+            // git-operator binary (#200). If a future refactor moves the
+            // entrypoint back to inline bash this test is no longer
+            // load-bearing — but until then the assertion holds.
             assert!(
                 role.entrypoint_script.contains("exec /usr/local/bin/")
-                    && role.entrypoint_script.contains("-runner"),
-                "role '{}' is expected to exec a host-built `*-runner` binary; \
+                    && (role.entrypoint_script.contains("-runner")
+                        || role.entrypoint_script.contains("git-operator")),
+                "role '{}' is expected to exec a host-built binary; \
                  if the entrypoint changed shape, revisit whether \
                  RUNNER_HOST_IMAGE still applies",
                 role.name
