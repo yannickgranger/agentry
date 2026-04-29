@@ -37,7 +37,7 @@ use futures::stream::{self, Stream, StreamExt};
 use orchestrator_runtime::Config;
 use orchestrator_types::{
     brief::EscalationMode, role::McpServer, AgentRole, Brief, MessageEdge, PackageManager,
-    PermitScope, Project, ProjectSlug, RoleName, StandingOrders, SubstrateClass, TeamName,
+    PermitScope, Project, ProjectSlug, RoleName, RoleRef, StandingOrders, SubstrateClass, TeamName,
     TeamTopology, ToolAllowlist,
 };
 use serde::Deserialize;
@@ -616,10 +616,11 @@ async fn teams_list(State(state): State<AppState>) -> Result<Html<String>, AppEr
         let roles = t
             .roles
             .iter()
-            .map(|r| r.0.as_str())
+            .map(|r| format!("{}@v{}", r.name.0, r.version))
             .collect::<Vec<_>>()
             .join(", ");
-        let terminal = t.terminal_role.0.as_str();
+        let terminal_owned = format!("{}@v{}", t.terminal_role.name.0, t.terminal_role.version);
+        let terminal = terminal_owned.as_str();
         rows.push_str(&format!(
             r#"<tr class="border-b border-slate-800">
 <td class="py-2 font-mono text-sm text-slate-200">{name}</td>
@@ -676,16 +677,34 @@ struct TeamForm {
     max_retries: u32,
 }
 
+fn parse_role_ref(token: &str) -> RoleRef {
+    // Accept either "name" (defaults to v1) or "name@vN".
+    let trimmed = token.trim();
+    if let Some((name, ver)) = trimmed.rsplit_once("@v") {
+        if let Ok(version) = ver.parse::<u32>() {
+            return RoleRef {
+                name: RoleName(name.to_string()),
+                version,
+            };
+        }
+    }
+    RoleRef {
+        name: RoleName(trimmed.to_string()),
+        version: 1,
+    }
+}
+
 fn parse_edge(line: &str) -> Option<MessageEdge> {
-    // Format: "from -> to" or "from -> to :overrides_key"
+    // Format: "from -> to" or "from -> to :overrides_key", with each
+    // endpoint optionally version-pinned as "name@vN" (defaults to v1).
     let (edge_part, overrides) = match line.split_once(':') {
         Some((e, rest)) => (e.trim(), Some(rest.trim().to_string())),
         None => (line.trim(), None),
     };
     let (from, to) = edge_part.split_once("->")?;
     Some(MessageEdge {
-        from: RoleName(from.trim().to_string()),
-        to: RoleName(to.trim().to_string()),
+        from: parse_role_ref(from),
+        to: parse_role_ref(to),
         permit_overrides_from: overrides,
     })
 }
@@ -694,7 +713,10 @@ async fn team_create(
     State(state): State<AppState>,
     Form(f): Form<TeamForm>,
 ) -> Result<Redirect, AppError> {
-    let roles: Vec<RoleName> = split_csv(&f.roles_csv).into_iter().map(RoleName).collect();
+    let roles: Vec<RoleRef> = split_csv(&f.roles_csv)
+        .iter()
+        .map(|s| parse_role_ref(s))
+        .collect();
     if roles.is_empty() {
         return Err(AppError(anyhow::anyhow!(
             "team must have at least one role"
@@ -711,7 +733,7 @@ async fn team_create(
         version,
         roles,
         message_graph: edges,
-        terminal_role: RoleName(f.terminal_role),
+        terminal_role: parse_role_ref(&f.terminal_role),
         max_retries: f.max_retries,
     };
     state

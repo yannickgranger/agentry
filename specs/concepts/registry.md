@@ -11,6 +11,13 @@ persisted (that is the persistence adapter) or how they are used at runtime
 
 Identifier for a role. Lowercase + hyphens, unique within the registry.
 
+## RoleRef
+
+A version-pinned reference to a role: `(name, version)`. Team topologies
+hold `RoleRef` values rather than bare names so a topology committed today
+keeps resolving to the exact role specs it was authored against — even as
+new role versions are registered.
+
 ## SubstrateClass
 
 Where an agent runs: Podman, Docker, LXC, SSH, or VM. Picked per role. The

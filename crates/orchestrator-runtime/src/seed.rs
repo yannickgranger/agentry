@@ -8,8 +8,8 @@
 
 use crate::{redis_io, role_dir_loader, Config, Result};
 use orchestrator_types::{
-    AgentRole, MessageEdge, Mount, PackageManager, PermitScope, RoleName, SubstrateClass, TeamName,
-    TeamTopology, ToolAllowlist, WorkspaceMount,
+    AgentRole, MessageEdge, Mount, PackageManager, PermitScope, RoleName, RoleRef, SubstrateClass,
+    TeamName, TeamTopology, ToolAllowlist, WorkspaceMount,
 };
 use std::path::PathBuf;
 
@@ -1929,9 +1929,15 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
     let echo_team = TeamTopology {
         name: TeamName("echo-team".into()),
         version: 1,
-        roles: vec![echo.name.clone()],
+        roles: vec![RoleRef {
+            name: echo.name.clone(),
+            version: echo.version,
+        }],
         message_graph: Vec::<MessageEdge>::new(),
-        terminal_role: echo.name.clone(),
+        terminal_role: RoleRef {
+            name: echo.name.clone(),
+            version: echo.version,
+        },
         max_retries: 0,
     };
 
@@ -1959,9 +1965,15 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
     let naughty_team = TeamTopology {
         name: TeamName("naughty-team".into()),
         version: 1,
-        roles: vec![naughty.name.clone()],
+        roles: vec![RoleRef {
+            name: naughty.name.clone(),
+            version: naughty.version,
+        }],
         message_graph: Vec::<MessageEdge>::new(),
-        terminal_role: naughty.name.clone(),
+        terminal_role: RoleRef {
+            name: naughty.name.clone(),
+            version: naughty.version,
+        },
         max_retries: 0,
     };
 
@@ -2009,13 +2021,31 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
     let speaker_listener_team = TeamTopology {
         name: TeamName("speaker-listener-team".into()),
         version: 1,
-        roles: vec![speaker.name.clone(), listener.name.clone()],
+        roles: vec![
+            RoleRef {
+                name: speaker.name.clone(),
+                version: speaker.version,
+            },
+            RoleRef {
+                name: listener.name.clone(),
+                version: listener.version,
+            },
+        ],
         message_graph: vec![MessageEdge {
-            from: speaker.name.clone(),
-            to: listener.name.clone(),
+            from: RoleRef {
+                name: speaker.name.clone(),
+                version: speaker.version,
+            },
+            to: RoleRef {
+                name: listener.name.clone(),
+                version: listener.version,
+            },
             permit_overrides_from: None,
         }],
-        terminal_role: listener.name.clone(),
+        terminal_role: RoleRef {
+            name: listener.name.clone(),
+            version: listener.version,
+        },
         max_retries: 0,
     };
 
@@ -2043,9 +2073,15 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
     let grok_team = TeamTopology {
         name: TeamName("grok-echo-team".into()),
         version: 1,
-        roles: vec![grok_echo.name.clone()],
+        roles: vec![RoleRef {
+            name: grok_echo.name.clone(),
+            version: grok_echo.version,
+        }],
         message_graph: vec![],
-        terminal_role: grok_echo.name.clone(),
+        terminal_role: RoleRef {
+            name: grok_echo.name.clone(),
+            version: grok_echo.version,
+        },
         max_retries: 0,
     };
 
@@ -2099,9 +2135,15 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
     let claude_team = TeamTopology {
         name: TeamName("claude-echo-team".into()),
         version: 1,
-        roles: vec![claude_echo.name.clone()],
+        roles: vec![RoleRef {
+            name: claude_echo.name.clone(),
+            version: claude_echo.version,
+        }],
         message_graph: vec![],
-        terminal_role: claude_echo.name.clone(),
+        terminal_role: RoleRef {
+            name: claude_echo.name.clone(),
+            version: claude_echo.version,
+        },
         max_retries: 0,
     };
 
@@ -2154,13 +2196,31 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
     let narrowed_team = TeamTopology {
         name: TeamName("narrowed-team".into()),
         version: 1,
-        roles: vec![synthesizer.name.clone(), narrowed_coder.name.clone()],
+        roles: vec![
+            RoleRef {
+                name: synthesizer.name.clone(),
+                version: synthesizer.version,
+            },
+            RoleRef {
+                name: narrowed_coder.name.clone(),
+                version: narrowed_coder.version,
+            },
+        ],
         message_graph: vec![MessageEdge {
-            from: synthesizer.name.clone(),
-            to: narrowed_coder.name.clone(),
+            from: RoleRef {
+                name: synthesizer.name.clone(),
+                version: synthesizer.version,
+            },
+            to: RoleRef {
+                name: narrowed_coder.name.clone(),
+                version: narrowed_coder.version,
+            },
             permit_overrides_from: Some("permit_overrides".into()),
         }],
-        terminal_role: narrowed_coder.name.clone(),
+        terminal_role: RoleRef {
+            name: narrowed_coder.name.clone(),
+            version: narrowed_coder.version,
+        },
         max_retries: 0,
     };
 
@@ -2191,9 +2251,15 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
     let shipper_team = TeamTopology {
         name: TeamName("shipper-solo-team".into()),
         version: 1,
-        roles: vec![shipper.name.clone()],
+        roles: vec![RoleRef {
+            name: shipper.name.clone(),
+            version: shipper.version,
+        }],
         message_graph: vec![],
-        terminal_role: shipper.name.clone(),
+        terminal_role: RoleRef {
+            name: shipper.name.clone(),
+            version: shipper.version,
+        },
         max_retries: 0,
     };
 
@@ -2227,9 +2293,15 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
     let workspace_probe_team = TeamTopology {
         name: TeamName("workspace-probe-team".into()),
         version: 1,
-        roles: vec![workspace_probe.name.clone()],
+        roles: vec![RoleRef {
+            name: workspace_probe.name.clone(),
+            version: workspace_probe.version,
+        }],
         message_graph: Vec::<MessageEdge>::new(),
-        terminal_role: workspace_probe.name.clone(),
+        terminal_role: RoleRef {
+            name: workspace_probe.name.clone(),
+            version: workspace_probe.version,
+        },
         max_retries: 0,
     };
 
@@ -2259,9 +2331,15 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
     let sccache_probe_team = TeamTopology {
         name: TeamName("sccache-probe-team".into()),
         version: 1,
-        roles: vec![sccache_probe.name.clone()],
+        roles: vec![RoleRef {
+            name: sccache_probe.name.clone(),
+            version: sccache_probe.version,
+        }],
         message_graph: Vec::<MessageEdge>::new(),
-        terminal_role: sccache_probe.name.clone(),
+        terminal_role: RoleRef {
+            name: sccache_probe.name.clone(),
+            version: sccache_probe.version,
+        },
         max_retries: 0,
     };
 
@@ -2289,9 +2367,15 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
     let timeout_probe_team = TeamTopology {
         name: TeamName("timeout-probe-team".into()),
         version: 1,
-        roles: vec![timeout_probe.name.clone()],
+        roles: vec![RoleRef {
+            name: timeout_probe.name.clone(),
+            version: timeout_probe.version,
+        }],
         message_graph: Vec::<MessageEdge>::new(),
-        terminal_role: timeout_probe.name.clone(),
+        terminal_role: RoleRef {
+            name: timeout_probe.name.clone(),
+            version: timeout_probe.version,
+        },
         max_retries: 0,
     };
 
@@ -2409,9 +2493,15 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
     let agentry_null_v0 = TeamTopology {
         name: TeamName("agentry-null-v0".into()),
         version: 1,
-        roles: vec![null_agent_agentry.name.clone()],
+        roles: vec![RoleRef {
+            name: null_agent_agentry.name.clone(),
+            version: null_agent_agentry.version,
+        }],
         message_graph: Vec::<MessageEdge>::new(),
-        terminal_role: null_agent_agentry.name.clone(),
+        terminal_role: RoleRef {
+            name: null_agent_agentry.name.clone(),
+            version: null_agent_agentry.version,
+        },
         max_retries: 0,
     };
 
@@ -2423,9 +2513,15 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
     let agentry_discovery_v0 = TeamTopology {
         name: TeamName("agentry-discovery-v0".into()),
         version: 1,
-        roles: vec![archaeologist_claude_agentry.name.clone()],
+        roles: vec![RoleRef {
+            name: archaeologist_claude_agentry.name.clone(),
+            version: archaeologist_claude_agentry.version,
+        }],
         message_graph: Vec::<MessageEdge>::new(),
-        terminal_role: archaeologist_claude_agentry.name.clone(),
+        terminal_role: RoleRef {
+            name: archaeologist_claude_agentry.name.clone(),
+            version: archaeologist_claude_agentry.version,
+        },
         max_retries: 0,
     };
 
@@ -2440,17 +2536,32 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         name: TeamName("agentry-planner-v0".into()),
         version: 1,
         roles: vec![
-            archaeologist_claude_agentry.name.clone(),
-            planner_claude_agentry.name.clone(),
+            RoleRef {
+                name: archaeologist_claude_agentry.name.clone(),
+                version: archaeologist_claude_agentry.version,
+            },
+            RoleRef {
+                name: planner_claude_agentry.name.clone(),
+                version: planner_claude_agentry.version,
+            },
         ],
         // discovery.json is on the shared workspace, not message-borne — the
         // edge exists only to gate the planner on the archaeologist shipping.
         message_graph: vec![MessageEdge {
-            from: archaeologist_claude_agentry.name.clone(),
-            to: planner_claude_agentry.name.clone(),
+            from: RoleRef {
+                name: archaeologist_claude_agentry.name.clone(),
+                version: archaeologist_claude_agentry.version,
+            },
+            to: RoleRef {
+                name: planner_claude_agentry.name.clone(),
+                version: planner_claude_agentry.version,
+            },
             permit_overrides_from: None,
         }],
-        terminal_role: planner_claude_agentry.name.clone(),
+        terminal_role: RoleRef {
+            name: planner_claude_agentry.name.clone(),
+            version: planner_claude_agentry.version,
+        },
         max_retries: 0,
     };
 
@@ -2463,9 +2574,15 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
     let agentry_verify_v0 = TeamTopology {
         name: TeamName("agentry-verify-v0".into()),
         version: 1,
-        roles: vec![verifier_claude_agentry.name.clone()],
+        roles: vec![RoleRef {
+            name: verifier_claude_agentry.name.clone(),
+            version: verifier_claude_agentry.version,
+        }],
         message_graph: Vec::<MessageEdge>::new(),
-        terminal_role: verifier_claude_agentry.name.clone(),
+        terminal_role: RoleRef {
+            name: verifier_claude_agentry.name.clone(),
+            version: verifier_claude_agentry.version,
+        },
         max_retries: 0,
     };
 
@@ -2473,14 +2590,38 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         name: TeamName("agentry-self-host-v0".into()),
         version: 1,
         roles: vec![
-            coder_claude_agentry.name.clone(),
-            ac_verifier_claude_agentry.name.clone(),
-            ac_verifier_gemini_agentry.name.clone(),
-            ac_verifier_grok_agentry.name.clone(),
-            reviewer_mechanical_agentry.name.clone(),
-            reviewer_claude_agentry.name.clone(),
-            shipper_agentry.name.clone(),
-            ci_watcher_agentry.name.clone(),
+            RoleRef {
+                name: coder_claude_agentry.name.clone(),
+                version: coder_claude_agentry.version,
+            },
+            RoleRef {
+                name: ac_verifier_claude_agentry.name.clone(),
+                version: ac_verifier_claude_agentry.version,
+            },
+            RoleRef {
+                name: ac_verifier_gemini_agentry.name.clone(),
+                version: ac_verifier_gemini_agentry.version,
+            },
+            RoleRef {
+                name: ac_verifier_grok_agentry.name.clone(),
+                version: ac_verifier_grok_agentry.version,
+            },
+            RoleRef {
+                name: reviewer_mechanical_agentry.name.clone(),
+                version: reviewer_mechanical_agentry.version,
+            },
+            RoleRef {
+                name: reviewer_claude_agentry.name.clone(),
+                version: reviewer_claude_agentry.version,
+            },
+            RoleRef {
+                name: shipper_agentry.name.clone(),
+                version: shipper_agentry.version,
+            },
+            RoleRef {
+                name: ci_watcher_agentry.name.clone(),
+                version: ci_watcher_agentry.version,
+            },
         ],
         // Rework loop enabled — max_retries=2 gives the coder two chances to
         // fix findings emitted by the reviewer before the team resolves Failed.
@@ -2490,88 +2631,175 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
             // `team.incoming(reviewer).first()` rework lookup rewinds to the
             // coder, not to a (non-corrective) ac-verifier. Do not reorder.
             MessageEdge {
-                from: coder_claude_agentry.name.clone(),
-                to: reviewer_mechanical_agentry.name.clone(),
+                from: RoleRef {
+                    name: coder_claude_agentry.name.clone(),
+                    version: coder_claude_agentry.version,
+                },
+                to: RoleRef {
+                    name: reviewer_mechanical_agentry.name.clone(),
+                    version: reviewer_mechanical_agentry.version,
+                },
                 permit_overrides_from: None,
             },
             MessageEdge {
-                from: coder_claude_agentry.name.clone(),
-                to: reviewer_claude_agentry.name.clone(),
+                from: RoleRef {
+                    name: coder_claude_agentry.name.clone(),
+                    version: coder_claude_agentry.version,
+                },
+                to: RoleRef {
+                    name: reviewer_claude_agentry.name.clone(),
+                    version: reviewer_claude_agentry.version,
+                },
                 permit_overrides_from: None,
             },
             // Coder fans out to ac-verifier as well; ac-verifier short-circuits
             // failed-AC reworks BEFORE reviewer-claude is spent.
             MessageEdge {
-                from: coder_claude_agentry.name.clone(),
-                to: ac_verifier_claude_agentry.name.clone(),
+                from: RoleRef {
+                    name: coder_claude_agentry.name.clone(),
+                    version: coder_claude_agentry.version,
+                },
+                to: RoleRef {
+                    name: ac_verifier_claude_agentry.name.clone(),
+                    version: ac_verifier_claude_agentry.version,
+                },
                 permit_overrides_from: None,
             },
             // Dual-inbound trick: ac-verifier also signals each reviewer so the
             // sequential flow holds, but rework still rewinds to coder above.
             MessageEdge {
-                from: ac_verifier_claude_agentry.name.clone(),
-                to: reviewer_mechanical_agentry.name.clone(),
+                from: RoleRef {
+                    name: ac_verifier_claude_agentry.name.clone(),
+                    version: ac_verifier_claude_agentry.version,
+                },
+                to: RoleRef {
+                    name: reviewer_mechanical_agentry.name.clone(),
+                    version: reviewer_mechanical_agentry.version,
+                },
                 permit_overrides_from: None,
             },
             MessageEdge {
-                from: ac_verifier_claude_agentry.name.clone(),
-                to: reviewer_claude_agentry.name.clone(),
+                from: RoleRef {
+                    name: ac_verifier_claude_agentry.name.clone(),
+                    version: ac_verifier_claude_agentry.version,
+                },
+                to: RoleRef {
+                    name: reviewer_claude_agentry.name.clone(),
+                    version: reviewer_claude_agentry.version,
+                },
                 permit_overrides_from: None,
             },
             // Parallel ac-verifier siblings: gemini + grok fan out from the
             // coder and signal both reviewers. Any verifier emitting failed
             // rewinds to the coder before reviewers spawn (fail-closed).
             MessageEdge {
-                from: coder_claude_agentry.name.clone(),
-                to: ac_verifier_gemini_agentry.name.clone(),
+                from: RoleRef {
+                    name: coder_claude_agentry.name.clone(),
+                    version: coder_claude_agentry.version,
+                },
+                to: RoleRef {
+                    name: ac_verifier_gemini_agentry.name.clone(),
+                    version: ac_verifier_gemini_agentry.version,
+                },
                 permit_overrides_from: None,
             },
             MessageEdge {
-                from: coder_claude_agentry.name.clone(),
-                to: ac_verifier_grok_agentry.name.clone(),
+                from: RoleRef {
+                    name: coder_claude_agentry.name.clone(),
+                    version: coder_claude_agentry.version,
+                },
+                to: RoleRef {
+                    name: ac_verifier_grok_agentry.name.clone(),
+                    version: ac_verifier_grok_agentry.version,
+                },
                 permit_overrides_from: None,
             },
             MessageEdge {
-                from: ac_verifier_gemini_agentry.name.clone(),
-                to: reviewer_mechanical_agentry.name.clone(),
+                from: RoleRef {
+                    name: ac_verifier_gemini_agentry.name.clone(),
+                    version: ac_verifier_gemini_agentry.version,
+                },
+                to: RoleRef {
+                    name: reviewer_mechanical_agentry.name.clone(),
+                    version: reviewer_mechanical_agentry.version,
+                },
                 permit_overrides_from: None,
             },
             MessageEdge {
-                from: ac_verifier_gemini_agentry.name.clone(),
-                to: reviewer_claude_agentry.name.clone(),
+                from: RoleRef {
+                    name: ac_verifier_gemini_agentry.name.clone(),
+                    version: ac_verifier_gemini_agentry.version,
+                },
+                to: RoleRef {
+                    name: reviewer_claude_agentry.name.clone(),
+                    version: reviewer_claude_agentry.version,
+                },
                 permit_overrides_from: None,
             },
             MessageEdge {
-                from: ac_verifier_grok_agentry.name.clone(),
-                to: reviewer_mechanical_agentry.name.clone(),
+                from: RoleRef {
+                    name: ac_verifier_grok_agentry.name.clone(),
+                    version: ac_verifier_grok_agentry.version,
+                },
+                to: RoleRef {
+                    name: reviewer_mechanical_agentry.name.clone(),
+                    version: reviewer_mechanical_agentry.version,
+                },
                 permit_overrides_from: None,
             },
             MessageEdge {
-                from: ac_verifier_grok_agentry.name.clone(),
-                to: reviewer_claude_agentry.name.clone(),
+                from: RoleRef {
+                    name: ac_verifier_grok_agentry.name.clone(),
+                    version: ac_verifier_grok_agentry.version,
+                },
+                to: RoleRef {
+                    name: reviewer_claude_agentry.name.clone(),
+                    version: reviewer_claude_agentry.version,
+                },
                 permit_overrides_from: None,
             },
             // Mechanical reviewer signals shipper only for sequential flow; no
             // data payload carried on this edge.
             MessageEdge {
-                from: reviewer_mechanical_agentry.name.clone(),
-                to: shipper_agentry.name.clone(),
+                from: RoleRef {
+                    name: reviewer_mechanical_agentry.name.clone(),
+                    version: reviewer_mechanical_agentry.version,
+                },
+                to: RoleRef {
+                    name: shipper_agentry.name.clone(),
+                    version: shipper_agentry.version,
+                },
                 permit_overrides_from: None,
             },
             // Claude reviewer also signals shipper.
             MessageEdge {
-                from: reviewer_claude_agentry.name.clone(),
-                to: shipper_agentry.name.clone(),
+                from: RoleRef {
+                    name: reviewer_claude_agentry.name.clone(),
+                    version: reviewer_claude_agentry.version,
+                },
+                to: RoleRef {
+                    name: shipper_agentry.name.clone(),
+                    version: shipper_agentry.version,
+                },
                 permit_overrides_from: None,
             },
             // Shipper routes head_sha + pr_number to ci-watcher via Message event.
             MessageEdge {
-                from: shipper_agentry.name.clone(),
-                to: ci_watcher_agentry.name.clone(),
+                from: RoleRef {
+                    name: shipper_agentry.name.clone(),
+                    version: shipper_agentry.version,
+                },
+                to: RoleRef {
+                    name: ci_watcher_agentry.name.clone(),
+                    version: ci_watcher_agentry.version,
+                },
                 permit_overrides_from: None,
             },
         ],
-        terminal_role: ci_watcher_agentry.name.clone(),
+        terminal_role: RoleRef {
+            name: ci_watcher_agentry.name.clone(),
+            version: ci_watcher_agentry.version,
+        },
         max_retries: 2,
     };
 
@@ -2579,29 +2807,62 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         name: TeamName("agentry-bugfix-v0".into()),
         version: 1,
         roles: vec![
-            coder_claude_agentry.name.clone(),
-            reviewer_mechanical_agentry.name.clone(),
-            shipper_agentry.name.clone(),
-            ci_watcher_agentry.name.clone(),
+            RoleRef {
+                name: coder_claude_agentry.name.clone(),
+                version: coder_claude_agentry.version,
+            },
+            RoleRef {
+                name: reviewer_mechanical_agentry.name.clone(),
+                version: reviewer_mechanical_agentry.version,
+            },
+            RoleRef {
+                name: shipper_agentry.name.clone(),
+                version: shipper_agentry.version,
+            },
+            RoleRef {
+                name: ci_watcher_agentry.name.clone(),
+                version: ci_watcher_agentry.version,
+            },
         ],
         message_graph: vec![
             MessageEdge {
-                from: coder_claude_agentry.name.clone(),
-                to: reviewer_mechanical_agentry.name.clone(),
+                from: RoleRef {
+                    name: coder_claude_agentry.name.clone(),
+                    version: coder_claude_agentry.version,
+                },
+                to: RoleRef {
+                    name: reviewer_mechanical_agentry.name.clone(),
+                    version: reviewer_mechanical_agentry.version,
+                },
                 permit_overrides_from: None,
             },
             MessageEdge {
-                from: reviewer_mechanical_agentry.name.clone(),
-                to: shipper_agentry.name.clone(),
+                from: RoleRef {
+                    name: reviewer_mechanical_agentry.name.clone(),
+                    version: reviewer_mechanical_agentry.version,
+                },
+                to: RoleRef {
+                    name: shipper_agentry.name.clone(),
+                    version: shipper_agentry.version,
+                },
                 permit_overrides_from: None,
             },
             MessageEdge {
-                from: shipper_agentry.name.clone(),
-                to: ci_watcher_agentry.name.clone(),
+                from: RoleRef {
+                    name: shipper_agentry.name.clone(),
+                    version: shipper_agentry.version,
+                },
+                to: RoleRef {
+                    name: ci_watcher_agentry.name.clone(),
+                    version: ci_watcher_agentry.version,
+                },
                 permit_overrides_from: None,
             },
         ],
-        terminal_role: ci_watcher_agentry.name.clone(),
+        terminal_role: RoleRef {
+            name: ci_watcher_agentry.name.clone(),
+            version: ci_watcher_agentry.version,
+        },
         max_retries: 2,
     };
 
@@ -2609,23 +2870,47 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         name: TeamName("agentry-spec-edit-v0".into()),
         version: 1,
         roles: vec![
-            coder_claude_agentry.name.clone(),
-            shipper_agentry.name.clone(),
-            ci_watcher_agentry.name.clone(),
+            RoleRef {
+                name: coder_claude_agentry.name.clone(),
+                version: coder_claude_agentry.version,
+            },
+            RoleRef {
+                name: shipper_agentry.name.clone(),
+                version: shipper_agentry.version,
+            },
+            RoleRef {
+                name: ci_watcher_agentry.name.clone(),
+                version: ci_watcher_agentry.version,
+            },
         ],
         message_graph: vec![
             MessageEdge {
-                from: coder_claude_agentry.name.clone(),
-                to: shipper_agentry.name.clone(),
+                from: RoleRef {
+                    name: coder_claude_agentry.name.clone(),
+                    version: coder_claude_agentry.version,
+                },
+                to: RoleRef {
+                    name: shipper_agentry.name.clone(),
+                    version: shipper_agentry.version,
+                },
                 permit_overrides_from: None,
             },
             MessageEdge {
-                from: shipper_agentry.name.clone(),
-                to: ci_watcher_agentry.name.clone(),
+                from: RoleRef {
+                    name: shipper_agentry.name.clone(),
+                    version: shipper_agentry.version,
+                },
+                to: RoleRef {
+                    name: ci_watcher_agentry.name.clone(),
+                    version: ci_watcher_agentry.version,
+                },
                 permit_overrides_from: None,
             },
         ],
-        terminal_role: ci_watcher_agentry.name.clone(),
+        terminal_role: RoleRef {
+            name: ci_watcher_agentry.name.clone(),
+            version: ci_watcher_agentry.version,
+        },
         max_retries: 1,
     };
 
@@ -2633,9 +2918,15 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
     let agentry_self_audit_v0 = TeamTopology {
         name: TeamName("agentry-self-audit-v0".into()),
         version: 1,
-        roles: vec![auditor_claude_agentry.name.clone()],
+        roles: vec![RoleRef {
+            name: auditor_claude_agentry.name.clone(),
+            version: auditor_claude_agentry.version,
+        }],
         message_graph: Vec::<MessageEdge>::new(),
-        terminal_role: auditor_claude_agentry.name.clone(),
+        terminal_role: RoleRef {
+            name: auditor_claude_agentry.name.clone(),
+            version: auditor_claude_agentry.version,
+        },
         max_retries: 0,
     };
 
@@ -3141,117 +3432,149 @@ mod tests {
         let reviewer_claude = build_reviewer_claude_agentry_role("/h", "/c");
         // Synthesize the names — mechanical reviewer + shipper + ci-watcher
         // are inline AgentRole literals in seed_m0; we only need their names
-        // to assert edge presence.
+        // and pinned versions to assert edge presence.
         let reviewer_mechanical = RoleName("reviewer-mechanical-agentry".into());
         let shipper = RoleName("shipper-agentry".into());
         let ci_watcher = RoleName("ci-watcher-agentry".into());
+        let coder_ref = RoleRef {
+            name: coder.name.clone(),
+            version: coder.version,
+        };
+        let ac_verifier_ref = RoleRef {
+            name: ac_verifier.name.clone(),
+            version: ac_verifier.version,
+        };
+        let ac_verifier_gemini_ref = RoleRef {
+            name: ac_verifier_gemini.name.clone(),
+            version: ac_verifier_gemini.version,
+        };
+        let ac_verifier_grok_ref = RoleRef {
+            name: ac_verifier_grok.name.clone(),
+            version: ac_verifier_grok.version,
+        };
+        let reviewer_claude_ref = RoleRef {
+            name: reviewer_claude.name.clone(),
+            version: reviewer_claude.version,
+        };
+        let reviewer_mechanical_ref = RoleRef {
+            name: reviewer_mechanical.clone(),
+            version: 1,
+        };
+        let shipper_ref = RoleRef {
+            name: shipper.clone(),
+            version: 1,
+        };
+        let ci_watcher_ref = RoleRef {
+            name: ci_watcher.clone(),
+            version: 1,
+        };
 
         let topology = TeamTopology {
             name: TeamName("agentry-self-host-v0".into()),
             version: 1,
             roles: vec![
-                coder.name.clone(),
-                ac_verifier.name.clone(),
-                ac_verifier_gemini.name.clone(),
-                ac_verifier_grok.name.clone(),
-                reviewer_mechanical.clone(),
-                reviewer_claude.name.clone(),
-                shipper.clone(),
-                ci_watcher.clone(),
+                coder_ref.clone(),
+                ac_verifier_ref.clone(),
+                ac_verifier_gemini_ref.clone(),
+                ac_verifier_grok_ref.clone(),
+                reviewer_mechanical_ref.clone(),
+                reviewer_claude_ref.clone(),
+                shipper_ref.clone(),
+                ci_watcher_ref.clone(),
             ],
             message_graph: vec![
                 MessageEdge {
-                    from: coder.name.clone(),
-                    to: reviewer_mechanical.clone(),
+                    from: coder_ref.clone(),
+                    to: reviewer_mechanical_ref.clone(),
                     permit_overrides_from: None,
                 },
                 MessageEdge {
-                    from: coder.name.clone(),
-                    to: reviewer_claude.name.clone(),
+                    from: coder_ref.clone(),
+                    to: reviewer_claude_ref.clone(),
                     permit_overrides_from: None,
                 },
                 MessageEdge {
-                    from: coder.name.clone(),
-                    to: ac_verifier.name.clone(),
+                    from: coder_ref.clone(),
+                    to: ac_verifier_ref.clone(),
                     permit_overrides_from: None,
                 },
                 MessageEdge {
-                    from: ac_verifier.name.clone(),
-                    to: reviewer_mechanical.clone(),
+                    from: ac_verifier_ref.clone(),
+                    to: reviewer_mechanical_ref.clone(),
                     permit_overrides_from: None,
                 },
                 MessageEdge {
-                    from: ac_verifier.name.clone(),
-                    to: reviewer_claude.name.clone(),
+                    from: ac_verifier_ref.clone(),
+                    to: reviewer_claude_ref.clone(),
                     permit_overrides_from: None,
                 },
                 MessageEdge {
-                    from: coder.name.clone(),
-                    to: ac_verifier_gemini.name.clone(),
+                    from: coder_ref.clone(),
+                    to: ac_verifier_gemini_ref.clone(),
                     permit_overrides_from: None,
                 },
                 MessageEdge {
-                    from: coder.name.clone(),
-                    to: ac_verifier_grok.name.clone(),
+                    from: coder_ref.clone(),
+                    to: ac_verifier_grok_ref.clone(),
                     permit_overrides_from: None,
                 },
                 MessageEdge {
-                    from: ac_verifier_gemini.name.clone(),
-                    to: reviewer_mechanical.clone(),
+                    from: ac_verifier_gemini_ref.clone(),
+                    to: reviewer_mechanical_ref.clone(),
                     permit_overrides_from: None,
                 },
                 MessageEdge {
-                    from: ac_verifier_gemini.name.clone(),
-                    to: reviewer_claude.name.clone(),
+                    from: ac_verifier_gemini_ref.clone(),
+                    to: reviewer_claude_ref.clone(),
                     permit_overrides_from: None,
                 },
                 MessageEdge {
-                    from: ac_verifier_grok.name.clone(),
-                    to: reviewer_mechanical.clone(),
+                    from: ac_verifier_grok_ref.clone(),
+                    to: reviewer_mechanical_ref.clone(),
                     permit_overrides_from: None,
                 },
                 MessageEdge {
-                    from: ac_verifier_grok.name.clone(),
-                    to: reviewer_claude.name.clone(),
+                    from: ac_verifier_grok_ref.clone(),
+                    to: reviewer_claude_ref.clone(),
                     permit_overrides_from: None,
                 },
                 MessageEdge {
-                    from: reviewer_mechanical.clone(),
-                    to: shipper.clone(),
+                    from: reviewer_mechanical_ref.clone(),
+                    to: shipper_ref.clone(),
                     permit_overrides_from: None,
                 },
                 MessageEdge {
-                    from: reviewer_claude.name.clone(),
-                    to: shipper.clone(),
+                    from: reviewer_claude_ref.clone(),
+                    to: shipper_ref.clone(),
                     permit_overrides_from: None,
                 },
                 MessageEdge {
-                    from: shipper.clone(),
-                    to: ci_watcher.clone(),
+                    from: shipper_ref.clone(),
+                    to: ci_watcher_ref.clone(),
                     permit_overrides_from: None,
                 },
             ],
-            terminal_role: ci_watcher.clone(),
+            terminal_role: ci_watcher_ref.clone(),
             max_retries: 2,
         };
 
         assert!(
-            topology.roles.contains(&ac_verifier.name),
+            topology.roles.contains(&ac_verifier_ref),
             "ac-verifier-claude-agentry must be in roles"
         );
 
-        let edge_idx = |from: &RoleName, to: &RoleName| -> Option<usize> {
+        let edge_idx = |from: &RoleRef, to: &RoleRef| -> Option<usize> {
             topology
                 .message_graph
                 .iter()
                 .position(|e| e.from == *from && e.to == *to)
         };
 
-        let coder_to_acv = edge_idx(&coder.name, &ac_verifier.name);
-        let acv_to_rev_mech = edge_idx(&ac_verifier.name, &reviewer_mechanical);
-        let acv_to_rev_claude = edge_idx(&ac_verifier.name, &reviewer_claude.name);
-        let coder_to_rev_mech = edge_idx(&coder.name, &reviewer_mechanical);
-        let coder_to_rev_claude = edge_idx(&coder.name, &reviewer_claude.name);
+        let coder_to_acv = edge_idx(&coder_ref, &ac_verifier_ref);
+        let acv_to_rev_mech = edge_idx(&ac_verifier_ref, &reviewer_mechanical_ref);
+        let acv_to_rev_claude = edge_idx(&ac_verifier_ref, &reviewer_claude_ref);
+        let coder_to_rev_mech = edge_idx(&coder_ref, &reviewer_mechanical_ref);
+        let coder_to_rev_claude = edge_idx(&coder_ref, &reviewer_claude_ref);
 
         assert!(coder_to_acv.is_some(), "coder→ac-verifier edge must exist");
         assert!(
@@ -3269,20 +3592,20 @@ mod tests {
 
         // Brief 5 of #134: gemini + grok wired as parallel siblings.
         assert!(
-            topology.roles.contains(&ac_verifier_gemini.name),
+            topology.roles.contains(&ac_verifier_gemini_ref),
             "ac-verifier-gemini-agentry must be in roles"
         );
         assert!(
-            topology.roles.contains(&ac_verifier_grok.name),
+            topology.roles.contains(&ac_verifier_grok_ref),
             "ac-verifier-grok-agentry must be in roles"
         );
 
-        let coder_to_acv_gemini = edge_idx(&coder.name, &ac_verifier_gemini.name);
-        let coder_to_acv_grok = edge_idx(&coder.name, &ac_verifier_grok.name);
-        let acv_gemini_to_rev_mech = edge_idx(&ac_verifier_gemini.name, &reviewer_mechanical);
-        let acv_gemini_to_rev_claude = edge_idx(&ac_verifier_gemini.name, &reviewer_claude.name);
-        let acv_grok_to_rev_mech = edge_idx(&ac_verifier_grok.name, &reviewer_mechanical);
-        let acv_grok_to_rev_claude = edge_idx(&ac_verifier_grok.name, &reviewer_claude.name);
+        let coder_to_acv_gemini = edge_idx(&coder_ref, &ac_verifier_gemini_ref);
+        let coder_to_acv_grok = edge_idx(&coder_ref, &ac_verifier_grok_ref);
+        let acv_gemini_to_rev_mech = edge_idx(&ac_verifier_gemini_ref, &reviewer_mechanical_ref);
+        let acv_gemini_to_rev_claude = edge_idx(&ac_verifier_gemini_ref, &reviewer_claude_ref);
+        let acv_grok_to_rev_mech = edge_idx(&ac_verifier_grok_ref, &reviewer_mechanical_ref);
+        let acv_grok_to_rev_claude = edge_idx(&ac_verifier_grok_ref, &reviewer_claude_ref);
 
         assert!(
             coder_to_acv_gemini.is_some(),
@@ -3363,107 +3686,139 @@ mod tests {
         let reviewer_mechanical = RoleName("reviewer-mechanical-agentry".into());
         let shipper = RoleName("shipper-agentry".into());
         let ci_watcher = RoleName("ci-watcher-agentry".into());
+        let coder_ref = RoleRef {
+            name: coder.name.clone(),
+            version: coder.version,
+        };
+        let ac_verifier_claude_ref = RoleRef {
+            name: ac_verifier_claude.name.clone(),
+            version: ac_verifier_claude.version,
+        };
+        let ac_verifier_gemini_ref = RoleRef {
+            name: ac_verifier_gemini.name.clone(),
+            version: ac_verifier_gemini.version,
+        };
+        let ac_verifier_grok_ref = RoleRef {
+            name: ac_verifier_grok.name.clone(),
+            version: ac_verifier_grok.version,
+        };
+        let reviewer_claude_ref = RoleRef {
+            name: reviewer_claude.name.clone(),
+            version: reviewer_claude.version,
+        };
+        let reviewer_mechanical_ref = RoleRef {
+            name: reviewer_mechanical.clone(),
+            version: 1,
+        };
+        let shipper_ref = RoleRef {
+            name: shipper.clone(),
+            version: 1,
+        };
+        let ci_watcher_ref = RoleRef {
+            name: ci_watcher.clone(),
+            version: 1,
+        };
 
         let topology = TeamTopology {
             name: TeamName("agentry-self-host-v0".into()),
             version: 1,
             roles: vec![
-                coder.name.clone(),
-                ac_verifier_claude.name.clone(),
-                ac_verifier_gemini.name.clone(),
-                ac_verifier_grok.name.clone(),
-                reviewer_mechanical.clone(),
-                reviewer_claude.name.clone(),
-                shipper.clone(),
-                ci_watcher.clone(),
+                coder_ref.clone(),
+                ac_verifier_claude_ref.clone(),
+                ac_verifier_gemini_ref.clone(),
+                ac_verifier_grok_ref.clone(),
+                reviewer_mechanical_ref.clone(),
+                reviewer_claude_ref.clone(),
+                shipper_ref.clone(),
+                ci_watcher_ref.clone(),
             ],
             message_graph: vec![
                 MessageEdge {
-                    from: coder.name.clone(),
-                    to: reviewer_mechanical.clone(),
+                    from: coder_ref.clone(),
+                    to: reviewer_mechanical_ref.clone(),
                     permit_overrides_from: None,
                 },
                 MessageEdge {
-                    from: coder.name.clone(),
-                    to: reviewer_claude.name.clone(),
+                    from: coder_ref.clone(),
+                    to: reviewer_claude_ref.clone(),
                     permit_overrides_from: None,
                 },
                 MessageEdge {
-                    from: coder.name.clone(),
-                    to: ac_verifier_claude.name.clone(),
+                    from: coder_ref.clone(),
+                    to: ac_verifier_claude_ref.clone(),
                     permit_overrides_from: None,
                 },
                 MessageEdge {
-                    from: ac_verifier_claude.name.clone(),
-                    to: reviewer_mechanical.clone(),
+                    from: ac_verifier_claude_ref.clone(),
+                    to: reviewer_mechanical_ref.clone(),
                     permit_overrides_from: None,
                 },
                 MessageEdge {
-                    from: ac_verifier_claude.name.clone(),
-                    to: reviewer_claude.name.clone(),
+                    from: ac_verifier_claude_ref.clone(),
+                    to: reviewer_claude_ref.clone(),
                     permit_overrides_from: None,
                 },
                 MessageEdge {
-                    from: coder.name.clone(),
-                    to: ac_verifier_gemini.name.clone(),
+                    from: coder_ref.clone(),
+                    to: ac_verifier_gemini_ref.clone(),
                     permit_overrides_from: None,
                 },
                 MessageEdge {
-                    from: coder.name.clone(),
-                    to: ac_verifier_grok.name.clone(),
+                    from: coder_ref.clone(),
+                    to: ac_verifier_grok_ref.clone(),
                     permit_overrides_from: None,
                 },
                 MessageEdge {
-                    from: ac_verifier_gemini.name.clone(),
-                    to: reviewer_mechanical.clone(),
+                    from: ac_verifier_gemini_ref.clone(),
+                    to: reviewer_mechanical_ref.clone(),
                     permit_overrides_from: None,
                 },
                 MessageEdge {
-                    from: ac_verifier_gemini.name.clone(),
-                    to: reviewer_claude.name.clone(),
+                    from: ac_verifier_gemini_ref.clone(),
+                    to: reviewer_claude_ref.clone(),
                     permit_overrides_from: None,
                 },
                 MessageEdge {
-                    from: ac_verifier_grok.name.clone(),
-                    to: reviewer_mechanical.clone(),
+                    from: ac_verifier_grok_ref.clone(),
+                    to: reviewer_mechanical_ref.clone(),
                     permit_overrides_from: None,
                 },
                 MessageEdge {
-                    from: ac_verifier_grok.name.clone(),
-                    to: reviewer_claude.name.clone(),
+                    from: ac_verifier_grok_ref.clone(),
+                    to: reviewer_claude_ref.clone(),
                     permit_overrides_from: None,
                 },
                 MessageEdge {
-                    from: reviewer_mechanical.clone(),
-                    to: shipper.clone(),
+                    from: reviewer_mechanical_ref.clone(),
+                    to: shipper_ref.clone(),
                     permit_overrides_from: None,
                 },
                 MessageEdge {
-                    from: reviewer_claude.name.clone(),
-                    to: shipper.clone(),
+                    from: reviewer_claude_ref.clone(),
+                    to: shipper_ref.clone(),
                     permit_overrides_from: None,
                 },
                 MessageEdge {
-                    from: shipper.clone(),
-                    to: ci_watcher.clone(),
+                    from: shipper_ref.clone(),
+                    to: ci_watcher_ref.clone(),
                     permit_overrides_from: None,
                 },
             ],
-            terminal_role: ci_watcher.clone(),
+            terminal_role: ci_watcher_ref.clone(),
             max_retries: 2,
         };
 
-        // (a) all three verifier role names present.
+        // (a) all three verifier role refs present.
         assert!(
-            topology.roles.contains(&ac_verifier_claude.name),
+            topology.roles.contains(&ac_verifier_claude_ref),
             "ac-verifier-claude-agentry must be in roles"
         );
         assert!(
-            topology.roles.contains(&ac_verifier_gemini.name),
+            topology.roles.contains(&ac_verifier_gemini_ref),
             "ac-verifier-gemini-agentry must be in roles"
         );
         assert!(
-            topology.roles.contains(&ac_verifier_grok.name),
+            topology.roles.contains(&ac_verifier_grok_ref),
             "ac-verifier-grok-agentry must be in roles"
         );
 
@@ -3472,10 +3827,10 @@ mod tests {
             .message_graph
             .iter()
             .filter(|e| {
-                e.from == coder.name
-                    && (e.to == ac_verifier_claude.name
-                        || e.to == ac_verifier_gemini.name
-                        || e.to == ac_verifier_grok.name)
+                e.from == coder_ref
+                    && (e.to == ac_verifier_claude_ref
+                        || e.to == ac_verifier_gemini_ref
+                        || e.to == ac_verifier_grok_ref)
             })
             .count();
         assert_eq!(
@@ -3488,10 +3843,10 @@ mod tests {
             .message_graph
             .iter()
             .filter(|e| {
-                (e.from == ac_verifier_claude.name
-                    || e.from == ac_verifier_gemini.name
-                    || e.from == ac_verifier_grok.name)
-                    && (e.to == reviewer_mechanical || e.to == reviewer_claude.name)
+                (e.from == ac_verifier_claude_ref
+                    || e.from == ac_verifier_gemini_ref
+                    || e.from == ac_verifier_grok_ref)
+                    && (e.to == reviewer_mechanical_ref || e.to == reviewer_claude_ref)
             })
             .count();
         assert_eq!(

@@ -18,6 +18,17 @@ impl fmt::Display for RoleName {
     }
 }
 
+/// A version-pinned reference to a role: `(name, version)`. The team topology
+/// pins each role to a specific version so that a topology committed today
+/// keeps resolving to the exact role specs it was authored against — even as
+/// new role versions are registered.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RoleRef {
+    pub name: RoleName,
+    pub version: u32,
+}
+
 /// Where the agent runs. User picks; orchestrator adapts.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]

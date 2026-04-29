@@ -315,6 +315,7 @@ fn _unused(_: TeamName) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use orchestrator_types::RoleRef;
 
     #[test]
     fn parse_versioned_key_basic() {
@@ -349,12 +350,16 @@ mod tests {
     }
 
     fn topo(name: &str, version: u32, role: &str) -> TeamTopology {
+        let role_ref = RoleRef {
+            name: RoleName(role.into()),
+            version: 1,
+        };
         TeamTopology {
             name: TeamName(name.into()),
             version,
-            roles: vec![RoleName(role.into())],
+            roles: vec![role_ref.clone()],
             message_graph: vec![],
-            terminal_role: RoleName(role.into()),
+            terminal_role: role_ref,
             max_retries: 0,
         }
     }

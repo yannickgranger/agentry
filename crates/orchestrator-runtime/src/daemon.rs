@@ -19,7 +19,7 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use futures::future::join_all;
 use orchestrator_types::{
     apply_overrides, now, AgentRole, Brief, BriefId, Budget, PermitOverrides, PermitScope,
-    RoleName, TeamTopology, ToolAllowlist, Verdict, VerdictKind, VersionedRef, WorkPermit,
+    RoleName, RoleRef, TeamTopology, ToolAllowlist, Verdict, VerdictKind, VersionedRef, WorkPermit,
 };
 use redis::aio::ConnectionManager;
 use redis::AsyncCommands;
@@ -214,7 +214,7 @@ async fn handle_brief(
     // Dispatch-time validation hook: catch malformed topologies before
     // spawning anything. The validator catches `roles.is_empty()` via the
     // Type check, but the explicit guard below is kept as defense-in-depth.
-    let registered_roles = redis_io::list_role_names(conn).await?;
+    let registered_roles = redis_io::list_roles(conn).await?;
     let violations = crate::team_validator::validate(&team, &registered_roles);
     if !violations.is_empty() {
         let payload = serde_json::json!({
@@ -261,7 +261,7 @@ async fn handle_brief(
     let mut state: HashMap<RoleName, RoleState> = team
         .roles
         .iter()
-        .map(|r| (r.clone(), RoleState::Pending))
+        .map(|r| (r.name.clone(), RoleState::Pending))
         .collect();
 
     'outer: loop {
@@ -272,10 +272,10 @@ async fn handle_brief(
             .filter(|(_, s)| **s == RoleState::Shipped)
             .map(|(r, _)| r.clone())
             .collect();
-        let ready: Vec<RoleName> = team
+        let ready: Vec<RoleRef> = team
             .roles
             .iter()
-            .filter(|r| state.get(*r) == Some(&RoleState::Pending))
+            .filter(|r| state.get(&r.name) == Some(&RoleState::Pending))
             .filter(|r| inbound_satisfied(r, &team, &shipped_set))
             .cloned()
             .collect();
@@ -287,7 +287,8 @@ async fn handle_brief(
         // Setup phase (serial): fetch role records, allocate workspace if
         // needed, mint+narrow+sign permits, build per-role TeamContexts.
         let mut runs: Vec<RoleRun> = Vec::with_capacity(ready.len());
-        for role_name in &ready {
+        for role_ref in &ready {
+            let role_name = &role_ref.name;
             let role = fetch_role_any_version(conn, role_name).await?;
 
             if role.workspace_mount.is_some() && workspace.is_none() {
@@ -336,7 +337,7 @@ async fn handle_brief(
 
         // Mark batch as Running.
         for r in &ready {
-            state.insert(r.clone(), RoleState::Running);
+            state.insert(r.name.clone(), RoleState::Running);
         }
 
         // Concurrent fan-out: each role gets its own ConnectionManager clone
@@ -386,19 +387,19 @@ async fn handle_brief(
                 for edge in team
                     .message_graph
                     .iter()
-                    .filter(|e| e.from == run.role.name && e.to.0 == msg.to)
+                    .filter(|e| e.from.name == run.role.name && e.to.name.0 == msg.to)
                 {
                     if let Some(key) = &edge.permit_overrides_from {
                         if let Some(value) = msg.payload.get(key) {
                             match serde_json::from_value::<PermitOverrides>(value.clone()) {
                                 Ok(po) => {
-                                    overrides_for.insert(edge.to.0.clone(), po);
+                                    overrides_for.insert(edge.to.name.0.clone(), po);
                                 }
                                 Err(e) => {
                                     tracing::warn!(
                                         brief = %brief.id,
                                         from = %run.role.name,
-                                        to = %edge.to,
+                                        to = %edge.to.name,
                                         key = %key,
                                         error = %e,
                                         "upstream message had override key but payload didn't deserialize"
@@ -430,12 +431,17 @@ async fn handle_brief(
         // once the upstream re-ships.
         let mut rewound_subdags: HashSet<RoleName> = HashSet::new();
         for (from_role, findings) in reworks {
-            let upstream = team.incoming(&from_role).first().map(|e| e.from.clone());
+            // Locate the RoleRef for `from_role` in the topology so we can call
+            // the now-RoleRef-typed `team.incoming(...)`. Brief 184b will
+            // replace this with proper RoleRef-keyed state.
+            let from_ref = team.roles.iter().find(|r| r.name == from_role);
+            let upstream =
+                from_ref.and_then(|fr| team.incoming(fr).first().map(|e| e.from.clone()));
             match upstream {
                 Some(up) if reworks_used < team.max_retries => {
                     all_messages.push(RoutedMessage {
                         from: from_role.0.clone(),
-                        to: up.0.clone(),
+                        to: up.name.0.clone(),
                         payload: serde_json::json!({ "findings": findings }),
                         at: now(),
                     });
@@ -443,14 +449,14 @@ async fn handle_brief(
                     tracing::info!(
                         brief = %brief.id,
                         from = %from_role,
-                        to = %up,
+                        to = %up.name,
                         findings_count = findings.len(),
                         reworks_used,
                         max_retries = team.max_retries,
                         "rework requested — resetting upstream sub-DAG"
                     );
-                    state.insert(up.clone(), RoleState::Pending);
-                    rewound_subdags.insert(up.clone());
+                    state.insert(up.name.clone(), RoleState::Pending);
+                    rewound_subdags.insert(up.name.clone());
                     for r in downstream_subdag(&up, &team) {
                         state.insert(r.clone(), RoleState::Pending);
                         rewound_subdags.insert(r);
@@ -460,7 +466,7 @@ async fn handle_brief(
                     tracing::warn!(
                         brief = %brief.id,
                         role = %from_role,
-                        upstream = %up,
+                        upstream = %up.name,
                         reworks_used,
                         max_retries = team.max_retries,
                         "rework requested but retry budget exhausted"
@@ -495,7 +501,7 @@ async fn handle_brief(
     }
 
     // Success requires the terminal role to have shipped.
-    if team_shipped && state.get(&team.terminal_role) != Some(&RoleState::Shipped) {
+    if team_shipped && state.get(&team.terminal_role.name) != Some(&RoleState::Shipped) {
         team_shipped = false;
     }
 
@@ -904,22 +910,24 @@ async fn load_next_brief(path: &str) -> Option<Brief> {
 }
 
 /// True iff every upstream role of `role` is in `shipped`. Roles with no
-/// inbound edges are trivially satisfied.
-fn inbound_satisfied(role: &RoleName, team: &TeamTopology, shipped: &HashSet<RoleName>) -> bool {
+/// inbound edges are trivially satisfied. The `shipped` set is keyed by
+/// `RoleName` because Brief 184a leaves the daemon's state-map RoleName-keyed
+/// — Brief 184b migrates state to `RoleRef`.
+fn inbound_satisfied(role: &RoleRef, team: &TeamTopology, shipped: &HashSet<RoleName>) -> bool {
     team.inbound_roles(role)
         .iter()
-        .all(|up| shipped.contains(*up))
+        .all(|up| shipped.contains(&up.name))
 }
 
 /// All roles reachable from `role` via outbound edges in `team.message_graph`.
 /// Used by rework: when `role` is rewound to Pending, every role in its
 /// downstream sub-DAG must also be reset to Pending so the slice re-fires
 /// once `role` re-ships.
-fn downstream_subdag(role: &RoleName, team: &TeamTopology) -> HashSet<RoleName> {
+fn downstream_subdag(role: &RoleRef, team: &TeamTopology) -> HashSet<RoleName> {
     let mut out: HashSet<RoleName> = HashSet::new();
-    let mut stack: Vec<RoleName> = team.outgoing(role).iter().map(|e| e.to.clone()).collect();
+    let mut stack: Vec<RoleRef> = team.outgoing(role).iter().map(|e| e.to.clone()).collect();
     while let Some(r) = stack.pop() {
-        if out.insert(r.clone()) {
+        if out.insert(r.name.clone()) {
             for e in team.outgoing(&r) {
                 stack.push(e.to.clone());
             }
@@ -1045,6 +1053,13 @@ mod tests {
         RoleName(s.into())
     }
 
+    fn rr(s: &str) -> RoleRef {
+        RoleRef {
+            name: rn(s),
+            version: 1,
+        }
+    }
+
     /// Build the agentry-self-host-v0 shape: scribe → coder; coder → mech;
     /// coder → claude; mech → shipper; claude → shipper. Reviewer siblings
     /// share `coder` as the only upstream.
@@ -1053,40 +1068,40 @@ mod tests {
             name: TeamName("test-diamond".into()),
             version: 1,
             roles: vec![
-                rn("scribe"),
-                rn("coder"),
-                rn("mech"),
-                rn("claude"),
-                rn("shipper"),
+                rr("scribe"),
+                rr("coder"),
+                rr("mech"),
+                rr("claude"),
+                rr("shipper"),
             ],
             message_graph: vec![
                 MessageEdge {
-                    from: rn("scribe"),
-                    to: rn("coder"),
+                    from: rr("scribe"),
+                    to: rr("coder"),
                     permit_overrides_from: None,
                 },
                 MessageEdge {
-                    from: rn("coder"),
-                    to: rn("mech"),
+                    from: rr("coder"),
+                    to: rr("mech"),
                     permit_overrides_from: None,
                 },
                 MessageEdge {
-                    from: rn("coder"),
-                    to: rn("claude"),
+                    from: rr("coder"),
+                    to: rr("claude"),
                     permit_overrides_from: None,
                 },
                 MessageEdge {
-                    from: rn("mech"),
-                    to: rn("shipper"),
+                    from: rr("mech"),
+                    to: rr("shipper"),
                     permit_overrides_from: None,
                 },
                 MessageEdge {
-                    from: rn("claude"),
-                    to: rn("shipper"),
+                    from: rr("claude"),
+                    to: rr("shipper"),
                     permit_overrides_from: None,
                 },
             ],
-            terminal_role: rn("shipper"),
+            terminal_role: rr("shipper"),
             max_retries: 2,
         }
     }
@@ -1096,7 +1111,7 @@ mod tests {
         let t = diamond_team();
         let shipped: HashSet<RoleName> = HashSet::new();
         // scribe has no inbound edges; trivially satisfied.
-        assert!(inbound_satisfied(&rn("scribe"), &t, &shipped));
+        assert!(inbound_satisfied(&rr("scribe"), &t, &shipped));
     }
 
     #[test]
@@ -1108,10 +1123,10 @@ mod tests {
         shipped.insert(rn("coder"));
         shipped.insert(rn("mech"));
         // Only one of two upstreams shipped — not yet satisfied.
-        assert!(!inbound_satisfied(&rn("shipper"), &t, &shipped));
+        assert!(!inbound_satisfied(&rr("shipper"), &t, &shipped));
         shipped.insert(rn("claude"));
         // Both upstreams shipped — now satisfied.
-        assert!(inbound_satisfied(&rn("shipper"), &t, &shipped));
+        assert!(inbound_satisfied(&rr("shipper"), &t, &shipped));
     }
 
     #[test]
@@ -1121,14 +1136,14 @@ mod tests {
         let mut shipped: HashSet<RoleName> = HashSet::new();
         shipped.insert(rn("scribe"));
         shipped.insert(rn("coder"));
-        assert!(inbound_satisfied(&rn("mech"), &t, &shipped));
-        assert!(inbound_satisfied(&rn("claude"), &t, &shipped));
+        assert!(inbound_satisfied(&rr("mech"), &t, &shipped));
+        assert!(inbound_satisfied(&rr("claude"), &t, &shipped));
     }
 
     #[test]
     fn downstream_subdag_full_reach_from_root() {
         let t = diamond_team();
-        let sub = downstream_subdag(&rn("scribe"), &t);
+        let sub = downstream_subdag(&rr("scribe"), &t);
         // scribe's downstream = coder, mech, claude, shipper (everything but scribe itself).
         assert_eq!(sub.len(), 4);
         assert!(sub.contains(&rn("coder")));
@@ -1141,7 +1156,7 @@ mod tests {
     #[test]
     fn downstream_subdag_from_coder_resets_diamond() {
         let t = diamond_team();
-        let sub = downstream_subdag(&rn("coder"), &t);
+        let sub = downstream_subdag(&rr("coder"), &t);
         // Rewind to coder must reset both reviewers and the shipper.
         assert_eq!(sub.len(), 3);
         assert!(sub.contains(&rn("mech")));
@@ -1152,7 +1167,7 @@ mod tests {
     #[test]
     fn downstream_subdag_terminal_is_empty() {
         let t = diamond_team();
-        let sub = downstream_subdag(&rn("shipper"), &t);
+        let sub = downstream_subdag(&rr("shipper"), &t);
         assert!(sub.is_empty());
     }
 
@@ -1603,9 +1618,9 @@ mod tests {
         let bad_team = TeamTopology {
             name: TeamName(team_name.clone()),
             version: 1,
-            roles: vec![rn("a")],
+            roles: vec![rr("a")],
             message_graph: vec![],
-            terminal_role: rn("phantom"),
+            terminal_role: rr("phantom"),
             max_retries: 0,
         };
         redis_io::save_team(&mut conn, &bad_team)
