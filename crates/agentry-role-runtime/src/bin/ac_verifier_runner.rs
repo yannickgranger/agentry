@@ -178,7 +178,10 @@ fn main() {
             emit_done(EventVerdict::Shipped, None);
             return;
         }
-        Err(InvokeErr::Failed { exit_code, stderr_tail }) => {
+        Err(InvokeErr::Failed {
+            exit_code,
+            stderr_tail,
+        }) => {
             emit_event(json!({
                 "msg": format!(
                     "{} invocation failed — degrading to shipped",
@@ -204,16 +207,14 @@ fn parse_provider_arg() -> Result<Provider, String> {
             let v = args
                 .next()
                 .ok_or_else(|| "--provider requires a value".to_string())?;
-            provider = Some(
-                Provider::parse(&v)
-                    .ok_or_else(|| format!("unknown provider '{v}' (expected claude|gemini|grok)"))?,
-            );
+            provider =
+                Some(Provider::parse(&v).ok_or_else(|| {
+                    format!("unknown provider '{v}' (expected claude|gemini|grok)")
+                })?);
         } else if let Some(rest) = a.strip_prefix("--provider=") {
-            provider = Some(
-                Provider::parse(rest).ok_or_else(|| {
-                    format!("unknown provider '{rest}' (expected claude|gemini|grok)")
-                })?,
-            );
+            provider = Some(Provider::parse(rest).ok_or_else(|| {
+                format!("unknown provider '{rest}' (expected claude|gemini|grok)")
+            })?);
         } else {
             return Err(format!("unknown argument '{a}'"));
         }
