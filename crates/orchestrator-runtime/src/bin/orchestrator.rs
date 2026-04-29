@@ -5,7 +5,9 @@
 //! `orchestrator abort --all` — abort all running briefs.
 
 use clap::{Parser, Subcommand};
-use orchestrator_runtime::{cli_agents, cli_teams, permit, redis_io, seed, state, Config, Result};
+use orchestrator_runtime::{
+    cli_agents, cli_roles, cli_teams, permit, redis_io, seed, state, Config, Result,
+};
 use orchestrator_types::Brief;
 use std::path::{Path, PathBuf};
 
@@ -46,11 +48,26 @@ enum Cmd {
         #[command(subcommand)]
         sub: AgentsCmd,
     },
+    /// Inspect the role catalog (engine-seeded; no register subcommand).
+    Role {
+        #[command(subcommand)]
+        sub: RoleCmd,
+    },
     /// Inspect or mutate the team-topology catalog.
     Team {
         #[command(subcommand)]
         sub: TeamCmd,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum RoleCmd {
+    /// List every registered `(name, version)` pair.
+    List,
+    /// Print one role as pretty JSON.
+    Show { name: String, version: u32 },
+    /// Validate a role JSON file (parse-only; does NOT contact Redis).
+    Validate { file: PathBuf },
 }
 
 #[derive(Subcommand, Debug)]
@@ -199,6 +216,19 @@ async fn main() -> Result<()> {
                         println!("{}", serde_json::to_string(&v)?);
                     }
                 }
+            }
+        }
+        Cmd::Role { sub } => {
+            let mut conn = redis_io::connect(&cfg.redis.url).await?;
+            match sub {
+                RoleCmd::List => cli_roles::list(&mut conn).await?,
+                RoleCmd::Show { name, version } => {
+                    cli_roles::show(&mut conn, &name, version).await?;
+                }
+                RoleCmd::Validate { file } => match cli_roles::validate(&mut conn, &file).await {
+                    Ok(()) => {}
+                    Err(_) => std::process::exit(2),
+                },
             }
         }
         Cmd::Team { sub } => {
