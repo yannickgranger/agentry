@@ -124,6 +124,18 @@ fn check_reference_integrity(
                 ),
             });
         }
+        if let Some(target) = &edge.rework_target {
+            if !role_set.contains(target) {
+                out.push(TeamValidationViolation {
+                    path: format!("message_graph[{i}].rework_target"),
+                    kind: ViolationKind::Reference,
+                    detail: format!(
+                        "rework_target '{}' v{} is not in topology.roles",
+                        target.name.0, target.version
+                    ),
+                });
+            }
+        }
     }
     if !role_set.contains(&topology.terminal_role) {
         out.push(TeamValidationViolation {
@@ -356,6 +368,7 @@ mod tests {
                     from: rr(f, *fv),
                     to: rr(t, *tv),
                     permit_overrides_from: None,
+                    rework_target: None,
                 })
                 .collect(),
             terminal_role: rr(terminal.0, terminal.1),
@@ -596,6 +609,62 @@ mod tests {
         assert!(
             v.iter().any(|x| x.kind == ViolationKind::MultipleTerminals),
             "expected MultipleTerminals violation, got: {v:?}"
+        );
+    }
+
+    #[test]
+    fn accepts_rework_target_in_roles() {
+        // a→b, with edge.rework_target = a (resolves in roles[]) → no violations.
+        let mut t = topo(
+            "t",
+            &[("a", 1), ("b", 1)],
+            &[(("a", 1), ("b", 1))],
+            ("b", 1),
+            1,
+        );
+        t.message_graph[0].rework_target = Some(rr("a", 1));
+        let v = validate(&t, &registry(&[("a", 1), ("b", 1)]));
+        assert!(v.is_empty(), "expected zero violations, got: {v:?}");
+    }
+
+    #[test]
+    fn accepts_no_rework_target() {
+        // Regression: existing workflows have rework_target=None and must validate cleanly.
+        let t = topo(
+            "t",
+            &[("a", 1), ("b", 1)],
+            &[(("a", 1), ("b", 1))],
+            ("b", 1),
+            1,
+        );
+        assert!(t.message_graph[0].rework_target.is_none());
+        let v = validate(&t, &registry(&[("a", 1), ("b", 1)]));
+        assert!(v.is_empty(), "expected zero violations, got: {v:?}");
+    }
+
+    #[test]
+    fn rejects_rework_target_not_in_roles() {
+        // a→b with rework_target = ghost (NOT in roles[]) → exactly one Reference violation
+        // on message_graph[0].rework_target.
+        let mut t = topo(
+            "t",
+            &[("a", 1), ("b", 1)],
+            &[(("a", 1), ("b", 1))],
+            ("b", 1),
+            1,
+        );
+        t.message_graph[0].rework_target = Some(rr("ghost", 1));
+        let v = validate(&t, &registry(&[("a", 1), ("b", 1)]));
+        let rework_violations: Vec<&TeamValidationViolation> = v
+            .iter()
+            .filter(|x| {
+                x.kind == ViolationKind::Reference && x.path == "message_graph[0].rework_target"
+            })
+            .collect();
+        assert_eq!(
+            rework_violations.len(),
+            1,
+            "expected exactly one Reference violation on message_graph[0].rework_target, got: {v:?}"
         );
     }
 

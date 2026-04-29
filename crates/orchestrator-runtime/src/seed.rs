@@ -2041,6 +2041,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
                 version: listener.version,
             },
             permit_overrides_from: None,
+            rework_target: None,
         }],
         terminal_role: RoleRef {
             name: listener.name.clone(),
@@ -2216,6 +2217,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
                 version: narrowed_coder.version,
             },
             permit_overrides_from: Some("permit_overrides".into()),
+            rework_target: None,
         }],
         terminal_role: RoleRef {
             name: narrowed_coder.name.clone(),
@@ -2557,6 +2559,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
                 version: planner_claude_agentry.version,
             },
             permit_overrides_from: None,
+            rework_target: None,
         }],
         terminal_role: RoleRef {
             name: planner_claude_agentry.name.clone(),
@@ -2640,6 +2643,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
                     version: reviewer_mechanical_agentry.version,
                 },
                 permit_overrides_from: None,
+                rework_target: None,
             },
             MessageEdge {
                 from: RoleRef {
@@ -2651,6 +2655,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
                     version: reviewer_claude_agentry.version,
                 },
                 permit_overrides_from: None,
+                rework_target: None,
             },
             // Coder fans out to ac-verifier as well; ac-verifier short-circuits
             // failed-AC reworks BEFORE reviewer-claude is spent.
@@ -2664,6 +2669,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
                     version: ac_verifier_claude_agentry.version,
                 },
                 permit_overrides_from: None,
+                rework_target: None,
             },
             // Dual-inbound trick: ac-verifier also signals each reviewer so the
             // sequential flow holds, but rework still rewinds to coder above.
@@ -2677,6 +2683,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
                     version: reviewer_mechanical_agentry.version,
                 },
                 permit_overrides_from: None,
+                rework_target: None,
             },
             MessageEdge {
                 from: RoleRef {
@@ -2688,6 +2695,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
                     version: reviewer_claude_agentry.version,
                 },
                 permit_overrides_from: None,
+                rework_target: None,
             },
             // Parallel ac-verifier siblings: gemini + grok fan out from the
             // coder and signal both reviewers. Any verifier emitting failed
@@ -2702,6 +2710,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
                     version: ac_verifier_gemini_agentry.version,
                 },
                 permit_overrides_from: None,
+                rework_target: None,
             },
             MessageEdge {
                 from: RoleRef {
@@ -2713,6 +2722,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
                     version: ac_verifier_grok_agentry.version,
                 },
                 permit_overrides_from: None,
+                rework_target: None,
             },
             MessageEdge {
                 from: RoleRef {
@@ -2724,6 +2734,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
                     version: reviewer_mechanical_agentry.version,
                 },
                 permit_overrides_from: None,
+                rework_target: None,
             },
             MessageEdge {
                 from: RoleRef {
@@ -2735,6 +2746,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
                     version: reviewer_claude_agentry.version,
                 },
                 permit_overrides_from: None,
+                rework_target: None,
             },
             MessageEdge {
                 from: RoleRef {
@@ -2746,6 +2758,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
                     version: reviewer_mechanical_agentry.version,
                 },
                 permit_overrides_from: None,
+                rework_target: None,
             },
             MessageEdge {
                 from: RoleRef {
@@ -2757,6 +2770,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
                     version: reviewer_claude_agentry.version,
                 },
                 permit_overrides_from: None,
+                rework_target: None,
             },
             // Mechanical reviewer signals shipper only for sequential flow; no
             // data payload carried on this edge.
@@ -2770,6 +2784,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
                     version: shipper_agentry.version,
                 },
                 permit_overrides_from: None,
+                rework_target: None,
             },
             // Claude reviewer also signals shipper.
             MessageEdge {
@@ -2782,6 +2797,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
                     version: shipper_agentry.version,
                 },
                 permit_overrides_from: None,
+                rework_target: None,
             },
             // Shipper routes head_sha + pr_number to ci-watcher via Message event.
             MessageEdge {
@@ -2794,6 +2810,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
                     version: ci_watcher_agentry.version,
                 },
                 permit_overrides_from: None,
+                rework_target: None,
             },
         ],
         terminal_role: RoleRef {
@@ -2835,6 +2852,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
                     version: reviewer_mechanical_agentry.version,
                 },
                 permit_overrides_from: None,
+                rework_target: None,
             },
             MessageEdge {
                 from: RoleRef {
@@ -2846,6 +2864,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
                     version: shipper_agentry.version,
                 },
                 permit_overrides_from: None,
+                rework_target: None,
             },
             MessageEdge {
                 from: RoleRef {
@@ -2857,6 +2876,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
                     version: ci_watcher_agentry.version,
                 },
                 permit_overrides_from: None,
+                rework_target: None,
             },
         ],
         terminal_role: RoleRef {
@@ -2894,6 +2914,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
                     version: shipper_agentry.version,
                 },
                 permit_overrides_from: None,
+                rework_target: None,
             },
             MessageEdge {
                 from: RoleRef {
@@ -2905,6 +2926,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
                     version: ci_watcher_agentry.version,
                 },
                 permit_overrides_from: None,
+                rework_target: None,
             },
         ],
         terminal_role: RoleRef {
@@ -3487,71 +3509,85 @@ mod tests {
                     from: coder_ref.clone(),
                     to: reviewer_mechanical_ref.clone(),
                     permit_overrides_from: None,
+                    rework_target: None,
                 },
                 MessageEdge {
                     from: coder_ref.clone(),
                     to: reviewer_claude_ref.clone(),
                     permit_overrides_from: None,
+                    rework_target: None,
                 },
                 MessageEdge {
                     from: coder_ref.clone(),
                     to: ac_verifier_ref.clone(),
                     permit_overrides_from: None,
+                    rework_target: None,
                 },
                 MessageEdge {
                     from: ac_verifier_ref.clone(),
                     to: reviewer_mechanical_ref.clone(),
                     permit_overrides_from: None,
+                    rework_target: None,
                 },
                 MessageEdge {
                     from: ac_verifier_ref.clone(),
                     to: reviewer_claude_ref.clone(),
                     permit_overrides_from: None,
+                    rework_target: None,
                 },
                 MessageEdge {
                     from: coder_ref.clone(),
                     to: ac_verifier_gemini_ref.clone(),
                     permit_overrides_from: None,
+                    rework_target: None,
                 },
                 MessageEdge {
                     from: coder_ref.clone(),
                     to: ac_verifier_grok_ref.clone(),
                     permit_overrides_from: None,
+                    rework_target: None,
                 },
                 MessageEdge {
                     from: ac_verifier_gemini_ref.clone(),
                     to: reviewer_mechanical_ref.clone(),
                     permit_overrides_from: None,
+                    rework_target: None,
                 },
                 MessageEdge {
                     from: ac_verifier_gemini_ref.clone(),
                     to: reviewer_claude_ref.clone(),
                     permit_overrides_from: None,
+                    rework_target: None,
                 },
                 MessageEdge {
                     from: ac_verifier_grok_ref.clone(),
                     to: reviewer_mechanical_ref.clone(),
                     permit_overrides_from: None,
+                    rework_target: None,
                 },
                 MessageEdge {
                     from: ac_verifier_grok_ref.clone(),
                     to: reviewer_claude_ref.clone(),
                     permit_overrides_from: None,
+                    rework_target: None,
                 },
                 MessageEdge {
                     from: reviewer_mechanical_ref.clone(),
                     to: shipper_ref.clone(),
                     permit_overrides_from: None,
+                    rework_target: None,
                 },
                 MessageEdge {
                     from: reviewer_claude_ref.clone(),
                     to: shipper_ref.clone(),
                     permit_overrides_from: None,
+                    rework_target: None,
                 },
                 MessageEdge {
                     from: shipper_ref.clone(),
                     to: ci_watcher_ref.clone(),
                     permit_overrides_from: None,
+                    rework_target: None,
                 },
             ],
             terminal_role: ci_watcher_ref.clone(),
@@ -3737,71 +3773,85 @@ mod tests {
                     from: coder_ref.clone(),
                     to: reviewer_mechanical_ref.clone(),
                     permit_overrides_from: None,
+                    rework_target: None,
                 },
                 MessageEdge {
                     from: coder_ref.clone(),
                     to: reviewer_claude_ref.clone(),
                     permit_overrides_from: None,
+                    rework_target: None,
                 },
                 MessageEdge {
                     from: coder_ref.clone(),
                     to: ac_verifier_claude_ref.clone(),
                     permit_overrides_from: None,
+                    rework_target: None,
                 },
                 MessageEdge {
                     from: ac_verifier_claude_ref.clone(),
                     to: reviewer_mechanical_ref.clone(),
                     permit_overrides_from: None,
+                    rework_target: None,
                 },
                 MessageEdge {
                     from: ac_verifier_claude_ref.clone(),
                     to: reviewer_claude_ref.clone(),
                     permit_overrides_from: None,
+                    rework_target: None,
                 },
                 MessageEdge {
                     from: coder_ref.clone(),
                     to: ac_verifier_gemini_ref.clone(),
                     permit_overrides_from: None,
+                    rework_target: None,
                 },
                 MessageEdge {
                     from: coder_ref.clone(),
                     to: ac_verifier_grok_ref.clone(),
                     permit_overrides_from: None,
+                    rework_target: None,
                 },
                 MessageEdge {
                     from: ac_verifier_gemini_ref.clone(),
                     to: reviewer_mechanical_ref.clone(),
                     permit_overrides_from: None,
+                    rework_target: None,
                 },
                 MessageEdge {
                     from: ac_verifier_gemini_ref.clone(),
                     to: reviewer_claude_ref.clone(),
                     permit_overrides_from: None,
+                    rework_target: None,
                 },
                 MessageEdge {
                     from: ac_verifier_grok_ref.clone(),
                     to: reviewer_mechanical_ref.clone(),
                     permit_overrides_from: None,
+                    rework_target: None,
                 },
                 MessageEdge {
                     from: ac_verifier_grok_ref.clone(),
                     to: reviewer_claude_ref.clone(),
                     permit_overrides_from: None,
+                    rework_target: None,
                 },
                 MessageEdge {
                     from: reviewer_mechanical_ref.clone(),
                     to: shipper_ref.clone(),
                     permit_overrides_from: None,
+                    rework_target: None,
                 },
                 MessageEdge {
                     from: reviewer_claude_ref.clone(),
                     to: shipper_ref.clone(),
                     permit_overrides_from: None,
+                    rework_target: None,
                 },
                 MessageEdge {
                     from: shipper_ref.clone(),
                     to: ci_watcher_ref.clone(),
                     permit_overrides_from: None,
+                    rework_target: None,
                 },
             ],
             terminal_role: ci_watcher_ref.clone(),
