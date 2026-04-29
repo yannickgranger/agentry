@@ -1,0 +1,24 @@
+{
+  "name": "null-agent-agentry",
+  "version": 1,
+  "model": null,
+  "system_prompt": null,
+  "image": "docker.io/library/alpine:3.21",
+  "substrate_class": "podman",
+  "package_manager": "apk",
+  "entrypoint_script": "#!/bin/sh\nexec /usr/local/bin/null-agent\n",
+  "binaries": [],
+  "mcp_servers": [],
+  "tool_allowlist": [],
+  "permit_scope": [],
+  "passthru_env": [],
+  "mounts": [
+    {
+      "source": "${HOME}/.local/bin/null-agent",
+      "target": "/usr/local/bin/null-agent",
+      "readonly": true
+    }
+  ],
+  "workspace_mount": null,
+  "sccache": false
+}

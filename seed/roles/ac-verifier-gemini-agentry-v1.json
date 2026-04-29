@@ -1,0 +1,36 @@
+{
+  "name": "ac-verifier-gemini-agentry",
+  "version": 1,
+  "model": "gemini-3-flash-preview",
+  "system_prompt": null,
+  "image": "docker.io/library/debian:trixie-slim",
+  "substrate_class": "podman",
+  "package_manager": "apt",
+  "entrypoint_script": "#!/bin/sh\nexec /usr/local/bin/ac-verifier-runner --provider gemini\n",
+  "binaries": ["git", "ca-certificates"],
+  "mcp_servers": [],
+  "tool_allowlist": [],
+  "permit_scope": [
+    "fs:read:/workspace/**",
+    "net:allow:generativelanguage.googleapis.com",
+    "net:allow:agency.lab"
+  ],
+  "passthru_env": ["GEMINI_API_KEY"],
+  "mounts": [
+    {
+      "source": "${HOME}/.local/bin/ac-verifier-gemini",
+      "target": "/usr/local/bin/ac-verifier-gemini",
+      "readonly": true
+    },
+    {
+      "source": "${HOME}/.local/bin/ac-verifier-runner",
+      "target": "/usr/local/bin/ac-verifier-runner",
+      "readonly": true
+    }
+  ],
+  "workspace_mount": {
+    "container_path": "/workspace",
+    "readonly": true
+  },
+  "sccache": false
+}
