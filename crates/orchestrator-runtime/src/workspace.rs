@@ -340,13 +340,41 @@ pub async fn destroy_with_disposition(
     match disposition {
         TerminationDisposition::TearDown => destroy(ws).await,
         TerminationDisposition::Preserve => {
+            detach_worktree_branch(ws).await.unwrap_or_else(|e| {
+                tracing::warn!(
+                    workspace = %ws.host_path.display(),
+                    error = %e,
+                    "failed to detach worktree branch — subsequent fetches may collide"
+                );
+            });
             tracing::info!(
-                "workspace preserved for forensics: {}",
+                "workspace preserved for forensics (worktree branch detached): {}",
                 ws.host_path.display()
             );
             Ok(())
         }
     }
+}
+
+/// On `Preserve`, detach the worktree from its branch ref so subsequent
+/// `git fetch` operations into the bare clone don't collide with
+/// `refs/heads/auto/<brief_id>` checked out in the preserved worktree.
+async fn detach_worktree_branch(ws: &BriefWorkspace) -> Result<()> {
+    let out = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(&ws.host_path)
+        .args(["checkout", "--detach", "HEAD"])
+        .output()
+        .await
+        .map_err(|e| Error::Config(format!("git checkout --detach HEAD spawn: {e}")))?;
+    if !out.status.success() {
+        return Err(Error::Config(format!(
+            "git checkout --detach HEAD in {} failed: {}",
+            ws.host_path.display(),
+            String::from_utf8_lossy(&out.stderr)
+        )));
+    }
+    Ok(())
 }
 
 /// Filesystem record for one preserved per-brief workspace dir.
@@ -1222,5 +1250,104 @@ mod tests {
             .await
             .expect("sweep on empty root");
         assert_eq!(count, 0);
+    }
+
+    /// On `Preserve`, the worktree's `auto/<brief_id>` branch must be detached
+    /// so subsequent `git fetch` calls into the bare clone don't refuse with
+    /// "refusing to fetch into branch ... checked out at <path>".
+    #[tokio::test]
+    async fn preserve_detaches_worktree_branch() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let url = setup_upstream(tmp.path()).await;
+        let bid = brief("brf_preserve_detach");
+        let ws = allocate_at(&bid, Some((url.as_str(), "main")), tmp.path())
+            .await
+            .expect("alloc");
+
+        let (org, repo) = derive_org_repo(&url).expect("derive");
+        let bare = tmp.path().join(".clones").join(&org).join(&repo);
+        let branch = format!("auto/{}", bid.0);
+
+        // Reproduce the pre-fix failure mode: give the upstream a divergent
+        // `auto/<brief_id>` ref so the bare's next `git fetch` will try to
+        // fast-forward the local ref — which the worktree blocks.
+        let seed = tmp.path().join("seed");
+        run_git(&seed, &["checkout", "-q", "-b", branch.as_str()]).await;
+        tokio::fs::write(seed.join("CHANGE"), b"diverge\n")
+            .await
+            .expect("write change");
+        run_git(&seed, &["add", "CHANGE"]).await;
+        run_git(&seed, &["commit", "-q", "-m", "diverge"]).await;
+        let upstream = tmp.path().join("upstream.git");
+        let push = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(&seed)
+            .args(["push", "-q"])
+            .arg(&upstream)
+            .arg(&branch)
+            .output()
+            .await
+            .expect("push spawn");
+        assert!(
+            push.status.success(),
+            "seed push failed: {}",
+            String::from_utf8_lossy(&push.stderr)
+        );
+
+        // Pre-condition: fetch in the bare must fail with the expected collision.
+        let pre = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(&bare)
+            .arg("fetch")
+            .output()
+            .await
+            .expect("pre-fetch spawn");
+        assert!(
+            !pre.status.success(),
+            "pre-detach fetch was expected to fail: worktree has the branch checked out"
+        );
+        let pre_stderr = String::from_utf8_lossy(&pre.stderr);
+        assert!(
+            pre_stderr.contains("checked out"),
+            "expected checkout collision in stderr, got: {pre_stderr}"
+        );
+
+        // Preserve must detach the worktree and leave the dir on disk.
+        destroy_with_disposition(&ws, TerminationDisposition::Preserve)
+            .await
+            .expect("destroy_with_disposition Preserve");
+        assert!(
+            ws.host_path.exists(),
+            "worktree dir must survive Preserve disposition"
+        );
+
+        // The same fetch must now succeed.
+        let post = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(&bare)
+            .arg("fetch")
+            .output()
+            .await
+            .expect("post-fetch spawn");
+        assert!(
+            post.status.success(),
+            "post-detach fetch must succeed: {}",
+            String::from_utf8_lossy(&post.stderr)
+        );
+    }
+
+    /// `detach_worktree_branch` failing (e.g. workspace dir is missing) must
+    /// not propagate — the Preserve arm logs a warning and returns Ok so the
+    /// daemon continues to record the retain.
+    #[tokio::test]
+    async fn preserve_logs_warning_on_detach_failure() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let ws = BriefWorkspace {
+            brief_id: brief("brf_preserve_no_dir"),
+            host_path: tmp.path().join("does_not_exist"),
+        };
+        destroy_with_disposition(&ws, TerminationDisposition::Preserve)
+            .await
+            .expect("Preserve must return Ok even when detach fails");
     }
 }
