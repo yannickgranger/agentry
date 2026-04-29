@@ -91,6 +91,18 @@ null-agent-binary:
     test -x ~/.local/bin/null-agent
     echo "null-agent installed at ~/.local/bin/null-agent"
 
+# Build ac-verifier-runner into ~/.local/bin/ac-verifier-runner — the shared
+# workspace-prep + provider-invocation runner for ac-verifier-{claude,gemini,
+# grok}-agentry roles. EPIC #161 Wave 1.3. Operator-invoked; idempotent. The
+# three roles bind-mount this binary at /usr/local/bin/ac-verifier-runner and
+# pass --provider {claude,gemini,grok} on the entrypoint exec line.
+ac-verifier-runner-binary:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo install --path crates/agentry-role-runtime --bin ac-verifier-runner --root ~/.local --locked --quiet
+    test -x ~/.local/bin/ac-verifier-runner
+    echo "ac-verifier-runner installed at ~/.local/bin/ac-verifier-runner"
+
 # Build git-operator into ~/.local/bin/git-operator for the git-operator
 # role's bind-mount. Operator-invoked; idempotent. EPIC #152 brief 5.
 git-operator-binary:
