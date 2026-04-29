@@ -643,8 +643,9 @@ for i in $(seq 1 "$max_polls"); do
             # Pull the first failing context for reason.
             ctx=$(jq -r '[.statuses[]? | select(.state=="failure" or .state=="error") | .context] | .[0] // "(no context)"' <<<"$resp")
             emit_event "$(jq -nc --arg s "$state" --arg ctx "$ctx" \
-                '{error:"CI red",state:$s,failing_context:$ctx}')"
-            emit_done "failed"; exit 0
+                '{msg:"CI red — emitting rework_needed for coder loop-back",state:$s,failing_context:$ctx}')"
+            emit_finding "blocker" "ci-watcher" "ci" "CI red on $ctx"
+            emit_done "rework_needed"; exit 0
             ;;
         pending|unknown|"")
             sleep 15
