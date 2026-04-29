@@ -22,6 +22,25 @@ use orchestrator_types::{
 // Minimal scripts that only emit hand-formatted printf lines skip the prelude.
 // ---------------------------------------------------------------------------
 
+/// Container base image for roles that bind-mount host-built runner
+/// binaries (`reviewer-claude-runner`, `ac-verifier-runner`, etc.) and have
+/// no Rust toolchain in the image itself.
+///
+/// Must have glibc ≥ the host build's compile-target glibc, otherwise the
+/// dynamic linker fails with `version 'GLIBC_X.Y' not found` BEFORE `main()`
+/// runs — the runner's `DoneGuard` never registers, no events emit, and the
+/// role's verdict is synthesised from a bare exit code (issue #175).
+///
+/// `bookworm-slim` (glibc 2.36) was insufficient for binaries built on
+/// Fedora 43 / glibc 2.42 toolchains, which emit GLIBC_2.39 symbols.
+/// `trixie-slim` (glibc 2.41) covers the current host fleet; bump if/when
+/// the host toolchain's glibc-target passes 2.41.
+///
+/// Roles whose image already ships a Rust toolchain (e.g. coder uses
+/// `rust:1.93`, which is debian trixie based) need no change here — they
+/// inherit a compatible glibc from the toolchain's own base.
+const RUNNER_HOST_IMAGE: &str = "docker.io/library/debian:trixie-slim";
+
 /// Bash helpers injected at the top of scripts that build structured events
 /// via jq. Defines `emit_event <payload-json>`, `emit_done <verdict>`,
 /// `emit_finding <severity> <tool> <category> <message>` (mechanical origin),
@@ -1096,7 +1115,7 @@ fn build_reviewer_claude_agentry_role(home: &str, claude_settings_path: &str) ->
         version: 1,
         model: Some("claude-max".into()),
         system_prompt: None,
-        image: "docker.io/library/debian:bookworm-slim".into(),
+        image: RUNNER_HOST_IMAGE.into(),
         substrate_class: SubstrateClass::Podman,
         package_manager: PackageManager::Apt,
         // Bootstrap glue only: exec the bind-mounted Rust runner. Workspace
@@ -1173,7 +1192,7 @@ fn build_ac_verifier_claude_agentry_role(home: &str, claude_settings_path: &str)
         model: Some("claude-max".into()),
         system_prompt: None,
         // No rust toolchain — the binary is bind-mounted from the host.
-        image: "docker.io/library/debian:bookworm-slim".into(),
+        image: RUNNER_HOST_IMAGE.into(),
         substrate_class: SubstrateClass::Podman,
         package_manager: PackageManager::Apt,
         // Bootstrap glue only: exec the bind-mounted Rust runner.
@@ -1247,7 +1266,7 @@ fn build_ac_verifier_gemini_agentry_role(home: &str) -> AgentRole {
         version: 1,
         model: Some("gemini-3-flash-preview".into()),
         system_prompt: None,
-        image: "docker.io/library/debian:bookworm-slim".into(),
+        image: RUNNER_HOST_IMAGE.into(),
         substrate_class: SubstrateClass::Podman,
         package_manager: PackageManager::Apt,
         // Bootstrap glue only: exec the bind-mounted Rust runner. EPIC #161
@@ -1297,7 +1316,7 @@ fn build_ac_verifier_grok_agentry_role(home: &str) -> AgentRole {
         model: Some("grok-4-fast".into()),
         system_prompt: None,
         // No rust toolchain — the binary is bind-mounted from the host.
-        image: "docker.io/library/debian:bookworm-slim".into(),
+        image: RUNNER_HOST_IMAGE.into(),
         substrate_class: SubstrateClass::Podman,
         package_manager: PackageManager::Apt,
         // Bootstrap glue only: exec the bind-mounted Rust runner. EPIC #161
@@ -4137,5 +4156,48 @@ mod tests {
              complex_count from $r.functions|length (mirroring the unwraps \
              stage which uses ($r.functions|map(.unwraps|length)|add // 0))"
         );
+    }
+
+    #[test]
+    fn issue_175_runner_host_roles_use_glibc_compatible_image() {
+        // Regression: roles whose entrypoint exec's a host-built runner
+        // binary (`reviewer-claude-runner`, `ac-verifier-runner`, etc.) MUST
+        // run in an image whose glibc is at least the host build's
+        // compile-target. `debian:bookworm-slim` (glibc 2.36) was the prior
+        // value; binaries built on a Fedora 43 / glibc 2.42 host emit
+        // GLIBC_2.39 symbols, so the dynamic linker fails before `main()`
+        // ever runs — `DoneGuard` never registers, no events emit, and the
+        // role's verdict is synthesised from a bare exit code.
+        //
+        // This test pins the four affected roles to `RUNNER_HOST_IMAGE`
+        // (currently `debian:trixie-slim`, glibc 2.41). Future regressions
+        // — e.g. someone copy-pasting `bookworm-slim` into a new role spec
+        // — surface here at `cargo test` rather than in production at the
+        // first reviewer dispatch.
+        let reviewer = build_reviewer_claude_agentry_role("/h", "/h/.claude/settings.json");
+        let acv_claude = build_ac_verifier_claude_agentry_role("/h", "/h/.claude/settings.json");
+        let acv_gemini = build_ac_verifier_gemini_agentry_role("/h");
+        let acv_grok = build_ac_verifier_grok_agentry_role("/h");
+
+        for role in &[reviewer, acv_claude, acv_gemini, acv_grok] {
+            assert_eq!(
+                role.image, RUNNER_HOST_IMAGE,
+                "role '{}' must use RUNNER_HOST_IMAGE — see #175 \
+                 (host-built runner binary fails to load on bookworm-slim glibc 2.36)",
+                role.name
+            );
+            // Sanity: the role exec's a runner binary, which is what makes
+            // glibc compatibility load-bearing here. If a future refactor
+            // moves the entrypoint back to inline bash this test is no
+            // longer load-bearing — but until then the assertion holds.
+            assert!(
+                role.entrypoint_script.contains("exec /usr/local/bin/")
+                    && role.entrypoint_script.contains("-runner"),
+                "role '{}' is expected to exec a host-built `*-runner` binary; \
+                 if the entrypoint changed shape, revisit whether \
+                 RUNNER_HOST_IMAGE still applies",
+                role.name
+            );
+        }
     }
 }
