@@ -1140,12 +1140,11 @@ emit_done "failed"
 /// pipeline (reviewer-claude `Role-spec audit` clause; permit broker; spawner
 /// teardown). NOT a probe role's substrate-style probe; deliberately the
 /// simplest possible AgentRole.
-const NULL_AGENT_AGENTRY_SCRIPT: &str = r#"#!/usr/bin/env bash
-set -euo pipefail
-emit_event '{"msg":"null-agent shake-down","status":"ok"}'
-emit_done "shipped"
-"#;
-
+///
+/// This role is the FIRST port of the EPIC #161 bash → Rust migration. The
+/// behaviour now lives in `crates/agentry-role-runtime/src/bin/null_agent.rs`.
+/// The role's `entrypoint_script` is a one-line shell wrapper that execs
+/// `/usr/local/bin/null-agent` (bind-mounted from the host).
 /// Archaeologist role for the `agentry-discovery-v0` team. First stage of the
 /// upcoming `agentry-planner-v0` pipeline (#49). Runs `cfdb extract` and
 /// `graph-specs check --json`, optionally evaluates seed cypher queries, then
@@ -2290,6 +2289,37 @@ fn build_auditor_claude_agentry_role(home: &str) -> AgentRole {
 /// invokes claude; it just runs `success_criteria` as a shell command on a
 /// read-only snapshot of the workspace. Strictest permits in the registry:
 /// fs:read on /workspace, fs:write on /tmp only, no net, no git, no claude.
+/// Build the null-agent role (EPIC #161 B0). First role ported from bash
+/// to Rust. The behaviour lives in
+/// `crates/agentry-role-runtime/src/bin/null_agent.rs`; the role spec just
+/// bind-mounts the host-built binary and execs it.
+fn build_null_agent_agentry_role(home: &str) -> AgentRole {
+    AgentRole {
+        name: RoleName("null-agent-agentry".into()),
+        version: 1,
+        model: None,
+        system_prompt: None,
+        image: ALPINE.into(),
+        substrate_class: SubstrateClass::Podman,
+        package_manager: PackageManager::Apk,
+        entrypoint_script: "#!/bin/sh\nexec /usr/local/bin/null-agent\n".into(),
+        exitpoint_script: None,
+        binaries: vec![],
+        mcp_servers: vec![],
+        tool_allowlist: ToolAllowlist::default(),
+        permit_scope: PermitScope::default(),
+        passthru_env: vec![],
+        extra_bootstrap: vec![],
+        mounts: vec![Mount {
+            source: format!("{home}/.local/bin/null-agent"),
+            target: "/usr/local/bin/null-agent".into(),
+            readonly: true,
+        }],
+        workspace_mount: None,
+        sccache: false,
+    }
+}
+
 fn build_verifier_claude_agentry_role() -> AgentRole {
     AgentRole {
         name: RoleName("verifier-claude-agentry".into()),
@@ -2985,26 +3015,11 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
     // the reviewer-claude Role-spec audit clause, permit broker, and spawner
     // teardown on a deliberately minimal-permitted, well-formed role before
     // real planner roles (archaeologist, planner, verifier) land.
-    let null_agent_agentry = AgentRole {
-        name: RoleName("null-agent-agentry".into()),
-        version: 1,
-        model: None,
-        system_prompt: None,
-        image: ALPINE.into(),
-        substrate_class: SubstrateClass::Podman,
-        package_manager: PackageManager::Apk,
-        entrypoint_script: format!("{BASH_PRELUDE}{NULL_AGENT_AGENTRY_SCRIPT}"),
-        exitpoint_script: None,
-        binaries: vec![],
-        mcp_servers: vec![],
-        tool_allowlist: ToolAllowlist::default(),
-        permit_scope: PermitScope::default(),
-        passthru_env: vec![],
-        extra_bootstrap: vec![],
-        mounts: vec![],
-        workspace_mount: None,
-        sccache: false,
-    };
+    // First role ported from bash to Rust under EPIC #161 B0. The legacy
+    // bash heredoc (4 lines: emit_event + emit_done) becomes a Rust binary
+    // built from `agentry-role-runtime`. The 1-line shell wrapper is
+    // acceptable bootstrap glue per the refined #161 rule.
+    let null_agent_agentry = build_null_agent_agentry_role(&home);
     let agentry_null_v0 = TeamTopology {
         name: TeamName("agentry-null-v0".into()),
         version: 1,
@@ -3531,20 +3546,30 @@ mod tests {
     }
 
     #[test]
-    fn null_agent_agentry_script_minimal() {
+    fn null_agent_agentry_role_uses_rust_binary() {
+        // EPIC #161 B0 — null-agent is the first role ported from a bash
+        // heredoc to a Rust binary. The role's entrypoint_script is now a
+        // one-line shell wrapper that execs the bind-mounted binary.
+        let null = build_null_agent_agentry_role("/var/home/test");
+        assert_eq!(null.name.0, "null-agent-agentry");
         assert!(
-            NULL_AGENT_AGENTRY_SCRIPT.contains("emit_done \"shipped\""),
-            "null-agent script must emit shipped"
+            null.entrypoint_script
+                .contains("exec /usr/local/bin/null-agent"),
+            "entrypoint must exec the Rust binary, got: {}",
+            null.entrypoint_script
         );
         assert!(
-            NULL_AGENT_AGENTRY_SCRIPT.contains("emit_event"),
-            "null-agent script must emit at least one event"
+            null.mounts
+                .iter()
+                .any(|m| m.target == "/usr/local/bin/null-agent"
+                    && m.source == "/var/home/test/.local/bin/null-agent"),
+            "null-agent role must bind-mount the host binary at the conventional path"
         );
-        // Defensive: forbid claude / git / curl / cargo references in the body.
-        for forbidden in ["claude", "git ", "curl", "cargo"] {
+        // Defensive: no bash heredoc carryover.
+        for forbidden in ["set -euo pipefail", "emit_done", "emit_event"] {
             assert!(
-                !NULL_AGENT_AGENTRY_SCRIPT.contains(forbidden),
-                "null-agent script must not contain {}",
+                !null.entrypoint_script.contains(forbidden),
+                "entrypoint must not contain {} (legacy bash leftover)",
                 forbidden
             );
         }

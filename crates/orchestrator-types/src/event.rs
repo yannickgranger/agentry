@@ -26,6 +26,24 @@ pub enum EventVerdict {
     Rejected,
 }
 
+/// Optional structured cause attached to a `Done` event when the verdict was
+/// forced by an unexpected exit, timeout, or signal — set by
+/// `agentry_role_runtime::DoneGuard`'s Drop impl. Absent on roles that
+/// emitted `done` explicitly on their own happy path.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DoneReason {
+    /// Short symbolic cause: `"unexpected_exit"` (DoneGuard default),
+    /// future: `"timeout"`, `"signal"`, etc.
+    pub cause: String,
+    /// Exit code captured at the call site if known. Drop-time always emits
+    /// `None` because Rust's drop runs before the kernel returns the
+    /// process status; roles that detect a specific failure code can call
+    /// `emit_done(EventVerdict::Failed, Some(DoneReason { exit_code: Some(_), .. }))`
+    /// explicitly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+}
+
 /// A tool call attempt — content that the permit broker inspects.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ToolCall {
@@ -67,7 +85,15 @@ pub enum EventKind {
         evidence_event_ids: Vec<String>,
     },
     /// Agent is done; terminal.
-    Done { verdict: EventVerdict },
+    Done {
+        verdict: EventVerdict,
+        /// Optional structured cause — set by `DoneGuard` on unexpected
+        /// exits, or by callers who know their failure code at the
+        /// emit-site. Backwards-compatible: missing in the JSON
+        /// deserialises to `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<DoneReason>,
+    },
 }
 
 /// A stamped event.
@@ -92,7 +118,7 @@ impl Event {
     #[must_use]
     pub fn verdict(&self) -> Option<EventVerdict> {
         match &self.kind {
-            EventKind::Done { verdict } => Some(*verdict),
+            EventKind::Done { verdict, .. } => Some(*verdict),
             _ => None,
         }
     }
@@ -118,9 +144,43 @@ mod tests {
     fn done_event_is_terminal() {
         let e = Event::new(EventKind::Done {
             verdict: EventVerdict::Shipped,
+            reason: None,
         });
         assert!(e.is_terminal());
         assert_eq!(e.verdict(), Some(EventVerdict::Shipped));
+    }
+
+    #[test]
+    fn done_event_with_reason_roundtrips() {
+        let e = Event::new(EventKind::Done {
+            verdict: EventVerdict::Failed,
+            reason: Some(DoneReason {
+                cause: "unexpected_exit".into(),
+                exit_code: Some(5),
+            }),
+        });
+        let s = serde_json::to_string(&e).expect("ser");
+        let back: Event = serde_json::from_str(&s).expect("de");
+        assert_eq!(e, back);
+        assert!(s.contains("\"reason\""));
+        assert!(s.contains("\"cause\":\"unexpected_exit\""));
+    }
+
+    #[test]
+    fn done_event_legacy_json_deserializes_with_reason_none() {
+        // Old wire format — no reason field — must still parse.
+        let line = r#"{"at":"2026-04-23T10:00:01Z","type":"done","verdict":"shipped"}"#;
+        let e: Event = serde_json::from_str(line).expect("parse");
+        match e.kind {
+            EventKind::Done { verdict, reason } => {
+                assert_eq!(verdict, EventVerdict::Shipped);
+                assert!(
+                    reason.is_none(),
+                    "legacy JSON must deserialize reason as None"
+                );
+            }
+            _ => panic!("wrong kind"),
+        }
     }
 
     #[test]

@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/agentry-role-runtime",
     "crates/coder-precommit",
     "crates/orchestrator-dashboard",
     "crates/orchestrator-runtime",
