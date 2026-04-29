@@ -36,7 +36,7 @@ pub async fn show(conn: &mut ConnectionManager, name: &str, version: u32) -> Res
 /// Sequence:
 /// 1. Read the file and deserialize it as `TeamTopology` (strict serde —
 ///    unknown fields are rejected here as a `Vocabulary`-equivalent violation).
-/// 2. Fetch the role registry via `redis_io::list_role_names`.
+/// 2. Fetch the role registry via `redis_io::list_roles`.
 /// 3. Run `team_validator::validate`; on any violations, print
 ///    `{"registered":false,"violations":[…]}` and return Err.
 /// 4. `register_team_strict` atomically; print outcome and (on already-exists)
