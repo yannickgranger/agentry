@@ -87,3 +87,23 @@ The pre-commit dead-pub gate, ported into the validator pipeline. Pipes
 a passing report and a `debug!` log when the binary isn't present —
 mirrors the `dead_pub_check_unavailable` warn-skip in the existing
 reviewer-mechanical seed script.
+
+Workflow validation is a separate pipeline that runs against
+`TeamTopology` records, not against a coder's diff. Six checks compose
+the union: vocabulary integrity (parse-time, structurally enforced by
+`#[serde(deny_unknown_fields)]` on the workflow types — typos and
+unknown keys are rejected before any runtime check sees the topology),
+type integrity (non-zero version, non-empty name / roles / terminal),
+reference integrity (every `roles[]` entry resolves in the role
+registry, every `message_graph` endpoint is in `roles[]`, the
+`terminal_role` is in `roles[]`), topological integrity (at least one
+entry role, the terminal is reachable from some entry, no orphans),
+acyclicity, and single-terminal (exactly one role with no outbound
+edges, equal to the declared `terminal_role`). The validator collects
+across all checks without short-circuit — see `team_validator.rs`.
+Workflow validation runs at two trigger points: register-time (the
+`orchestrator team register` CLI runs it before persisting and rejects
+the body on any violation) AND dispatch-time (the daemon's
+`handle_brief` runs it between `fetch_team` and the role spawn loop, so
+a stale or malformed catalog entry is caught with a structured
+`team_validation_failed` trace event before any container fires).

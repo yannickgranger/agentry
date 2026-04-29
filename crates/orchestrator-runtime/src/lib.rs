@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 
 pub mod cli_agents;
+pub mod cli_teams;
 pub mod config;
 pub mod daemon;
 pub mod delivery;
