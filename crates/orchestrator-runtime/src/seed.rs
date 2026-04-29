@@ -40,6 +40,7 @@ use std::path::PathBuf;
 /// Roles whose image already ships a Rust toolchain (e.g. coder uses
 /// `rust:1.93`, which is debian trixie based) need no change here — they
 /// inherit a compatible glibc from the toolchain's own base.
+#[cfg(test)]
 const RUNNER_HOST_IMAGE: &str = "docker.io/library/debian:trixie-slim";
 
 /// Bash helpers injected at the top of scripts that build structured events
@@ -1106,353 +1107,6 @@ fn build_archaeologist_claude_agentry_role(home: &str, claude_settings_path: &st
     }
 }
 
-/// Build the reviewer-claude-agentry role. Extracted from `seed_m0` so the
-/// bind-mounts (claude, credentials, settings, transcripts, ra-query) can be
-/// asserted in unit tests. ra-query is operator-installed via
-/// `just ra-query-binary` and bind-mounted at /usr/local/bin/ra-query; the
-/// entrypoint script's pre-pass tolerates a missing binary.
-fn build_reviewer_claude_agentry_role(home: &str, claude_settings_path: &str) -> AgentRole {
-    AgentRole {
-        name: RoleName("reviewer-claude-agentry".into()),
-        version: 1,
-        model: Some("claude-max".into()),
-        system_prompt: None,
-        image: RUNNER_HOST_IMAGE.into(),
-        substrate_class: SubstrateClass::Podman,
-        package_manager: PackageManager::Apt,
-        // Bootstrap glue only: exec the bind-mounted Rust runner. Workspace
-        // diff capture, optional ra-query pre-pass, claude streaming, and
-        // finding emission live in the binary
-        // (`crates/agentry-role-runtime/src/bin/reviewer_claude_runner.rs`).
-        // EPIC #161 Wave 1.4 — replaces `BASH_PRELUDE +
-        // REVIEWER_CLAUDE_AGENTRY_SCRIPT`.
-        entrypoint_script: "#!/bin/sh\nexec /usr/local/bin/reviewer-claude-runner\n".into(),
-        exitpoint_script: None,
-        // git for diff; no rust toolchain — LLM reviewer does no compilation.
-        binaries: vec!["git".into(), "ca-certificates".into()],
-        mcp_servers: vec![],
-        tool_allowlist: ToolAllowlist(vec![]),
-        permit_scope: PermitScope(vec![
-            "fs:read:/workspace/**".into(),
-            "net:allow:api.anthropic.com".into(),
-            "net:allow:agency.lab".into(), // for git fetch origin/<base_branch>
-        ]),
-        passthru_env: vec![],
-        extra_bootstrap: vec![],
-        mounts: vec![
-            Mount {
-                source: format!("{home}/.local/bin/claude"),
-                target: "/usr/local/bin/claude".into(),
-                readonly: true,
-            },
-            Mount {
-                source: format!("{home}/.claude/.credentials.json"),
-                target: "/root/.claude/.credentials.json".into(),
-                readonly: true,
-            },
-            Mount {
-                source: claude_settings_path.into(),
-                target: "/root/.claude/settings.json".into(),
-                readonly: true,
-            },
-            Mount {
-                source: "/var/lib/agentry/transcripts".into(),
-                target: "/transcripts".into(),
-                readonly: false,
-            },
-            Mount {
-                source: format!("{home}/.local/bin/ra-query"),
-                target: "/usr/local/bin/ra-query".into(),
-                readonly: true,
-            },
-            Mount {
-                source: format!("{home}/.local/bin/reviewer-claude-runner"),
-                target: "/usr/local/bin/reviewer-claude-runner".into(),
-                readonly: true,
-            },
-        ],
-        // Read-only workspace — LLM reviewer does not mutate the coder's tree.
-        workspace_mount: Some(WorkspaceMount {
-            container_path: "/workspace".into(),
-            readonly: true,
-        }),
-        sccache: false,
-    }
-}
-
-/// Build the ac-verifier-claude-agentry role. Slotted between the coder and
-/// the reviewer pair in `agentry-self-host-v0`. Reads the brief's
-/// `acceptance_criteria` (Vec<String>) + the coder's git diff, asks claude
-/// for a per-AC verdict, and emits one blocker `Finding` per failed AC.
-/// Degrades to `done shipped` whenever AC list is missing/empty, the
-/// ac-verifier binary is not on PATH, or claude returns invalid JSON —
-/// reviewer-claude is the architectural backstop.
-fn build_ac_verifier_claude_agentry_role(home: &str, claude_settings_path: &str) -> AgentRole {
-    AgentRole {
-        name: RoleName("ac-verifier-claude-agentry".into()),
-        version: 1,
-        model: Some("claude-max".into()),
-        system_prompt: None,
-        // No rust toolchain — the binary is bind-mounted from the host.
-        image: RUNNER_HOST_IMAGE.into(),
-        substrate_class: SubstrateClass::Podman,
-        package_manager: PackageManager::Apt,
-        // Bootstrap glue only: exec the bind-mounted Rust runner.
-        // Workspace prep + provider invocation lives in the binary
-        // (`crates/agentry-role-runtime/src/bin/ac_verifier_runner.rs`).
-        // EPIC #161 Wave 1.3 — replaces `BASH_PRELUDE +
-        // AC_VERIFIER_CLAUDE_AGENTRY_SCRIPT`.
-        entrypoint_script: "#!/bin/sh\nexec /usr/local/bin/ac-verifier-runner --provider claude\n"
-            .into(),
-        exitpoint_script: None,
-        binaries: vec!["git".into(), "ca-certificates".into()],
-        mcp_servers: vec![],
-        tool_allowlist: ToolAllowlist(vec![]),
-        permit_scope: PermitScope(vec![
-            "fs:read:/workspace/**".into(),
-            "net:allow:api.anthropic.com".into(),
-            "net:allow:agency.lab".into(),
-        ]),
-        passthru_env: vec![],
-        extra_bootstrap: vec![],
-        mounts: vec![
-            Mount {
-                source: format!("{home}/.local/bin/claude"),
-                target: "/usr/local/bin/claude".into(),
-                readonly: true,
-            },
-            Mount {
-                source: format!("{home}/.claude/.credentials.json"),
-                target: "/root/.claude/.credentials.json".into(),
-                readonly: true,
-            },
-            Mount {
-                source: claude_settings_path.into(),
-                target: "/root/.claude/settings.json".into(),
-                readonly: true,
-            },
-            Mount {
-                source: "/var/lib/agentry/transcripts".into(),
-                target: "/transcripts".into(),
-                readonly: false,
-            },
-            Mount {
-                source: format!("{home}/.local/bin/ac-verifier"),
-                target: "/usr/local/bin/ac-verifier".into(),
-                readonly: true,
-            },
-            Mount {
-                source: format!("{home}/.local/bin/ac-verifier-runner"),
-                target: "/usr/local/bin/ac-verifier-runner".into(),
-                readonly: true,
-            },
-        ],
-        workspace_mount: Some(WorkspaceMount {
-            container_path: "/workspace".into(),
-            readonly: true,
-        }),
-        sccache: false,
-    }
-}
-
-/// Build the ac-verifier-gemini-agentry role. Sibling of
-/// `ac-verifier-claude-agentry` (brief 2 of #134). Same shape: reads the
-/// brief's `acceptance_criteria` + the coder's git diff, asks Gemini for a
-/// per-AC verdict, emits one blocker `Finding` per failed AC. Brief 5 of #134
-/// wired this role into `agentry-self-host-v0` as a parallel sibling of the
-/// claude variant; coder fans out to all three providers and any verifier
-/// emitting failed rewinds to the coder before reviewers spawn.
-fn build_ac_verifier_gemini_agentry_role(home: &str) -> AgentRole {
-    AgentRole {
-        name: RoleName("ac-verifier-gemini-agentry".into()),
-        version: 1,
-        model: Some("gemini-3-flash-preview".into()),
-        system_prompt: None,
-        image: RUNNER_HOST_IMAGE.into(),
-        substrate_class: SubstrateClass::Podman,
-        package_manager: PackageManager::Apt,
-        // Bootstrap glue only: exec the bind-mounted Rust runner. EPIC #161
-        // Wave 1.3 — replaces `BASH_PRELUDE + AC_VERIFIER_GEMINI_AGENTRY_SCRIPT`.
-        entrypoint_script: "#!/bin/sh\nexec /usr/local/bin/ac-verifier-runner --provider gemini\n"
-            .into(),
-        exitpoint_script: None,
-        binaries: vec!["git".into(), "ca-certificates".into()],
-        mcp_servers: vec![],
-        tool_allowlist: ToolAllowlist(vec![]),
-        permit_scope: PermitScope(vec![
-            "fs:read:/workspace/**".into(),
-            "net:allow:generativelanguage.googleapis.com".into(),
-            "net:allow:agency.lab".into(),
-        ]),
-        passthru_env: vec!["GEMINI_API_KEY".into()],
-        extra_bootstrap: vec![],
-        mounts: vec![
-            Mount {
-                source: format!("{home}/.local/bin/ac-verifier-gemini"),
-                target: "/usr/local/bin/ac-verifier-gemini".into(),
-                readonly: true,
-            },
-            Mount {
-                source: format!("{home}/.local/bin/ac-verifier-runner"),
-                target: "/usr/local/bin/ac-verifier-runner".into(),
-                readonly: true,
-            },
-        ],
-        workspace_mount: Some(WorkspaceMount {
-            container_path: "/workspace".into(),
-            readonly: true,
-        }),
-        sccache: false,
-    }
-}
-
-/// Build the ac-verifier-grok-agentry role. Sibling of the claude variant
-/// (brief 4 of #134). Brief 5 of #134 enabled parallel mode by wiring grok
-/// alongside claude and gemini in the `agentry-self-host-v0` DAG. Same
-/// degradation envelope: missing/empty AC list, missing binary, or invalid
-/// grok JSON degrades to `done shipped`.
-fn build_ac_verifier_grok_agentry_role(home: &str) -> AgentRole {
-    AgentRole {
-        name: RoleName("ac-verifier-grok-agentry".into()),
-        version: 1,
-        model: Some("grok-4-fast".into()),
-        system_prompt: None,
-        // No rust toolchain — the binary is bind-mounted from the host.
-        image: RUNNER_HOST_IMAGE.into(),
-        substrate_class: SubstrateClass::Podman,
-        package_manager: PackageManager::Apt,
-        // Bootstrap glue only: exec the bind-mounted Rust runner. EPIC #161
-        // Wave 1.3 — replaces `BASH_PRELUDE + AC_VERIFIER_GROK_AGENTRY_SCRIPT`.
-        entrypoint_script: "#!/bin/sh\nexec /usr/local/bin/ac-verifier-runner --provider grok\n"
-            .into(),
-        exitpoint_script: None,
-        binaries: vec!["git".into(), "curl".into(), "ca-certificates".into()],
-        mcp_servers: vec![],
-        tool_allowlist: ToolAllowlist(vec![]),
-        permit_scope: PermitScope(vec![
-            "fs:read:/workspace/**".into(),
-            "net:allow:api.x.ai".into(),
-            "net:allow:agency.lab".into(),
-        ]),
-        passthru_env: vec!["XAI_API_KEY".into()],
-        extra_bootstrap: vec![],
-        mounts: vec![
-            Mount {
-                source: format!("{home}/.local/bin/ac-verifier-grok"),
-                target: "/usr/local/bin/ac-verifier-grok".into(),
-                readonly: true,
-            },
-            Mount {
-                source: format!("{home}/.local/bin/ac-verifier-runner"),
-                target: "/usr/local/bin/ac-verifier-runner".into(),
-                readonly: true,
-            },
-        ],
-        workspace_mount: Some(WorkspaceMount {
-            container_path: "/workspace".into(),
-            readonly: true,
-        }),
-        sccache: false,
-    }
-}
-
-/// Build the coder-claude-agentry role. Extracted from `seed_m0` so the
-/// bind-mounts (claude, credentials, settings, transcripts, ra-query) can be
-/// asserted in unit tests. ra-query is operator-installed via
-/// `just ra-query-binary` and bind-mounted at /usr/local/bin/ra-query; the
-/// exitpoint's pre-commit dead-pub gate tolerates a missing binary.
-fn build_coder_claude_agentry_role(home: &str, claude_settings_path: &str) -> AgentRole {
-    AgentRole {
-        name: RoleName("coder-claude-agentry".into()),
-        version: 1,
-        model: Some("claude-max".into()),
-        system_prompt: None,
-        // rust:1.93 already has cargo + rustc. Apt installs the git client
-        // + ca-certificates; claude CLI is bind-mounted from the host.
-        image: "docker.io/library/rust:1.93".into(),
-        substrate_class: SubstrateClass::Podman,
-        package_manager: PackageManager::Apt,
-        // EPIC #161 Wave 1.2a + 1.2b — entrypoint AND exitpoint ported to
-        // a single Rust runner that owns the full role lifecycle: bundle
-        // parse, rework banner, prompt build, claude streaming, then
-        // (v0 only) cargo fmt → quality-hygiene → acceptance eval →
-        // git add → optional self-review claude soft-fail → optional
-        // dead-pub-check → git commit. The merged binary uses the standard
-        // DoneGuard pattern; v1+ topologies short-circuit to a best-effort
-        // fmt + done shipped (git-operator role handles commit/push).
-        entrypoint_script: "#!/bin/sh\nexec /usr/local/bin/coder-claude-runner\n".into(),
-        exitpoint_script: None,
-        binaries: vec!["git".into(), "curl".into(), "ca-certificates".into()],
-        mcp_servers: vec![],
-        tool_allowlist: ToolAllowlist(vec![]),
-        permit_scope: PermitScope(vec![
-            "fs:read:/workspace/**".into(),
-            "fs:write:/workspace/**".into(),
-            "net:allow:api.anthropic.com".into(),
-            "net:allow:agency.lab".into(),
-        ]),
-        passthru_env: vec!["GITEA_TOKEN".into()],
-        extra_bootstrap: vec![
-            "rustup component add rustfmt clippy".into(),
-            "git config --global http.sslVerify false".into(),
-            "CARGO_NET_GIT_FETCH_WITH_CLI=true cargo install --git https://oauth2:${GITEA_TOKEN}@agency.lab:3000/yg/quality-architecture.git --bin quality-hygiene --root /usr/local --locked --quiet || true".into(),
-            "CARGO_NET_GIT_FETCH_WITH_CLI=true cargo install --git https://oauth2:${GITEA_TOKEN}@agency.lab:3000/yg/cfdb.git --rev 02c5a45 --root /usr/local --locked --quiet cfdb-cli || true".into(),
-            "CARGO_NET_GIT_FETCH_WITH_CLI=true cargo install --git https://oauth2:${GITEA_TOKEN}@agency.lab:3000/yg/graph-specs-rust.git --rev ecaedb9 --root /usr/local --locked --quiet application || true".into(),
-        ],
-        mounts: vec![
-            Mount {
-                source: format!("{home}/.local/bin/claude"),
-                target: "/usr/local/bin/claude".into(),
-                readonly: true,
-            },
-            Mount {
-                source: format!("{home}/.claude/.credentials.json"),
-                target: "/root/.claude/.credentials.json".into(),
-                readonly: true,
-            },
-            Mount {
-                source: claude_settings_path.into(),
-                target: "/root/.claude/settings.json".into(),
-                readonly: true,
-            },
-            Mount {
-                source: "/var/lib/agentry/transcripts".into(),
-                target: "/transcripts".into(),
-                readonly: false,
-            },
-            Mount {
-                source: format!("{home}/.local/bin/ra-query"),
-                target: "/usr/local/bin/ra-query".into(),
-                readonly: true,
-            },
-            Mount {
-                source: format!("{home}/.local/bin/dead-pub-check"),
-                target: "/usr/local/bin/dead-pub-check".into(),
-                readonly: true,
-            },
-            Mount {
-                source: format!("{home}/.local/bin/ship"),
-                target: "/usr/local/bin/ship".into(),
-                readonly: true,
-            },
-            Mount {
-                source: format!("{home}/.local/bin/coder-claude-runner"),
-                target: "/usr/local/bin/coder-claude-runner".into(),
-                readonly: true,
-            },
-        ],
-        workspace_mount: Some(WorkspaceMount {
-            container_path: "/workspace".into(),
-            readonly: false,
-        }),
-        // sccache disabled for v0 — rust:1.93 is debian-based; sccache is not
-        // in apt/bookworm. Issue #9/#10 or a follow-up brief will add a
-        // static binary download here. Without sccache, each brief does a
-        // cold compile of the target repo (~60–90s for agentry itself).
-        sccache: false,
-    }
-}
-
 /// Verifier role for the `agentry-verify-v0` team. The DOL composer
 /// (daemon-side, see `daemon.rs::on_all_children_resolved`) auto-dispatches a
 /// verifier brief whenever a meta-brief's children all reach terminal verdict
@@ -1724,42 +1378,12 @@ fn build_auditor_claude_agentry_role(home: &str) -> AgentRole {
     }
 }
 
-/// Build the verifier-claude-agentry role. Despite the `claude` in the name —
-/// kept for symmetry with the other agentry-* roles — the verifier never
-/// invokes claude; it just runs `success_criteria` as a shell command on a
-/// read-only snapshot of the workspace. Strictest permits in the registry:
-/// fs:read on /workspace, fs:write on /tmp only, no net, no git, no claude.
-/// Build the null-agent role (EPIC #161 B0). First role ported from bash
-/// to Rust. The behaviour lives in
-/// `crates/agentry-role-runtime/src/bin/null_agent.rs`; the role spec just
-/// bind-mounts the host-built binary and execs it.
-fn build_null_agent_agentry_role(home: &str) -> AgentRole {
-    AgentRole {
-        name: RoleName("null-agent-agentry".into()),
-        version: 1,
-        model: None,
-        system_prompt: None,
-        image: ALPINE.into(),
-        substrate_class: SubstrateClass::Podman,
-        package_manager: PackageManager::Apk,
-        entrypoint_script: "#!/bin/sh\nexec /usr/local/bin/null-agent\n".into(),
-        exitpoint_script: None,
-        binaries: vec![],
-        mcp_servers: vec![],
-        tool_allowlist: ToolAllowlist::default(),
-        permit_scope: PermitScope::default(),
-        passthru_env: vec![],
-        extra_bootstrap: vec![],
-        mounts: vec![Mount {
-            source: format!("{home}/.local/bin/null-agent"),
-            target: "/usr/local/bin/null-agent".into(),
-            readonly: true,
-        }],
-        workspace_mount: None,
-        sccache: false,
-    }
-}
-
+/// Verifier role for the `agentry-verify-v0` team. Despite the `claude` in
+/// the name — kept for symmetry with the other agentry-* roles — the
+/// verifier never invokes claude; it just runs `success_criteria` as a
+/// shell command on a read-only snapshot of the workspace. Strictest
+/// permits in the registry: fs:read on /workspace, fs:write on /tmp only,
+/// no net, no git, no claude.
 fn build_verifier_claude_agentry_role() -> AgentRole {
     AgentRole {
         name: RoleName("verifier-claude-agentry".into()),
@@ -2388,7 +2012,10 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
     // Shipper pushes the branch and opens a PR on the forge.
     // Ci-watcher polls forge CI on the PR's head sha and merges on green.
     let home = std::env::var("HOME").unwrap_or_else(|_| "/var/home/yg".into());
-    let coder_claude_agentry = build_coder_claude_agentry_role(&home, &claude_settings_path);
+    let coder_claude_agentry = RoleRef {
+        name: RoleName("coder-claude-agentry".into()),
+        version: 1,
+    };
     let reviewer_mechanical_agentry = AgentRole {
         name: RoleName("reviewer-mechanical-agentry".into()),
         version: 1,
@@ -2424,11 +2051,22 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         }),
         sccache: false,
     };
-    let reviewer_claude_agentry = build_reviewer_claude_agentry_role(&home, &claude_settings_path);
-    let ac_verifier_claude_agentry =
-        build_ac_verifier_claude_agentry_role(&home, &claude_settings_path);
-    let ac_verifier_gemini_agentry = build_ac_verifier_gemini_agentry_role(&home);
-    let ac_verifier_grok_agentry = build_ac_verifier_grok_agentry_role(&home);
+    let reviewer_claude_agentry = RoleRef {
+        name: RoleName("reviewer-claude-agentry".into()),
+        version: 1,
+    };
+    let ac_verifier_claude_agentry = RoleRef {
+        name: RoleName("ac-verifier-claude-agentry".into()),
+        version: 1,
+    };
+    let ac_verifier_gemini_agentry = RoleRef {
+        name: RoleName("ac-verifier-gemini-agentry".into()),
+        version: 1,
+    };
+    let ac_verifier_grok_agentry = RoleRef {
+        name: RoleName("ac-verifier-grok-agentry".into()),
+        version: 1,
+    };
     let shipper_agentry = AgentRole {
         name: RoleName("shipper-agentry".into()),
         version: 1,
@@ -2492,7 +2130,10 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
     // bash heredoc (4 lines: emit_event + emit_done) becomes a Rust binary
     // built from `agentry-role-runtime`. The 1-line shell wrapper is
     // acceptable bootstrap glue per the refined #161 rule.
-    let null_agent_agentry = build_null_agent_agentry_role(&home);
+    let null_agent_agentry = RoleRef {
+        name: RoleName("null-agent-agentry".into()),
+        version: 1,
+    };
     let agentry_null_v0 = TeamTopology {
         name: TeamName("agentry-null-v0".into()),
         version: 1,
@@ -2976,12 +2617,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
     redis_io::save_team(&mut conn, &narrowed_team).await?;
     redis_io::save_role(&mut conn, &shipper).await?;
     redis_io::save_team(&mut conn, &shipper_team).await?;
-    redis_io::save_role(&mut conn, &coder_claude_agentry).await?;
     redis_io::save_role(&mut conn, &reviewer_mechanical_agentry).await?;
-    redis_io::save_role(&mut conn, &reviewer_claude_agentry).await?;
-    redis_io::save_role(&mut conn, &ac_verifier_claude_agentry).await?;
-    redis_io::save_role(&mut conn, &ac_verifier_gemini_agentry).await?;
-    redis_io::save_role(&mut conn, &ac_verifier_grok_agentry).await?;
     redis_io::save_role(&mut conn, &shipper_agentry).await?;
     redis_io::save_role(&mut conn, &ci_watcher_agentry).await?;
     redis_io::save_team(&mut conn, &agentry_self_host_v0).await?;
@@ -2989,7 +2625,6 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
     redis_io::save_team(&mut conn, &agentry_spec_edit_v0).await?;
     redis_io::save_role(&mut conn, &auditor_claude_agentry).await?;
     redis_io::save_team(&mut conn, &agentry_self_audit_v0).await?;
-    redis_io::save_role(&mut conn, &null_agent_agentry).await?;
     redis_io::save_team(&mut conn, &agentry_null_v0).await?;
     redis_io::save_role(&mut conn, &archaeologist_claude_agentry).await?;
     redis_io::save_team(&mut conn, &agentry_discovery_v0).await?;
@@ -3054,106 +2689,14 @@ mod tests {
     // clauses, salvage path, ra-query pre-pass) moved into the runner binary
     // at `crates/agentry-role-runtime/src/bin/reviewer_claude_runner.rs`.
     // Per-clause assertions live next to `build_review_prompt` and
-    // `parse_findings` in that file's `mod tests`. The seed tests here now
-    // only assert role-spec wiring (entrypoint, bind-mounts, permit_scope).
-
-    #[test]
-    fn reviewer_claude_role_entrypoint_invokes_runner() {
-        let role = build_reviewer_claude_agentry_role(
-            "/var/home/test",
-            "/var/home/test/.config/agentry/claude-container-settings.json",
-        );
-        assert!(
-            role.entrypoint_script
-                .contains("exec /usr/local/bin/reviewer-claude-runner"),
-            "reviewer-claude entrypoint must exec the runner: {}",
-            role.entrypoint_script
-        );
-        // Defensive: no bash heredoc carryover from the pre-port script.
-        for forbidden in ["set -euo pipefail", "stream_claude", "emit_event"] {
-            assert!(
-                !role.entrypoint_script.contains(forbidden),
-                "entrypoint must not contain {} (legacy bash leftover)",
-                forbidden
-            );
-        }
-    }
-
-    #[test]
-    fn reviewer_claude_role_bind_mounts_runner_binary() {
-        let role = build_reviewer_claude_agentry_role(
-            "/var/home/test",
-            "/var/home/test/.config/agentry/claude-container-settings.json",
-        );
-        assert!(
-            role.mounts
-                .iter()
-                .any(|m| m.target == "/usr/local/bin/reviewer-claude-runner" && m.readonly),
-            "reviewer-claude must bind-mount the runner read-only at /usr/local/bin/reviewer-claude-runner"
-        );
-    }
-
-    #[test]
-    fn reviewer_role_bind_mounts_ra_query() {
-        let role = build_reviewer_claude_agentry_role(
-            "/var/home/test",
-            "/var/home/test/.config/agentry/claude-container-settings.json",
-        );
-        assert!(
-            role.mounts
-                .iter()
-                .any(|m| m.target == "/usr/local/bin/ra-query" && m.readonly),
-            "reviewer-claude must bind-mount ra-query read-only at /usr/local/bin/ra-query"
-        );
-    }
-
-    #[test]
-    fn coder_role_has_ra_query_mount() {
-        let role = build_coder_claude_agentry_role(
-            "/var/home/test",
-            "/var/home/test/.config/agentry/claude-container-settings.json",
-        );
-        assert!(
-            role.mounts
-                .iter()
-                .any(|m| m.target == "/usr/local/bin/ra-query" && m.readonly),
-            "coder-claude must bind-mount ra-query read-only at /usr/local/bin/ra-query"
-        );
-    }
+    // `parse_findings` in that file's `mod tests`. The role-spec wiring
+    // (entrypoint, bind-mounts, permit_scope) lives in
+    // `seed/roles/reviewer-claude-agentry-v1.json` and is exercised by the
+    // role_dir_loader at every `orchestrator seed`.
 
     // EPIC #161 Wave 1.4 — ra-query pre-pass behaviour, prompt summary
     // injection, and missing-binary tolerance assertions live next to their
     // implementation in the runner binary's `mod tests`.
-
-    #[test]
-    fn null_agent_agentry_role_uses_rust_binary() {
-        // EPIC #161 B0 — null-agent is the first role ported from a bash
-        // heredoc to a Rust binary. The role's entrypoint_script is now a
-        // one-line shell wrapper that execs the bind-mounted binary.
-        let null = build_null_agent_agentry_role("/var/home/test");
-        assert_eq!(null.name.0, "null-agent-agentry");
-        assert!(
-            null.entrypoint_script
-                .contains("exec /usr/local/bin/null-agent"),
-            "entrypoint must exec the Rust binary, got: {}",
-            null.entrypoint_script
-        );
-        assert!(
-            null.mounts
-                .iter()
-                .any(|m| m.target == "/usr/local/bin/null-agent"
-                    && m.source == "/var/home/test/.local/bin/null-agent"),
-            "null-agent role must bind-mount the host binary at the conventional path"
-        );
-        // Defensive: no bash heredoc carryover.
-        for forbidden in ["set -euo pipefail", "emit_done", "emit_event"] {
-            assert!(
-                !null.entrypoint_script.contains(forbidden),
-                "entrypoint must not contain {} (legacy bash leftover)",
-                forbidden
-            );
-        }
-    }
 
     #[test]
     fn bash_prelude_defines_stream_claude_with_pipefail_guard() {
@@ -3252,243 +2795,49 @@ mod tests {
     // for those behaviours moved into the runner's own `mod tests`:
     // `parse_self_review_object_*`, `build_self_review_prompt_*`,
     // `slice_json_object_*`, plus the `run_self_review` / `run_dead_pub_check_phase`
-    // wiring is tested at integration-runner level. The seed test below
-    // pins down that the role wiring keeps the dead-pub-check bind-mount
-    // (the runner needs the binary on PATH inside the container).
-
-    #[test]
-    fn coder_role_has_dead_pub_check_mount() {
-        let role = build_coder_claude_agentry_role(
-            "/var/home/test",
-            "/var/home/test/.config/agentry/claude-container-settings.json",
-        );
-        assert!(
-            role.mounts
-                .iter()
-                .any(|m| m.target == "/usr/local/bin/dead-pub-check" && m.readonly),
-            "coder-claude must bind-mount dead-pub-check read-only at /usr/local/bin/dead-pub-check"
-        );
-    }
-
-    #[test]
-    fn coder_claude_agentry_role_has_ship_mount() {
-        // EPIC #152 brief 1: stub `ship` binary must be bind-mounted at
-        // /usr/local/bin/ship so future briefs (4 wires the validator
-        // pipeline; 6 makes it the only path to publication) have the
-        // delivery surface in place. Stub: prompt mentions but does NOT
-        // call it yet.
-        let role = build_coder_claude_agentry_role(
-            "/var/home/test",
-            "/var/home/test/.config/agentry/claude-container-settings.json",
-        );
-        assert!(
-            role.mounts
-                .iter()
-                .any(|m| m.target == "/usr/local/bin/ship" && m.readonly),
-            "coder-claude must bind-mount ship read-only at /usr/local/bin/ship"
-        );
-    }
-
-    #[test]
-    fn ac_verifier_claude_role_entrypoint_invokes_runner() {
-        // EPIC #161 Wave 1.3 — script-content asserts (was: AC list parsing,
-        // missing-binary degradation) moved to the runner's own unit tests
-        // in `crates/agentry-role-runtime/src/bin/ac_verifier_runner.rs`.
-        let role = build_ac_verifier_claude_agentry_role("/h", "/c");
-        assert!(
-            role.entrypoint_script
-                .contains("ac-verifier-runner --provider claude"),
-            "ac-verifier-claude entrypoint must exec the runner with --provider claude: {}",
-            role.entrypoint_script
-        );
-    }
-
-    #[test]
-    fn ac_verifier_role_bind_mounts_ac_verifier_binary() {
-        let role = build_ac_verifier_claude_agentry_role("/h", "/c");
-        assert!(
-            role.mounts
-                .iter()
-                .any(|m| m.target == "/usr/local/bin/ac-verifier" && m.readonly),
-            "ac-verifier role must bind-mount ac-verifier read-only at /usr/local/bin/ac-verifier"
-        );
-    }
-
-    #[test]
-    fn ac_verifier_role_bind_mounts_claude_binary() {
-        let role = build_ac_verifier_claude_agentry_role("/h", "/c");
-        assert!(
-            role.mounts
-                .iter()
-                .any(|m| m.target == "/usr/local/bin/claude" && m.readonly),
-            "ac-verifier role must bind-mount claude read-only at /usr/local/bin/claude"
-        );
-    }
-
-    #[test]
-    fn ac_verifier_claude_role_bind_mounts_runner_binary() {
-        let role = build_ac_verifier_claude_agentry_role("/h", "/c");
-        assert!(
-            role.mounts
-                .iter()
-                .any(|m| m.target == "/usr/local/bin/ac-verifier-runner" && m.readonly),
-            "ac-verifier-claude must bind-mount the runner read-only at /usr/local/bin/ac-verifier-runner"
-        );
-    }
-
-    #[test]
-    fn ac_verifier_gemini_role_entrypoint_invokes_runner() {
-        let role = build_ac_verifier_gemini_agentry_role("/h");
-        assert!(
-            role.entrypoint_script
-                .contains("ac-verifier-runner --provider gemini"),
-            "ac-verifier-gemini entrypoint must exec the runner with --provider gemini: {}",
-            role.entrypoint_script
-        );
-    }
-
-    #[test]
-    fn ac_verifier_grok_role_entrypoint_invokes_runner() {
-        let role = build_ac_verifier_grok_agentry_role("/h");
-        assert!(
-            role.entrypoint_script
-                .contains("ac-verifier-runner --provider grok"),
-            "ac-verifier-grok entrypoint must exec the runner with --provider grok: {}",
-            role.entrypoint_script
-        );
-    }
-
-    #[test]
-    fn ac_verifier_gemini_role_bind_mounts_runner_binary() {
-        let role = build_ac_verifier_gemini_agentry_role("/h");
-        assert!(
-            role.mounts
-                .iter()
-                .any(|m| m.target == "/usr/local/bin/ac-verifier-runner" && m.readonly),
-            "ac-verifier-gemini must bind-mount the runner read-only at /usr/local/bin/ac-verifier-runner"
-        );
-    }
-
-    #[test]
-    fn ac_verifier_grok_role_bind_mounts_runner_binary() {
-        let role = build_ac_verifier_grok_agentry_role("/h");
-        assert!(
-            role.mounts
-                .iter()
-                .any(|m| m.target == "/usr/local/bin/ac-verifier-runner" && m.readonly),
-            "ac-verifier-grok must bind-mount the runner read-only at /usr/local/bin/ac-verifier-runner"
-        );
-    }
-
-    #[test]
-    fn ac_verifier_gemini_role_bind_mounts_ac_verifier_gemini_binary() {
-        let role = build_ac_verifier_gemini_agentry_role("/h");
-        assert!(
-            role.mounts
-                .iter()
-                .any(|m| m.target == "/usr/local/bin/ac-verifier-gemini" && m.readonly),
-            "ac-verifier-gemini role must bind-mount ac-verifier-gemini read-only at /usr/local/bin/ac-verifier-gemini"
-        );
-    }
-
-    #[test]
-    fn ac_verifier_grok_role_bind_mounts_ac_verifier_grok_binary() {
-        let role = build_ac_verifier_grok_agentry_role("/h");
-        assert!(
-            role.mounts
-                .iter()
-                .any(|m| m.target == "/usr/local/bin/ac-verifier-grok" && m.readonly),
-            "ac-verifier-grok role must bind-mount ac-verifier-grok read-only at /usr/local/bin/ac-verifier-grok"
-        );
-    }
-
-    #[test]
-    fn ac_verifier_gemini_role_passes_through_gemini_api_key() {
-        let role = build_ac_verifier_gemini_agentry_role("/h");
-        assert!(
-            role.passthru_env.contains(&"GEMINI_API_KEY".to_string()),
-            "ac-verifier-gemini role must pass through GEMINI_API_KEY: {:?}",
-            role.passthru_env
-        );
-    }
-
-    #[test]
-    fn ac_verifier_grok_role_passes_through_xai_api_key() {
-        let role = build_ac_verifier_grok_agentry_role("/h");
-        assert!(
-            role.passthru_env.contains(&"XAI_API_KEY".to_string()),
-            "ac-verifier-grok role must passthru XAI_API_KEY"
-        );
-    }
-
-    #[test]
-    fn ac_verifier_gemini_role_permits_gemini_endpoint() {
-        let role = build_ac_verifier_gemini_agentry_role("/h");
-        assert!(
-            role.permit_scope
-                .0
-                .iter()
-                .any(|s| s.contains("generativelanguage.googleapis.com")),
-            "ac-verifier-gemini role must allow generativelanguage.googleapis.com: {:?}",
-            role.permit_scope.0
-        );
-    }
-
-    #[test]
-    fn ac_verifier_grok_role_permit_scope_allows_xai_api() {
-        let role = build_ac_verifier_grok_agentry_role("/h");
-        assert!(
-            role.permit_scope.0.iter().any(|s| s.contains("api.x.ai")),
-            "ac-verifier-grok role permit_scope must allow api.x.ai"
-        );
-    }
+    // wiring is tested at integration-runner level. Per-mount and
+    // permit-scope assertions for the six Rust-runner roles
+    // (coder/reviewer/ac-verifier-{claude,gemini,grok}/null-agent) live in
+    // their respective `seed/roles/*.json` files and are exercised by the
+    // role_dir_loader at every `orchestrator seed`.
 
     #[test]
     fn agentry_self_host_v0_topology_has_ac_verifier_with_correct_edges() {
         // Mirror of the agentry-self-host-v0 topology block in seed_m0 — built
         // here so the dual-inbound ordering invariant is covered without
-        // touching Redis. Keep in sync with seed_m0.
-        let coder = build_coder_claude_agentry_role("/h", "/c");
-        let ac_verifier = build_ac_verifier_claude_agentry_role("/h", "/c");
-        let ac_verifier_gemini = build_ac_verifier_gemini_agentry_role("/h");
-        let ac_verifier_grok = build_ac_verifier_grok_agentry_role("/h");
-        let reviewer_claude = build_reviewer_claude_agentry_role("/h", "/c");
-        // Synthesize the names — mechanical reviewer + shipper + ci-watcher
-        // are inline AgentRole literals in seed_m0; we only need their names
-        // and pinned versions to assert edge presence.
-        let reviewer_mechanical = RoleName("reviewer-mechanical-agentry".into());
-        let shipper = RoleName("shipper-agentry".into());
-        let ci_watcher = RoleName("ci-watcher-agentry".into());
+        // touching Redis. Keep in sync with seed_m0. Roles are referenced by
+        // (name, version); the six Rust-runner roles are now JSON-defined and
+        // registered by the role_dir_loader.
         let coder_ref = RoleRef {
-            name: coder.name.clone(),
-            version: coder.version,
+            name: RoleName("coder-claude-agentry".into()),
+            version: 1,
         };
         let ac_verifier_ref = RoleRef {
-            name: ac_verifier.name.clone(),
-            version: ac_verifier.version,
+            name: RoleName("ac-verifier-claude-agentry".into()),
+            version: 1,
         };
         let ac_verifier_gemini_ref = RoleRef {
-            name: ac_verifier_gemini.name.clone(),
-            version: ac_verifier_gemini.version,
+            name: RoleName("ac-verifier-gemini-agentry".into()),
+            version: 1,
         };
         let ac_verifier_grok_ref = RoleRef {
-            name: ac_verifier_grok.name.clone(),
-            version: ac_verifier_grok.version,
+            name: RoleName("ac-verifier-grok-agentry".into()),
+            version: 1,
         };
         let reviewer_claude_ref = RoleRef {
-            name: reviewer_claude.name.clone(),
-            version: reviewer_claude.version,
+            name: RoleName("reviewer-claude-agentry".into()),
+            version: 1,
         };
         let reviewer_mechanical_ref = RoleRef {
-            name: reviewer_mechanical.clone(),
+            name: RoleName("reviewer-mechanical-agentry".into()),
             version: 1,
         };
         let shipper_ref = RoleRef {
-            name: shipper.clone(),
+            name: RoleName("shipper-agentry".into()),
             version: 1,
         };
         let ci_watcher_ref = RoleRef {
-            name: ci_watcher.clone(),
+            name: RoleName("ci-watcher-agentry".into()),
             version: 1,
         };
 
@@ -3715,44 +3064,36 @@ mod tests {
         // Mirror of the agentry-self-host-v0 topology block in seed_m0 — built
         // here so the parallel-verifier wiring is covered without touching
         // Redis. Keep in sync with seed_m0.
-        let coder = build_coder_claude_agentry_role("/h", "/c");
-        let ac_verifier_claude = build_ac_verifier_claude_agentry_role("/h", "/c");
-        let ac_verifier_gemini = build_ac_verifier_gemini_agentry_role("/h");
-        let ac_verifier_grok = build_ac_verifier_grok_agentry_role("/h");
-        let reviewer_claude = build_reviewer_claude_agentry_role("/h", "/c");
-        let reviewer_mechanical = RoleName("reviewer-mechanical-agentry".into());
-        let shipper = RoleName("shipper-agentry".into());
-        let ci_watcher = RoleName("ci-watcher-agentry".into());
         let coder_ref = RoleRef {
-            name: coder.name.clone(),
-            version: coder.version,
+            name: RoleName("coder-claude-agentry".into()),
+            version: 1,
         };
         let ac_verifier_claude_ref = RoleRef {
-            name: ac_verifier_claude.name.clone(),
-            version: ac_verifier_claude.version,
+            name: RoleName("ac-verifier-claude-agentry".into()),
+            version: 1,
         };
         let ac_verifier_gemini_ref = RoleRef {
-            name: ac_verifier_gemini.name.clone(),
-            version: ac_verifier_gemini.version,
+            name: RoleName("ac-verifier-gemini-agentry".into()),
+            version: 1,
         };
         let ac_verifier_grok_ref = RoleRef {
-            name: ac_verifier_grok.name.clone(),
-            version: ac_verifier_grok.version,
+            name: RoleName("ac-verifier-grok-agentry".into()),
+            version: 1,
         };
         let reviewer_claude_ref = RoleRef {
-            name: reviewer_claude.name.clone(),
-            version: reviewer_claude.version,
+            name: RoleName("reviewer-claude-agentry".into()),
+            version: 1,
         };
         let reviewer_mechanical_ref = RoleRef {
-            name: reviewer_mechanical.clone(),
+            name: RoleName("reviewer-mechanical-agentry".into()),
             version: 1,
         };
         let shipper_ref = RoleRef {
-            name: shipper.clone(),
+            name: RoleName("shipper-agentry".into()),
             version: 1,
         };
         let ci_watcher_ref = RoleRef {
-            name: ci_watcher.clone(),
+            name: RoleName("ci-watcher-agentry".into()),
             version: 1,
         };
 
@@ -3922,59 +3263,10 @@ mod tests {
     //   - `build_rework_banner_*`
     //   - `write_brief_vars_emits_sourceable_script`
     //   - `build_coder_prompt_*`
-
-    #[test]
-    fn coder_role_entrypoint_invokes_runner() {
-        let role = build_coder_claude_agentry_role(
-            "/var/home/test",
-            "/var/home/test/.config/agentry/claude-container-settings.json",
-        );
-        assert!(
-            role.entrypoint_script
-                .contains("exec /usr/local/bin/coder-claude-runner"),
-            "coder entrypoint must exec the runner: {}",
-            role.entrypoint_script
-        );
-        // Defensive: no bash heredoc carryover from the pre-port script.
-        for forbidden in ["set -euo pipefail", "stream_claude", "team_context"] {
-            assert!(
-                !role.entrypoint_script.contains(forbidden),
-                "coder entrypoint must not contain {} (legacy bash leftover)",
-                forbidden
-            );
-        }
-    }
-
-    #[test]
-    fn coder_role_bind_mounts_runner_binary() {
-        let role = build_coder_claude_agentry_role(
-            "/var/home/test",
-            "/var/home/test/.config/agentry/claude-container-settings.json",
-        );
-        assert!(
-            role.mounts
-                .iter()
-                .any(|m| m.target == "/usr/local/bin/coder-claude-runner" && m.readonly),
-            "coder must bind-mount the runner read-only at /usr/local/bin/coder-claude-runner"
-        );
-    }
-
-    #[test]
-    fn coder_role_uses_single_rust_runner_no_bash_exitpoint() {
-        // EPIC #161 Wave 1.2b: entrypoint AND exitpoint merged into one
-        // Rust binary. The role's exitpoint_script is None — the merged
-        // runner owns the full lifecycle (cargo fmt, quality-hygiene,
-        // acceptance, self-review, dead-pub-check, git commit) in-process.
-        let role = build_coder_claude_agentry_role(
-            "/var/home/test",
-            "/var/home/test/.config/agentry/claude-container-settings.json",
-        );
-        assert!(
-            role.exitpoint_script.is_none(),
-            "coder role must have no bash exitpoint after Wave 1.2b — got: {:?}",
-            role.exitpoint_script
-        );
-    }
+    //
+    // Per-mount + entrypoint + no-bash-exitpoint assertions for the coder
+    // role now live in `seed/roles/coder-claude-agentry-v1.json` and are
+    // exercised by the role_dir_loader at every `orchestrator seed`.
 
     #[test]
     fn claude_using_roles_mount_transcripts_dir() {
@@ -4510,19 +3802,33 @@ mod tests {
         // role's verdict is synthesised from a bare exit code.
         //
         // This test pins the affected roles to `RUNNER_HOST_IMAGE`
-        // (currently `debian:trixie-slim`, glibc 2.41). Future regressions
-        // — e.g. someone copy-pasting `bookworm-slim` into a new role spec
-        // — surface here at `cargo test` rather than in production at the
-        // first reviewer dispatch.
-        let reviewer = build_reviewer_claude_agentry_role("/h", "/h/.claude/settings.json");
-        let acv_claude = build_ac_verifier_claude_agentry_role("/h", "/h/.claude/settings.json");
-        let acv_gemini = build_ac_verifier_gemini_agentry_role("/h");
-        let acv_grok = build_ac_verifier_grok_agentry_role("/h");
-
-        for role in &[reviewer, acv_claude, acv_gemini, acv_grok] {
+        // (currently `debian:trixie-slim`, glibc 2.41). The four roles now
+        // live as JSON files under `seed/roles/`; this test reads each one
+        // and asserts `image == RUNNER_HOST_IMAGE`. Future regressions —
+        // e.g. someone editing a JSON to `bookworm-slim` — surface here at
+        // `cargo test` rather than in production at the first reviewer
+        // dispatch.
+        let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let seed_roles = manifest
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("workspace root from CARGO_MANIFEST_DIR")
+            .join("seed/roles");
+        let files = [
+            "reviewer-claude-agentry-v1.json",
+            "ac-verifier-claude-agentry-v1.json",
+            "ac-verifier-gemini-agentry-v1.json",
+            "ac-verifier-grok-agentry-v1.json",
+        ];
+        for file in files {
+            let path = seed_roles.join(file);
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+            let role: AgentRole = serde_json::from_str(&text)
+                .unwrap_or_else(|e| panic!("parse {}: {e}", path.display()));
             assert_eq!(
                 role.image, RUNNER_HOST_IMAGE,
-                "role '{}' must use RUNNER_HOST_IMAGE — see #175 \
+                "role '{}' (from {file}) must use RUNNER_HOST_IMAGE — see #175 \
                  (host-built runner binary fails to load on bookworm-slim glibc 2.36)",
                 role.name
             );
@@ -4533,7 +3839,7 @@ mod tests {
             assert!(
                 role.entrypoint_script.contains("exec /usr/local/bin/")
                     && role.entrypoint_script.contains("-runner"),
-                "role '{}' is expected to exec a host-built binary; \
+                "role '{}' (from {file}) is expected to exec a host-built binary; \
                  if the entrypoint changed shape, revisit whether \
                  RUNNER_HOST_IMAGE still applies",
                 role.name
