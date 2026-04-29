@@ -6,11 +6,12 @@
 //! the methodology.
 
 use crate::role::RoleName;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(transparent)]
 pub struct TeamName(pub String);
 
@@ -22,7 +23,7 @@ impl fmt::Display for TeamName {
 
 /// A directed edge in the message graph: "from's outbox messages routed to to's inbox".
 /// The optional `permit_overrides_from` names a contract-field set that `to` inherits.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct MessageEdge {
     pub from: RoleName,
@@ -37,7 +38,7 @@ pub struct MessageEdge {
 
 /// Narrowing constraints that can be inherited from an upstream contract message.
 /// Orchestrator validates shape; it does not interpret semantics beyond substitution.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct PermitOverrides {
     /// Narrow `fs:write:*` scopes to only these paths.
     #[serde(default)]
@@ -54,7 +55,7 @@ pub struct PermitOverrides {
 }
 
 /// The team topology.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TeamTopology {
     pub name: TeamName,

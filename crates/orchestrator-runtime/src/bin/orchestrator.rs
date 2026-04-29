@@ -68,6 +68,8 @@ enum RoleCmd {
     Show { name: String, version: u32 },
     /// Validate a role JSON file (parse-only; does NOT contact Redis).
     Validate { file: PathBuf },
+    /// Print the JSON schema of `AgentRole` (offline; no Redis).
+    Schema,
 }
 
 #[derive(Subcommand, Debug)]
@@ -80,6 +82,8 @@ enum TeamCmd {
     Register { file: PathBuf },
     /// Validate a `TeamTopology` JSON file without persisting.
     Validate { file: PathBuf },
+    /// Print the JSON schema of `TeamTopology` (offline; no Redis).
+    Schema,
 }
 
 #[derive(Subcommand, Debug)]
@@ -218,33 +222,46 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Cmd::Role { sub } => {
-            let mut conn = redis_io::connect(&cfg.redis.url).await?;
-            match sub {
-                RoleCmd::List => cli_roles::list(&mut conn).await?,
-                RoleCmd::Show { name, version } => {
-                    cli_roles::show(&mut conn, &name, version).await?;
-                }
-                RoleCmd::Validate { file } => match cli_roles::validate(&mut conn, &file).await {
+        Cmd::Role { sub } => match sub {
+            RoleCmd::Schema => cli_roles::schema()?,
+            RoleCmd::List => {
+                let mut conn = redis_io::connect(&cfg.redis.url).await?;
+                cli_roles::list(&mut conn).await?;
+            }
+            RoleCmd::Show { name, version } => {
+                let mut conn = redis_io::connect(&cfg.redis.url).await?;
+                cli_roles::show(&mut conn, &name, version).await?;
+            }
+            RoleCmd::Validate { file } => {
+                let mut conn = redis_io::connect(&cfg.redis.url).await?;
+                match cli_roles::validate(&mut conn, &file).await {
                     Ok(()) => {}
                     Err(_) => std::process::exit(2),
-                },
-            }
-        }
-        Cmd::Team { sub } => {
-            let mut conn = redis_io::connect(&cfg.redis.url).await?;
-            match sub {
-                TeamCmd::List => cli_teams::list(&mut conn).await?,
-                TeamCmd::Show { name, version } => {
-                    cli_teams::show(&mut conn, &name, version).await?;
                 }
-                TeamCmd::Register { file } => match cli_teams::register(&mut conn, &file).await {
+            }
+        },
+        Cmd::Team { sub } => match sub {
+            TeamCmd::Schema => cli_teams::schema()?,
+            TeamCmd::List => {
+                let mut conn = redis_io::connect(&cfg.redis.url).await?;
+                cli_teams::list(&mut conn).await?;
+            }
+            TeamCmd::Show { name, version } => {
+                let mut conn = redis_io::connect(&cfg.redis.url).await?;
+                cli_teams::show(&mut conn, &name, version).await?;
+            }
+            TeamCmd::Register { file } => {
+                let mut conn = redis_io::connect(&cfg.redis.url).await?;
+                match cli_teams::register(&mut conn, &file).await {
                     Ok(()) => {}
                     Err(_) => std::process::exit(2),
-                },
-                TeamCmd::Validate { file } => cli_teams::validate(&mut conn, &file).await?,
+                }
             }
-        }
+            TeamCmd::Validate { file } => {
+                let mut conn = redis_io::connect(&cfg.redis.url).await?;
+                cli_teams::validate(&mut conn, &file).await?;
+            }
+        },
     }
     Ok(())
 }

@@ -3,11 +3,12 @@
 //! Lives at `agentry:role:{name}:v{version}`. Typed, edited via dashboard forms.
 //! Describes: what model, what tools, what substrate, what binaries, what prompt.
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// Role name. Lowercase, hyphens only: `coder-rust`, `archaeologist`, `shipper`.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(transparent)]
 pub struct RoleName(pub String);
 
@@ -18,7 +19,7 @@ impl fmt::Display for RoleName {
 }
 
 /// Where the agent runs. User picks; orchestrator adapts.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum SubstrateClass {
     /// Rootless podman on the dev box. Default.
@@ -36,7 +37,7 @@ pub enum SubstrateClass {
 
 /// Which package manager the spawner uses to install `binaries` at spawn time.
 /// Picked explicitly per role; no heuristic from image name.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum PackageManager {
     /// Alpine — `apk add --no-cache <binaries>`.
@@ -47,7 +48,7 @@ pub enum PackageManager {
 
 /// What tools the agent is permitted to call. Names are stable symbolic ids;
 /// the container runner maps them to actual binaries / MCP methods.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(transparent)]
 pub struct ToolAllowlist(pub Vec<String>);
 
@@ -59,7 +60,7 @@ impl ToolAllowlist {
 }
 
 /// An MCP server to mount into the agent's container.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct McpServer {
     /// Symbolic name: `ra-query`, `mcp-forge`, etc.
@@ -73,7 +74,7 @@ pub struct McpServer {
 /// A host→container bind mount, optionally read-only. Used by Claude-Max
 /// agents to bring in the `claude` binary and `~/.claude/.credentials.json`
 /// without baking them into an image.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Mount {
     /// Absolute host path.
@@ -88,7 +89,7 @@ pub struct Mount {
 /// Declaration that a role wants the brief's workspace bind-mounted into its
 /// container. The host path is allocated by the daemon at brief dispatch; the
 /// role only names the container-side mount point.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceMount {
     /// Absolute container path where the brief's workspace appears, e.g. `/workspace`.
@@ -100,12 +101,12 @@ pub struct WorkspaceMount {
 
 /// Permission scopes — narrowed further at spawn time by brief/team overrides.
 /// Each entry is a symbolic scope string: `fs:read:/workspace/**`, `net:deny:*`.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(transparent)]
 pub struct PermitScope(pub Vec<String>);
 
 /// An agent role — the full specification for one kind of agent container.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AgentRole {
     pub name: RoleName,
