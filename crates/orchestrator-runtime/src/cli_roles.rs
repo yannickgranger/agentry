@@ -1,0 +1,139 @@
+//! Role-catalog CLI handlers backing `orchestrator role` subcommands.
+//!
+//! Mirrors `cli_teams` in shape: each function takes a `&mut ConnectionManager`
+//! plus the parsed args, prints structured JSON to stdout, and returns
+//! `Result<()>`. The binary glues clap to these. There is no `register`
+//! subcommand for roles — roles are engine-seeded only (per the EPIC's Q9
+//! directive), so the only CLI surface is list / show / validate.
+
+use crate::{redis_io, Error, Result};
+use orchestrator_types::AgentRole;
+use redis::aio::ConnectionManager;
+use serde_json::json;
+use std::path::Path;
+
+/// `orchestrator role list` — print one `{"name":"…","version":N}` per line.
+pub async fn list(conn: &mut ConnectionManager) -> Result<()> {
+    let pairs = redis_io::list_roles(conn).await?;
+    for (name, version) in pairs {
+        let line = json!({ "name": name.0, "version": version });
+        println!("{line}");
+    }
+    Ok(())
+}
+
+/// `orchestrator role show <name> <version>` — pretty-printed `AgentRole`.
+pub async fn show(conn: &mut ConnectionManager, name: &str, version: u32) -> Result<()> {
+    let role_name = orchestrator_types::RoleName(name.into());
+    let role = redis_io::fetch_role(conn, &role_name, version).await?;
+    println!("{}", serde_json::to_string_pretty(&role)?);
+    Ok(())
+}
+
+/// `orchestrator role validate <file>` — parse-only validation. Reads the
+/// file, attempts strict deserialization as `AgentRole`. On success prints
+/// `{"valid":true,"name":"…","version":N}`. On failure prints
+/// `{"valid":false,"error":"…"}` and returns Err so the caller exits non-zero.
+/// Does NOT contact Redis.
+pub async fn validate(_conn: &mut ConnectionManager, file: &Path) -> Result<()> {
+    let text = tokio::fs::read_to_string(file).await?;
+    match serde_json::from_str::<AgentRole>(&text) {
+        Ok(role) => {
+            println!(
+                "{}",
+                json!({
+                    "valid": true,
+                    "name": role.name.0,
+                    "version": role.version,
+                })
+            );
+            Ok(())
+        }
+        Err(e) => {
+            println!(
+                "{}",
+                json!({
+                    "valid": false,
+                    "error": e.to_string(),
+                })
+            );
+            Err(Error::Config(format!("invalid role JSON: {e}")))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use orchestrator_types::{
+        AgentRole, PackageManager, PermitScope, RoleName, SubstrateClass, ToolAllowlist,
+    };
+    use std::io::Write;
+
+    fn minimal_role() -> AgentRole {
+        AgentRole {
+            name: RoleName("validate-probe".into()),
+            version: 7,
+            model: None,
+            system_prompt: None,
+            image: "alpine:3.21".into(),
+            substrate_class: SubstrateClass::Podman,
+            package_manager: PackageManager::Apk,
+            entrypoint_script: "#!/usr/bin/env bash\nexit 0\n".into(),
+            exitpoint_script: None,
+            binaries: vec![],
+            mcp_servers: vec![],
+            tool_allowlist: ToolAllowlist::default(),
+            permit_scope: PermitScope::default(),
+            passthru_env: vec![],
+            mounts: vec![],
+            workspace_mount: None,
+            sccache: false,
+            extra_bootstrap: vec![],
+        }
+    }
+
+    /// Build a stub ConnectionManager-typed ref. `validate` does not use it,
+    /// but the function signature still requires one. We avoid dialling
+    /// Redis by guarding on the env var; tests requiring Redis are
+    /// `#[ignore]`'d uniformly across this crate.
+    fn redis_url() -> Option<String> {
+        std::env::var("AGENTRY_TEST_REDIS_URL").ok()
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Redis (AGENTRY_TEST_REDIS_URL) — connection unused but signature requires one"]
+    async fn validate_accepts_minimal_role() {
+        let Some(url) = redis_url() else { return };
+        let mut conn = redis_io::connect(&url).await.expect("connect");
+        let role = minimal_role();
+        let body = serde_json::to_string_pretty(&role).expect("ser");
+        let mut f = tempfile::NamedTempFile::new().expect("tmp");
+        f.write_all(body.as_bytes()).expect("write");
+
+        let r = validate(&mut conn, f.path()).await;
+        assert!(r.is_ok(), "minimal valid role must validate clean");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Redis (AGENTRY_TEST_REDIS_URL) — connection unused but signature requires one"]
+    async fn validate_rejects_unknown_field() {
+        let Some(url) = redis_url() else { return };
+        let mut conn = redis_io::connect(&url).await.expect("connect");
+        // Build minimal role JSON, then inject an unknown top-level field.
+        let role = minimal_role();
+        let mut value = serde_json::to_value(&role).expect("to_value");
+        if let serde_json::Value::Object(ref mut map) = value {
+            map.insert("__bogus__".into(), serde_json::Value::String("nope".into()));
+        }
+        let body = serde_json::to_string_pretty(&value).expect("ser");
+        let mut f = tempfile::NamedTempFile::new().expect("tmp");
+        f.write_all(body.as_bytes()).expect("write");
+
+        let r = validate(&mut conn, f.path()).await;
+        assert!(
+            r.is_err(),
+            "unknown top-level field must be rejected by deny_unknown_fields"
+        );
+    }
+}

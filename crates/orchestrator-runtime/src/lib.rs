@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 
 pub mod cli_agents;
+pub mod cli_roles;
 pub mod cli_teams;
 pub mod config;
 pub mod daemon;
@@ -16,6 +17,7 @@ pub mod errors;
 pub mod permit;
 pub mod projector;
 pub mod redis_io;
+pub mod role_dir_loader;
 pub mod seed;
 pub mod spawner;
 pub mod state;

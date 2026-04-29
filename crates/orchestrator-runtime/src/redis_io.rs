@@ -203,6 +203,35 @@ pub async fn list_teams(conn: &mut ConnectionManager) -> Result<Vec<(TeamName, u
     Ok(out)
 }
 
+/// Scan the role catalog and return every `(name, version)` pair currently
+/// registered, sorted by name then version ascending. Distinct from
+/// [`list_role_names`], which dedupes versions.
+pub async fn list_roles(conn: &mut ConnectionManager) -> Result<Vec<(RoleName, u32)>> {
+    let mut out: Vec<(RoleName, u32)> = Vec::new();
+    let mut cursor: u64 = 0;
+    loop {
+        let (next, batch): (u64, Vec<String>) = redis::cmd("SCAN")
+            .arg(cursor)
+            .arg("MATCH")
+            .arg("agentry:role:*:v*")
+            .arg("COUNT")
+            .arg(100)
+            .query_async(conn)
+            .await?;
+        for key in batch {
+            if let Some((name, version)) = parse_versioned_key(&key, "role") {
+                out.push((RoleName(name), version));
+            }
+        }
+        cursor = next;
+        if cursor == 0 {
+            break;
+        }
+    }
+    out.sort_by(|a, b| a.0 .0.cmp(&b.0 .0).then_with(|| a.1.cmp(&b.1)));
+    Ok(out)
+}
+
 /// Scan the role catalog and return every distinct role name, regardless of
 /// version. Sorted ascending.
 pub async fn list_role_names(conn: &mut ConnectionManager) -> Result<Vec<RoleName>> {
@@ -392,6 +421,48 @@ mod tests {
         for (name, version) in [(n_a.clone(), 1), (n_a.clone(), 2), (n_b.clone(), 2)] {
             let key = format!("agentry:team:{name}:v{version}");
             let _: () = conn.del(&key).await.expect("cleanup");
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Redis (AGENTRY_TEST_REDIS_URL)"]
+    async fn list_roles_returns_sorted_pairs() {
+        let Some(url) = test_redis_url() else { return };
+        let mut conn = connect(&url).await.expect("connect");
+        let s = slug();
+        let n_a = format!("zz-rio-list-a-{s}");
+        let n_b = format!("zz-rio-list-b-{s}");
+        // Seed two versions per role under our own slug — keys constructed
+        // directly to avoid pulling AgentRole's full shape into this test.
+        let body = serde_json::json!({"_": "probe"}).to_string();
+        let keys = vec![
+            format!("agentry:role:{n_b}:v2"),
+            format!("agentry:role:{n_a}:v1"),
+            format!("agentry:role:{n_a}:v2"),
+            format!("agentry:role:{n_b}:v1"),
+        ];
+        for k in &keys {
+            let _: () = conn.set(k, body.as_str()).await.expect("set");
+        }
+
+        let listed = list_roles(&mut conn).await.expect("list");
+        let ours: Vec<(RoleName, u32)> = listed
+            .into_iter()
+            .filter(|(n, _)| n.0 == n_a || n.0 == n_b)
+            .collect();
+        assert_eq!(
+            ours,
+            vec![
+                (RoleName(n_a.clone()), 1),
+                (RoleName(n_a.clone()), 2),
+                (RoleName(n_b.clone()), 1),
+                (RoleName(n_b.clone()), 2),
+            ],
+            "roles must come back sorted by name then version"
+        );
+
+        for k in &keys {
+            let _: () = conn.del(k).await.expect("cleanup");
         }
     }
 

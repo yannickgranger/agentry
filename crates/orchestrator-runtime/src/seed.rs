@@ -6,11 +6,12 @@
 //!
 //! Idempotent: overwrites existing records with current definitions.
 
-use crate::{redis_io, Config, Result};
+use crate::{redis_io, role_dir_loader, Config, Result};
 use orchestrator_types::{
     AgentRole, MessageEdge, Mount, PackageManager, PermitScope, RoleName, SubstrateClass, TeamName,
     TeamTopology, ToolAllowlist, WorkspaceMount,
 };
+use std::path::PathBuf;
 
 // ---------------------------------------------------------------------------
 // Entrypoint scripts — inlined from what used to live in containers/*/entrypoint.sh.
@@ -2778,10 +2779,46 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
     redis_io::save_team(&mut conn, &agentry_verify_v0).await?;
     redis_io::save_role(&mut conn, &git_operator).await?;
 
+    let roles_dir = seed_roles_dir();
+    if roles_dir.exists() {
+        let loaded = role_dir_loader::load_roles_from_dir(&mut conn, &roles_dir).await?;
+        tracing::info!(
+            count = loaded.len(),
+            dir = %roles_dir.display(),
+            "loaded JSON role catalog from seed directory",
+        );
+    } else {
+        tracing::debug!(
+            dir = %roles_dir.display(),
+            "seed roles directory absent — skipping JSON role load",
+        );
+    }
+
     tracing::info!(
         "seeded: roles [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker, listener, grok-echo, claude-echo, synthesizer, narrowed-coder, shipper, coder-claude-agentry, ac-verifier-claude-agentry, ac-verifier-gemini-agentry, ac-verifier-grok-agentry, reviewer-mechanical-agentry, shipper-agentry, ci-watcher-agentry, reviewer-claude-agentry, auditor-claude-agentry, null-agent-agentry, archaeologist-claude-agentry, planner-claude-agentry, verifier-claude-agentry, git-operator] (inline entrypoint scripts); teams [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker-listener, grok-echo, claude-echo, narrowed-team, shipper-solo-team, agentry-self-host-v0, agentry-self-host-v1, agentry-self-audit-v0, agentry-null-v0, agentry-discovery-v0, agentry-planner-v0, agentry-verify-v0]"
     );
     Ok(())
+}
+
+/// Resolve the directory containing role JSON files for seed-time loading.
+///
+/// The default is `<workspace_root>/seed/roles`, computed by walking up two
+/// levels from `CARGO_MANIFEST_DIR` (which points at the
+/// `crates/orchestrator-runtime` directory). The env var
+/// `AGENTRY_SEED_ROLES_DIR` overrides it for substrates that ship the
+/// catalog elsewhere.
+fn seed_roles_dir() -> PathBuf {
+    if let Ok(override_path) = std::env::var("AGENTRY_SEED_ROLES_DIR") {
+        return PathBuf::from(override_path);
+    }
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    // crates/orchestrator-runtime → workspace root.
+    let workspace_root = manifest
+        .parent()
+        .and_then(|p| p.parent())
+        .map(PathBuf::from)
+        .unwrap_or(manifest);
+    workspace_root.join("seed").join("roles")
 }
 
 #[cfg(test)]

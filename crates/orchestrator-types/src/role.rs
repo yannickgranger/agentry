@@ -60,6 +60,7 @@ impl ToolAllowlist {
 
 /// An MCP server to mount into the agent's container.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct McpServer {
     /// Symbolic name: `ra-query`, `mcp-forge`, etc.
     pub name: String,
@@ -73,6 +74,7 @@ pub struct McpServer {
 /// agents to bring in the `claude` binary and `~/.claude/.credentials.json`
 /// without baking them into an image.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Mount {
     /// Absolute host path.
     pub source: String,
@@ -87,6 +89,7 @@ pub struct Mount {
 /// container. The host path is allocated by the daemon at brief dispatch; the
 /// role only names the container-side mount point.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkspaceMount {
     /// Absolute container path where the brief's workspace appears, e.g. `/workspace`.
     pub container_path: String,
@@ -103,6 +106,7 @@ pub struct PermitScope(pub Vec<String>);
 
 /// An agent role — the full specification for one kind of agent container.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AgentRole {
     pub name: RoleName,
     /// Monotonic version; bump on every save.
