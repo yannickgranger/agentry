@@ -31,6 +31,15 @@ path = "src/bin/ac_verifier_runner.rs"
 name = "reviewer-claude-runner"
 path = "src/bin/reviewer_claude_runner.rs"
 
+# coder-claude-runner: entrypoint half of the coder-claude-agentry role
+# (Wave 1.2a). Reads the bundle, builds the verb-structured prompt
+# (with prior-rework banner if applicable), writes /tmp/brief_vars.sh
+# for the (still-bash) exitpoint, and streams claude. Exitpoint port
+# is Wave 1.2b.
+[[bin]]
+name = "coder-claude-runner"
+path = "src/bin/coder_claude_runner.rs"
+
 [dependencies]
 orchestrator-types = { path = "../orchestrator-types" }
 serde.workspace = true

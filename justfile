@@ -115,6 +115,19 @@ reviewer-claude-runner-binary:
     test -x ~/.local/bin/reviewer-claude-runner
     echo "reviewer-claude-runner installed at ~/.local/bin/reviewer-claude-runner"
 
+# Build coder-claude-runner into ~/.local/bin/coder-claude-runner — the
+# entrypoint half of the coder-claude-agentry role (Wave 1.2a). Reads the
+# bundle, builds the verb-structured prompt with optional rework banner,
+# writes /tmp/brief_vars.sh for the (still-bash) exitpoint, and streams
+# claude. Operator-invoked; idempotent. The role bind-mounts this binary
+# at /usr/local/bin/coder-claude-runner. Wave 1.2b will port the exitpoint.
+coder-claude-runner-binary:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo install --path crates/agentry-role-runtime --bin coder-claude-runner --root ~/.local --locked --quiet
+    test -x ~/.local/bin/coder-claude-runner
+    echo "coder-claude-runner installed at ~/.local/bin/coder-claude-runner"
+
 # Build git-operator into ~/.local/bin/git-operator for the git-operator
 # role's bind-mount. Operator-invoked; idempotent. EPIC #152 brief 5.
 git-operator-binary:

@@ -23,6 +23,9 @@
 //! {"at":"...","type":"done","verdict":"failed","reason":{"cause":"unexpected_exit","exit_code":null}}
 //! ```
 
+pub mod claude;
+pub use claude::{stream_claude, StreamErr};
+
 use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -43,6 +46,15 @@ pub fn read_bundle<T: DeserializeOwned>() -> anyhow::Result<T> {
         .read_to_string(&mut buf)
         .map_err(|e| anyhow::anyhow!("read stdin: {e}"))?;
     serde_json::from_str(&buf).map_err(|e| anyhow::anyhow!("parse bundle: {e}"))
+}
+
+/// Read the startup JSON bundle from stdin as an opaque [`serde_json::Value`].
+///
+/// Use this when the binary doesn't have a strict typed shape for the bundle
+/// — e.g. opaque `brief.payload` access via JSON pointer paths. Prefer
+/// [`read_bundle`] when a typed deserialization is possible.
+pub fn read_bundle_value() -> anyhow::Result<Value> {
+    read_bundle::<Value>()
 }
 
 /// Emit one freeform event with a typed payload.
