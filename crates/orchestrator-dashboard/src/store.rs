@@ -99,6 +99,7 @@ impl DashboardStore {
 
     /// Most-recent verdicts (XREVRANGE on `agentry:verdicts`).
     pub async fn fetch_recent_verdicts(&self, count: usize) -> anyhow::Result<Vec<Value>> {
+        let _t = std::time::Instant::now();
         let mut conn = self.inner.conn.clone();
         let reply: redis::streams::StreamRangeReply = conn
             .xrevrange_count(VERDICTS_STREAM, "+", "-", count)
@@ -111,11 +112,18 @@ impl DashboardStore {
                 }
             }
         }
+        tracing::info!(
+            method = "fetch_recent_verdicts",
+            elapsed_ms = _t.elapsed().as_millis(),
+            n_commands = 1usize,
+            "dashboard_store_call"
+        );
         Ok(out)
     }
 
     /// Most-recent brief submissions (XREVRANGE on `agentry:briefs`).
     pub async fn fetch_recent_briefs(&self, count: usize) -> anyhow::Result<Vec<Value>> {
+        let _t = std::time::Instant::now();
         let mut conn = self.inner.conn.clone();
         let reply: redis::streams::StreamRangeReply =
             conn.xrevrange_count(BRIEFS_STREAM, "+", "-", count).await?;
@@ -127,6 +135,12 @@ impl DashboardStore {
                 }
             }
         }
+        tracing::info!(
+            method = "fetch_recent_briefs",
+            elapsed_ms = _t.elapsed().as_millis(),
+            n_commands = 1usize,
+            "dashboard_store_call"
+        );
         Ok(out)
     }
 
@@ -134,9 +148,18 @@ impl DashboardStore {
     /// set (maintained by the daemon on intake / verdict-emit), then a
     /// single MGET across the `agentry:brief:<id>:body` keys to materialize.
     pub async fn active_briefs(&self) -> anyhow::Result<Vec<Value>> {
+        let _t = std::time::Instant::now();
+        let mut n_commands: usize = 0;
         let mut conn = self.inner.conn.clone();
         let ids: Vec<String> = conn.smembers(ACTIVE_BRIEFS_SET).await?;
+        n_commands += 1;
         if ids.is_empty() {
+            tracing::info!(
+                method = "active_briefs",
+                elapsed_ms = _t.elapsed().as_millis(),
+                n_commands,
+                "dashboard_store_call"
+            );
             return Ok(Vec::new());
         }
         let keys: Vec<String> = ids
@@ -144,12 +167,19 @@ impl DashboardStore {
             .map(|id| format!("agentry:brief:{id}:body"))
             .collect();
         let bodies: Vec<Option<String>> = conn.mget(&keys).await?;
+        n_commands += 1;
         let mut out = Vec::with_capacity(bodies.len());
         for body in bodies.into_iter().flatten() {
             if let Ok(v) = serde_json::from_str::<Value>(&body) {
                 out.push(v);
             }
         }
+        tracing::info!(
+            method = "active_briefs",
+            elapsed_ms = _t.elapsed().as_millis(),
+            n_commands,
+            "dashboard_store_call"
+        );
         Ok(out)
     }
 
@@ -157,6 +187,7 @@ impl DashboardStore {
     /// `agentry:brief:{id}:trace`). Used by the SSE handler when the JS
     /// asks for `?from=0-0` (history+live unified).
     pub async fn fetch_trace(&self, brief_id: &str, count: usize) -> anyhow::Result<Vec<Value>> {
+        let _t = std::time::Instant::now();
         let stream = format!("agentry:brief:{brief_id}:trace");
         let mut conn = self.inner.conn.clone();
         let reply: redis::streams::StreamRangeReply =
@@ -169,19 +200,35 @@ impl DashboardStore {
                 }
             }
         }
+        tracing::info!(
+            method = "fetch_trace",
+            elapsed_ms = _t.elapsed().as_millis(),
+            n_commands = 1usize,
+            "dashboard_store_call"
+        );
         Ok(out)
     }
 
     /// List records of `kind` via the `agentry:{kind}:_index` ZSET, then a
     /// single MGET across the indexed keys. One round-trip each.
     pub async fn list<T: DeserializeOwned>(&self, kind: &str) -> anyhow::Result<Vec<(String, T)>> {
+        let _t = std::time::Instant::now();
+        let mut n_commands: usize = 0;
         let mut conn = self.inner.conn.clone();
         let index_key = format!("agentry:{kind}:_index");
         let keys: Vec<String> = conn.zrange(&index_key, 0, -1).await?;
+        n_commands += 1;
         if keys.is_empty() {
+            tracing::info!(
+                method = "list",
+                elapsed_ms = _t.elapsed().as_millis(),
+                n_commands,
+                "dashboard_store_call"
+            );
             return Ok(Vec::new());
         }
         let bodies: Vec<Option<String>> = conn.mget(&keys).await?;
+        n_commands += 1;
         let mut out = Vec::with_capacity(bodies.len());
         for (key, body) in keys.into_iter().zip(bodies.into_iter()) {
             if let Some(s) = body {
@@ -190,6 +237,12 @@ impl DashboardStore {
                 }
             }
         }
+        tracing::info!(
+            method = "list",
+            elapsed_ms = _t.elapsed().as_millis(),
+            n_commands,
+            "dashboard_store_call"
+        );
         Ok(out)
     }
 
@@ -218,9 +271,16 @@ impl DashboardStore {
     /// Atomic next-version counter (INCR on
     /// `agentry:{kind}:{name}:_v`). Replaces the old SCAN+rsplit logic.
     pub async fn next_version(&self, kind: &str, name: &str) -> anyhow::Result<u32> {
+        let _t = std::time::Instant::now();
         let key = format!("agentry:{kind}:{name}:_v");
         let mut conn = self.inner.conn.clone();
         let v: i64 = conn.incr(&key, 1).await?;
+        tracing::info!(
+            method = "next_version",
+            elapsed_ms = _t.elapsed().as_millis(),
+            n_commands = 1usize,
+            "dashboard_store_call"
+        );
         Ok(u32::try_from(v).unwrap_or(u32::MAX))
     }
 
