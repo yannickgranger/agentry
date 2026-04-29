@@ -128,15 +128,6 @@ coder-claude-runner-binary:
     test -x ~/.local/bin/coder-claude-runner
     echo "coder-claude-runner installed at ~/.local/bin/coder-claude-runner"
 
-# Build git-operator into ~/.local/bin/git-operator for the git-operator
-# role's bind-mount. Operator-invoked; idempotent. EPIC #152 brief 5.
-git-operator-binary:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    cargo install --path crates/coder-precommit --bin git-operator --root ~/.local --locked --quiet
-    test -x ~/.local/bin/git-operator
-    echo "git-operator installed at ~/.local/bin/git-operator"
-
 # Build git-op-commit into ~/.local/bin/git-op-commit for the git-op-commit
 # role's bind-mount. Operator-invoked; idempotent. Brief 190b of #182 — the
 # commit half of the git-operator split.

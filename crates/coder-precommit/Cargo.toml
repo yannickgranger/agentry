@@ -44,10 +44,6 @@ name = "ship"
 path = "src/bin/ship.rs"
 
 [[bin]]
-name = "git-operator"
-path = "src/bin/git_operator.rs"
-
-[[bin]]
 name = "git-op-commit"
 path = "src/bin/git_op_commit.rs"
 
