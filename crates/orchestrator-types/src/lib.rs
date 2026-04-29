@@ -16,7 +16,7 @@ pub mod team;
 pub mod verdict;
 
 pub use brief::{Brief, BriefId, BriefKind, Budget, EscalationMode, Payload};
-pub use event::{Event, EventKind, EventVerdict, ToolCall};
+pub use event::{DoneReason, Event, EventKind, EventVerdict, ToolCall};
 pub use permit::{PermitScope, ToolAllowlist, WorkPermit};
 pub use project::{Project, ProjectSlug, StandingOrders};
 pub use review::{FindingOrigin, ReviewFinding, Severity};

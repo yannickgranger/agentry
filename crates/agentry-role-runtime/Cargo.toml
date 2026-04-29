@@ -1,0 +1,27 @@
+[package]
+name = "agentry-role-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[lib]
+name = "agentry_role_runtime"
+path = "src/lib.rs"
+
+# null-agent: meta-brief no-op shake-down agent. First role ported from bash
+# (NULL_AGENT_AGENTRY_SCRIPT) to Rust under EPIC #161 B0.
+[[bin]]
+name = "null-agent"
+path = "src/bin/null_agent.rs"
+
+[dependencies]
+orchestrator-types = { path = "../orchestrator-types" }
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+anyhow = "1.0"
+
+[lints]
+workspace = true

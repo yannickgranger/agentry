@@ -36,6 +36,30 @@ downstream consumers (dashboards, captain stdin-daemon, future
 commandant officer council) read them on the same wire as every other
 agent event.
 
+## DoneReason
+
+Optional structured cause attached to a terminal `Done` event when the
+verdict was forced by an unexpected exit, a timeout, or an external signal,
+rather than by the role's happy path. Carries a short symbolic `cause`
+("unexpected_exit", future: "timeout", "signal") and an optional
+`exit_code` if known at the emit site. Absent on roles that called
+`emit_done` explicitly with a normal verdict.
+
+## DoneGuard
+
+Drop guard owned by every Rust role binary. Constructed at the top of
+`main`. On normal exit the role calls `emit_done(verdict, ...)`, the guard
+sees a flag and no-ops on drop. On panic / `?`-bubbled error / abrupt
+return, the flag is unset and `Drop` synthesises `done failed` with
+`reason: { cause: "unexpected_exit", exit_code: None }`. Closes the
+silent-exit failure class structurally — the substrate always sees a
+terminal `Done` event for every spawned role, and the daemon never has to
+synthesise generic "agent exited without done event" verdicts.
+
+The `BASH_PRELUDE` `EXIT` trap (legacy bash heredoc roles) does the same
+job for roles that haven't migrated yet; both patterns coexist until EPIC
+\#161 ports every role to Rust.
+
 ## Event
 
 A timestamped event: `Ts` + `EventKind`. The unit that the spawner reads

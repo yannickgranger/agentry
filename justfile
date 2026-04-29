@@ -81,6 +81,16 @@ ship-binary:
     test -x ~/.local/bin/ship
     echo "ship installed at ~/.local/bin/ship"
 
+# Build null-agent into ~/.local/bin/null-agent — first role binary under
+# EPIC #161 (bash → Rust port). Used by the null-agent-agentry role in
+# agentry-null-v0 topology. Operator-invoked; idempotent.
+null-agent-binary:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo install --path crates/agentry-role-runtime --bin null-agent --root ~/.local --locked --quiet
+    test -x ~/.local/bin/null-agent
+    echo "null-agent installed at ~/.local/bin/null-agent"
+
 # Build git-operator into ~/.local/bin/git-operator for the git-operator
 # role's bind-mount. Operator-invoked; idempotent. EPIC #152 brief 5.
 git-operator-binary:
