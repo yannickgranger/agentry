@@ -18,6 +18,7 @@ pub mod redis_io;
 pub mod seed;
 pub mod spawner;
 pub mod state;
+pub mod team_validator;
 pub mod transcript;
 pub mod watchdog;
 pub mod workspace;

@@ -95,7 +95,30 @@ extracted by the daemon along a `MessageEdge` that declares the carrier key.
 
 The full specification of one team: name, version, role list, message graph,
 terminal role, retry budget. Fetched by the daemon when a brief names this
-team as its topology.
+team as its topology. `MessageEdge` and `TeamTopology` both carry
+`#[serde(deny_unknown_fields)]`, so any unknown key in a serialized topology
+is rejected at parse time — vocabulary integrity is enforced structurally,
+not by a runtime check.
+
+## TeamValidationViolation
+
+A single violation surfaced by the team-topology validator. Names the
+offending `path` (e.g. `roles[2]`, `message_graph[0].from`, `terminal_role`),
+a `ViolationKind` classifying it, and a human-readable `detail`. The
+validator collects violations across all five checks without short-circuit,
+so a single call may return multiple kinds in one batch.
+
+## ViolationKind
+
+Classification of a `TeamValidationViolation`. `Type` covers empty / zero
+where a non-empty / non-zero value is required. `Reference` covers a name
+that does not resolve in its target set (a role missing from the registry,
+an edge endpoint missing from `topology.roles`, a terminal role missing
+from `topology.roles`). `Topological` covers absence of any entry role,
+unreachability of `terminal_role` from any entry, or roles in `roles[]`
+that no edge references. `Acyclic` covers a cycle in `message_graph`.
+`MultipleTerminals` covers more than one role with no outbound edges, or
+a unique sink that is not the declared `terminal_role`.
 
 ## ProjectSlug
 
