@@ -1793,59 +1793,6 @@ fn build_verifier_claude_agentry_role() -> AgentRole {
     }
 }
 
-/// Build the `git-operator` role. Ephemeral substrate-side worker that runs
-/// `git add`/`commit`/`push` against /workspace and opens a PR via the gitea
-/// REST API. The role's entrypoint is a one-line shell exec into the
-/// bind-mounted Rust binary at `/usr/local/bin/git-operator` — acceptable
-/// bootstrap glue per the refined EPIC #161 rule (no bash logic).
-///
-/// Bind-mounts `~/.local/bin/git-operator` from the host (built via
-/// `just git-operator-binary`). Workspace mount is writable because git
-/// updates `.git/{HEAD,refs,reflog}` during commit and push.
-///
-/// Registered in the seed but NOT wired into any topology — brief 6 of
-/// EPIC #152 cuts agentry-self-host-v0 over from `shipper-agentry`.
-fn build_git_operator_role(home: &str) -> AgentRole {
-    AgentRole {
-        name: RoleName("git-operator".into()),
-        version: 1,
-        model: None,
-        system_prompt: None,
-        image: RUNNER_HOST_IMAGE.into(),
-        substrate_class: SubstrateClass::Podman,
-        package_manager: PackageManager::Apt,
-        // Bootstrap glue only: exec the bind-mounted Rust binary. All git +
-        // forge logic lives in the binary, not in this script.
-        entrypoint_script: "#!/bin/sh\nexec /usr/local/bin/git-operator\n".into(),
-        exitpoint_script: None,
-        // alpine + git + ca-certificates is enough — reqwest links rustls and
-        // talks to the gitea API directly, so curl is not needed.
-        binaries: vec!["git".into(), "ca-certificates".into()],
-        mcp_servers: vec![],
-        tool_allowlist: ToolAllowlist(vec!["git".into()]),
-        permit_scope: PermitScope(vec![
-            "fs:read:/workspace/**".into(),
-            "fs:write:/workspace/**".into(),
-            "net:allow:agency.lab".into(),
-            "forge:write:yg/*".into(),
-        ]),
-        passthru_env: vec!["GITEA_TOKEN".into()],
-        extra_bootstrap: vec![],
-        mounts: vec![Mount {
-            source: format!("{home}/.local/bin/git-operator"),
-            target: "/usr/local/bin/git-operator".into(),
-            readonly: true,
-        }],
-        // git push writes to /workspace/.git/{HEAD,refs,reflog,FETCH_HEAD};
-        // workspace mount must be writable.
-        workspace_mount: Some(WorkspaceMount {
-            container_path: "/workspace".into(),
-            readonly: false,
-        }),
-        sccache: false,
-    }
-}
-
 const SHIPPER_SCRIPT: &str = r#"#!/usr/bin/env bash
 # Reads {repo, branch, file, content, commit_msg, pr_title, pr_body, base,
 # forge_host} from brief.payload. Clones forge repo with GITEA_TOKEN,
@@ -2628,46 +2575,6 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         max_retries: 2,
     };
 
-    // EPIC #152 brief 5: git-operator role registered. Brief 6 (this brief)
-    // wires it into the new agentry-self-host-v1 topology below.
-    let git_operator = build_git_operator_role(&home);
-
-    // EPIC #152 brief 6: agentry-self-host-v1 — new topology shape.
-    // Validators inside the coder's `/usr/local/bin/ship` tool absorb
-    // reviewer-mechanical + ac-verifier roles. `git-operator` absorbs
-    // shipper-agentry. `reviewer-claude` stays as design-review.
-    //
-    // v0 stays unchanged so in-flight v0 briefs continue to ship clean.
-    let agentry_self_host_v1 = TeamTopology {
-        name: TeamName("agentry-self-host-v1".into()),
-        version: 1,
-        roles: vec![
-            coder_claude_agentry.name.clone(),
-            reviewer_claude_agentry.name.clone(),
-            git_operator.name.clone(),
-            ci_watcher_agentry.name.clone(),
-        ],
-        message_graph: vec![
-            MessageEdge {
-                from: coder_claude_agentry.name.clone(),
-                to: reviewer_claude_agentry.name.clone(),
-                permit_overrides_from: None,
-            },
-            MessageEdge {
-                from: reviewer_claude_agentry.name.clone(),
-                to: git_operator.name.clone(),
-                permit_overrides_from: None,
-            },
-            MessageEdge {
-                from: git_operator.name.clone(),
-                to: ci_watcher_agentry.name.clone(),
-                permit_overrides_from: None,
-            },
-        ],
-        terminal_role: ci_watcher_agentry.name.clone(),
-        max_retries: 2,
-    };
-
     let agentry_bugfix_v0 = TeamTopology {
         name: TeamName("agentry-bugfix-v0".into()),
         version: 1,
@@ -2764,7 +2671,6 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
     redis_io::save_role(&mut conn, &shipper_agentry).await?;
     redis_io::save_role(&mut conn, &ci_watcher_agentry).await?;
     redis_io::save_team(&mut conn, &agentry_self_host_v0).await?;
-    redis_io::save_team(&mut conn, &agentry_self_host_v1).await?;
     redis_io::save_team(&mut conn, &agentry_bugfix_v0).await?;
     redis_io::save_team(&mut conn, &agentry_spec_edit_v0).await?;
     redis_io::save_role(&mut conn, &auditor_claude_agentry).await?;
@@ -2777,7 +2683,6 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
     redis_io::save_team(&mut conn, &agentry_planner_v0).await?;
     redis_io::save_role(&mut conn, &verifier_claude_agentry).await?;
     redis_io::save_team(&mut conn, &agentry_verify_v0).await?;
-    redis_io::save_role(&mut conn, &git_operator).await?;
 
     let roles_dir = seed_roles_dir();
     if roles_dir.exists() {
@@ -2795,7 +2700,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
     }
 
     tracing::info!(
-        "seeded: roles [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker, listener, grok-echo, claude-echo, synthesizer, narrowed-coder, shipper, coder-claude-agentry, ac-verifier-claude-agentry, ac-verifier-gemini-agentry, ac-verifier-grok-agentry, reviewer-mechanical-agentry, shipper-agentry, ci-watcher-agentry, reviewer-claude-agentry, auditor-claude-agentry, null-agent-agentry, archaeologist-claude-agentry, planner-claude-agentry, verifier-claude-agentry, git-operator] (inline entrypoint scripts); teams [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker-listener, grok-echo, claude-echo, narrowed-team, shipper-solo-team, agentry-self-host-v0, agentry-self-host-v1, agentry-self-audit-v0, agentry-null-v0, agentry-discovery-v0, agentry-planner-v0, agentry-verify-v0]"
+        "seeded: roles [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker, listener, grok-echo, claude-echo, synthesizer, narrowed-coder, shipper, coder-claude-agentry, ac-verifier-claude-agentry, ac-verifier-gemini-agentry, ac-verifier-grok-agentry, reviewer-mechanical-agentry, shipper-agentry, ci-watcher-agentry, reviewer-claude-agentry, auditor-claude-agentry, null-agent-agentry, archaeologist-claude-agentry, planner-claude-agentry, verifier-claude-agentry] (inline entrypoint scripts); teams [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker-listener, grok-echo, claude-echo, narrowed-team, shipper-solo-team, agentry-self-host-v0, agentry-self-audit-v0, agentry-null-v0, agentry-discovery-v0, agentry-planner-v0, agentry-verify-v0]"
     );
     Ok(())
 }
@@ -2829,48 +2734,6 @@ mod tests {
     fn claude_p_timeout_is_env_overridable_in_bash_prelude() {
         assert!(BASH_PRELUDE.contains("CLAUDE_P_TIMEOUT=\"${CLAUDE_P_TIMEOUT:-1200}\""));
         assert!(!BASH_PRELUDE.contains("timeout 600"));
-    }
-
-    #[test]
-    fn git_operator_role_has_workspace_mount_and_token_passthru() {
-        let role = build_git_operator_role("/h");
-        assert_eq!(role.name.0, "git-operator");
-        assert!(
-            role.workspace_mount.is_some(),
-            "git-operator must have a workspace_mount (writable for git push)"
-        );
-        let ws = role.workspace_mount.as_ref().expect("workspace_mount");
-        assert_eq!(ws.container_path, "/workspace");
-        assert!(
-            !ws.readonly,
-            "workspace mount must be writable — git push updates .git/{{HEAD,refs,reflog}}"
-        );
-        assert!(
-            role.passthru_env.iter().any(|e| e == "GITEA_TOKEN"),
-            "git-operator must passthru GITEA_TOKEN for the gitea API auth header"
-        );
-        assert!(
-            role.permit_scope
-                .0
-                .iter()
-                .any(|s| s == "net:allow:agency.lab"),
-            "git-operator permit_scope must allow net:allow:agency.lab for the gitea API call"
-        );
-        assert!(
-            role.mounts
-                .iter()
-                .any(|m| m.target == "/usr/local/bin/git-operator" && m.readonly),
-            "git-operator must bind-mount the host binary read-only at /usr/local/bin/git-operator"
-        );
-        assert!(
-            role.entrypoint_script
-                .contains("exec /usr/local/bin/git-operator"),
-            "git-operator entrypoint must be the one-line shell exec into the Rust binary"
-        );
-        assert!(
-            !role.entrypoint_script.contains("jq") && !role.entrypoint_script.contains("curl"),
-            "git-operator entrypoint must not embed bash logic — all logic is in the Rust binary"
-        );
     }
 
     // EPIC #161 Wave 1.4 — reviewer-claude prompt content (CRITICAL audit
@@ -3637,87 +3500,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn agentry_self_host_v1_topology_has_expected_shape() {
-        // EPIC #152 brief 6: mirror of the agentry-self-host-v1 topology block
-        // in seed_m0 — built here so the topology shape is covered without
-        // touching Redis. Keep in sync with seed_m0.
-        let coder = build_coder_claude_agentry_role("/h", "/c");
-        let reviewer_claude = build_reviewer_claude_agentry_role("/h", "/c");
-        let git_operator = build_git_operator_role("/h");
-        let ci_watcher = RoleName("ci-watcher-agentry".into());
-
-        let topology = TeamTopology {
-            name: TeamName("agentry-self-host-v1".into()),
-            version: 1,
-            roles: vec![
-                coder.name.clone(),
-                reviewer_claude.name.clone(),
-                git_operator.name.clone(),
-                ci_watcher.clone(),
-            ],
-            message_graph: vec![
-                MessageEdge {
-                    from: coder.name.clone(),
-                    to: reviewer_claude.name.clone(),
-                    permit_overrides_from: None,
-                },
-                MessageEdge {
-                    from: reviewer_claude.name.clone(),
-                    to: git_operator.name.clone(),
-                    permit_overrides_from: None,
-                },
-                MessageEdge {
-                    from: git_operator.name.clone(),
-                    to: ci_watcher.clone(),
-                    permit_overrides_from: None,
-                },
-            ],
-            terminal_role: ci_watcher.clone(),
-            max_retries: 2,
-        };
-
-        assert_eq!(
-            topology.roles.len(),
-            4,
-            "v1 topology must have exactly 4 roles (coder, reviewer-claude, git-operator, ci-watcher) — not 8 like v0"
-        );
-        assert!(topology.roles.contains(&coder.name));
-        assert!(topology.roles.contains(&reviewer_claude.name));
-        assert!(topology.roles.contains(&git_operator.name));
-        assert!(topology.roles.contains(&ci_watcher));
-
-        assert_eq!(
-            topology.terminal_role, ci_watcher,
-            "v1 terminal role must be ci-watcher-agentry"
-        );
-        assert_eq!(topology.max_retries, 2, "v1 max_retries must be 2");
-
-        assert_eq!(
-            topology.message_graph.len(),
-            3,
-            "v1 must have exactly 3 edges (coder→reviewer-claude, reviewer-claude→git-operator, git-operator→ci-watcher)"
-        );
-        let has_edge = |from: &RoleName, to: &RoleName| -> bool {
-            topology
-                .message_graph
-                .iter()
-                .any(|e| e.from == *from && e.to == *to)
-        };
-        assert!(
-            has_edge(&coder.name, &reviewer_claude.name),
-            "v1 must have edge coder→reviewer-claude"
-        );
-        assert!(
-            has_edge(&reviewer_claude.name, &git_operator.name),
-            "v1 must have edge reviewer-claude→git-operator"
-        );
-        assert!(
-            has_edge(&git_operator.name, &ci_watcher),
-            "v1 must have edge git-operator→ci-watcher"
-        );
-    }
-
     // EPIC #161 Wave 1.2b — `coder_exitpoint_skips_git_under_v1` retired.
     // The v1+ topology short-circuit (was bash regex `-v[1-9][0-9]*$`,
     // now Rust `is_v1_plus_topology` in the runner) is asserted in the
@@ -4325,15 +4107,13 @@ mod tests {
         // (currently `debian:trixie-slim`, glibc 2.41). Future regressions
         // — e.g. someone copy-pasting `bookworm-slim` into a new role spec
         // — surface here at `cargo test` rather than in production at the
-        // first reviewer dispatch. `git-operator` joined the set per #200:
-        // its host-built binary has the same glibc dependency.
+        // first reviewer dispatch.
         let reviewer = build_reviewer_claude_agentry_role("/h", "/h/.claude/settings.json");
         let acv_claude = build_ac_verifier_claude_agentry_role("/h", "/h/.claude/settings.json");
         let acv_gemini = build_ac_verifier_gemini_agentry_role("/h");
         let acv_grok = build_ac_verifier_grok_agentry_role("/h");
-        let git_operator = build_git_operator_role("/h");
 
-        for role in &[reviewer, acv_claude, acv_gemini, acv_grok, git_operator] {
+        for role in &[reviewer, acv_claude, acv_gemini, acv_grok] {
             assert_eq!(
                 role.image, RUNNER_HOST_IMAGE,
                 "role '{}' must use RUNNER_HOST_IMAGE — see #175 \
@@ -4341,15 +4121,12 @@ mod tests {
                 role.name
             );
             // Sanity: the role exec's a host-built binary, which is what
-            // makes glibc compatibility load-bearing. Accepts either a
-            // `*-runner` binary (reviewer, ac-verifier family) or the
-            // git-operator binary (#200). If a future refactor moves the
-            // entrypoint back to inline bash this test is no longer
-            // load-bearing — but until then the assertion holds.
+            // makes glibc compatibility load-bearing. If a future refactor
+            // moves the entrypoint back to inline bash this test is no
+            // longer load-bearing — but until then the assertion holds.
             assert!(
                 role.entrypoint_script.contains("exec /usr/local/bin/")
-                    && (role.entrypoint_script.contains("-runner")
-                        || role.entrypoint_script.contains("git-operator")),
+                    && role.entrypoint_script.contains("-runner"),
                 "role '{}' is expected to exec a host-built binary; \
                  if the entrypoint changed shape, revisit whether \
                  RUNNER_HOST_IMAGE still applies",
