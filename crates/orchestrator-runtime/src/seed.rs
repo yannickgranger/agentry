@@ -367,202 +367,24 @@ sleep 300
 printf '{"at":"%s","type":"done","verdict":"shipped"}\n' "$(date -Iseconds)"
 "#;
 
-// EPIC #161 Wave 1.2a: CODER_CLAUDE_AGENTRY_SCRIPT (entrypoint half) bash
-// heredoc that used to live here has been ported to a Rust runner —
+// EPIC #161 Wave 1.2a + 1.2b: BOTH halves of the coder-claude bash heredoc
+// (entrypoint AND exitpoint) have been ported to one Rust runner —
 // `crates/agentry-role-runtime/src/bin/coder_claude_runner.rs`. The role's
-// entrypoint_script now just `exec /usr/local/bin/coder-claude-runner`.
-// The runner has its own unit-test coverage for blocker-finding extraction,
-// rework-banner construction, /tmp/brief_vars.sh writing, prompt
-// composition, and POSIX-safe shell quoting.
+// entrypoint_script now `exec`s the runner; exitpoint_script is None. The
+// merged binary owns the full role lifecycle:
 //
-// CODER_CLAUDE_AGENTRY_EXITPOINT (the cargo fmt + quality-hygiene +
-// acceptance + self-review + dead-pub-check + git commit half) stays bash
-// for now; Wave 1.2b is its dedicated port.
-
-const CODER_CLAUDE_AGENTRY_EXITPOINT: &str = r##"#!/usr/bin/env bash
-set -euo pipefail
-. /tmp/brief_vars.sh
-cd /workspace
-
-# If running under a v1+ topology, the orchestrator's git-operator role
-# handles commit + push. Coder's exitpoint just runs baseline fmt and exits.
-if [[ "${topology_name}" =~ -v[1-9][0-9]*$ ]]; then
-    emit_event '{"msg":"v1+ topology — skipping coder-side commit/push (git-operator role does it)"}'
-    cargo fmt --all 2>/dev/null || true
-    emit_done "shipped"; exit 0
-fi
-
-# Baseline fmt — always run, no install dependency. rustfmt ships with
-# rustup and is already provisioned via extra_bootstrap. Protects against
-# quality-hygiene being absent (its `cargo install` is best-effort).
-emit_event '{"msg":"running cargo fmt --all (baseline)"}'
-if ! cargo fmt --all 2>/tmp/fmt.err; then
-    err=$(tail -50 /tmp/fmt.err)
-    emit_event "$(jq -nc --arg err "$err" '{error:"cargo fmt --all failed",detail:$err}')"
-    emit_finding "blocker" "cargo-fmt" "fmt" "$err"
-    emit_done "failed"; exit 0
-fi
-emit_event '{"msg":"cargo fmt --all clean"}'
-
-# quality-hygiene — role-local hygiene gate. If the binary was installed by
-# extra_bootstrap, run --fix so the commit is clean. If the install failed
-# (binary absent), skip and let the reviewer catch anything hygiene would have.
-if command -v quality-hygiene >/dev/null 2>&1; then
-    emit_event '{"msg":"running quality-hygiene --fix"}'
-    if ! quality-hygiene --fix --workspace /workspace --base "${base_branch}" >/tmp/qh.out 2>/tmp/qh.err; then
-        err=$(tail -100 /tmp/qh.err)
-        emit_event "$(jq -nc --arg err "$err" '{error:"quality-hygiene --fix failed",detail:$err}')"
-        emit_finding "blocker" "quality-hygiene" "hygiene" "$err"
-        emit_done "failed"; exit 0
-    fi
-    emit_event '{"msg":"quality-hygiene --fix clean"}'
-else
-    emit_event '{"msg":"quality-hygiene not installed, skipping role-local gate"}'
-fi
-
-# Acceptance self-check — same command the reviewer will run.
-if eval "$acceptance" >/tmp/acc.out 2>/tmp/acc.err; then
-    emit_event '{"msg":"acceptance passed (self-check)"}'
-else
-    err=$(tail -50 /tmp/acc.err)
-    emit_event "$(jq -nc --arg err "$err" '{error:"acceptance failed (self-check)",detail:$err}')"
-    emit_finding "blocker" "cargo" "acceptance" "$err"
-    emit_done "failed"; exit 0
-fi
-
-# Stage + commit whatever claude (and quality-hygiene --fix) changed.
-git add -A
-if git diff --cached --quiet; then
-    emit_event '{"error":"no changes produced"}'
-    emit_done "failed"; exit 0
-fi
-
-# Self-review — LLM checks verb-completeness before commit.
-# Skips silently if issue body has no verb syntax (legacy free-form briefs).
-# On malformed claude output, warns and falls through to commit — this is
-# a cheap pre-filter, not a hard gate; reviewer-claude is the backstop.
-if printf '%s' "$issue_body" | grep -qE '^(### [0-9]+\. |CREATE |UPDATE |REPLACE |DELETE |MOVE )'; then
-    emit_event '{"msg":"running self-review (verb completeness)"}'
-    git diff --cached > /tmp/staged.patch
-    cat > /tmp/self_rev.txt <<PROMPT
-You are a self-review check for the agentry project. Below is the TASK
-BODY (with explicit verbs — CREATE/UPDATE/REPLACE/DELETE/MOVE) and the
-STAGED DIFF you are about to commit.
-
-TASK BODY:
-$(printf '%s' "$issue_body" | head -c 3000)
-
-STAGED DIFF:
-$(cat /tmp/staged.patch)
-
-For each verb declared in the task body, check whether it has been applied
-in the diff at the named location. Output EXACTLY a JSON object — no
-markdown fences, no prose:
-
-{
-  "all_applied": true,
-  "unapplied": []
-}
-
-If any verb is missing, set all_applied:false and list each missing verb
-as a short description (max 200 chars each, max 6 entries).
-
-Your response, right now, starting with { and ending with }:
-PROMPT
-    # Self-review tolerates failure: instead of `exit 0` (which `stream_claude`
-    # does on hard failure), wrap so a transient claude error degrades to
-    # "all applied" rather than killing the role. Skip stream_claude here
-    # because we need the soft-fail; emit the call directly under the same
-    # set -e + pipefail guard pattern.
-    mkdir -p /transcripts
-    SR_TRANSCRIPT="/transcripts/${brief_id}.self-review.jsonl"
-    {
-        HOME=/root timeout "$CLAUDE_P_TIMEOUT" claude -p \
-            --output-format stream-json --verbose \
-            "$(cat /tmp/self_rev.txt)" 2>&1 \
-          | tee "$SR_TRANSCRIPT" \
-          | while IFS= read -r _line; do
-                if printf '%s' "$_line" | jq -e . >/dev/null 2>&1; then
-                    emit_event "$(jq -nc --argjson c "$_line" '{claude:$c}')"
-                else
-                    emit_event "$(jq -nc --arg s "$_line" '{claude_raw:$s}')"
-                fi
-            done
-    } || true
-    sr_ec=${PIPESTATUS[0]}
-    if [ "$sr_ec" -ne 0 ]; then
-        emit_event "$(jq -nc --arg ec "$sr_ec" '{warn:"self-review claude call failed; proceeding",exit_code:$ec}')"
-        sr='{"all_applied":true,"unapplied":[]}'
-    else
-        # Same regression class as PR #129: piping `.result` through `tail -1`
-        # silently truncates pretty-printed multi-line JSON to a single trailing
-        # `}`, which then trips the `grep -m1 '{'` + `set -e` chain below. The
-        # result event is unique per transcript, so no `tail` is needed.
-        sr=$(jq -r 'select(.type=="result") | .result' "$SR_TRANSCRIPT" 2>/dev/null)
-        if [ -z "$sr" ]; then
-            sr=$(jq -r 'select(.type=="assistant") | .message.content[]? | select(.type=="text") | .text' "$SR_TRANSCRIPT" 2>/dev/null)
-        fi
-        [ -z "$sr" ] && sr='{"all_applied":true,"unapplied":[]}'
-    fi
-    cleaned=$(printf '%s' "$sr" | sed -e 's/^```json$//' -e 's/^```$//' -e '/^$/d' | tr -d '\r')
-    start=$(printf '%s' "$cleaned" | grep -b -m1 '{' | head -1 | cut -d: -f1)
-    end=$(printf '%s' "$cleaned" | grep -bo '}' | tail -1 | cut -d: -f1)
-    if [ -n "$start" ] && [ -n "$end" ]; then
-        payload=$(printf '%s' "$cleaned" | tail -c +$((start+1)) | head -c $((end-start+1)))
-        if printf '%s' "$payload" | jq -e 'type == "object"' >/dev/null 2>&1; then
-            all_applied=$(printf '%s' "$payload" | jq -r '.all_applied // true')
-            if [ "$all_applied" = "false" ]; then
-                printf '%s' "$payload" | jq -r '.unapplied[]?' | while read -r item; do
-                    emit_finding_model "blocker" "coder-self-review" "completeness" "unapplied verb: $item"
-                done
-                emit_event '{"error":"self-review found unapplied verbs"}'
-                emit_done "failed"; exit 0
-            fi
-            emit_event '{"msg":"self-review: all verbs applied"}'
-        else
-            emit_event '{"warn":"self-review response not a JSON object; proceeding"}'
-        fi
-    else
-        emit_event '{"warn":"self-review response missing JSON braces; proceeding"}'
-    fi
-fi
-
-# Pre-commit dead-pub gate: invoke the dead-pub-check binary if the host
-# has bind-mounted it. Binary reads {diff, workspace_root} JSON on stdin,
-# emits findings as JSONL on stdout, exits 0. Falls through silently if
-# the binary is missing (warn-skip mount handles that side). Brief 1 of
-# #134 replaces the prior bash pipeline (PR #133, hot-fixed in #135) —
-# the binary is structurally immune to the empty-grep × set -euo pipefail
-# failure class that bit PRs #129/#130/#135.
-if command -v dead-pub-check >/dev/null 2>&1; then
-    emit_event '{"msg":"running dead-pub-check"}'
-    diff_text=$(git diff --cached -U0)
-    findings=$(jq -nc --arg d "$diff_text" --arg w "/workspace" '{diff:$d, workspace_root:$w}' \
-        | dead-pub-check 2>/tmp/dpc.err) || {
-            emit_event "$(jq -nc --arg err "$(tail -c 4096 /tmp/dpc.err)" '{warn:"dead-pub-check failed",detail:$err}')"
-            findings=""
-        }
-    while IFS= read -r line; do
-        [ -z "$line" ] && continue
-        sev=$(jq -r '.severity' <<<"$line" 2>/dev/null || echo "warn")
-        cat=$(jq -r '.category' <<<"$line" 2>/dev/null || echo "dead-pub")
-        msg=$(jq -r '.message' <<<"$line" 2>/dev/null || echo "<malformed finding>")
-        if [ "$sev" = "warn" ]; then
-            emit_finding "warn" "ra-query" "$cat" "$msg"
-        else
-            emit_event "$(jq -nc --arg s "$sev" --arg c "$cat" --arg m "$msg" '{msg:"dead_pub_info",severity:$s,category:$c,detail:$m}')"
-        fi
-    done <<< "$findings"
-else
-    emit_event '{"msg":"dead_pub_check_unavailable","detail":"binary not on PATH; coder gate skipped"}'
-fi
-
-git commit -m "auto(${brief_id}): ${issue_title}" > /dev/null
-sha=$(git rev-parse HEAD)
-emit_event "$(jq -nc --arg br "$branch" --arg s "$sha" '{msg:"committed",branch:$br,sha:$s}')"
-
-emit_done "shipped"
-"##;
+//   - Read bundle, walk team_context for prior blocker findings,
+//     compose verb-structured prompt with optional rework banner, stream
+//     `claude -p` to /transcripts/<brief_id>.coder.jsonl.
+//   - v1+ topology shortcut: best-effort `cargo fmt --all` then ship
+//     (git-operator role handles commit/push for v1+).
+//   - v0 topology exitpoint: cargo fmt → quality-hygiene → eval acceptance
+//     → git add -A → optional self-review claude soft-fail → optional
+//     dead-pub-check JSONL → git commit + emit committed event → done shipped.
+//
+// /tmp/brief_vars.sh cross-language IPC is gone (Wave 1.2a's transitional
+// handle); state lives in typed Rust structs throughout. DoneGuard now
+// wraps the whole role.
 
 /// Mechanical reviewer role. Reads the coder's workspace read-only,
 /// re-runs the acceptance command in an isolated build dir (`CARGO_TARGET_DIR=/tmp/review-target`),
@@ -1529,15 +1351,16 @@ fn build_coder_claude_agentry_role(home: &str, claude_settings_path: &str) -> Ag
         image: "docker.io/library/rust:1.93".into(),
         substrate_class: SubstrateClass::Podman,
         package_manager: PackageManager::Apt,
-        // EPIC #161 Wave 1.2a — entrypoint ported to Rust runner. The
-        // runner reads the bundle, builds the verb-structured prompt
-        // (with prior-rework banner if applicable), writes
-        // `/tmp/brief_vars.sh` for the (still-bash) exitpoint to source,
-        // and streams claude. The exitpoint stays bash for now (Wave 1.2b
-        // is its dedicated port — cargo fmt + quality-hygiene + acceptance
-        // eval + self-review claude call + dead-pub-check + git commit).
+        // EPIC #161 Wave 1.2a + 1.2b — entrypoint AND exitpoint ported to
+        // a single Rust runner that owns the full role lifecycle: bundle
+        // parse, rework banner, prompt build, claude streaming, then
+        // (v0 only) cargo fmt → quality-hygiene → acceptance eval →
+        // git add → optional self-review claude soft-fail → optional
+        // dead-pub-check → git commit. The merged binary uses the standard
+        // DoneGuard pattern; v1+ topologies short-circuit to a best-effort
+        // fmt + done shipped (git-operator role handles commit/push).
         entrypoint_script: "#!/bin/sh\nexec /usr/local/bin/coder-claude-runner\n".into(),
-        exitpoint_script: Some(format!("{BASH_PRELUDE}{CODER_CLAUDE_AGENTRY_EXITPOINT}")),
+        exitpoint_script: None,
         binaries: vec!["git".into(), "curl".into(), "ca-certificates".into()],
         mcp_servers: vec![],
         tool_allowlist: ToolAllowlist(vec![]),
@@ -3114,60 +2937,16 @@ mod tests {
         }
     }
 
-    #[test]
-    fn coder_exitpoint_self_review_uses_pipefail_guard() {
-        // Self-review is intentionally soft-fail (degrades to all_applied:true
-        // on claude error) so it does not use stream_claude — but it MUST use
-        // the same pipeline guard so set -e + pipefail does not kill the role
-        // before the failure branch runs.
-        let s = CODER_CLAUDE_AGENTRY_EXITPOINT;
-        assert!(
-            s.contains("--output-format stream-json --verbose"),
-            "self-review must use stream-json output"
-        );
-        assert!(
-            s.contains("PIPESTATUS[0]"),
-            "self-review must capture exit via PIPESTATUS[0]"
-        );
-        assert!(
-            s.contains(".self-review.jsonl"),
-            "self-review transcript filename suffix"
-        );
-        // Same regression class as PR #129's stream_claude fix: piping `.result`
-        // through `tail -1` truncates multi-line JSON to a trailing `}` and
-        // the downstream `grep -m1 '{'` then misses, tripping pipefail+set -e.
-        assert!(
-            !s.contains(
-                "select(.type==\"result\") | .result' \"$SR_TRANSCRIPT\" 2>/dev/null | tail"
-            ),
-            "self-review must NOT pipe .result through tail (truncates multi-line JSON)"
-        );
-        assert!(
-            !s.contains("select(.type==\"assistant\") | .message.content[]? | select(.type==\"text\") | .text' \"$SR_TRANSCRIPT\" 2>/dev/null | tail"),
-            "self-review assistant-text fallback must NOT pipe through tail"
-        );
-    }
-
-    #[test]
-    fn coder_exitpoint_has_dead_pub_gate() {
-        // Lock down the pre-commit dead-pub gate so a future cleanup can't
-        // silently delete it. Brief 1 of #134 ported the bash pipeline to a
-        // Rust binary (`dead-pub-check`); a missing binary degrades to a
-        // `dead_pub_check_unavailable` event without failing the role.
-        let s = CODER_CLAUDE_AGENTRY_EXITPOINT;
-        assert!(
-            s.contains("dead-pub-check"),
-            "coder exitpoint must invoke the dead-pub-check binary"
-        );
-        assert!(
-            s.contains("running dead-pub-check"),
-            "coder exitpoint must announce the dead-pub gate before running it"
-        );
-        assert!(
-            s.contains("dead_pub_check_unavailable"),
-            "coder exitpoint must emit dead_pub_check_unavailable when the binary is missing"
-        );
-    }
+    // EPIC #161 Wave 1.2b — self-review pipeline structure (stream-json
+    // output, transcript suffix, multi-line JSON salvage, soft-fail
+    // semantics) and dead-pub-check gate behaviour now live in
+    // `crates/agentry-role-runtime/src/bin/coder_claude_runner.rs`. Tests
+    // for those behaviours moved into the runner's own `mod tests`:
+    // `parse_self_review_object_*`, `build_self_review_prompt_*`,
+    // `slice_json_object_*`, plus the `run_self_review` / `run_dead_pub_check_phase`
+    // wiring is tested at integration-runner level. The seed test below
+    // pins down that the role wiring keeps the dead-pub-check bind-mount
+    // (the runner needs the binary on PATH inside the container).
 
     #[test]
     fn coder_role_has_dead_pub_check_mount() {
@@ -3808,33 +3587,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn coder_exitpoint_skips_git_under_v1() {
-        // EPIC #152 brief 6: when topology_name matches `-v[1-9]+$` (v1, v2, …),
-        // the coder exitpoint must short-circuit out of the commit/push path
-        // because the orchestrator's git-operator role takes over. Validate the
-        // literal `topology_name … -v[1-9]` regex appears in the same line.
-        let s = CODER_CLAUDE_AGENTRY_EXITPOINT;
-        let line_with_pattern = s
-            .lines()
-            .find(|l| l.contains("topology_name") && l.contains("=~") && l.contains("-v[1-9]"));
-        assert!(
-            line_with_pattern.is_some(),
-            "exitpoint must contain a `[[ \"${{topology_name}}\" =~ -v[1-9]… ]]` short-circuit guard"
-        );
-        assert!(
-            s.contains("v1+ topology"),
-            "exitpoint must announce the v1+ topology branch via emit_event"
-        );
-        assert!(
-            s.contains("git-operator role does it"),
-            "exitpoint must explain that git-operator handles commit/push"
-        );
-        assert!(
-            s.contains("emit_done \"shipped\"; exit 0"),
-            "exitpoint must terminate with emit_done shipped and exit 0 in the v1+ branch"
-        );
-    }
+    // EPIC #161 Wave 1.2b — `coder_exitpoint_skips_git_under_v1` retired.
+    // The v1+ topology short-circuit (was bash regex `-v[1-9][0-9]*$`,
+    // now Rust `is_v1_plus_topology` in the runner) is asserted in the
+    // runner binary's `mod tests`:
+    // `is_v1_plus_topology_matches_v1_through_v99` (positive cases) and
+    // `is_v1_plus_topology_rejects_v0_and_other_shapes` (v0, no leading
+    // dash, leading zeros, suffixes after digits).
 
     // EPIC #161 Wave 1.2a — coder entrypoint behaviour assertions
     // (topology_name export, team_context.messages walk, rework banner
@@ -3882,22 +3641,19 @@ mod tests {
     }
 
     #[test]
-    fn coder_role_keeps_bash_exitpoint_for_now() {
-        // EPIC #161 Wave 1.2a ports the entrypoint only; the exitpoint
-        // (cargo fmt + quality-hygiene + acceptance + self-review +
-        // dead-pub-check + git commit) stays bash until Wave 1.2b. Verify
-        // the exitpoint is still wired so tests for it remain meaningful.
+    fn coder_role_uses_single_rust_runner_no_bash_exitpoint() {
+        // EPIC #161 Wave 1.2b: entrypoint AND exitpoint merged into one
+        // Rust binary. The role's exitpoint_script is None — the merged
+        // runner owns the full lifecycle (cargo fmt, quality-hygiene,
+        // acceptance, self-review, dead-pub-check, git commit) in-process.
         let role = build_coder_claude_agentry_role(
             "/var/home/test",
             "/var/home/test/.config/agentry/claude-container-settings.json",
         );
-        let ep = role
-            .exitpoint_script
-            .as_ref()
-            .expect("coder role must have an exitpoint");
         assert!(
-            ep.contains("cargo fmt --all"),
-            "exitpoint must still run cargo fmt --all (Wave 1.2b will port this)"
+            role.exitpoint_script.is_none(),
+            "coder role must have no bash exitpoint after Wave 1.2b — got: {:?}",
+            role.exitpoint_script
         );
     }
 

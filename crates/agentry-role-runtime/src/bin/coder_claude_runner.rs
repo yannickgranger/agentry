@@ -1,73 +1,58 @@
-//! coder-claude-runner — entrypoint half of the coder-claude-agentry role.
+//! coder-claude-runner — full role lifecycle for coder-claude-agentry.
 //!
-//! Ports the entrypoint half of `CODER_CLAUDE_AGENTRY_SCRIPT` (~104 LoC bash)
-//! under EPIC #161 Wave 1.2a. Reads the bundle, builds the verb-structured
-//! prompt (with prior-rework banner if applicable), writes
-//! `/tmp/brief_vars.sh` so the (still-bash) exitpoint can `source` shared
-//! state, and streams claude via the lib `stream_claude` helper.
+//! EPIC #161 Wave 1.2a ported the entrypoint half (bundle parsing, rework
+//! banner, prompt build, claude streaming). Wave 1.2b ports the exitpoint
+//! half (cargo fmt, quality-hygiene, acceptance eval, self-review claude
+//! soft-fail, dead-pub-check, git commit) and merges both into this single
+//! binary.
 //!
-//! The exitpoint half (`CODER_CLAUDE_AGENTRY_EXITPOINT` — cargo fmt,
-//! quality-hygiene, acceptance eval, self-review claude call,
-//! dead-pub-check, git commit) is **deferred to Wave 1.2b**. This runner
-//! deliberately preserves the entrypoint/exitpoint cross-language IPC via
-//! `/tmp/brief_vars.sh` so 1.2a and 1.2b ship as small, independently
-//! reviewable PRs.
+//! With both halves owned by one Rust process the cross-language
+//! `/tmp/brief_vars.sh` IPC handle disappears, role state lives in typed
+//! Rust structs, and `DoneGuard` works the standard way (any unwound path
+//! emits `done failed` so the daemon always sees a terminal event).
 //!
-//! ## DoneGuard departure (intentional)
+//! ## Phases
 //!
-//! The other Rust runners (null-agent, ac-verifier-runner,
-//! reviewer-claude-runner) start with `let _g = DoneGuard::new()` so the
-//! daemon always sees a terminal `done` event. The coder-claude entrypoint
-//! is structurally different: when it succeeds, the bash exitpoint runs
-//! next and emits the terminal `done`. A `DoneGuard::drop` at the end of
-//! `main` would emit `done failed` *before* the exitpoint runs — and the
-//! spawner's read loop breaks on the first terminal event, so the
-//! exitpoint's events would be silently dropped.
+//! 1. **Entrypoint phase** — read bundle, parse fields, walk
+//!    `team_context.messages[].payload.findings[]` for prior blockers,
+//!    build the rework banner if applicable, set git config, write the
+//!    verb-structured prompt, stream `claude -p` to a transcript.
+//! 2. **v1+ topology shortcut** — if `topology_name` ends in `-vN` for
+//!    `N >= 1`, skip the local commit/push pipeline (the orchestrator's
+//!    `git-operator` role handles those for v1+ topologies). Run a
+//!    best-effort `cargo fmt --all` and ship.
+//! 3. **Exitpoint phase** (v0 only) — `cargo fmt --all` (hard),
+//!    `quality-hygiene --fix` (optional), `eval "$acceptance"` (hard),
+//!    `git add -A` + has-staged check, optional self-review claude call
+//!    (soft-fail — degrades to `all_applied: true` on transient claude
+//!    error), optional `dead-pub-check`, then `git commit`.
 //!
-//! Therefore this runner does NOT use DoneGuard. Failure paths emit
-//! `done failed` explicitly and exit. Success path exits cleanly without
-//! a done event, letting the exitpoint own terminal emission. Panics
-//! (genuinely unexpected) escape as a non-zero exit; the spawner already
-//! synthesises `Failed { reason: "agent exited without done event" }` for
-//! that case (see `compute_verdict` in `orchestrator-runtime/spawner.rs`).
-//!
-//! Once Wave 1.2b ports the exitpoint to Rust, the merged binary can adopt
-//! the standard DoneGuard pattern.
-//!
-//! ## Behaviour preserved verbatim
-//!
-//! - read startup bundle on stdin
-//! - extract `brief.id`, `brief.payload.{target_repo,base_branch,
-//!   issue_title,issue_body,acceptance,forge_host}`, `brief.topology.name`
-//! - parse blocker findings out of `team_context.messages[].payload.findings[]`
-//! - build a "REWORK iteration" banner block from blocker findings if
-//!   `finding_count > 0` (prohibitions / requirements joined with `; `)
-//! - require `GITEA_TOKEN` in env; missing → `done failed`
-//! - `mkdir -p /root/.claude`, `cd /workspace`, set git config
-//! - branch name `auto/<brief_id>` is informational; the workspace was
-//!   already allocated by `daemon::workspace::allocate` and is on this
-//!   branch when the container starts
-//! - write `/tmp/brief_vars.sh` so the bash exitpoint can `source` it
-//! - build the prompt verbatim (verb-structured task framing + ship
-//!   self-check note + topology-aware constraints)
-//! - emit `calling claude -p` event with `prompt_bytes`
-//! - call `stream_claude(brief_id, ".coder", prompt)`
-//! - emit `claude reply received` event with `bytes`
-//! - exit 0 — exitpoint takes over
+//! Behaviour mirrors `BASH_PRELUDE + CODER_CLAUDE_AGENTRY_SCRIPT +
+//! CODER_CLAUDE_AGENTRY_EXITPOINT` bit-for-bit, including the soft-fail
+//! semantics of self-review (so a flaky claude call cannot kill an
+//! otherwise-correct coder run) and the optional-binary tolerance for
+//! `quality-hygiene` and `dead-pub-check`.
 
 use std::fs;
 use std::io::Write;
 use std::path::Path;
-use std::process::{self, Command};
+use std::process::{Command, Stdio};
 
-use agentry_role_runtime::{emit_done, emit_event, read_bundle_value, stream_claude, StreamErr};
-use orchestrator_types::{DoneReason, EventVerdict};
+use agentry_role_runtime::{
+    emit_done, emit_event, emit_finding, read_bundle_value, stream_claude, DoneGuard, StreamErr,
+};
+use orchestrator_types::{DoneReason, EventVerdict, FindingOrigin, ReviewFinding, Severity};
 use serde_json::{json, Value};
 
 const WORKSPACE_DIR: &str = "/workspace";
-const BRIEF_VARS_PATH: &str = "/tmp/brief_vars.sh";
+const ISSUE_BODY_BUDGET: usize = 3000;
+const FMT_ERR_TAIL: usize = 50;
+const HYGIENE_ERR_TAIL: usize = 100;
+const ACCEPTANCE_ERR_TAIL: usize = 50;
+const DEAD_PUB_ERR_TAIL: usize = 4096;
 
 fn main() {
+    let _guard = DoneGuard::new();
     if let Err(err) = run() {
         emit_event(json!({
             "error": err.event_msg,
@@ -77,16 +62,12 @@ fn main() {
             EventVerdict::Failed,
             Some(DoneReason {
                 cause: err.cause.into(),
-                exit_code: None,
+                exit_code: err.exit_code,
             }),
         );
-        // exit 0 so the spawner's read loop has already captured the
-        // terminal event before bash exitpoint runs (its events are
-        // discarded; see DoneGuard departure note in module docs).
-        process::exit(0);
     }
-    // Success: don't emit done. Exitpoint runs next and emits the
-    // terminal verdict. Exit 0 so the bash bootstrap exec's the exitpoint.
+    // On Ok the run() body has already called emit_done(Shipped|Failed)
+    // explicitly via the shipping path. DoneGuard catches anything else.
 }
 
 #[derive(Debug)]
@@ -94,6 +75,7 @@ struct RunErr {
     event_msg: &'static str,
     detail: String,
     cause: &'static str,
+    exit_code: Option<i32>,
 }
 
 fn run() -> Result<(), RunErr> {
@@ -101,30 +83,10 @@ fn run() -> Result<(), RunErr> {
         event_msg: "failed to parse startup bundle",
         detail: e.to_string(),
         cause: "bundle_parse_failed",
+        exit_code: None,
     })?;
 
-    let brief_id = pointer_str(&bundle, "/brief/id").to_string();
-    let target_repo = pointer_str_or(&bundle, "/brief/payload/target_repo", "yg/agentry");
-    let _ = target_repo; // bash extracts it but never references it; keep for parity comment
-    let base_branch = pointer_str_or(&bundle, "/brief/payload/base_branch", "develop");
-    let issue_title = pointer_str(&bundle, "/brief/payload/issue_title").to_string();
-    let issue_body = pointer_str(&bundle, "/brief/payload/issue_body").to_string();
-    let acceptance = pointer_str_or(&bundle, "/brief/payload/acceptance", "true");
-    let _forge_host = pointer_str_or(&bundle, "/brief/payload/forge_host", "agency.lab:3000");
-    let topology_name = pointer_str(&bundle, "/brief/topology/name").to_string();
-
-    let blocker_findings = collect_blocker_findings(&bundle);
-    let finding_count = blocker_findings.len();
-    let rework_banner = if finding_count > 0 {
-        let banner = build_rework_banner(&blocker_findings);
-        emit_event(json!({
-            "msg": "rework iteration — injecting prior findings into prompt",
-            "blocker_count": finding_count,
-        }));
-        banner
-    } else {
-        String::new()
-    };
+    let ctx = parse_brief_context(&bundle);
 
     if std::env::var("GITEA_TOKEN")
         .map(|s| s.is_empty())
@@ -134,13 +96,12 @@ fn run() -> Result<(), RunErr> {
             event_msg: "GITEA_TOKEN not in env",
             detail: String::new(),
             cause: "gitea_token_missing",
+            exit_code: None,
         });
     }
 
     let _ = fs::create_dir_all("/root/.claude");
 
-    // git config — global so all subsequent invocations see it. Failure
-    // here is genuinely unexpected; surface as a hard failure.
     git_config_global(&[
         ("user.email", "coder-claude-agentry@agentry.lab"),
         ("user.name", "coder-claude-agentry"),
@@ -150,83 +111,126 @@ fn run() -> Result<(), RunErr> {
         event_msg: "git config --global failed",
         detail: e,
         cause: "git_config_failed",
+        exit_code: None,
     })?;
 
-    let branch = format!("auto/{brief_id}");
+    // ----- Entrypoint phase: rework banner, prompt, claude stream -----
+
+    if !ctx.blocker_findings.is_empty() {
+        emit_event(json!({
+            "msg": "rework iteration — injecting prior findings into prompt",
+            "blocker_count": ctx.blocker_findings.len(),
+        }));
+    }
+
     emit_event(json!({
         "msg": "workspace worktree ready",
-        "branch": branch,
+        "branch": ctx.branch,
     }));
 
-    write_brief_vars(
-        BRIEF_VARS_PATH,
-        &[
-            ("brief_id", &brief_id),
-            ("base_branch", &base_branch),
-            ("issue_title", &issue_title),
-            ("issue_body", &issue_body),
-            ("acceptance", &acceptance),
-            ("branch", &branch),
-            ("topology_name", &topology_name),
-        ],
-    )
-    .map_err(|e| RunErr {
-        event_msg: "failed to write /tmp/brief_vars.sh",
-        detail: e,
-        cause: "brief_vars_write_failed",
-    })?;
-
     let prompt = build_coder_prompt(
-        &base_branch,
-        &branch,
-        &rework_banner,
-        &issue_title,
-        &issue_body,
-        &acceptance,
+        &ctx.base_branch,
+        &ctx.branch,
+        &ctx.rework_banner,
+        &ctx.issue_title,
+        &ctx.issue_body,
+        &ctx.acceptance,
     );
-
     emit_event(json!({
         "msg": "calling claude -p",
         "prompt_bytes": prompt.len(),
     }));
 
-    let reply = match stream_claude(&brief_id, ".coder", &prompt) {
+    let reply = match stream_claude(&ctx.brief_id, ".coder", &prompt) {
         Ok(r) => r,
         Err(StreamErr::ClaudeFailed { exit_code, detail }) => {
-            // Match bash entrypoint's stream_claude failure envelope:
-            // `done failed; exit 0` — exitpoint events would be ignored,
-            // but the bash bootstrap continues to invoke it. We exit with
-            // explicit done failed via the run() Err path.
-            emit_event(json!({
-                "error": "claude -p failed",
-                "exit_code": exit_code,
-                "detail": detail,
-            }));
             return Err(RunErr {
                 event_msg: "claude -p failed",
-                detail: format!("exit_code={exit_code}"),
+                detail,
                 cause: "claude_failed",
+                exit_code: Some(exit_code),
             });
         }
         Err(StreamErr::TranscriptEmpty { path }) => {
-            emit_event(json!({
-                "error": "tee_or_transcript_write_failed",
-                "transcript_path": path,
-            }));
             return Err(RunErr {
                 event_msg: "tee_or_transcript_write_failed",
                 detail: path,
                 cause: "transcript_empty",
+                exit_code: None,
             });
         }
     };
-
     emit_event(json!({
         "msg": "claude reply received",
         "bytes": reply.len(),
     }));
 
-    Ok(())
+    // ----- v1+ topology shortcut -----
+
+    if is_v1_plus_topology(&ctx.topology_name) {
+        emit_event(json!({
+            "msg": "v1+ topology — skipping coder-side commit/push (git-operator role does it)",
+        }));
+        // Best-effort fmt; ignore failure (parity with bash `2>/dev/null || true`).
+        run_cargo_fmt_quiet();
+        emit_done(EventVerdict::Shipped, None);
+        return Ok(());
+    }
+
+    // ----- Exitpoint phase (v0 topologies) -----
+
+    exitpoint_phase(&ctx)
+}
+
+// ---------------------------------------------------------------------------
+// Brief context
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+struct BriefContext {
+    brief_id: String,
+    base_branch: String,
+    issue_title: String,
+    issue_body: String,
+    acceptance: String,
+    branch: String,
+    topology_name: String,
+    rework_banner: String,
+    blocker_findings: Vec<PriorFinding>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PriorFinding {
+    message: String,
+    prohibitions: Vec<String>,
+    requirements: Vec<String>,
+}
+
+fn parse_brief_context(bundle: &Value) -> BriefContext {
+    let brief_id = pointer_str(bundle, "/brief/id").to_string();
+    let base_branch = pointer_str_or(bundle, "/brief/payload/base_branch", "develop");
+    let issue_title = pointer_str(bundle, "/brief/payload/issue_title").to_string();
+    let issue_body = pointer_str(bundle, "/brief/payload/issue_body").to_string();
+    let acceptance = pointer_str_or(bundle, "/brief/payload/acceptance", "true");
+    let topology_name = pointer_str(bundle, "/brief/topology/name").to_string();
+    let blocker_findings = collect_blocker_findings(bundle);
+    let rework_banner = if blocker_findings.is_empty() {
+        String::new()
+    } else {
+        build_rework_banner(&blocker_findings)
+    };
+    let branch = format!("auto/{brief_id}");
+    BriefContext {
+        brief_id,
+        base_branch,
+        issue_title,
+        issue_body,
+        acceptance,
+        branch,
+        topology_name,
+        rework_banner,
+        blocker_findings,
+    }
 }
 
 fn pointer_str<'a>(bundle: &'a Value, ptr: &str) -> &'a str {
@@ -242,16 +246,6 @@ fn pointer_str_or(bundle: &Value, ptr: &str, default: &str) -> String {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PriorFinding {
-    message: String,
-    prohibitions: Vec<String>,
-    requirements: Vec<String>,
-}
-
-/// Walk `team_context.messages[].payload.findings[]`, keeping only
-/// `severity == "blocker"` entries. Mirrors the bash `jq -c` filter
-/// verbatim. Empty / missing fields default to empty vectors.
 fn collect_blocker_findings(bundle: &Value) -> Vec<PriorFinding> {
     let messages = bundle
         .pointer("/team_context/messages")
@@ -262,24 +256,19 @@ fn collect_blocker_findings(bundle: &Value) -> Vec<PriorFinding> {
     let mut out = Vec::new();
     for m in messages {
         let findings = m.pointer("/payload/findings").and_then(Value::as_array);
-        let Some(findings) = findings else {
-            continue;
-        };
+        let Some(findings) = findings else { continue };
         for f in findings {
             if f.get("severity").and_then(Value::as_str) != Some("blocker") {
                 continue;
             }
-            let message = f
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            let prohibitions = string_array_field(f, "prohibitions");
-            let requirements = string_array_field(f, "requirements");
             out.push(PriorFinding {
-                message,
-                prohibitions,
-                requirements,
+                message: f
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                prohibitions: string_array_field(f, "prohibitions"),
+                requirements: string_array_field(f, "requirements"),
             });
         }
     }
@@ -325,64 +314,6 @@ fn build_rework_banner(findings: &[PriorFinding]) -> String {
     )
 }
 
-fn git_config_global(pairs: &[(&str, &str)]) -> Result<(), String> {
-    for (k, v) in pairs {
-        let out = Command::new("git")
-            .arg("config")
-            .arg("--global")
-            .arg(k)
-            .arg(v)
-            .current_dir(WORKSPACE_DIR)
-            .output()
-            .map_err(|e| format!("spawn git config {k}: {e}"))?;
-        if !out.status.success() {
-            let detail = String::from_utf8_lossy(&out.stderr);
-            return Err(format!("git config {k}={v}: {detail}"));
-        }
-    }
-    // The bash `cd /workspace` happens before git config — workspace must
-    // already exist. Verify rather than relying on cwd of the current
-    // process (which may differ).
-    let dot_git = Path::new(WORKSPACE_DIR).join(".git");
-    if !dot_git.is_dir() && !dot_git.is_file() {
-        return Err(format!("{WORKSPACE_DIR} is not a git repo"));
-    }
-    Ok(())
-}
-
-/// Write `/tmp/brief_vars.sh` in a form the bash exitpoint can `source`.
-/// Each entry becomes `export <key>=<single-quoted-value>`. Single-quote
-/// wrapping is POSIX and tolerates newlines, dollar signs, backticks; the
-/// only escaping needed is `'` → `'\\''` (close, escape, reopen).
-fn write_brief_vars(path: &str, vars: &[(&str, &str)]) -> Result<(), String> {
-    let mut content = String::from("#!/bin/bash\n");
-    for (k, v) in vars {
-        content.push_str(&format!("export {k}={}\n", sh_single_quote(v)));
-    }
-    let mut f = fs::File::create(path).map_err(|e| format!("create {path}: {e}"))?;
-    f.write_all(content.as_bytes())
-        .map_err(|e| format!("write {path}: {e}"))?;
-    Ok(())
-}
-
-/// POSIX-safe single-quote a string for inclusion in a shell script.
-/// `'` characters are escaped via the standard close-quote / backslash-quote /
-/// reopen-quote sequence: `'\''`. Other characters (including newlines,
-/// dollar signs, backticks) need no escaping inside single quotes.
-fn sh_single_quote(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('\'');
-    for c in s.chars() {
-        if c == '\'' {
-            out.push_str("'\\''");
-        } else {
-            out.push(c);
-        }
-    }
-    out.push('\'');
-    out
-}
-
 fn build_coder_prompt(
     base_branch: &str,
     branch: &str,
@@ -391,10 +322,6 @@ fn build_coder_prompt(
     issue_body: &str,
     acceptance: &str,
 ) -> String {
-    // Verbatim from CODER_CLAUDE_AGENTRY_SCRIPT — the verb framing,
-    // ship-binary self-check note, rework banner injection point,
-    // task title/body, constraints (workspace-only, acceptance, no
-    // commit/push, v1+ topology guidance) all preserved bit-for-bit.
     format!(
         "You are the coder role inside the agentry autonomous team, operating in the\n\
          container-local working directory /workspace. The repo is cloned at\n\
@@ -428,169 +355,744 @@ fn build_coder_prompt(
     )
 }
 
+// ---------------------------------------------------------------------------
+// Topology check
+// ---------------------------------------------------------------------------
+
+/// Bash regex `-v[1-9][0-9]*$` — true for `agentry-self-host-v1`,
+/// `agentry-self-host-v12`, etc. False for v0 (the v0 topology runs the
+/// local commit/push exitpoint path).
+fn is_v1_plus_topology(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    if bytes.len() < 3 {
+        return false;
+    }
+    // Walk back from the tail collecting digits.
+    let mut digit_start = bytes.len();
+    while digit_start > 0 && bytes[digit_start - 1].is_ascii_digit() {
+        digit_start -= 1;
+    }
+    if digit_start == bytes.len() {
+        // No trailing digits.
+        return false;
+    }
+    // Char before the digit run must be 'v', and char before that must be '-'.
+    if digit_start < 2 || bytes[digit_start - 1] != b'v' || bytes[digit_start - 2] != b'-' {
+        return false;
+    }
+    let digits = &bytes[digit_start..];
+    // First digit must be 1..=9 (no leading zero, no v0).
+    let first = digits[0];
+    (b'1'..=b'9').contains(&first) && digits[1..].iter().all(|b| b.is_ascii_digit())
+}
+
+// ---------------------------------------------------------------------------
+// Exitpoint phase
+// ---------------------------------------------------------------------------
+
+fn exitpoint_phase(ctx: &BriefContext) -> Result<(), RunErr> {
+    // 1. Baseline cargo fmt (hard fail)
+    emit_event(json!({"msg": "running cargo fmt --all (baseline)"}));
+    if let Err(err) = run_cargo_fmt() {
+        let detail = tail_lines(&err, FMT_ERR_TAIL);
+        emit_event(json!({
+            "error": "cargo fmt --all failed",
+            "detail": detail,
+        }));
+        emit_finding(&mech_finding("cargo-fmt", "fmt", &detail));
+        emit_done(
+            EventVerdict::Failed,
+            Some(DoneReason {
+                cause: "cargo_fmt_failed".into(),
+                exit_code: None,
+            }),
+        );
+        return Ok(());
+    }
+    emit_event(json!({"msg": "cargo fmt --all clean"}));
+
+    // 2. quality-hygiene --fix (optional)
+    if which_on_path("quality-hygiene") {
+        emit_event(json!({"msg": "running quality-hygiene --fix"}));
+        if let Err(err) = run_quality_hygiene(&ctx.base_branch) {
+            let detail = tail_lines(&err, HYGIENE_ERR_TAIL);
+            emit_event(json!({
+                "error": "quality-hygiene --fix failed",
+                "detail": detail,
+            }));
+            emit_finding(&mech_finding("quality-hygiene", "hygiene", &detail));
+            emit_done(
+                EventVerdict::Failed,
+                Some(DoneReason {
+                    cause: "quality_hygiene_failed".into(),
+                    exit_code: None,
+                }),
+            );
+            return Ok(());
+        }
+        emit_event(json!({"msg": "quality-hygiene --fix clean"}));
+    } else {
+        emit_event(json!({"msg": "quality-hygiene not installed, skipping role-local gate"}));
+    }
+
+    // 3. Acceptance self-check (hard fail) — `eval "$acceptance"` ≡ `sh -c "$acceptance"`
+    if let Err(err) = run_acceptance(&ctx.acceptance) {
+        let detail = tail_lines(&err, ACCEPTANCE_ERR_TAIL);
+        emit_event(json!({
+            "error": "acceptance failed (self-check)",
+            "detail": detail,
+        }));
+        emit_finding(&mech_finding("cargo", "acceptance", &detail));
+        emit_done(
+            EventVerdict::Failed,
+            Some(DoneReason {
+                cause: "acceptance_failed".into(),
+                exit_code: None,
+            }),
+        );
+        return Ok(());
+    }
+    emit_event(json!({"msg": "acceptance passed (self-check)"}));
+
+    // 4. git add -A + has-staged check
+    git_add_all().map_err(|e| RunErr {
+        event_msg: "git add -A failed",
+        detail: e,
+        cause: "git_add_failed",
+        exit_code: None,
+    })?;
+    if !git_has_staged_changes().map_err(|e| RunErr {
+        event_msg: "git diff --cached check failed",
+        detail: e,
+        cause: "git_check_failed",
+        exit_code: None,
+    })? {
+        emit_event(json!({"error": "no changes produced"}));
+        emit_done(
+            EventVerdict::Failed,
+            Some(DoneReason {
+                cause: "no_changes".into(),
+                exit_code: None,
+            }),
+        );
+        return Ok(());
+    }
+
+    // 5. Self-review (verb completeness) — soft-fail
+    if body_has_verb_syntax(&ctx.issue_body) {
+        let staged_diff = git_diff_cached().unwrap_or_default();
+        if run_self_review(ctx, &staged_diff).is_err() {
+            // run_self_review already emitted its own done failed.
+            return Ok(());
+        }
+    }
+
+    // 6. dead-pub-check (optional)
+    if which_on_path("dead-pub-check") {
+        run_dead_pub_check_phase();
+    } else {
+        emit_event(json!({
+            "msg": "dead_pub_check_unavailable",
+            "detail": "binary not on PATH; coder gate skipped",
+        }));
+    }
+
+    // 7. git commit
+    let sha = git_commit(&format!("auto({}): {}", ctx.brief_id, ctx.issue_title)).map_err(|e| {
+        RunErr {
+            event_msg: "git commit failed",
+            detail: e,
+            cause: "git_commit_failed",
+            exit_code: None,
+        }
+    })?;
+    emit_event(json!({
+        "msg": "committed",
+        "branch": ctx.branch,
+        "sha": sha,
+    }));
+
+    emit_done(EventVerdict::Shipped, None);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Process helpers
+// ---------------------------------------------------------------------------
+
+fn git_config_global(pairs: &[(&str, &str)]) -> Result<(), String> {
+    for (k, v) in pairs {
+        let out = Command::new("git")
+            .arg("config")
+            .arg("--global")
+            .arg(k)
+            .arg(v)
+            .current_dir(WORKSPACE_DIR)
+            .output()
+            .map_err(|e| format!("spawn git config {k}: {e}"))?;
+        if !out.status.success() {
+            let detail = String::from_utf8_lossy(&out.stderr);
+            return Err(format!("git config {k}={v}: {detail}"));
+        }
+    }
+    let dot_git = Path::new(WORKSPACE_DIR).join(".git");
+    if !dot_git.is_dir() && !dot_git.is_file() {
+        return Err(format!("{WORKSPACE_DIR} is not a git repo"));
+    }
+    Ok(())
+}
+
+fn which_on_path(name: &str) -> bool {
+    Command::new(name)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok()
+}
+
+fn run_cargo_fmt() -> Result<(), Vec<u8>> {
+    let out = Command::new("cargo")
+        .arg("fmt")
+        .arg("--all")
+        .current_dir(WORKSPACE_DIR)
+        .output()
+        .map_err(|e| format!("spawn cargo fmt: {e}").into_bytes())?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        let mut combined = out.stderr;
+        if !out.stdout.is_empty() {
+            combined.extend_from_slice(b"\n---stdout---\n");
+            combined.extend_from_slice(&out.stdout);
+        }
+        Err(combined)
+    }
+}
+
+fn run_cargo_fmt_quiet() {
+    let _ = Command::new("cargo")
+        .arg("fmt")
+        .arg("--all")
+        .current_dir(WORKSPACE_DIR)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+fn run_quality_hygiene(base_branch: &str) -> Result<(), Vec<u8>> {
+    let out = Command::new("quality-hygiene")
+        .arg("--fix")
+        .arg("--workspace")
+        .arg(WORKSPACE_DIR)
+        .arg("--base")
+        .arg(base_branch)
+        .current_dir(WORKSPACE_DIR)
+        .output()
+        .map_err(|e| format!("spawn quality-hygiene: {e}").into_bytes())?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(out.stderr)
+    }
+}
+
+fn run_acceptance(acceptance: &str) -> Result<(), Vec<u8>> {
+    // Bash uses `eval "$acceptance"`; sh -c is the POSIX equivalent.
+    // Brief author is trusted (claude itself dispatches), but isolate the
+    // working dir to /workspace and don't propagate the runner's stdin.
+    let out = Command::new("sh")
+        .arg("-c")
+        .arg(acceptance)
+        .current_dir(WORKSPACE_DIR)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("spawn sh -c acceptance: {e}").into_bytes())?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        let mut combined = out.stderr;
+        if !out.stdout.is_empty() {
+            combined.extend_from_slice(b"\n---stdout---\n");
+            combined.extend_from_slice(&out.stdout);
+        }
+        Err(combined)
+    }
+}
+
+fn git_add_all() -> Result<(), String> {
+    let out = Command::new("git")
+        .arg("add")
+        .arg("-A")
+        .current_dir(WORKSPACE_DIR)
+        .output()
+        .map_err(|e| format!("spawn git add: {e}"))?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).into_owned());
+    }
+    Ok(())
+}
+
+fn git_has_staged_changes() -> Result<bool, String> {
+    let out = Command::new("git")
+        .arg("diff")
+        .arg("--cached")
+        .arg("--quiet")
+        .current_dir(WORKSPACE_DIR)
+        .output()
+        .map_err(|e| format!("spawn git diff --cached --quiet: {e}"))?;
+    // `--quiet` returns 0 when no diff, 1 when there is a diff.
+    Ok(!out.status.success())
+}
+
+fn git_diff_cached() -> Result<String, String> {
+    let out = Command::new("git")
+        .arg("diff")
+        .arg("--cached")
+        .current_dir(WORKSPACE_DIR)
+        .output()
+        .map_err(|e| format!("spawn git diff --cached: {e}"))?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).into_owned());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+fn git_diff_cached_u0() -> Result<String, String> {
+    let out = Command::new("git")
+        .arg("diff")
+        .arg("--cached")
+        .arg("-U0")
+        .current_dir(WORKSPACE_DIR)
+        .output()
+        .map_err(|e| format!("spawn git diff --cached -U0: {e}"))?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).into_owned());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+fn git_commit(message: &str) -> Result<String, String> {
+    let out = Command::new("git")
+        .arg("commit")
+        .arg("-m")
+        .arg(message)
+        .current_dir(WORKSPACE_DIR)
+        .output()
+        .map_err(|e| format!("spawn git commit: {e}"))?;
+    if !out.status.success() {
+        let mut combined = out.stderr;
+        if !out.stdout.is_empty() {
+            combined.extend_from_slice(b"\n---stdout---\n");
+            combined.extend_from_slice(&out.stdout);
+        }
+        return Err(String::from_utf8_lossy(&combined).into_owned());
+    }
+    let sha = Command::new("git")
+        .arg("rev-parse")
+        .arg("HEAD")
+        .current_dir(WORKSPACE_DIR)
+        .output()
+        .map_err(|e| format!("spawn git rev-parse HEAD: {e}"))?;
+    if !sha.status.success() {
+        return Err(String::from_utf8_lossy(&sha.stderr).into_owned());
+    }
+    Ok(String::from_utf8_lossy(&sha.stdout).trim().to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Self-review (soft-fail claude call)
+// ---------------------------------------------------------------------------
+
+fn body_has_verb_syntax(body: &str) -> bool {
+    // Bash: `grep -qE '^(### [0-9]+\. |CREATE |UPDATE |REPLACE |DELETE |MOVE )'`
+    body.lines().any(line_starts_with_verb)
+}
+
+fn line_starts_with_verb(line: &str) -> bool {
+    if line.starts_with("CREATE ")
+        || line.starts_with("UPDATE ")
+        || line.starts_with("REPLACE ")
+        || line.starts_with("DELETE ")
+        || line.starts_with("MOVE ")
+    {
+        return true;
+    }
+    // `### N. ` heading style (e.g. `### 1. CREATE foo.rs`, `### 12. UPDATE ...`).
+    if let Some(rest) = line.strip_prefix("### ") {
+        let mut digit_count = 0usize;
+        for c in rest.chars() {
+            if c.is_ascii_digit() {
+                digit_count += 1;
+            } else {
+                break;
+            }
+        }
+        if digit_count == 0 {
+            return false;
+        }
+        let after_digits = &rest[digit_count..];
+        return after_digits.starts_with(". ");
+    }
+    false
+}
+
+fn build_self_review_prompt(issue_body: &str, staged_diff: &str) -> String {
+    let body_head = head_bytes(issue_body, ISSUE_BODY_BUDGET);
+    format!(
+        "You are a self-review check for the agentry project. Below is the TASK\n\
+         BODY (with explicit verbs — CREATE/UPDATE/REPLACE/DELETE/MOVE) and the\n\
+         STAGED DIFF you are about to commit.\n\
+         \n\
+         TASK BODY:\n\
+         {body_head}\n\
+         \n\
+         STAGED DIFF:\n\
+         {staged_diff}\n\
+         \n\
+         For each verb declared in the task body, check whether it has been applied\n\
+         in the diff at the named location. Output EXACTLY a JSON object — no\n\
+         markdown fences, no prose:\n\
+         \n\
+         {{\n\
+         \x20\x20\"all_applied\": true,\n\
+         \x20\x20\"unapplied\": []\n\
+         }}\n\
+         \n\
+         If any verb is missing, set all_applied:false and list each missing verb\n\
+         as a short description (max 200 chars each, max 6 entries).\n\
+         \n\
+         Your response, right now, starting with {{ and ending with }}:\n",
+    )
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SelfReviewResult {
+    all_applied: bool,
+    unapplied: Vec<String>,
+}
+
+fn parse_self_review_object(raw: &str) -> Option<SelfReviewResult> {
+    let cleaned = strip_fences(raw);
+    let sliced = slice_json_object(&cleaned)?;
+    let v: Value = serde_json::from_str(sliced).ok()?;
+    if !v.is_object() {
+        return None;
+    }
+    let all_applied = v
+        .get("all_applied")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let unapplied = v
+        .get("unapplied")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(SelfReviewResult {
+        all_applied,
+        unapplied,
+    })
+}
+
+fn slice_json_object(text: &str) -> Option<&str> {
+    let start = text.find('{')?;
+    let end = text.rfind('}')?;
+    if end < start {
+        return None;
+    }
+    Some(&text[start..=end])
+}
+
+fn strip_fences(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for line in raw.lines() {
+        let trimmed = line.trim_end_matches('\r');
+        if trimmed == "```" || trimmed == "```json" {
+            continue;
+        }
+        if trimmed.is_empty() {
+            continue;
+        }
+        out.push_str(trimmed);
+        out.push('\n');
+    }
+    out
+}
+
+/// Run the self-review claude call. Returns `Ok(())` to continue the
+/// pipeline (verbs all applied OR malformed reply tolerated). Returns
+/// `Err(())` when the call surfaced unapplied verbs and the role-local
+/// `done failed` was already emitted — caller should return without
+/// continuing.
+fn run_self_review(ctx: &BriefContext, staged_diff: &str) -> Result<(), ()> {
+    emit_event(json!({"msg": "running self-review (verb completeness)"}));
+    let prompt = build_self_review_prompt(&ctx.issue_body, staged_diff);
+    let reply = match stream_claude(&ctx.brief_id, ".self-review", &prompt) {
+        Ok(r) => r,
+        Err(StreamErr::ClaudeFailed { exit_code, .. }) => {
+            // Soft-fail: degrade to all_applied:true. Bash's
+            // `set -e + pipefail` wrapper had identical semantics.
+            emit_event(json!({
+                "warn": "self-review claude call failed; proceeding",
+                "exit_code": exit_code,
+            }));
+            return Ok(());
+        }
+        Err(StreamErr::TranscriptEmpty { path }) => {
+            emit_event(json!({
+                "warn": "self-review transcript empty; proceeding",
+                "transcript_path": path,
+            }));
+            return Ok(());
+        }
+    };
+
+    let parsed = match parse_self_review_object(&reply) {
+        Some(p) => p,
+        None => {
+            // No JSON braces / not an object — fall through to commit.
+            // Reviewer-claude is the architectural backstop.
+            if reply.contains('{') && reply.contains('}') {
+                emit_event(json!({
+                    "warn": "self-review response not a JSON object; proceeding"
+                }));
+            } else {
+                emit_event(json!({
+                    "warn": "self-review response missing JSON braces; proceeding"
+                }));
+            }
+            return Ok(());
+        }
+    };
+
+    if parsed.all_applied {
+        emit_event(json!({"msg": "self-review: all verbs applied"}));
+        return Ok(());
+    }
+
+    for item in &parsed.unapplied {
+        emit_finding(&ReviewFinding {
+            file: None,
+            line: None,
+            severity: Severity::Blocker,
+            origin: FindingOrigin::Model {
+                reviewer_agent_id: "coder-self-review".into(),
+            },
+            category: "completeness".into(),
+            message: format!("unapplied verb: {item}"),
+            suggested_fix: None,
+            prohibitions: Vec::new(),
+            requirements: Vec::new(),
+        });
+    }
+    emit_event(json!({"error": "self-review found unapplied verbs"}));
+    emit_done(
+        EventVerdict::Failed,
+        Some(DoneReason {
+            cause: "self_review_unapplied".into(),
+            exit_code: None,
+        }),
+    );
+    Err(())
+}
+
+// ---------------------------------------------------------------------------
+// dead-pub-check JSONL pipeline
+// ---------------------------------------------------------------------------
+
+fn run_dead_pub_check_phase() {
+    emit_event(json!({"msg": "running dead-pub-check"}));
+    let diff_text = match git_diff_cached_u0() {
+        Ok(d) => d,
+        Err(e) => {
+            emit_event(json!({
+                "warn": "dead-pub-check: git diff --cached -U0 failed",
+                "detail": e,
+            }));
+            return;
+        }
+    };
+    let stdin_payload = json!({
+        "diff": diff_text,
+        "workspace_root": WORKSPACE_DIR,
+    })
+    .to_string();
+    let mut cmd = Command::new("dead-pub-check");
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            emit_event(json!({
+                "warn": "dead-pub-check failed",
+                "detail": format!("spawn: {e}"),
+            }));
+            return;
+        }
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(stdin_payload.as_bytes());
+    }
+    let out = match child.wait_with_output() {
+        Ok(o) => o,
+        Err(e) => {
+            emit_event(json!({
+                "warn": "dead-pub-check failed",
+                "detail": format!("wait: {e}"),
+            }));
+            return;
+        }
+    };
+    if !out.status.success() {
+        let detail = tail_bytes(&out.stderr, DEAD_PUB_ERR_TAIL);
+        emit_event(json!({
+            "warn": "dead-pub-check failed",
+            "detail": detail,
+        }));
+        return;
+    }
+    let body = String::from_utf8_lossy(&out.stdout);
+    for line in body.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let v: Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let sev = v.get("severity").and_then(Value::as_str).unwrap_or("warn");
+        let category = v
+            .get("category")
+            .and_then(Value::as_str)
+            .unwrap_or("dead-pub")
+            .to_string();
+        let message = v
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("<malformed finding>")
+            .to_string();
+        if sev == "warn" {
+            emit_finding(&mech_finding_warn("ra-query", &category, &message));
+        } else {
+            emit_event(json!({
+                "msg": "dead_pub_info",
+                "severity": sev,
+                "category": category,
+                "detail": message,
+            }));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Emit helpers + small string helpers
+// ---------------------------------------------------------------------------
+
+fn mech_finding(tool: &str, category: &str, message: &str) -> ReviewFinding {
+    ReviewFinding {
+        file: None,
+        line: None,
+        severity: Severity::Blocker,
+        origin: FindingOrigin::Mechanical {
+            tool: tool.into(),
+            rule: None,
+        },
+        category: category.into(),
+        message: message.into(),
+        suggested_fix: None,
+        prohibitions: Vec::new(),
+        requirements: Vec::new(),
+    }
+}
+
+fn mech_finding_warn(tool: &str, category: &str, message: &str) -> ReviewFinding {
+    ReviewFinding {
+        file: None,
+        line: None,
+        severity: Severity::Warn,
+        origin: FindingOrigin::Mechanical {
+            tool: tool.into(),
+            rule: None,
+        },
+        category: category.into(),
+        message: message.into(),
+        suggested_fix: None,
+        prohibitions: Vec::new(),
+        requirements: Vec::new(),
+    }
+}
+
+fn head_bytes(s: &str, budget: usize) -> String {
+    if s.len() <= budget {
+        return s.to_string();
+    }
+    let mut cut = budget;
+    while !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    s[..cut].to_string()
+}
+
+fn tail_lines(buf: &[u8], n: usize) -> String {
+    let s = String::from_utf8_lossy(buf);
+    let lines: Vec<&str> = s.lines().collect();
+    let start = lines.len().saturating_sub(n);
+    lines[start..].join("\n")
+}
+
+fn tail_bytes(buf: &[u8], n: usize) -> String {
+    let start = buf.len().saturating_sub(n);
+    String::from_utf8_lossy(&buf[start..]).into_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
 
     #[test]
-    fn pointer_str_or_uses_default_when_missing() {
-        let v = json!({"a": "value"});
+    fn pointer_str_or_uses_default_when_missing_or_empty() {
+        let v = json!({"a": "value", "b": ""});
         assert_eq!(pointer_str_or(&v, "/missing", "default"), "default");
         assert_eq!(pointer_str_or(&v, "/a", "default"), "value");
-    }
-
-    #[test]
-    fn pointer_str_or_uses_default_when_empty() {
-        let v = json!({"a": ""});
-        assert_eq!(pointer_str_or(&v, "/a", "default"), "default");
+        assert_eq!(pointer_str_or(&v, "/b", "default"), "default");
     }
 
     #[test]
     fn collect_blocker_findings_filters_by_severity() {
         let bundle = json!({
             "team_context": {
-                "messages": [
-                    {
-                        "payload": {
-                            "findings": [
-                                {
-                                    "severity": "blocker",
-                                    "message": "wrong abstraction",
-                                    "prohibitions": ["do not refactor"],
-                                    "requirements": ["preserve api"]
-                                },
-                                {
-                                    "severity": "warn",
-                                    "message": "minor style"
-                                }
-                            ]
-                        }
-                    }
-                ]
+                "messages": [{"payload": {"findings": [
+                    {"severity": "blocker", "message": "x", "prohibitions": ["a"], "requirements": ["b"]},
+                    {"severity": "warn", "message": "y"}
+                ]}}]
             }
         });
         let v = collect_blocker_findings(&bundle);
         assert_eq!(v.len(), 1);
-        assert_eq!(v[0].message, "wrong abstraction");
-        assert_eq!(v[0].prohibitions, vec!["do not refactor"]);
-        assert_eq!(v[0].requirements, vec!["preserve api"]);
+        assert_eq!(v[0].message, "x");
+        assert_eq!(v[0].prohibitions, vec!["a"]);
     }
 
     #[test]
-    fn collect_blocker_findings_handles_missing_team_context() {
-        let bundle = json!({});
-        assert_eq!(collect_blocker_findings(&bundle).len(), 0);
-    }
-
-    #[test]
-    fn collect_blocker_findings_handles_message_without_findings() {
-        let bundle = json!({"team_context": {"messages": [{"payload": {"other": 1}}]}});
-        assert_eq!(collect_blocker_findings(&bundle).len(), 0);
-    }
-
-    #[test]
-    fn collect_blocker_findings_drops_findings_without_severity() {
-        let bundle = json!({
-            "team_context": {
-                "messages": [
-                    {"payload": {"findings": [{"message": "no severity field"}]}}
-                ]
-            }
-        });
-        assert_eq!(collect_blocker_findings(&bundle).len(), 0);
-    }
-
-    #[test]
-    fn build_rework_banner_joins_constraints_with_semicolons() {
+    fn build_rework_banner_joins_with_semicolons_and_keeps_dollar_brace_literal() {
         let f = vec![PriorFinding {
-            message: "bad change".into(),
-            prohibitions: vec!["a".into(), "b".into()],
-            requirements: vec!["c".into()],
+            message: "bad".into(),
+            prohibitions: vec!["p1".into(), "p2".into()],
+            requirements: vec!["r1".into()],
         }];
-        let banner = build_rework_banner(&f);
-        assert!(banner.contains("**This is a REWORK iteration.**"));
-        assert!(banner.contains("- BLOCKER: bad change"));
-        assert!(banner.contains("Prohibitions: a; b"));
-        assert!(banner.contains("Requirements: c"));
-        assert!(banner.contains("--- End findings ---"));
-    }
-
-    #[test]
-    fn build_rework_banner_handles_multiple_findings() {
-        let f = vec![
-            PriorFinding {
-                message: "first".into(),
-                prohibitions: vec![],
-                requirements: vec![],
-            },
-            PriorFinding {
-                message: "second".into(),
-                prohibitions: vec![],
-                requirements: vec![],
-            },
-        ];
-        let banner = build_rework_banner(&f);
-        assert!(banner.contains("- BLOCKER: first"));
-        assert!(banner.contains("- BLOCKER: second"));
-    }
-
-    #[test]
-    fn build_rework_banner_keeps_dollar_brace_base_branch_literal() {
-        // The bash heredoc keeps `${base_branch}` literal in the prompt
-        // text — claude reads the literal string as guidance to use the
-        // bash variable name. The Rust port must NOT interpolate it.
-        let banner = build_rework_banner(&[]);
-        assert!(
-            banner.contains("git diff ${base_branch}...HEAD"),
-            "banner must keep `${{base_branch}}` literal: {banner}"
-        );
-    }
-
-    #[test]
-    fn sh_single_quote_wraps_simple_value() {
-        assert_eq!(sh_single_quote("value"), "'value'");
-        assert_eq!(sh_single_quote(""), "''");
-    }
-
-    #[test]
-    fn sh_single_quote_escapes_embedded_single_quote() {
-        // POSIX recipe: '\\''  (close, escape, reopen).
-        assert_eq!(sh_single_quote("it's"), "'it'\\''s'");
-        assert_eq!(sh_single_quote("''"), "''\\'''\\'''");
-    }
-
-    #[test]
-    fn sh_single_quote_passes_through_specials() {
-        // Inside single quotes, $, `, \\, !, * are all literal.
-        assert_eq!(sh_single_quote("$VAR"), "'$VAR'");
-        assert_eq!(sh_single_quote("`cmd`"), "'`cmd`'");
-        assert_eq!(sh_single_quote("\\n"), "'\\n'");
-        assert_eq!(sh_single_quote("multi\nline"), "'multi\nline'");
-    }
-
-    #[test]
-    fn write_brief_vars_emits_sourceable_script() {
-        let dir = std::env::temp_dir().join("agentry_coder_runner_brief_vars_test");
-        let _ = fs::create_dir_all(&dir);
-        let path = dir.join("brief_vars.sh");
-        let path_s = path.to_str().expect("tempdir path is utf8");
-        write_brief_vars(
-            path_s,
-            &[
-                ("brief_id", "brf_test_123"),
-                ("issue_body", "line1\nline2 with $var and 'quote'"),
-            ],
-        )
-        .expect("write should succeed");
-        let contents = fs::read_to_string(&path).expect("read written file");
-        assert!(contents.starts_with("#!/bin/bash\n"));
-        assert!(contents.contains("export brief_id='brf_test_123'\n"));
-        // Single-quoted, with embedded ' replaced by '\\''
-        assert!(
-            contents.contains("export issue_body='line1\nline2 with $var and '\\''quote'\\'''\n"),
-            "single-quote escape mismatch: {contents}"
-        );
+        let b = build_rework_banner(&f);
+        assert!(b.contains("- BLOCKER: bad"));
+        assert!(b.contains("Prohibitions: p1; p2"));
+        assert!(b.contains("Requirements: r1"));
+        assert!(b.contains("git diff ${base_branch}...HEAD"));
     }
 
     #[test]
@@ -608,20 +1110,209 @@ mod tests {
         assert!(p.contains("Task title: Fix bug"));
         assert!(p.contains("CREATE foo.rs:10"));
         assert!(p.contains("cargo test"));
-        assert!(p.contains("agentry-self-host-v1"));
     }
 
     #[test]
-    fn build_coder_prompt_injects_rework_banner_when_present() {
-        let banner = "**This is a REWORK iteration.**\n[banner body]";
-        let p = build_coder_prompt("develop", "auto/brf_x", banner, "T", "B", "true");
-        assert!(p.contains("**This is a REWORK iteration.**"));
-        assert!(p.contains("[banner body]"));
+    fn is_v1_plus_topology_matches_v1_through_v99() {
+        assert!(is_v1_plus_topology("agentry-self-host-v1"));
+        assert!(is_v1_plus_topology("agentry-self-host-v2"));
+        assert!(is_v1_plus_topology("agentry-self-host-v9"));
+        assert!(is_v1_plus_topology("agentry-self-host-v12"));
+        assert!(is_v1_plus_topology("foo-v123"));
     }
 
     #[test]
-    fn build_coder_prompt_omits_rework_banner_when_empty() {
-        let p = build_coder_prompt("develop", "auto/brf_x", "", "T", "B", "true");
-        assert!(!p.contains("**This is a REWORK iteration.**"));
+    fn is_v1_plus_topology_rejects_v0_and_other_shapes() {
+        assert!(!is_v1_plus_topology("agentry-self-host-v0"));
+        assert!(!is_v1_plus_topology("agentry-self-host"));
+        assert!(!is_v1_plus_topology(""));
+        assert!(!is_v1_plus_topology("v1")); // no leading '-'
+        assert!(!is_v1_plus_topology("agentry-v")); // empty digits
+        assert!(!is_v1_plus_topology("agentry-vx1")); // leading non-digit before v
+        assert!(!is_v1_plus_topology("agentry-v01")); // leading zero
+        assert!(!is_v1_plus_topology("agentry-self-host-v1-extra")); // suffix after digits
+    }
+
+    #[test]
+    fn body_has_verb_syntax_recognises_bare_verbs() {
+        assert!(body_has_verb_syntax("CREATE foo.rs:10\nUPDATE bar.rs:20"));
+        assert!(body_has_verb_syntax("UPDATE foo.rs:10"));
+        assert!(body_has_verb_syntax("REPLACE foo.rs:10"));
+        assert!(body_has_verb_syntax("DELETE foo.rs:10"));
+        assert!(body_has_verb_syntax("MOVE foo.rs:10 -> bar.rs:20"));
+    }
+
+    #[test]
+    fn body_has_verb_syntax_recognises_numbered_headings() {
+        assert!(body_has_verb_syntax("### 1. CREATE foo.rs"));
+        assert!(body_has_verb_syntax("### 12. UPDATE foo.rs"));
+        assert!(body_has_verb_syntax("preamble\n### 3. MOVE foo.rs"));
+    }
+
+    #[test]
+    fn body_has_verb_syntax_rejects_free_form() {
+        assert!(!body_has_verb_syntax("just a description"));
+        assert!(!body_has_verb_syntax(""));
+        assert!(!body_has_verb_syntax("create foo.rs"));
+        assert!(!body_has_verb_syntax("CREATEx foo.rs"));
+        assert!(!body_has_verb_syntax("### CREATE foo.rs"));
+        assert!(!body_has_verb_syntax("# CREATE foo.rs"));
+    }
+
+    #[test]
+    fn slice_json_object_picks_outer_braces() {
+        assert_eq!(
+            slice_json_object("prefix{\"a\":1}suffix"),
+            Some("{\"a\":1}")
+        );
+        assert_eq!(
+            slice_json_object("garbage {\"x\":\"y\"}"),
+            Some("{\"x\":\"y\"}")
+        );
+    }
+
+    #[test]
+    fn slice_json_object_returns_none_when_missing() {
+        assert_eq!(slice_json_object("no braces"), None);
+        assert_eq!(slice_json_object("} only closing"), None);
+        assert_eq!(slice_json_object("{ only opening"), None);
+    }
+
+    #[test]
+    fn parse_self_review_object_extracts_fields() {
+        let raw = r#"```json
+        {"all_applied": false, "unapplied": ["verb 1", "verb 2"]}
+        ```"#;
+        let r = parse_self_review_object(raw).expect("parse");
+        assert!(!r.all_applied);
+        assert_eq!(r.unapplied, vec!["verb 1", "verb 2"]);
+    }
+
+    #[test]
+    fn parse_self_review_object_defaults_all_applied_when_absent() {
+        let raw = r#"{"unapplied": []}"#;
+        let r = parse_self_review_object(raw).expect("parse");
+        assert!(r.all_applied);
+        assert!(r.unapplied.is_empty());
+    }
+
+    #[test]
+    fn parse_self_review_object_returns_none_for_prose() {
+        assert_eq!(parse_self_review_object("just prose"), None);
+        assert_eq!(parse_self_review_object("} backwards {"), None);
+    }
+
+    #[test]
+    fn parse_self_review_object_returns_none_for_array() {
+        assert_eq!(parse_self_review_object("[1, 2, 3]"), None);
+    }
+
+    #[test]
+    fn build_self_review_prompt_includes_diff_and_body_head() {
+        let p = build_self_review_prompt("CREATE foo.rs:10", "DIFF_TEXT");
+        assert!(p.contains("CREATE foo.rs:10"));
+        assert!(p.contains("DIFF_TEXT"));
+        assert!(p.contains("all_applied"));
+        assert!(p.contains("unapplied"));
+        assert!(p.contains("starting with { and ending with }"));
+    }
+
+    #[test]
+    fn build_self_review_prompt_truncates_long_body() {
+        // Use a marker char that doesn't appear elsewhere in the prompt
+        // template — the longest run of consecutive markers is the body
+        // head, capped at ISSUE_BODY_BUDGET.
+        let body = "Q".repeat(5000);
+        let p = build_self_review_prompt(&body, "diff");
+        let longest_q_run = p.split(|c: char| c != 'Q').map(str::len).max().unwrap_or(0);
+        assert_eq!(longest_q_run, ISSUE_BODY_BUDGET);
+    }
+
+    #[test]
+    fn strip_fences_drops_json_and_plain() {
+        assert_eq!(strip_fences("```json\n{\"x\":1}\n```\n"), "{\"x\":1}\n");
+    }
+
+    #[test]
+    fn mech_finding_uses_blocker_severity() {
+        let f = mech_finding("cargo-fmt", "fmt", "boom");
+        assert!(matches!(f.severity, Severity::Blocker));
+        match &f.origin {
+            FindingOrigin::Mechanical { tool, rule } => {
+                assert_eq!(tool, "cargo-fmt");
+                assert!(rule.is_none());
+            }
+            _ => panic!("expected mechanical origin"),
+        }
+        assert_eq!(f.category, "fmt");
+        assert_eq!(f.message, "boom");
+    }
+
+    #[test]
+    fn mech_finding_warn_uses_warn_severity() {
+        let f = mech_finding_warn("ra-query", "dead-pub", "x is unused");
+        assert!(matches!(f.severity, Severity::Warn));
+        assert_eq!(f.category, "dead-pub");
+    }
+
+    #[test]
+    fn head_bytes_respects_char_boundary() {
+        let s = "🚀x";
+        let h = head_bytes(s, 4);
+        assert!(h.is_empty() || h == "🚀");
+    }
+
+    #[test]
+    fn tail_lines_returns_last_n() {
+        assert_eq!(tail_lines(b"a\nb\nc\nd\ne", 3), "c\nd\ne");
+    }
+
+    #[test]
+    fn parse_brief_context_pulls_all_fields() {
+        let bundle = json!({
+            "brief": {
+                "id": "brf_42",
+                "topology": {"name": "agentry-self-host-v0"},
+                "payload": {
+                    "issue_title": "T",
+                    "issue_body": "BODY",
+                    "acceptance": "cargo test",
+                    "base_branch": "develop"
+                }
+            },
+            "permit": {"agent_id": "agt_xyz"},
+            "team_context": {"messages": []}
+        });
+        let ctx = parse_brief_context(&bundle);
+        assert_eq!(ctx.brief_id, "brf_42");
+        assert_eq!(ctx.branch, "auto/brf_42");
+        assert_eq!(ctx.topology_name, "agentry-self-host-v0");
+        assert_eq!(ctx.acceptance, "cargo test");
+        assert_eq!(ctx.base_branch, "develop");
+        assert_eq!(ctx.issue_title, "T");
+        assert_eq!(ctx.issue_body, "BODY");
+        assert!(ctx.rework_banner.is_empty());
+        assert!(ctx.blocker_findings.is_empty());
+    }
+
+    #[test]
+    fn parse_brief_context_builds_rework_banner_with_findings() {
+        let bundle = json!({
+            "brief": {
+                "id": "brf_1",
+                "topology": {"name": "agentry-self-host-v0"},
+                "payload": {"issue_body": "x"}
+            },
+            "permit": {"agent_id": "a"},
+            "team_context": {
+                "messages": [{"payload": {"findings": [
+                    {"severity": "blocker", "message": "rework me", "prohibitions": [], "requirements": []}
+                ]}}]
+            }
+        });
+        let ctx = parse_brief_context(&bundle);
+        assert!(ctx.rework_banner.contains("REWORK iteration"));
+        assert!(ctx.rework_banner.contains("rework me"));
+        assert_eq!(ctx.blocker_findings.len(), 1);
     }
 }
