@@ -710,229 +710,13 @@ else
 fi
 "##;
 
-/// LLM reviewer role for the `agentry-self-host-v0` team. Reads the diff
-/// produced by the coder, prompts claude -p for a JSON array of findings,
-/// emits each as a Finding event, and resolves rework_needed if any Blocker
-/// is present. Currently executed after the mechanical reviewer by the
-/// sequential scheduler; message_graph is parallel-capable (issue #13
-/// will enable parallel execution).
-const REVIEWER_CLAUDE_AGENTRY_SCRIPT: &str = r####"#!/usr/bin/env bash
-set -euo pipefail
-bundle="$(cat)"
-
-brief_id=$(jq -r '.brief.id' <<<"$bundle")
-base_branch=$(jq -r '.brief.payload.base_branch // "develop"' <<<"$bundle")
-issue_title=$(jq -r '.brief.payload.issue_title // ""' <<<"$bundle")
-issue_body=$(jq -r '.brief.payload.issue_body // ""' <<<"$bundle")
-agent_id=$(jq -r '.permit.agent_id' <<<"$bundle")
-
-if [ ! -d /workspace/.git ] && [ ! -f /workspace/.git ]; then
-    emit_event '{"error":"workspace is not a git repo — coder did not produce it"}'
-    emit_done "failed"; exit 0
-fi
-
-mkdir -p /root/.claude
-export HOME=/root
-cd /workspace
-
-# Diff against develop. The coder produces commits on top of origin/develop;
-# we review what was ADDED, not the whole file set.
-if ! git diff "${base_branch}...HEAD" > /tmp/diff.patch 2>/tmp/diff.err; then
-    err=$(tail -20 /tmp/diff.err)
-    emit_event "$(jq -nc --arg err "$err" '{error:"git diff failed",detail:$err}')"
-    emit_done "failed"; exit 0
-fi
-
-diff_bytes=$(wc -c < /tmp/diff.patch)
-if [ "$diff_bytes" -eq 0 ]; then
-    emit_event '{"error":"empty diff — coder produced no changes"}'
-    emit_done "failed"; exit 0
-fi
-
-emit_event "$(jq -nc --argjson b "$diff_bytes" '{msg:"reviewing diff",diff_bytes:$b}')"
-
-# Mechanical pre-pass: when the host-built ra-query binary is bind-mounted
-# in, walk the .rs files touched by the diff and aggregate ra-query findings
-# into a panel. The reviewer prompt receives a short summary so the LLM has
-# anchor points for unwraps + complexity hot-spots without having to
-# re-derive them from raw source. Tolerate a missing binary — operators may
-# not have run `just ra-query-binary` yet.
-panel_summary=""
-if command -v ra-query >/dev/null 2>&1; then
-    changed_files=$(grep -E '^\+\+\+ b/.*\.rs$' /tmp/diff.patch | sed 's|^\+\+\+ b/||' || true)
-    panel='[]'
-    while IFS= read -r f; do
-        [ -z "$f" ] && continue
-        [ -f "/workspace/$f" ] || continue
-        u=$(ra-query unwraps "/workspace/$f" --severity high --format json 2>/dev/null || echo '{"functions":[]}')
-        c=$(ra-query complexity "/workspace/$f" --threshold 15 --format json 2>/dev/null || echo '{"functions":[]}')
-        panel=$(jq --argjson u "$u" --argjson c "$c" --arg f "$f" '. + [{file:$f, unwraps:$u, complexity:$c}]' <<<"$panel")
-    done <<< "$changed_files"
-    panel_tail=$(jq -c . <<<"$panel" | tail -c 8192)
-    emit_event "$(jq -nc --arg out "$panel_tail" '{msg:"ra_query_review_panel",findings_json_tail:$out}')"
-    panel_summary=$(jq -r '[.[] | select(((.unwraps.summary.total // 0) + (.complexity.summary.total // 0)) > 0) | "\(.file): unwraps=\((.unwraps.summary.total // 0)) complexity_hot=\((.complexity.summary.total // 0))"] | join("\n")' <<<"$panel" 2>/dev/null | head -c 512)
-else
-    emit_event '{"msg":"ra_query_unavailable","detail":"skipping reviewer pre-pass"}'
-fi
-
-# Review prompt. The output format is strict so downstream parsing is
-# deterministic. Any prose (fences, explanations) breaks the jq parse and
-# the script resolves the role as Failed — signaling prompt drift.
-cat > /tmp/rev_prompt.txt <<PROMPT
-You are a senior code reviewer for the agentry project — a Rust workspace
-that orchestrates short-lived agent containers. Review the following diff
-produced against branch "${base_branch}" in response to this task:
-
-TITLE: ${issue_title}
-
-BODY (first 2000 chars):
-$(printf '%s' "$issue_body" | head -c 2000)
-
---- DIFF ---
-$(cat /tmp/diff.patch)
---- END DIFF ---
-PROMPT
-
-if [ -n "$panel_summary" ]; then
-    cat >> /tmp/rev_prompt.txt <<EOM
-
---- Mechanical findings from ra-query (unwraps>=high, complexity>=15) ---
-${panel_summary}
---- End mechanical findings ---
-EOM
-fi
-
-cat >> /tmp/rev_prompt.txt <<PROMPT
-
-Output EXACTLY a JSON array of findings — nothing else. No markdown fences,
-no prose, no preamble, no explanation. Each element:
-
-{
-  "severity": "blocker" | "warn",
-  "category": "design" | "naming" | "clarity" | "invariant" | "other",
-  "message": "one-sentence human-readable description (max 200 chars)",
-  "prohibitions": ["..."],   // for blockers, what the rework must NOT do
-  "requirements": ["..."]    // for blockers, what the rework MUST do
-}
-
-Guidance:
-- \`blocker\` = ships-broken, security-risk, invariant-violation, wrong abstraction.
-- \`warn\` = minor cleanup, non-load-bearing style.
-- If the diff is acceptable as-is, output exactly: []
-- Maximum 6 findings. Prefer a single Blocker over many Warns.
-- Do not comment on fmt/clippy/test — those are mechanical-reviewer scope.
-- For each Blocker, populate \`prohibitions\` (things the next coder pass
-  MUST NOT do) and \`requirements\` (things the next coder pass MUST do).
-  These anchor the rework so the coder does not solve the wrong problem.
-- For Warns, both arrays SHOULD be empty — a warn is informational, not
-  a rework constraint.
-
-Scope guardrail (CRITICAL):
-- ONLY flag changes INSIDE the DIFF. Pre-existing inconsistencies in the
-  repo that the diff did not touch are OUT of scope for blocker-level
-  findings.
-- If you notice a pre-existing concern adjacent to the diff, you MAY emit
-  at most ONE warn-level finding with category "scope" describing it, so
-  it is on-record for a follow-up brief — but NEVER emit a blocker for
-  something the diff did not change.
-- The unit of review is "did THIS diff ship broken/unsafe/wrong?", not
-  "is the whole repo now consistent?".
-
-Verb-completeness check (CRITICAL):
-- The TASK BODY above may contain explicit verbs: CREATE, UPDATE, REPLACE,
-  DELETE, MOVE — usually headed as "### N. <VERB> <file:line>" or the bare
-  form "<VERB> <file:line>".
-- For EACH such verb in the body, verify the diff contains the corresponding
-  change at the named location (file path and approximate area).
-- An unapplied verb is a blocker with category "invariant" and message
-  "unapplied verb: <short description of what was missed>".
-- If the body contains no verb syntax (legacy free-form brief), skip this
-  check and apply only the design/naming/clarity/invariant guidance above.
-- Applied-but-incomplete counts as unapplied (e.g. the verb asked to change
-  three sites and only two were touched — the remaining one is unapplied).
-
-Role-spec audit (CRITICAL):
-- If the diff adds or modifies an \`AgentRole\` (i.e. introduces a \`RoleName(...)\` registration in seed.rs or changes the fields of an existing one), verify each of:
-  (a) \`permit_scope\` is minimal for the stated job — no fs:write outside the workspace, no net access unless justified, no git tools on roles that do not ship code.
-  (b) \`tool_allowlist\` matches what the role's entrypoint actually does (a read-only role must not be allowed to write arbitrary streams).
-  (c) the deny-list is explicit for the categories of tool the role does not need.
-  (d) any \`binaries\` or \`mcp_servers\` named are justified by the role's job.
-- Mismatches are blockers with category "invariant" and a message starting with "role-spec audit:".
-- This complements (does not replace) the scope-guardrail and verb-completeness checks above.
-
-Bootstrap-command audit (CRITICAL):
-- If the diff modifies any role's \`extra_bootstrap\` shell strings, verify each shell command:
-  (a) \`cargo install --git URL --bin <name>\` is rejected when the target is a workspace with multiple binaries — must use positional package name (e.g. \`cfdb-cli\`, \`application\`) or \`--package\`.
-  (b) Bootstrap commands that may transiently fail must end with \`|| true\` for fault tolerance, matching the existing \`reviewer-mechanical-agentry\` quality-hygiene install pattern.
-  Mismatch is a blocker with category "invariant".
-
-Daemon-lifecycle ordering (CRITICAL):
-- If the diff modifies the daemon's \`handle_brief\` shipping flow (workspace teardown, chain-trigger, terminal-handler), verify the ORDER:
-  chain-trigger MUST read \`next_brief_refs\` and submit children to Redis BEFORE workspace destruction.
-  Reason: planner-emitted child JSONs live IN the workspace; destroyed-before-read = lost children.
-  Wrong order is a blocker with category "invariant".
-
-State-machine emission idempotency (CRITICAL):
-- If the diff adds or modifies a state-machine compose/finalize function (DOL \`compose_meta_verdict\`, future composers in recursive sub-planning, etc.), verify exactly-once semantics:
-  guard the emission with SETNX on a Redis marker key, OR a Redis transaction, OR an equivalent atomic check.
-  Concurrent terminal handlers can re-enter; without the gate, duplicate verdicts will fire (observed in A7v3: 3× duplicate failed-verdicts for one meta-brief).
-  Missing idempotency gate is a blocker with category "invariant".
-
-Your response, right now, starting with [ and ending with ]:
-PROMPT
-
-stream_claude response ".reviewer" "$(cat /tmp/rev_prompt.txt)"
-
-# Tolerate (and strip) leading/trailing fences if claude adds them despite
-# the instruction — common drift pattern.
-cleaned=$(printf '%s' "$response" | sed -e 's/^```json$//' -e 's/^```$//' -e '/^$/d' | tr -d '\r')
-# Find first [ and last ] — slice.
-start=$(printf '%s' "$cleaned" | grep -b -m1 '\[' | head -1 | cut -d: -f1)
-end=$(printf '%s' "$cleaned" | grep -bo '\]' | tail -1 | cut -d: -f1)
-if [ -z "$start" ] || [ -z "$end" ]; then
-    emit_event "$(jq -nc --arg r "$(printf '%s' "$cleaned" | head -c 300)" '{error:"claude response missing JSON array brackets",head:$r}')"
-    # Salvage: prose-only reply (no JSON brackets at all). Wrap as a single
-    # format_deviation finding so the LLM's reasoning reaches the verdict trail.
-    salvaged_msg=$(printf '%s' "$cleaned" | head -c 4096)
-    payload=$(jq -nc --arg m "$salvaged_msg" '[{file:null,line:null,severity:"error",origin:{kind:"model"},category:"format_deviation",message:$m,suggested_fix:null,prohibitions:[],requirements:[]}]')
-    emit_event "$(jq -nc --arg m "$salvaged_msg" '{msg:"reviewer prose-reply salvaged as format_deviation",bytes:($m|length)}')"
-else
-    payload=$(printf '%s' "$cleaned" | tail -c +$((start+1)) | head -c $((end-start+1)))
-
-    if ! printf '%s' "$payload" | jq -e 'type == "array"' >/dev/null 2>&1; then
-        emit_event "$(jq -nc --arg r "$(printf '%s' "$payload" | head -c 300)" '{error:"claude response not a JSON array",head:$r}')"
-        salvaged_msg=$(printf '%s' "$payload" | head -c 4096)
-        payload=$(jq -nc --arg m "$salvaged_msg" '[{file:null,line:null,severity:"error",origin:{kind:"model"},category:"format_deviation",message:$m,suggested_fix:null,prohibitions:[],requirements:[]}]')
-        emit_event "$(jq -nc --arg m "$salvaged_msg" '{msg:"reviewer prose-reply salvaged as format_deviation",bytes:($m|length)}')"
-    fi
-fi
-
-count=$(printf '%s' "$payload" | jq 'length')
-emit_event "$(jq -nc --argjson n "$count" '{msg:"claude review parsed",findings_count:$n}')"
-
-# Emit each finding as a Finding event. A file marker captures whether any
-# Blocker was seen, since a while-read piped subshell can't set outer vars.
-rm -f /tmp/has_blocker.marker
-printf '%s' "$payload" | jq -c '.[]' | while read -r finding; do
-    severity=$(jq -r '.severity // "warn"' <<<"$finding")
-    category=$(jq -r '.category // "other"' <<<"$finding")
-    message=$(jq -r '.message // ""' <<<"$finding")
-    prohibitions=$(jq -c '[.prohibitions[]?]' <<<"$finding")
-    requirements=$(jq -c '[.requirements[]?]' <<<"$finding")
-    emit_finding_model "$severity" "$agent_id" "$category" "$message" "$prohibitions" "$requirements"
-    if [ "$severity" = "blocker" ]; then
-        touch /tmp/has_blocker.marker
-    fi
-done
-
-if [ -f /tmp/has_blocker.marker ]; then
-    emit_event '{"msg":"blockers present — requesting rework"}'
-    emit_done "rework_needed"
-else
-    emit_event '{"msg":"no blockers — claude-reviewer passes"}'
-    emit_done "shipped"
-fi
-"####;
+// EPIC #161 Wave 1.4: REVIEWER_CLAUDE_AGENTRY_SCRIPT bash heredoc that used
+// to live here has been ported to a Rust runner —
+// `crates/agentry-role-runtime/src/bin/reviewer_claude_runner.rs`. The role's
+// entrypoint_script now just `exec /usr/local/bin/reviewer-claude-runner`.
+// The runner has its own unit-test coverage for diff parsing, fence
+// stripping, JSON salvage, severity mapping, and assistant-text reconstruction
+// from claude stream-json transcripts.
 
 /// Shipper role for the `agentry-self-host-v0` team. Pushes the branch
 /// already committed in the brief's workspace (by the coder) and opens a
@@ -1594,7 +1378,13 @@ fn build_reviewer_claude_agentry_role(home: &str, claude_settings_path: &str) ->
         image: "docker.io/library/debian:bookworm-slim".into(),
         substrate_class: SubstrateClass::Podman,
         package_manager: PackageManager::Apt,
-        entrypoint_script: format!("{BASH_PRELUDE}{REVIEWER_CLAUDE_AGENTRY_SCRIPT}"),
+        // Bootstrap glue only: exec the bind-mounted Rust runner. Workspace
+        // diff capture, optional ra-query pre-pass, claude streaming, and
+        // finding emission live in the binary
+        // (`crates/agentry-role-runtime/src/bin/reviewer_claude_runner.rs`).
+        // EPIC #161 Wave 1.4 — replaces `BASH_PRELUDE +
+        // REVIEWER_CLAUDE_AGENTRY_SCRIPT`.
+        entrypoint_script: "#!/bin/sh\nexec /usr/local/bin/reviewer-claude-runner\n".into(),
         exitpoint_script: None,
         // git for diff; no rust toolchain — LLM reviewer does no compilation.
         binaries: vec!["git".into(), "ca-certificates".into()],
@@ -1631,6 +1421,11 @@ fn build_reviewer_claude_agentry_role(home: &str, claude_settings_path: &str) ->
             Mount {
                 source: format!("{home}/.local/bin/ra-query"),
                 target: "/usr/local/bin/ra-query".into(),
+                readonly: true,
+            },
+            Mount {
+                source: format!("{home}/.local/bin/reviewer-claude-runner"),
+                target: "/usr/local/bin/reviewer-claude-runner".into(),
                 readonly: true,
             },
         ],
@@ -3213,80 +3008,47 @@ mod tests {
         );
     }
 
-    #[test]
-    fn reviewer_claude_prompt_includes_role_spec_audit_clause() {
-        assert!(
-            REVIEWER_CLAUDE_AGENTRY_SCRIPT.contains("Role-spec audit (CRITICAL)"),
-            "reviewer-claude prompt must include the Role-spec audit critical clause"
-        );
-        assert!(
-            REVIEWER_CLAUDE_AGENTRY_SCRIPT.contains("permit_scope"),
-            "Role-spec audit clause must reference permit_scope"
-        );
-        assert!(
-            REVIEWER_CLAUDE_AGENTRY_SCRIPT.contains("tool_allowlist"),
-            "Role-spec audit clause must reference tool_allowlist"
-        );
-    }
+    // EPIC #161 Wave 1.4 — reviewer-claude prompt content (CRITICAL audit
+    // clauses, salvage path, ra-query pre-pass) moved into the runner binary
+    // at `crates/agentry-role-runtime/src/bin/reviewer_claude_runner.rs`.
+    // Per-clause assertions live next to `build_review_prompt` and
+    // `parse_findings` in that file's `mod tests`. The seed tests here now
+    // only assert role-spec wiring (entrypoint, bind-mounts, permit_scope).
 
     #[test]
-    fn reviewer_claude_prompt_includes_bootstrap_command_audit_clause() {
-        assert!(
-            REVIEWER_CLAUDE_AGENTRY_SCRIPT.contains("Bootstrap-command audit (CRITICAL)"),
-            "reviewer-claude prompt must include the Bootstrap-command audit critical clause"
+    fn reviewer_claude_role_entrypoint_invokes_runner() {
+        let role = build_reviewer_claude_agentry_role(
+            "/var/home/test",
+            "/var/home/test/.config/agentry/claude-container-settings.json",
         );
-    }
-
-    #[test]
-    fn reviewer_claude_prompt_includes_daemon_lifecycle_ordering_clause() {
         assert!(
-            REVIEWER_CLAUDE_AGENTRY_SCRIPT.contains("Daemon-lifecycle ordering (CRITICAL)"),
-            "reviewer-claude prompt must include the Daemon-lifecycle ordering critical clause"
+            role.entrypoint_script
+                .contains("exec /usr/local/bin/reviewer-claude-runner"),
+            "reviewer-claude entrypoint must exec the runner: {}",
+            role.entrypoint_script
         );
-    }
-
-    #[test]
-    fn reviewer_claude_prompt_includes_state_machine_emission_idempotency_clause() {
-        assert!(
-            REVIEWER_CLAUDE_AGENTRY_SCRIPT.contains("State-machine emission idempotency (CRITICAL)"),
-            "reviewer-claude prompt must include the State-machine emission idempotency critical clause"
-        );
-    }
-
-    #[test]
-    fn reviewer_script_salvages_missing_brackets() {
-        assert!(
-            REVIEWER_CLAUDE_AGENTRY_SCRIPT
-                .contains("reviewer prose-reply salvaged as format_deviation"),
-            "reviewer-claude script must salvage prose replies as format_deviation findings"
-        );
-    }
-
-    #[test]
-    fn reviewer_script_emits_format_deviation_finding() {
-        assert!(
-            REVIEWER_CLAUDE_AGENTRY_SCRIPT.contains("category:\"format_deviation\""),
-            "reviewer-claude script must synthesize a finding with category format_deviation"
-        );
-    }
-
-    #[test]
-    fn reviewer_script_no_failed_emit_on_format_deviation() {
-        let s = REVIEWER_CLAUDE_AGENTRY_SCRIPT;
-        for marker in [
-            "claude response not a JSON array",
-            "claude response missing JSON array brackets",
-        ] {
-            let after = s
-                .split_once(marker)
-                .unwrap_or_else(|| panic!("marker {marker:?} must appear in reviewer script"))
-                .1;
-            let window = &after[..after.len().min(500)];
+        // Defensive: no bash heredoc carryover from the pre-port script.
+        for forbidden in ["set -euo pipefail", "stream_claude", "emit_event"] {
             assert!(
-                !window.contains("emit_done \"failed\""),
-                "reviewer salvage path after {marker:?} must not emit_done \"failed\"; window was: {window}"
+                !role.entrypoint_script.contains(forbidden),
+                "entrypoint must not contain {} (legacy bash leftover)",
+                forbidden
             );
         }
+    }
+
+    #[test]
+    fn reviewer_claude_role_bind_mounts_runner_binary() {
+        let role = build_reviewer_claude_agentry_role(
+            "/var/home/test",
+            "/var/home/test/.config/agentry/claude-container-settings.json",
+        );
+        assert!(
+            role.mounts
+                .iter()
+                .any(|m| m.target == "/usr/local/bin/reviewer-claude-runner" && m.readonly),
+            "reviewer-claude must bind-mount the runner read-only at /usr/local/bin/reviewer-claude-runner"
+        );
     }
 
     #[test]
@@ -3317,48 +3079,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn reviewer_script_runs_ra_query_pre_pass() {
-        let s = REVIEWER_CLAUDE_AGENTRY_SCRIPT;
-        assert!(
-            s.contains("ra-query unwraps"),
-            "reviewer pre-pass must invoke ra-query unwraps"
-        );
-        assert!(
-            s.contains("ra-query complexity"),
-            "reviewer pre-pass must invoke ra-query complexity"
-        );
-        assert!(
-            s.contains("ra_query_review_panel"),
-            "reviewer pre-pass must emit ra_query_review_panel event"
-        );
-    }
-
-    #[test]
-    fn reviewer_script_tolerates_missing_ra_query() {
-        let s = REVIEWER_CLAUDE_AGENTRY_SCRIPT;
-        assert!(
-            s.contains("command -v ra-query"),
-            "reviewer pre-pass must guard ra-query with command -v"
-        );
-        assert!(
-            s.contains("ra_query_unavailable"),
-            "reviewer pre-pass must emit ra_query_unavailable when binary is missing"
-        );
-    }
-
-    #[test]
-    fn reviewer_script_injects_panel_summary_into_prompt() {
-        let s = REVIEWER_CLAUDE_AGENTRY_SCRIPT;
-        assert!(
-            s.contains("Mechanical findings from ra-query"),
-            "reviewer prompt must include the mechanical-findings header"
-        );
-        assert!(
-            s.contains("--- End mechanical findings ---"),
-            "reviewer prompt must include the mechanical-findings footer"
-        );
-    }
+    // EPIC #161 Wave 1.4 — ra-query pre-pass behaviour, prompt summary
+    // injection, and missing-binary tolerance assertions live next to their
+    // implementation in the runner binary's `mod tests`.
 
     #[test]
     fn null_agent_agentry_role_uses_rust_binary() {
@@ -3447,13 +3170,14 @@ mod tests {
         // so the streaming + pipefail guard is uniform. Self-review is the
         // one exception (intentional soft-fail; uses inline pipeline that
         // mirrors stream_claude's guard).
+        // EPIC #161 Wave 1.4 — REVIEWER_CLAUDE_AGENTRY_SCRIPT was deleted
+        // and the role's claude invocation now lives in
+        // `crates/agentry-role-runtime/src/bin/reviewer_claude_runner.rs`,
+        // which uses `stream_claude` natively in Rust. The remaining bash
+        // scripts must continue to use the bash `stream_claude` helper.
         for (name, s) in [
             ("CLAUDE_SCRIPT", CLAUDE_SCRIPT),
             ("CODER_CLAUDE_AGENTRY_SCRIPT", CODER_CLAUDE_AGENTRY_SCRIPT),
-            (
-                "REVIEWER_CLAUDE_AGENTRY_SCRIPT",
-                REVIEWER_CLAUDE_AGENTRY_SCRIPT,
-            ),
             (
                 "ARCHAEOLOGIST_CLAUDE_AGENTRY_SCRIPT",
                 ARCHAEOLOGIST_CLAUDE_AGENTRY_SCRIPT,

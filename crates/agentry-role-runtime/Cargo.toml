@@ -24,6 +24,13 @@ path = "src/bin/null_agent.rs"
 name = "ac-verifier-runner"
 path = "src/bin/ac_verifier_runner.rs"
 
+# reviewer-claude-runner: workspace-prep + claude streaming + finding emission
+# for the reviewer-claude-agentry role. Ports REVIEWER_CLAUDE_AGENTRY_SCRIPT
+# (~220 LoC bash) to Rust under EPIC #161 Wave 1.4.
+[[bin]]
+name = "reviewer-claude-runner"
+path = "src/bin/reviewer_claude_runner.rs"
+
 [dependencies]
 orchestrator-types = { path = "../orchestrator-types" }
 serde.workspace = true
