@@ -75,6 +75,19 @@ Do not invent new primitives, add new crates, or re-open deferred features. If t
 - Brief payloads use verbs `CREATE / DELETE / REPLACE / UPDATE / MOVE` + `crate:file:line` targets. Free-form "fix this issue" briefs are forbidden.
 - See `docs/dogfood-protocol.md` for the example payload shape and the dispatch recipe.
 
+## Seeding roles
+
+`orchestrator seed` loads roles from two sources and writes them to the registry:
+
+1. The Rust-defined defaults compiled into `crates/orchestrator-runtime/src/seed.rs`.
+2. Any `*.json` files in `seed/roles/` at the workspace root (override the directory with `AGENTRY_SEED_ROLES_DIR=<path> orchestrator seed`).
+
+JSON role files use the same `AgentRole` struct schema as the Rust definitions; `serde(deny_unknown_fields)` rejects typos. `~/` and `${HOME}` in any `Mount.source` are expanded against the substrate's `$HOME` at seed time (see issue #199 for context).
+
+Inspect or pre-validate role definitions with `orchestrator role list / show / validate`; the equivalent for workflows is `orchestrator team list / show / register / validate`.
+
+Operator note: re-running `orchestrator seed` after editing a JSON file is idempotent (last-writer-wins via `save_role`) and required for the daemon to pick up the change.
+
 ## Known limitations (current develop)
 
 - **Single-daemon.** `orchestratord` uses `XREAD BLOCK $` — no consumer groups. Running two daemon processes against the same Redis double-processes every brief. Issue #13 introduces concurrent brief execution; multi-daemon consumer groups are a later step.
