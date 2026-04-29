@@ -706,6 +706,7 @@ fn parse_edge(line: &str) -> Option<MessageEdge> {
         from: parse_role_ref(from),
         to: parse_role_ref(to),
         permit_overrides_from: overrides,
+        rework_target: None,
     })
 }
 

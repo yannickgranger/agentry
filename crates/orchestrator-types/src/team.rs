@@ -34,6 +34,15 @@ pub struct MessageEdge {
     /// coder's permit narrows accordingly.
     #[serde(default)]
     pub permit_overrides_from: Option<String>,
+    /// When this edge's `to` role emits a `ReworkNeeded` verdict, route the
+    /// rework back to this role instead of the immediate upstream (`from`).
+    /// Default: `None` (daemon falls back to single-upstream rework — the
+    /// current behavior). Used in self-host workflows to make the coder the
+    /// rework target for code-level rejections at any downstream role.
+    /// Brief 191b makes the daemon actually consume this; 191a only ships
+    /// the vocabulary and validation.
+    #[serde(default)]
+    pub rework_target: Option<RoleRef>,
 }
 
 /// Narrowing constraints that can be inherited from an upstream contract message.
@@ -136,21 +145,25 @@ mod tests {
                     from: rr("archaeologist"),
                     to: rr("prescriber"),
                     permit_overrides_from: None,
+                    rework_target: None,
                 },
                 MessageEdge {
                     from: rr("prescriber"),
                     to: rr("coder-rust"),
                     permit_overrides_from: Some("permit_overrides".into()),
+                    rework_target: None,
                 },
                 MessageEdge {
                     from: rr("coder-rust"),
                     to: rr("reviewer"),
                     permit_overrides_from: None,
+                    rework_target: None,
                 },
                 MessageEdge {
                     from: rr("reviewer"),
                     to: rr("shipper"),
                     permit_overrides_from: None,
+                    rework_target: None,
                 },
             ],
             terminal_role: rr("shipper"),
@@ -189,16 +202,19 @@ mod tests {
                     from: rr("a"),
                     to: rr("c"),
                     permit_overrides_from: None,
+                    rework_target: None,
                 },
                 MessageEdge {
                     from: rr("b"),
                     to: rr("c"),
                     permit_overrides_from: None,
+                    rework_target: None,
                 },
                 MessageEdge {
                     from: rr("a"),
                     to: rr("c"),
                     permit_overrides_from: Some("k".into()),
+                    rework_target: None,
                 },
             ],
             terminal_role: rr("c"),

@@ -303,11 +303,13 @@ mod tests {
                     from: rr(&role_a),
                     to: rr(&role_b),
                     permit_overrides_from: None,
+                    rework_target: None,
                 },
                 MessageEdge {
                     from: rr(&role_b),
                     to: rr(&role_a),
                     permit_overrides_from: None,
+                    rework_target: None,
                 },
             ],
             terminal_role: rr(&role_b),
