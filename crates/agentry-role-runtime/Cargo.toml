@@ -16,6 +16,14 @@ path = "src/lib.rs"
 name = "null-agent"
 path = "src/bin/null_agent.rs"
 
+# ac-verifier-runner: shared workspace-prep + provider-invocation wrapper for
+# the ac-verifier-{claude,gemini,grok}-agentry role trio. Ports the three
+# AC_VERIFIER_*_AGENTRY_SCRIPT bash entrypoints to one Rust binary
+# parameterized by --provider.
+[[bin]]
+name = "ac-verifier-runner"
+path = "src/bin/ac_verifier_runner.rs"
+
 [dependencies]
 orchestrator-types = { path = "../orchestrator-types" }
 serde.workspace = true

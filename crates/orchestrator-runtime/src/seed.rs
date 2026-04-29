@@ -1660,7 +1660,13 @@ fn build_ac_verifier_claude_agentry_role(home: &str, claude_settings_path: &str)
         image: "docker.io/library/debian:bookworm-slim".into(),
         substrate_class: SubstrateClass::Podman,
         package_manager: PackageManager::Apt,
-        entrypoint_script: format!("{BASH_PRELUDE}{AC_VERIFIER_CLAUDE_AGENTRY_SCRIPT}"),
+        // Bootstrap glue only: exec the bind-mounted Rust runner.
+        // Workspace prep + provider invocation lives in the binary
+        // (`crates/agentry-role-runtime/src/bin/ac_verifier_runner.rs`).
+        // EPIC #161 Wave 1.3 — replaces `BASH_PRELUDE +
+        // AC_VERIFIER_CLAUDE_AGENTRY_SCRIPT`.
+        entrypoint_script: "#!/bin/sh\nexec /usr/local/bin/ac-verifier-runner --provider claude\n"
+            .into(),
         exitpoint_script: None,
         binaries: vec!["git".into(), "ca-certificates".into()],
         mcp_servers: vec![],
@@ -1698,6 +1704,11 @@ fn build_ac_verifier_claude_agentry_role(home: &str, claude_settings_path: &str)
                 target: "/usr/local/bin/ac-verifier".into(),
                 readonly: true,
             },
+            Mount {
+                source: format!("{home}/.local/bin/ac-verifier-runner"),
+                target: "/usr/local/bin/ac-verifier-runner".into(),
+                readonly: true,
+            },
         ],
         workspace_mount: Some(WorkspaceMount {
             container_path: "/workspace".into(),
@@ -1723,7 +1734,10 @@ fn build_ac_verifier_gemini_agentry_role(home: &str) -> AgentRole {
         image: "docker.io/library/debian:bookworm-slim".into(),
         substrate_class: SubstrateClass::Podman,
         package_manager: PackageManager::Apt,
-        entrypoint_script: format!("{BASH_PRELUDE}{AC_VERIFIER_GEMINI_AGENTRY_SCRIPT}"),
+        // Bootstrap glue only: exec the bind-mounted Rust runner. EPIC #161
+        // Wave 1.3 — replaces `BASH_PRELUDE + AC_VERIFIER_GEMINI_AGENTRY_SCRIPT`.
+        entrypoint_script: "#!/bin/sh\nexec /usr/local/bin/ac-verifier-runner --provider gemini\n"
+            .into(),
         exitpoint_script: None,
         binaries: vec!["git".into(), "ca-certificates".into()],
         mcp_servers: vec![],
@@ -1735,11 +1749,18 @@ fn build_ac_verifier_gemini_agentry_role(home: &str) -> AgentRole {
         ]),
         passthru_env: vec!["GEMINI_API_KEY".into()],
         extra_bootstrap: vec![],
-        mounts: vec![Mount {
-            source: format!("{home}/.local/bin/ac-verifier-gemini"),
-            target: "/usr/local/bin/ac-verifier-gemini".into(),
-            readonly: true,
-        }],
+        mounts: vec![
+            Mount {
+                source: format!("{home}/.local/bin/ac-verifier-gemini"),
+                target: "/usr/local/bin/ac-verifier-gemini".into(),
+                readonly: true,
+            },
+            Mount {
+                source: format!("{home}/.local/bin/ac-verifier-runner"),
+                target: "/usr/local/bin/ac-verifier-runner".into(),
+                readonly: true,
+            },
+        ],
         workspace_mount: Some(WorkspaceMount {
             container_path: "/workspace".into(),
             readonly: true,
@@ -1763,7 +1784,10 @@ fn build_ac_verifier_grok_agentry_role(home: &str) -> AgentRole {
         image: "docker.io/library/debian:bookworm-slim".into(),
         substrate_class: SubstrateClass::Podman,
         package_manager: PackageManager::Apt,
-        entrypoint_script: format!("{BASH_PRELUDE}{AC_VERIFIER_GROK_AGENTRY_SCRIPT}"),
+        // Bootstrap glue only: exec the bind-mounted Rust runner. EPIC #161
+        // Wave 1.3 — replaces `BASH_PRELUDE + AC_VERIFIER_GROK_AGENTRY_SCRIPT`.
+        entrypoint_script: "#!/bin/sh\nexec /usr/local/bin/ac-verifier-runner --provider grok\n"
+            .into(),
         exitpoint_script: None,
         binaries: vec!["git".into(), "curl".into(), "ca-certificates".into()],
         mcp_servers: vec![],
@@ -1775,11 +1799,18 @@ fn build_ac_verifier_grok_agentry_role(home: &str) -> AgentRole {
         ]),
         passthru_env: vec!["XAI_API_KEY".into()],
         extra_bootstrap: vec![],
-        mounts: vec![Mount {
-            source: format!("{home}/.local/bin/ac-verifier-grok"),
-            target: "/usr/local/bin/ac-verifier-grok".into(),
-            readonly: true,
-        }],
+        mounts: vec![
+            Mount {
+                source: format!("{home}/.local/bin/ac-verifier-grok"),
+                target: "/usr/local/bin/ac-verifier-grok".into(),
+                readonly: true,
+            },
+            Mount {
+                source: format!("{home}/.local/bin/ac-verifier-runner"),
+                target: "/usr/local/bin/ac-verifier-runner".into(),
+                readonly: true,
+            },
+        ],
         workspace_mount: Some(WorkspaceMount {
             container_path: "/workspace".into(),
             readonly: true,
@@ -1905,228 +1936,12 @@ else
 fi
 "##;
 
-/// Entrypoint for `ac-verifier-claude-agentry`. Reads
-/// `brief.payload.acceptance_criteria` (Vec<String>), captures the coder's
-/// diff against `base_branch`, builds the binary's stdin JSON, and runs
-/// `timeout $CLAUDE_P_TIMEOUT ac-verifier`. Degrades to `done shipped` when
-/// AC list is empty/missing or the binary is not on PATH — reviewer-claude
-/// is the architectural backstop.
-const AC_VERIFIER_CLAUDE_AGENTRY_SCRIPT: &str = r##"#!/usr/bin/env bash
-set -uo pipefail
-bundle="$(cat)"
-
-agent_id=$(jq -r '.permit.agent_id' <<<"$bundle")
-base_branch=$(jq -r '.brief.payload.base_branch // "develop"' <<<"$bundle")
-verb_body=$(jq -r '.brief.payload.issue_body // ""' <<<"$bundle")
-acs_json=$(jq -c '.brief.payload.acceptance_criteria // null' <<<"$bundle")
-
-# Fast path: no acceptance_criteria carried on this brief — short-circuit
-# without spending any claude tokens. Reviewer-claude still runs.
-if [ "$acs_json" = "null" ] || [ "$(jq 'length' <<<"$acs_json")" -eq 0 ]; then
-    emit_event '{"msg":"no acceptance_criteria in payload — skipping ac-verifier"}'
-    emit_done "shipped"; exit 0
-fi
-
-if [ ! -d /workspace/.git ] && [ ! -f /workspace/.git ]; then
-    emit_event '{"error":"workspace is not a git repo — coder did not produce it"}'
-    emit_done "shipped"; exit 0
-fi
-
-cd /workspace
-if ! git fetch origin "$base_branch" >/tmp/acv_fetch.err 2>&1; then
-    err=$(tail -20 /tmp/acv_fetch.err)
-    emit_event "$(jq -nc --arg err "$err" '{msg:"git fetch failed — degrading to shipped",detail:$err}')"
-    emit_done "shipped"; exit 0
-fi
-if ! git diff "origin/${base_branch}..HEAD" > /tmp/acv_diff.patch 2>/tmp/acv_diff.err; then
-    err=$(tail -20 /tmp/acv_diff.err)
-    emit_event "$(jq -nc --arg err "$err" '{msg:"git diff failed — degrading to shipped",detail:$err}')"
-    emit_done "shipped"; exit 0
-fi
-diff_text=$(cat /tmp/acv_diff.patch)
-
-if ! command -v ac-verifier >/dev/null 2>&1; then
-    emit_event '{"warn":"ac_verifier_unavailable","detail":"ac-verifier binary not on PATH; reviewer-claude is the backstop"}'
-    emit_done "shipped"; exit 0
-fi
-
-bundle_json=$(jq -nc --argjson acs "$acs_json" --arg diff "$diff_text" --arg vb "$verb_body" \
-    '{acceptance_criteria:$acs, diff:$diff, verb_body:$vb}')
-
-if ! outcome_json=$(timeout "$CLAUDE_P_TIMEOUT" ac-verifier <<<"$bundle_json" 2>/tmp/acv.err); then
-    rc=$?
-    err=$(tail -c 2048 /tmp/acv.err)
-    emit_event "$(jq -nc --argjson rc "$rc" --arg err "$err" '{msg:"ac-verifier invocation failed — degrading to shipped",exit_code:$rc,detail:$err}')"
-    emit_done "shipped"; exit 0
-fi
-
-outcome=$(jq -r '.outcome // "shipped"' <<<"$outcome_json")
-if [ "$outcome" = "rework" ]; then
-    findings_count=$(jq '.findings | length' <<<"$outcome_json")
-    emit_event "$(jq -nc --argjson n "$findings_count" '{msg:"ac-verifier rework",findings_count:$n}')"
-    i=0
-    while [ "$i" -lt "$findings_count" ]; do
-        sev=$(jq -r ".findings[$i].severity" <<<"$outcome_json")
-        cat=$(jq -r ".findings[$i].category" <<<"$outcome_json")
-        msg=$(jq -r ".findings[$i].message" <<<"$outcome_json")
-        emit_finding_model "$sev" "$agent_id" "$cat" "$msg"
-        i=$((i+1))
-    done
-    emit_done "rework_needed"
-else
-    emit_event '{"msg":"ac-verifier shipped — all acceptance criteria met or unverifiable"}'
-    emit_done "shipped"
-fi
-"##;
-
-/// Entrypoint for `ac-verifier-gemini-agentry`. Mirrors
-/// `AC_VERIFIER_CLAUDE_AGENTRY_SCRIPT`: reads
-/// `brief.payload.acceptance_criteria`, captures the coder's diff against
-/// `base_branch`, builds the binary's stdin JSON, and runs
-/// `timeout $CLAUDE_P_TIMEOUT ac-verifier-gemini`. Degrades to `done shipped`
-/// when AC list is empty/missing or the binary is not on PATH —
-/// reviewer-claude is the architectural backstop.
-const AC_VERIFIER_GEMINI_AGENTRY_SCRIPT: &str = r##"#!/usr/bin/env bash
-set -uo pipefail
-bundle="$(cat)"
-
-agent_id=$(jq -r '.permit.agent_id' <<<"$bundle")
-base_branch=$(jq -r '.brief.payload.base_branch // "develop"' <<<"$bundle")
-verb_body=$(jq -r '.brief.payload.issue_body // ""' <<<"$bundle")
-acs_json=$(jq -c '.brief.payload.acceptance_criteria // null' <<<"$bundle")
-
-# Fast path: no acceptance_criteria carried on this brief — short-circuit
-# without spending any gemini tokens. Reviewer-claude still runs.
-if [ "$acs_json" = "null" ] || [ "$(jq 'length' <<<"$acs_json")" -eq 0 ]; then
-    emit_event '{"msg":"no acceptance_criteria in payload — skipping ac-verifier-gemini"}'
-    emit_done "shipped"; exit 0
-fi
-
-if [ ! -d /workspace/.git ] && [ ! -f /workspace/.git ]; then
-    emit_event '{"error":"workspace is not a git repo — coder did not produce it"}'
-    emit_done "shipped"; exit 0
-fi
-
-cd /workspace
-if ! git fetch origin "$base_branch" >/tmp/acv_fetch.err 2>&1; then
-    err=$(tail -20 /tmp/acv_fetch.err)
-    emit_event "$(jq -nc --arg err "$err" '{msg:"git fetch failed — degrading to shipped",detail:$err}')"
-    emit_done "shipped"; exit 0
-fi
-if ! git diff "origin/${base_branch}..HEAD" > /tmp/acv_diff.patch 2>/tmp/acv_diff.err; then
-    err=$(tail -20 /tmp/acv_diff.err)
-    emit_event "$(jq -nc --arg err "$err" '{msg:"git diff failed — degrading to shipped",detail:$err}')"
-    emit_done "shipped"; exit 0
-fi
-diff_text=$(cat /tmp/acv_diff.patch)
-
-if ! command -v ac-verifier-gemini >/dev/null 2>&1; then
-    emit_event '{"warn":"ac_verifier_unavailable","detail":"ac-verifier-gemini binary not on PATH; reviewer-claude is the backstop"}'
-    emit_done "shipped"; exit 0
-fi
-
-bundle_json=$(jq -nc --argjson acs "$acs_json" --arg diff "$diff_text" --arg vb "$verb_body" \
-    '{acceptance_criteria:$acs, diff:$diff, verb_body:$vb}')
-
-if ! outcome_json=$(timeout "$CLAUDE_P_TIMEOUT" ac-verifier-gemini <<<"$bundle_json" 2>/tmp/acv.err); then
-    rc=$?
-    err=$(tail -c 2048 /tmp/acv.err)
-    emit_event "$(jq -nc --argjson rc "$rc" --arg err "$err" '{msg:"ac-verifier-gemini invocation failed — degrading to shipped",exit_code:$rc,detail:$err}')"
-    emit_done "shipped"; exit 0
-fi
-
-outcome=$(jq -r '.outcome // "shipped"' <<<"$outcome_json")
-if [ "$outcome" = "rework" ]; then
-    findings_count=$(jq '.findings | length' <<<"$outcome_json")
-    emit_event "$(jq -nc --argjson n "$findings_count" '{msg:"ac-verifier-gemini rework",findings_count:$n}')"
-    i=0
-    while [ "$i" -lt "$findings_count" ]; do
-        sev=$(jq -r ".findings[$i].severity" <<<"$outcome_json")
-        cat=$(jq -r ".findings[$i].category" <<<"$outcome_json")
-        msg=$(jq -r ".findings[$i].message" <<<"$outcome_json")
-        emit_finding_model "$sev" "$agent_id" "$cat" "$msg"
-        i=$((i+1))
-    done
-    emit_done "rework_needed"
-else
-    emit_event '{"msg":"ac-verifier-gemini shipped — all acceptance criteria met or unverifiable"}'
-    emit_done "shipped"
-fi
-"##;
-
-/// Entrypoint for `ac-verifier-grok-agentry`. Sibling of the claude variant —
-/// same bash shape (read bundle, short-circuit on empty AC list, fetch
-/// base_branch + diff HEAD, build binary stdin JSON, pre-flight binary
-/// presence) but invokes `ac-verifier-grok` and the binary itself talks to
-/// the xAI API with `XAI_API_KEY`. Brief 4 of #134 — registered in seed but
-/// not wired into a topology (brief 5 enables parallel mode).
-const AC_VERIFIER_GROK_AGENTRY_SCRIPT: &str = r##"#!/usr/bin/env bash
-set -uo pipefail
-bundle="$(cat)"
-
-agent_id=$(jq -r '.permit.agent_id' <<<"$bundle")
-base_branch=$(jq -r '.brief.payload.base_branch // "develop"' <<<"$bundle")
-verb_body=$(jq -r '.brief.payload.issue_body // ""' <<<"$bundle")
-acs_json=$(jq -c '.brief.payload.acceptance_criteria // null' <<<"$bundle")
-
-# Fast path: no acceptance_criteria carried on this brief — short-circuit
-# without spending any grok tokens. Reviewer-claude still runs.
-if [ "$acs_json" = "null" ] || [ "$(jq 'length' <<<"$acs_json")" -eq 0 ]; then
-    emit_event '{"msg":"no acceptance_criteria in payload — skipping ac-verifier-grok"}'
-    emit_done "shipped"; exit 0
-fi
-
-if [ ! -d /workspace/.git ] && [ ! -f /workspace/.git ]; then
-    emit_event '{"error":"workspace is not a git repo — coder did not produce it"}'
-    emit_done "shipped"; exit 0
-fi
-
-cd /workspace
-if ! git fetch origin "$base_branch" >/tmp/acv_fetch.err 2>&1; then
-    err=$(tail -20 /tmp/acv_fetch.err)
-    emit_event "$(jq -nc --arg err "$err" '{msg:"git fetch failed — degrading to shipped",detail:$err}')"
-    emit_done "shipped"; exit 0
-fi
-if ! git diff "origin/${base_branch}..HEAD" > /tmp/acv_diff.patch 2>/tmp/acv_diff.err; then
-    err=$(tail -20 /tmp/acv_diff.err)
-    emit_event "$(jq -nc --arg err "$err" '{msg:"git diff failed — degrading to shipped",detail:$err}')"
-    emit_done "shipped"; exit 0
-fi
-diff_text=$(cat /tmp/acv_diff.patch)
-
-if ! command -v ac-verifier-grok >/dev/null 2>&1; then
-    emit_event '{"warn":"ac_verifier_unavailable","detail":"ac-verifier-grok binary not on PATH; reviewer-claude is the backstop"}'
-    emit_done "shipped"; exit 0
-fi
-
-bundle_json=$(jq -nc --argjson acs "$acs_json" --arg diff "$diff_text" --arg vb "$verb_body" \
-    '{acceptance_criteria:$acs, diff:$diff, verb_body:$vb}')
-
-if ! outcome_json=$(timeout "$CLAUDE_P_TIMEOUT" ac-verifier-grok <<<"$bundle_json" 2>/tmp/acv.err); then
-    rc=$?
-    err=$(tail -c 2048 /tmp/acv.err)
-    emit_event "$(jq -nc --argjson rc "$rc" --arg err "$err" '{msg:"ac-verifier-grok invocation failed — degrading to shipped",exit_code:$rc,detail:$err}')"
-    emit_done "shipped"; exit 0
-fi
-
-outcome=$(jq -r '.outcome // "shipped"' <<<"$outcome_json")
-if [ "$outcome" = "rework" ]; then
-    findings_count=$(jq '.findings | length' <<<"$outcome_json")
-    emit_event "$(jq -nc --argjson n "$findings_count" '{msg:"ac-verifier-grok rework",findings_count:$n}')"
-    i=0
-    while [ "$i" -lt "$findings_count" ]; do
-        sev=$(jq -r ".findings[$i].severity" <<<"$outcome_json")
-        cat=$(jq -r ".findings[$i].category" <<<"$outcome_json")
-        msg=$(jq -r ".findings[$i].message" <<<"$outcome_json")
-        emit_finding_model "$sev" "$agent_id" "$cat" "$msg"
-        i=$((i+1))
-    done
-    emit_done "rework_needed"
-else
-    emit_event '{"msg":"ac-verifier-grok shipped — all acceptance criteria met or unverifiable"}'
-    emit_done "shipped"
-fi
-"##;
+// EPIC #161 Wave 1.3: the three AC_VERIFIER_*_AGENTRY_SCRIPT bash heredocs
+// that used to live here have been ported to one Rust runner —
+// `crates/agentry-role-runtime/src/bin/ac_verifier_runner.rs` — parameterized
+// by `--provider claude|gemini|grok`. The roles' entrypoint_scripts now just
+// `exec /usr/local/bin/ac-verifier-runner --provider X`. The runner has its
+// own unit-test coverage for AC parsing / degradation envelopes.
 
 const AUDITOR_CLAUDE_AGENTRY_SCRIPT: &str = r##"#!/usr/bin/env bash
 set -uo pipefail
@@ -3749,26 +3564,16 @@ mod tests {
     }
 
     #[test]
-    fn ac_verifier_script_invokes_binary() {
+    fn ac_verifier_claude_role_entrypoint_invokes_runner() {
+        // EPIC #161 Wave 1.3 — script-content asserts (was: AC list parsing,
+        // missing-binary degradation) moved to the runner's own unit tests
+        // in `crates/agentry-role-runtime/src/bin/ac_verifier_runner.rs`.
+        let role = build_ac_verifier_claude_agentry_role("/h", "/c");
         assert!(
-            AC_VERIFIER_CLAUDE_AGENTRY_SCRIPT.contains("ac-verifier"),
-            "ac-verifier script must invoke the ac-verifier binary"
-        );
-    }
-
-    #[test]
-    fn ac_verifier_script_reads_acceptance_criteria_payload_key() {
-        assert!(
-            AC_VERIFIER_CLAUDE_AGENTRY_SCRIPT.contains("acceptance_criteria"),
-            "ac-verifier script must read brief.payload.acceptance_criteria"
-        );
-    }
-
-    #[test]
-    fn ac_verifier_script_handles_missing_binary() {
-        assert!(
-            AC_VERIFIER_CLAUDE_AGENTRY_SCRIPT.contains("ac_verifier_unavailable"),
-            "ac-verifier script must emit ac_verifier_unavailable when the binary is missing"
+            role.entrypoint_script
+                .contains("ac-verifier-runner --provider claude"),
+            "ac-verifier-claude entrypoint must exec the runner with --provider claude: {}",
+            role.entrypoint_script
         );
     }
 
@@ -3795,50 +3600,57 @@ mod tests {
     }
 
     #[test]
-    fn ac_verifier_gemini_script_invokes_binary() {
+    fn ac_verifier_claude_role_bind_mounts_runner_binary() {
+        let role = build_ac_verifier_claude_agentry_role("/h", "/c");
         assert!(
-            AC_VERIFIER_GEMINI_AGENTRY_SCRIPT.contains("ac-verifier-gemini"),
-            "ac-verifier-gemini script must invoke the ac-verifier-gemini binary"
+            role.mounts
+                .iter()
+                .any(|m| m.target == "/usr/local/bin/ac-verifier-runner" && m.readonly),
+            "ac-verifier-claude must bind-mount the runner read-only at /usr/local/bin/ac-verifier-runner"
         );
     }
 
     #[test]
-    fn ac_verifier_grok_script_invokes_binary() {
+    fn ac_verifier_gemini_role_entrypoint_invokes_runner() {
+        let role = build_ac_verifier_gemini_agentry_role("/h");
         assert!(
-            AC_VERIFIER_GROK_AGENTRY_SCRIPT.contains("ac-verifier-grok"),
-            "ac-verifier-grok script must invoke the ac-verifier-grok binary"
+            role.entrypoint_script
+                .contains("ac-verifier-runner --provider gemini"),
+            "ac-verifier-gemini entrypoint must exec the runner with --provider gemini: {}",
+            role.entrypoint_script
         );
     }
 
     #[test]
-    fn ac_verifier_gemini_script_reads_acceptance_criteria_payload_key() {
+    fn ac_verifier_grok_role_entrypoint_invokes_runner() {
+        let role = build_ac_verifier_grok_agentry_role("/h");
         assert!(
-            AC_VERIFIER_GEMINI_AGENTRY_SCRIPT.contains("acceptance_criteria"),
-            "ac-verifier-gemini script must read brief.payload.acceptance_criteria"
+            role.entrypoint_script
+                .contains("ac-verifier-runner --provider grok"),
+            "ac-verifier-grok entrypoint must exec the runner with --provider grok: {}",
+            role.entrypoint_script
         );
     }
 
     #[test]
-    fn ac_verifier_grok_script_reads_acceptance_criteria_payload_key() {
+    fn ac_verifier_gemini_role_bind_mounts_runner_binary() {
+        let role = build_ac_verifier_gemini_agentry_role("/h");
         assert!(
-            AC_VERIFIER_GROK_AGENTRY_SCRIPT.contains("acceptance_criteria"),
-            "ac-verifier-grok script must read brief.payload.acceptance_criteria"
+            role.mounts
+                .iter()
+                .any(|m| m.target == "/usr/local/bin/ac-verifier-runner" && m.readonly),
+            "ac-verifier-gemini must bind-mount the runner read-only at /usr/local/bin/ac-verifier-runner"
         );
     }
 
     #[test]
-    fn ac_verifier_gemini_script_handles_missing_binary() {
+    fn ac_verifier_grok_role_bind_mounts_runner_binary() {
+        let role = build_ac_verifier_grok_agentry_role("/h");
         assert!(
-            AC_VERIFIER_GEMINI_AGENTRY_SCRIPT.contains("ac_verifier_unavailable"),
-            "ac-verifier-gemini script must emit ac_verifier_unavailable when the binary is missing"
-        );
-    }
-
-    #[test]
-    fn ac_verifier_grok_script_handles_missing_binary() {
-        assert!(
-            AC_VERIFIER_GROK_AGENTRY_SCRIPT.contains("ac_verifier_unavailable"),
-            "ac-verifier-grok script must emit ac_verifier_unavailable when the binary is missing"
+            role.mounts
+                .iter()
+                .any(|m| m.target == "/usr/local/bin/ac-verifier-runner" && m.readonly),
+            "ac-verifier-grok must bind-mount the runner read-only at /usr/local/bin/ac-verifier-runner"
         );
     }
 
