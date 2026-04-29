@@ -143,6 +143,107 @@ pub async fn save_team(conn: &mut ConnectionManager, t: &TeamTopology) -> Result
     Ok(())
 }
 
+/// Outcome of an atomic team register: a first-writer-wins write that does
+/// NOT overwrite an existing key at the same `(name, version)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RegisterOutcome {
+    Registered,
+    AlreadyExists,
+}
+
+/// Atomically register a team topology under `agentry:team:<name>:v<version>`
+/// using `SET ... NX` semantics. Returns `Registered` if this call wrote the
+/// key, `AlreadyExists` if the key was already present (the existing body is
+/// untouched). Coexists with [`save_team`], which is overwriting and intended
+/// for seed-time use.
+pub async fn register_team_strict(
+    conn: &mut ConnectionManager,
+    t: &TeamTopology,
+) -> Result<RegisterOutcome> {
+    let key = format!("agentry:team:{}:v{}", t.name.0, t.version);
+    let body = serde_json::to_string(t)?;
+    let acquired: bool = redis::cmd("SET")
+        .arg(&key)
+        .arg(body)
+        .arg("NX")
+        .query_async(conn)
+        .await?;
+    if acquired {
+        Ok(RegisterOutcome::Registered)
+    } else {
+        Ok(RegisterOutcome::AlreadyExists)
+    }
+}
+
+/// Scan the team catalog and return every `(name, version)` pair currently
+/// registered, sorted by name then version ascending.
+pub async fn list_teams(conn: &mut ConnectionManager) -> Result<Vec<(TeamName, u32)>> {
+    let mut out: Vec<(TeamName, u32)> = Vec::new();
+    let mut cursor: u64 = 0;
+    loop {
+        let (next, batch): (u64, Vec<String>) = redis::cmd("SCAN")
+            .arg(cursor)
+            .arg("MATCH")
+            .arg("agentry:team:*:v*")
+            .arg("COUNT")
+            .arg(100)
+            .query_async(conn)
+            .await?;
+        for key in batch {
+            if let Some((name, version)) = parse_versioned_key(&key, "team") {
+                out.push((TeamName(name), version));
+            }
+        }
+        cursor = next;
+        if cursor == 0 {
+            break;
+        }
+    }
+    out.sort_by(|a, b| a.0 .0.cmp(&b.0 .0).then_with(|| a.1.cmp(&b.1)));
+    Ok(out)
+}
+
+/// Scan the role catalog and return every distinct role name, regardless of
+/// version. Sorted ascending.
+pub async fn list_role_names(conn: &mut ConnectionManager) -> Result<Vec<RoleName>> {
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut cursor: u64 = 0;
+    loop {
+        let (next, batch): (u64, Vec<String>) = redis::cmd("SCAN")
+            .arg(cursor)
+            .arg("MATCH")
+            .arg("agentry:role:*:v*")
+            .arg("COUNT")
+            .arg(100)
+            .query_async(conn)
+            .await?;
+        for key in batch {
+            if let Some((name, _version)) = parse_versioned_key(&key, "role") {
+                seen.insert(name);
+            }
+        }
+        cursor = next;
+        if cursor == 0 {
+            break;
+        }
+    }
+    Ok(seen.into_iter().map(RoleName).collect())
+}
+
+/// Parse `agentry:<kind>:<name>:v<version>`. Returns `None` if the key shape
+/// does not match (extra colons in `<name>` are tolerated by treating the
+/// final `:v<digits>` as the version suffix).
+fn parse_versioned_key(key: &str, kind: &str) -> Option<(String, u32)> {
+    let prefix = format!("agentry:{kind}:");
+    let rest = key.strip_prefix(&prefix)?;
+    let (name, vsuffix) = rest.rsplit_once(":v")?;
+    let version: u32 = vsuffix.parse().ok()?;
+    if name.is_empty() {
+        return None;
+    }
+    Some((name.to_string(), version))
+}
+
 /// Block-read the next brief from `agentry:briefs`, starting after `last_id`.
 /// Returns `(stream_id, brief)`.
 pub async fn read_next_brief(
@@ -181,3 +282,142 @@ pub async fn read_next_brief(
 /// Hint that we're skipping fields (silences dead-code warnings on unused helper types).
 #[allow(dead_code)]
 fn _unused(_: TeamName) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_versioned_key_basic() {
+        assert_eq!(
+            parse_versioned_key("agentry:team:foo:v1", "team"),
+            Some(("foo".to_string(), 1))
+        );
+        assert_eq!(
+            parse_versioned_key("agentry:role:coder-rust:v42", "role"),
+            Some(("coder-rust".to_string(), 42))
+        );
+        // Wrong kind.
+        assert_eq!(parse_versioned_key("agentry:team:foo:v1", "role"), None);
+        // Missing version suffix.
+        assert_eq!(parse_versioned_key("agentry:team:foo", "team"), None);
+        // Non-numeric version tail.
+        assert_eq!(parse_versioned_key("agentry:team:foo:vN", "team"), None);
+    }
+
+    fn test_redis_url() -> Option<String> {
+        std::env::var("AGENTRY_TEST_REDIS_URL").ok()
+    }
+
+    fn slug() -> String {
+        format!(
+            "rio_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        )
+    }
+
+    fn topo(name: &str, version: u32, role: &str) -> TeamTopology {
+        TeamTopology {
+            name: TeamName(name.into()),
+            version,
+            roles: vec![RoleName(role.into())],
+            message_graph: vec![],
+            terminal_role: RoleName(role.into()),
+            max_retries: 0,
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Redis (AGENTRY_TEST_REDIS_URL)"]
+    async fn register_team_strict_first_writer_wins() {
+        let Some(url) = test_redis_url() else { return };
+        let mut conn = connect(&url).await.expect("connect");
+        let s = slug();
+        let name = format!("team-{s}");
+        let t1 = topo(&name, 1, "echo-agent");
+        // Different body but same key.
+        let mut t2 = t1.clone();
+        t2.max_retries = 7;
+
+        let r1 = register_team_strict(&mut conn, &t1).await.expect("first");
+        assert_eq!(r1, RegisterOutcome::Registered);
+        let r2 = register_team_strict(&mut conn, &t2).await.expect("second");
+        assert_eq!(r2, RegisterOutcome::AlreadyExists);
+
+        // Body must equal t1 (first writer's body), not t2.
+        let key = format!("agentry:team:{name}:v1");
+        let raw: Option<String> = conn.get(&key).await.expect("get");
+        let raw = raw.expect("body present");
+        let back: TeamTopology = serde_json::from_str(&raw).expect("parse");
+        assert_eq!(back.max_retries, 0, "first writer's body must be retained");
+
+        let _: () = conn.del(&key).await.expect("cleanup");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Redis (AGENTRY_TEST_REDIS_URL)"]
+    async fn list_teams_returns_sorted_pairs() {
+        let Some(url) = test_redis_url() else { return };
+        let mut conn = connect(&url).await.expect("connect");
+        let s = slug();
+        let n_a = format!("zz-{s}-alpha");
+        let n_b = format!("zz-{s}-beta");
+        let teams = vec![
+            topo(&n_b, 2, "echo-agent"),
+            topo(&n_a, 1, "echo-agent"),
+            topo(&n_a, 2, "echo-agent"),
+        ];
+        for t in &teams {
+            let _ = register_team_strict(&mut conn, t).await.expect("register");
+        }
+        let listed = list_teams(&mut conn).await.expect("list");
+
+        let ours: Vec<(TeamName, u32)> = listed
+            .into_iter()
+            .filter(|(n, _)| n.0 == n_a || n.0 == n_b)
+            .collect();
+        assert_eq!(
+            ours,
+            vec![
+                (TeamName(n_a.clone()), 1),
+                (TeamName(n_a.clone()), 2),
+                (TeamName(n_b.clone()), 2),
+            ],
+            "teams must come back sorted by name then version"
+        );
+
+        for (name, version) in [(n_a.clone(), 1), (n_a.clone(), 2), (n_b.clone(), 2)] {
+            let key = format!("agentry:team:{name}:v{version}");
+            let _: () = conn.del(&key).await.expect("cleanup");
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Redis (AGENTRY_TEST_REDIS_URL)"]
+    async fn list_role_names_dedupes_versions() {
+        let Some(url) = test_redis_url() else { return };
+        let mut conn = connect(&url).await.expect("connect");
+        let s = slug();
+        let role_name = format!("zz-rio-role-{s}");
+        // Seed two versions of the same role name. We construct the keys
+        // directly to avoid pulling AgentRole's full shape into this test.
+        let body = serde_json::json!({"_": "probe"}).to_string();
+        let k1 = format!("agentry:role:{role_name}:v1");
+        let k2 = format!("agentry:role:{role_name}:v2");
+        let _: () = conn.set(&k1, body.as_str()).await.expect("set v1");
+        let _: () = conn.set(&k2, body.as_str()).await.expect("set v2");
+
+        let listed = list_role_names(&mut conn).await.expect("list");
+        let count = listed.iter().filter(|r| r.0 == role_name).count();
+        assert_eq!(
+            count, 1,
+            "list must dedupe across versions of the same role"
+        );
+
+        let _: () = conn.del(&k1).await.expect("cleanup v1");
+        let _: () = conn.del(&k2).await.expect("cleanup v2");
+    }
+}

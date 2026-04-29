@@ -211,6 +211,38 @@ async fn handle_brief(
 ) -> Result<VerdictKind> {
     let team = redis_io::fetch_team(conn, &brief.topology).await?;
 
+    // Dispatch-time validation hook: catch malformed topologies before
+    // spawning anything. The validator catches `roles.is_empty()` via the
+    // Type check, but the explicit guard below is kept as defense-in-depth.
+    let registered_roles = redis_io::list_role_names(conn).await?;
+    let violations = crate::team_validator::validate(&team, &registered_roles);
+    if !violations.is_empty() {
+        let payload = serde_json::json!({
+            "msg": "team_validation_failed",
+            "team": team.name.0,
+            "version": team.version,
+            "violations": violations
+                .iter()
+                .map(|v| serde_json::json!({
+                    "path": v.path,
+                    "kind": format!("{:?}", v.kind),
+                    "detail": v.detail,
+                }))
+                .collect::<Vec<_>>(),
+        });
+        let event =
+            orchestrator_types::Event::new(orchestrator_types::EventKind::Event { payload });
+        if let Err(e) = redis_io::append_trace(conn, &brief.id, "daemon", &event).await {
+            tracing::warn!(brief = %brief.id, error = %e, "append_trace for team_validation_failed failed");
+        }
+        return Err(Error::Config(format!(
+            "team {} v{} failed validation: {} violation(s)",
+            team.name.0,
+            team.version,
+            violations.len()
+        )));
+    }
+
     if team.roles.is_empty() {
         return Err(Error::Config(format!("team {} has no roles", team.name.0)));
     }
@@ -1528,5 +1560,116 @@ mod tests {
 
         let _: () = conn.del(&verdicts_key).await.expect("cleanup verdicts");
         let _: () = conn.del(&final_emitted_key).await.expect("cleanup marker");
+    }
+
+    /// Mock spawner that panics if invoked. The dispatch-time validation
+    /// hook must reject the brief before any role spawn, so the spawner
+    /// being unreachable is the actual assertion.
+    struct PanickingSpawner;
+
+    #[async_trait::async_trait]
+    impl crate::spawner::Spawner for PanickingSpawner {
+        async fn run_agent(
+            &self,
+            _ctx: crate::spawner::RunAgentCtx<'_>,
+            _conn: &mut ConnectionManager,
+        ) -> Result<crate::spawner::AgentOutcome> {
+            panic!("spawner must not be invoked when validation rejects topology");
+        }
+    }
+
+    /// Regression for brief 2/2 of #183: when the daemon dequeues a brief
+    /// whose team topology fails validation (here: terminal_role not in
+    /// roles[]), `handle_brief` must (a) emit a structured
+    /// `team_validation_failed` trace event, and (b) return Err WITHOUT
+    /// invoking the spawner.
+    ///
+    /// Gated on a live Redis (`AGENTRY_TEST_REDIS_URL`, default
+    /// `redis://127.0.0.1:6380`).
+    #[tokio::test]
+    #[ignore = "requires live Redis (AGENTRY_TEST_REDIS_URL)"]
+    async fn handle_brief_rejects_invalid_topology() {
+        use ed25519_dalek::SigningKey;
+        use orchestrator_types::{Brief, TeamName};
+        use rand_core::OsRng;
+
+        let url = std::env::var("AGENTRY_TEST_REDIS_URL")
+            .unwrap_or_else(|_| "redis://127.0.0.1:6380".into());
+        let mut conn = redis_io::connect(&url).await.expect("redis connect");
+
+        let suffix = uuid::Uuid::now_v7();
+        let team_name = format!("zz-bad-{suffix}");
+        // terminal_role 'phantom' is not in roles[] — Reference violation.
+        let bad_team = TeamTopology {
+            name: TeamName(team_name.clone()),
+            version: 1,
+            roles: vec![rn("a")],
+            message_graph: vec![],
+            terminal_role: rn("phantom"),
+            max_retries: 0,
+        };
+        redis_io::save_team(&mut conn, &bad_team)
+            .await
+            .expect("save bad team");
+
+        let brief_id = format!("brf_validation_{suffix}");
+        let mut brief = Brief::new(
+            "test",
+            VersionedRef::new(team_name.clone(), 1),
+            serde_json::Value::Null,
+        );
+        brief.id = BriefId(brief_id.clone());
+
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let verifying_key = signing_key.verifying_key();
+        let spawner = PanickingSpawner;
+
+        let outcome = handle_brief(&mut conn, &spawner, &brief, &signing_key, &verifying_key).await;
+        assert!(
+            outcome.is_err(),
+            "handle_brief must reject malformed topology"
+        );
+        let err = outcome.expect_err("err already asserted");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("failed validation"),
+            "error must mention validation failure; got: {msg}"
+        );
+
+        // Trace stream should carry one team_validation_failed event.
+        let trace_key = format!("agentry:brief:{brief_id}:trace");
+        let reply: redis::streams::StreamRangeReply = redis::cmd("XRANGE")
+            .arg(&trace_key)
+            .arg("-")
+            .arg("+")
+            .query_async(&mut conn)
+            .await
+            .expect("xrange trace");
+        let mut found = false;
+        for entry in &reply.ids {
+            let ev = entry.map.get("event").and_then(|v| match v {
+                redis::Value::BulkString(b) => std::str::from_utf8(b).ok().map(String::from),
+                redis::Value::SimpleString(s) => Some(s.clone()),
+                _ => None,
+            });
+            if let Some(body) = ev {
+                if body.contains("team_validation_failed") {
+                    found = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            found,
+            "expected team_validation_failed trace event; got {} entries",
+            reply.ids.len()
+        );
+
+        // Cleanup.
+        let _: () = conn
+            .del(format!("agentry:team:{team_name}:v1"))
+            .await
+            .expect("cleanup team");
+        let _: () = conn.del(&trace_key).await.expect("cleanup trace");
     }
 }
