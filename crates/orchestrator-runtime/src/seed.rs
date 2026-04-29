@@ -1535,6 +1535,44 @@ if command -v ra-query >/dev/null 2>&1; then
 else
     emit_event '{"msg":"ra_query_unavailable_complexity","detail":"skipping complexity stage"}'
 fi
+if command -v ra-query >/dev/null 2>&1; then
+    pfindings='[]'; total_dead_pub=0
+    while IFS= read -r ctoml; do
+        [ -f "$ctoml" ] || continue
+        cdir=$(dirname "$ctoml")
+        pout=$(ra-query pub-surface "$cdir" --format json 2>/dev/null || echo '[]')
+        crate_dead='{}'
+        ilen=$(echo "$pout" | jq 'length')
+        i=0
+        while [ "$i" -lt "$ilen" ]; do
+            ifile=$(echo "$pout" | jq -r ".[$i].file // \"\"")
+            iline=$(echo "$pout" | jq -r ".[$i].line // 0")
+            iname=$(echo "$pout" | jq -r ".[$i].name // \"\"")
+            case "$ifile" in
+                */lib.rs) i=$((i+1)); continue ;;
+            esac
+            cout=$(ra-query callers "${ifile}:${iline}" --format json 2>/dev/null || echo '{"callers":[]}')
+            ccnt=$(echo "$cout" | jq '[.callers[]?] | length')
+            if [ "$ccnt" -eq 0 ]; then
+                crate_dead=$(echo "$crate_dead" | jq --arg f "$ifile" --arg n "$iname" --argjson l "$iline" '.[$f] = ((.[$f] // []) + [{name:$n,line:$l}])')
+            fi
+            i=$((i+1))
+        done
+        per_file=$(echo "$crate_dead" | jq -c '[to_entries[] | {file:.key, dead_count:(.value|length), items:.value}]')
+        plen=$(echo "$per_file" | jq 'length')
+        k=0
+        while [ "$k" -lt "$plen" ]; do
+            entry=$(echo "$per_file" | jq -c ".[$k]")
+            ecnt=$(echo "$entry" | jq '.dead_count')
+            pfindings=$(echo "$pfindings" | jq --argjson e "$entry" '. + [$e]')
+            total_dead_pub=$((total_dead_pub + ecnt))
+            k=$((k+1))
+        done
+    done < <(find crates -mindepth 2 -maxdepth 2 -name 'Cargo.toml' -not -path '*/target/*')
+    emit_event "$(jq -nc --argjson cnt "$total_dead_pub" --arg out "$(echo "$pfindings" | jq -c . | tail -c 8192)" '{msg:"pub_surface_report",dead_pub_total:$cnt,findings_json_tail:$out}')"
+else
+    emit_event '{"msg":"ra_query_unavailable_pub_surface","detail":"skipping pub-surface stage"}'
+fi
 mkdir -p /workspace/audit-children
 host_workspace="/var/mnt/workspaces/agentry-work/briefs/${brief_id}"
 refs='[]'
@@ -1574,6 +1612,43 @@ while [ "$j" -lt "$unwrap_k" ]; do
         submitted_by:"auditor-self-heal",
         submitted_at:(now|todate)}' > "$child"
   refs=$(echo "$refs" | jq -c --arg p "${host_workspace}/audit-children/child-unwrap-${j}.json" '. + [$p]')
+  j=$((j+1))
+done
+top_dead_pub_files=$(echo "$pfindings" | jq -c 'sort_by(-.dead_count) | .[:3]')
+dead_pub_k=$(echo "$top_dead_pub_files" | jq 'length')
+j=0
+while [ "$j" -lt "$dead_pub_k" ]; do
+  pfile=$(echo "$top_dead_pub_files" | jq -r ".[$j].file")
+  base=$(basename "$pfile")
+  child="/workspace/audit-children/child-dead-pub-${j}.json"
+  jq -nc \
+    --arg id "brf_self_heal_${brief_id}_dead_pub_${j}" \
+    --arg parent "$brief_id" \
+    --arg pfile "$pfile" \
+    --arg base "$base" \
+    --argjson finding "$(echo "$top_dead_pub_files" | jq ".[$j]")" \
+    --argjson rank "$j" \
+    '($finding.items // []
+        | map("  - " + ($finding.file) + ":" + ((.line // 0) | tostring) + " — " + (.name // "?"))
+        | join("\n")) as $sites
+     | {id:$id, project:null,
+        topology:{name:"agentry-self-host-v0",version:1},
+        payload:{
+          issue_number:0,
+          issue_title:("fix(dead-pub): remove or expose dead pub items in " + $base),
+          issue_body:("Dead pub items in " + $pfile + " (zero workspace callers per ra-query callers).\n\nSites:\n" + $sites + "\n\nFor each site: DELETE the pub keyword OR add a `pub use` re-export in lib.rs to expose it as documented API surface. Do NOT silently leave items pub-but-unused — pick one path and apply it."),
+          acceptance:"cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace && scripts/arch-check.sh",
+          target_repo:"yg/agentry",
+          base_branch:"develop",
+          pr_title:("fix(dead-pub): remove or expose dead pub items in " + $base),
+          pr_body:("Auto-dispatched by auditor (ra-query pub-surface + ra-query callers, file ranked top-" + ($rank|tostring) + " by dead-pub count).")
+        },
+        budget:{max_wall_seconds:1500},
+        escalation:"autonomous",
+        parent_brief:$parent,
+        submitted_by:"auditor-self-heal",
+        submitted_at:(now|todate)}' > "$child"
+  refs=$(echo "$refs" | jq -c --arg p "${host_workspace}/audit-children/child-dead-pub-${j}.json" '. + [$p]')
   j=$((j+1))
 done
 pairs=$(echo "$udeps_json" | jq -c '[.unused_deps // {} | to_entries[] | .key as $k | ((.value.normal // []) + (.value.development // []) + (.value.build // []))[] as $d | {crate:($k|split(" ")[0]), dep:$d}]')
@@ -4155,6 +4230,46 @@ mod tests {
             "issue #147: auditor complexity jq filter must compute \
              complex_count from $r.functions|length (mirroring the unwraps \
              stage which uses ($r.functions|map(.unwraps|length)|add // 0))"
+        );
+    }
+
+    #[test]
+    fn auditor_script_runs_ra_query_pub_surface() {
+        assert!(
+            AUDITOR_CLAUDE_AGENTRY_SCRIPT.contains("ra-query pub-surface"),
+            "auditor script must invoke `ra-query pub-surface`"
+        );
+        assert!(
+            AUDITOR_CLAUDE_AGENTRY_SCRIPT.contains("ra-query callers"),
+            "auditor script must invoke `ra-query callers` to count workspace usages of pub items"
+        );
+        assert!(
+            AUDITOR_CLAUDE_AGENTRY_SCRIPT.contains("pub_surface_report"),
+            "auditor script must emit a pub_surface_report trace event"
+        );
+        assert!(
+            AUDITOR_CLAUDE_AGENTRY_SCRIPT.contains("ra_query_unavailable_pub_surface"),
+            "auditor script must emit ra_query_unavailable_pub_surface when the binary is missing"
+        );
+    }
+
+    #[test]
+    fn auditor_emits_dead_pub_fix_children() {
+        assert!(
+            AUDITOR_CLAUDE_AGENTRY_SCRIPT.contains("audit-children/child-dead-pub-"),
+            "auditor must write dead-pub fix-child briefs to audit-children/child-dead-pub-*"
+        );
+        assert!(
+            AUDITOR_CLAUDE_AGENTRY_SCRIPT.contains("brf_self_heal_${brief_id}_dead_pub_"),
+            "auditor must generate brf_self_heal_<brief_id>_dead_pub_<j> identifiers"
+        );
+        assert!(
+            AUDITOR_CLAUDE_AGENTRY_SCRIPT.contains("sort_by(-.dead_count)"),
+            "auditor must select top-K dead-pub files via sort_by(-.dead_count)"
+        );
+        assert!(
+            AUDITOR_CLAUDE_AGENTRY_SCRIPT.contains("agentry-self-host-v0"),
+            "dead-pub fix-child briefs must dispatch into agentry-self-host-v0 (mirrors unwrap children)"
         );
     }
 
