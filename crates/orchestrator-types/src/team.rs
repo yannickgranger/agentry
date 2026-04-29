@@ -23,6 +23,7 @@ impl fmt::Display for TeamName {
 /// A directed edge in the message graph: "from's outbox messages routed to to's inbox".
 /// The optional `permit_overrides_from` names a contract-field set that `to` inherits.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MessageEdge {
     pub from: RoleName,
     pub to: RoleName,
@@ -54,6 +55,7 @@ pub struct PermitOverrides {
 
 /// The team topology.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TeamTopology {
     pub name: TeamName,
     pub version: u32,
