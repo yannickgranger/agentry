@@ -103,6 +103,18 @@ ac-verifier-runner-binary:
     test -x ~/.local/bin/ac-verifier-runner
     echo "ac-verifier-runner installed at ~/.local/bin/ac-verifier-runner"
 
+# Build reviewer-claude-runner into ~/.local/bin/reviewer-claude-runner — the
+# workspace-prep + claude-streaming + finding-emission runner for the
+# reviewer-claude-agentry role. EPIC #161 Wave 1.4. Operator-invoked;
+# idempotent. The role bind-mounts this binary at
+# /usr/local/bin/reviewer-claude-runner and execs it directly.
+reviewer-claude-runner-binary:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo install --path crates/agentry-role-runtime --bin reviewer-claude-runner --root ~/.local --locked --quiet
+    test -x ~/.local/bin/reviewer-claude-runner
+    echo "reviewer-claude-runner installed at ~/.local/bin/reviewer-claude-runner"
+
 # Build git-operator into ~/.local/bin/git-operator for the git-operator
 # role's bind-mount. Operator-invoked; idempotent. EPIC #152 brief 5.
 git-operator-binary:
