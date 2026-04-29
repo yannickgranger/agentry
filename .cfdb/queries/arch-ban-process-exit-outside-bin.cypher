@@ -15,7 +15,7 @@
 //   the same canonical path).
 // - caller.is_test = false — exclude #[cfg(test)] callers.
 // - cs.is_test = false — exclude #[cfg(test)] call expressions.
-// - NOT cs.file =~ '.*/bin/.*\.rs' — exclude src/bin/ entry-point files.
+// - NOT cs.file =~ '.*/bin/.*\\.rs' — exclude src/bin/ entry-point files.
 //
 // Verified zero violations on develop tip.
 //
@@ -25,5 +25,5 @@ MATCH (caller:Item)-[:INVOKES_AT]->(cs:CallSite)
 WHERE cs.callee_path = 'std::process::exit'
   AND caller.is_test = false
   AND cs.is_test = false
-  AND NOT cs.file =~ '.*/bin/.*\.rs'
+  AND NOT cs.file =~ '.*/bin/.*\\.rs'
 RETURN caller.qname, caller.crate, cs.file, cs.line
