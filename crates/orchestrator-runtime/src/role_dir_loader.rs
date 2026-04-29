@@ -27,6 +27,25 @@ fn expand_home_in_source(source: &str, home: &str) -> String {
     out
 }
 
+/// Read and deserialize a single role JSON file. Both file-read and parse
+/// errors surface as `Error::RoleLoadFailed` so the offending path is named.
+///
+/// Exposed so integration tests (and any caller that wants the parse path
+/// without persistence) can exercise the structured-error contract without
+/// a live Redis connection.
+pub async fn read_and_parse_role(path: &Path) -> Result<AgentRole> {
+    let text = tokio::fs::read_to_string(path)
+        .await
+        .map_err(|e| Error::RoleLoadFailed {
+            path: path.to_path_buf(),
+            source: Box::new(e),
+        })?;
+    serde_json::from_str::<AgentRole>(&text).map_err(|e| Error::RoleLoadFailed {
+        path: path.to_path_buf(),
+        source: Box::new(e),
+    })
+}
+
 /// Load every `*.json` role file in `dir` into Redis. Returns the list of
 /// names registered, in the order the files were processed (sorted by file
 /// name for determinism).
@@ -56,9 +75,7 @@ pub async fn load_roles_from_dir(
 
     let mut out: Vec<RoleName> = Vec::with_capacity(json_files.len());
     for path in json_files {
-        let text = tokio::fs::read_to_string(&path).await?;
-        let mut role: AgentRole = serde_json::from_str(&text)
-            .map_err(|e| Error::Config(format!("failed to parse {}: {}", path.display(), e)))?;
+        let mut role = read_and_parse_role(&path).await?;
         for mount in role.mounts.iter_mut() {
             let expanded = expand_home_in_source(&mount.source, &home);
             if expanded != mount.source {
@@ -71,7 +88,12 @@ pub async fn load_roles_from_dir(
                 mount.source = expanded;
             }
         }
-        redis_io::save_role(conn, &role).await?;
+        redis_io::save_role(conn, &role)
+            .await
+            .map_err(|e| Error::RoleLoadFailed {
+                path: path.clone(),
+                source: Box::new(e),
+            })?;
         tracing::info!(
             role_name = %role.name.0,
             file_path = %path.display(),
@@ -113,6 +135,31 @@ mod tests {
         // Just a tilde with no slash — leave as-is to avoid surprise.
         let s = expand_home_in_source("~", "/home/agent");
         assert_eq!(s, "~");
+    }
+
+    /// Sanity check: a malformed JSON role file surfaces as
+    /// `Error::RoleLoadFailed` with the offending path named, instead of
+    /// panicking the daemon at boot.
+    #[tokio::test]
+    async fn unwraps_replaced_with_propagation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("bogus.json");
+        std::fs::write(&path, b"{ not valid json").expect("write bogus");
+
+        let err = read_and_parse_role(&path)
+            .await
+            .expect_err("malformed JSON must propagate as Err");
+
+        match err {
+            Error::RoleLoadFailed { path: reported, .. } => {
+                assert_eq!(
+                    reported.file_name().and_then(|s| s.to_str()),
+                    Some("bogus.json"),
+                    "RoleLoadFailed must name the offending file",
+                );
+            }
+            other => panic!("expected RoleLoadFailed, got {other:?}"),
+        }
     }
 
     /// End-to-end-ish: build a role with a `~/...` mount, serialize it, parse

@@ -1,5 +1,6 @@
 //! Error type for the runtime.
 
+use std::path::PathBuf;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -12,6 +13,12 @@ pub enum Error {
     Json(#[from] serde_json::Error),
     #[error("podman: {0}")]
     Podman(String),
+    #[error("failed to load role from {path}: {source}")]
+    RoleLoadFailed {
+        path: PathBuf,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync + 'static>,
+    },
     #[error("sqlite: {0}")]
     Sqlite(#[from] rusqlite::Error),
     #[error("not found: {kind} {key}")]
