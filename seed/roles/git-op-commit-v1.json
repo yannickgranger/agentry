@@ -1,0 +1,32 @@
+{
+  "name": "git-op-commit",
+  "version": 1,
+  "model": null,
+  "system_prompt": null,
+  "image": "docker.io/library/alpine:3.21",
+  "substrate_class": "podman",
+  "package_manager": "apk",
+  "entrypoint_script": "#!/bin/sh\nexec /usr/local/bin/git-op-commit\n",
+  "binaries": ["git", "ca-certificates"],
+  "mcp_servers": [],
+  "tool_allowlist": ["git"],
+  "permit_scope": [
+    "fs:read:/workspace/**",
+    "fs:write:/workspace/**",
+    "net:allow:agency.lab",
+    "forge:write:yg/*"
+  ],
+  "passthru_env": ["GITEA_TOKEN"],
+  "mounts": [
+    {
+      "source": "~/.local/bin/git-op-commit",
+      "target": "/usr/local/bin/git-op-commit",
+      "readonly": true
+    }
+  ],
+  "workspace_mount": {
+    "container_path": "/workspace",
+    "readonly": false
+  },
+  "sccache": false
+}

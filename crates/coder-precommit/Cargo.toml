@@ -46,5 +46,13 @@ path = "src/bin/ship.rs"
 name = "git-operator"
 path = "src/bin/git_operator.rs"
 
+[[bin]]
+name = "git-op-commit"
+path = "src/bin/git_op_commit.rs"
+
+[[bin]]
+name = "git-op-push"
+path = "src/bin/git_op_push.rs"
+
 [lints]
 workspace = true

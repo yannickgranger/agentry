@@ -60,6 +60,14 @@ The `BASH_PRELUDE` `EXIT` trap (legacy bash heredoc roles) does the same
 job for roles that haven't migrated yet; both patterns coexist until EPIC
 \#161 ports every role to Rust.
 
+## PrOpened
+
+Result of a successful gitea pull-request open call. Carries the numeric
+`pr_number` and the public `pr_url`. Returned by the git-operator family
+(`git-op-push`, the legacy combined `git-operator`) so the binary can
+attach both fields to its terminal `done shipped` event without re-parsing
+the gitea response at the call site.
+
 ## StreamErr
 
 Failure type returned by the `stream_claude` lib helper that Rust role
