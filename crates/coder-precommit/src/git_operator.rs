@@ -179,6 +179,42 @@ pub async fn push_branch(cwd: &Path, branch: &str) -> Result<()> {
     run_git(cwd, &["push", "-u", "origin", branch]).await
 }
 
+/// Fetch the latest base_branch from origin, then rebase HEAD onto it.
+/// Returns Ok(()) on a clean rebase. On conflict (any merge conflict markers
+/// produced by `git rebase`), abort the rebase via `git rebase --abort` and
+/// return Err with a structured detail (file paths reported by `git status`,
+/// truncated to a sane size). The caller is responsible for emitting the
+/// terminal `done` event with the failure reason.
+pub async fn rebase_onto(cwd: &Path, base_branch: &str) -> Result<()> {
+    run_git(cwd, &["fetch", "origin", base_branch]).await?;
+    let rebase_target = format!("origin/{base_branch}");
+    let out = Command::new("git")
+        .args(["rebase", &rebase_target])
+        .current_dir(cwd)
+        .output()
+        .await
+        .with_context(|| format!("git rebase {rebase_target}"))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let conflicts = capture_git(cwd, &["diff", "--name-only", "--diff-filter=U"])
+        .await
+        .unwrap_or_default();
+    let files: Vec<&str> = conflicts
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    let count = files.len();
+    let mut paths = files.join(", ");
+    if paths.len() > 1024 {
+        paths.truncate(1024);
+        paths.push_str("...(truncated)");
+    }
+    let _ = run_git(cwd, &["rebase", "--abort"]).await;
+    Err(anyhow!("rebase conflict in {count} file(s): {paths}"))
+}
+
 pub struct PrOpened {
     pub pr_number: u64,
     pub pr_url: String,
@@ -329,6 +365,85 @@ mod tests {
             events[0].get("at").and_then(|v| v.as_str()),
             Some(PRESET),
             "emit_event must NOT overwrite an existing `at` value"
+        );
+    }
+
+    async fn init_origin_and_work(root: &Path) -> (PathBuf, PathBuf) {
+        let bare = root.join("origin.git");
+        let work = root.join("work");
+        std::fs::create_dir(&work).expect("mkdir work");
+        let bare_str = bare.to_str().expect("bare utf8");
+        Command::new("git")
+            .args(["-c", "init.defaultBranch=main", "init", "--bare", bare_str])
+            .current_dir(root)
+            .output()
+            .await
+            .expect("git init --bare");
+        Command::new("git")
+            .args(["-c", "init.defaultBranch=main", "init"])
+            .current_dir(&work)
+            .output()
+            .await
+            .expect("git init work");
+        git_config_idempotent(&work).await.expect("git config");
+        run_git(&work, &["remote", "add", "origin", bare_str])
+            .await
+            .expect("remote add");
+        std::fs::write(work.join("file.txt"), "line1\n").expect("write file");
+        run_git(&work, &["add", "."]).await.expect("git add");
+        run_git(&work, &["commit", "-m", "init"])
+            .await
+            .expect("git commit");
+        run_git(&work, &["push", "-u", "origin", "main"])
+            .await
+            .expect("git push");
+        (bare, work)
+    }
+
+    #[tokio::test]
+    async fn rebase_onto_is_no_op_on_already_in_sync() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (_bare, work) = init_origin_and_work(dir.path()).await;
+        rebase_onto(&work, "main").await.expect("rebase clean");
+        let status = capture_git(&work, &["status", "--porcelain"])
+            .await
+            .expect("status");
+        assert!(
+            status.trim().is_empty(),
+            "worktree should be clean after no-op rebase: {status}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rebase_onto_aborts_on_conflict() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (_bare, work) = init_origin_and_work(dir.path()).await;
+
+        std::fs::write(work.join("file.txt"), "version-A\n").expect("write A");
+        run_git(&work, &["commit", "-am", "version-A"])
+            .await
+            .expect("commit A");
+        run_git(&work, &["push", "origin", "main"])
+            .await
+            .expect("push A");
+
+        run_git(&work, &["checkout", "-b", "feature", "HEAD~1"])
+            .await
+            .expect("checkout feature");
+        std::fs::write(work.join("file.txt"), "version-B\n").expect("write B");
+        run_git(&work, &["commit", "-am", "version-B"])
+            .await
+            .expect("commit B");
+
+        let result = rebase_onto(&work, "main").await;
+        assert!(result.is_err(), "expected rebase to fail with conflict");
+
+        let status = capture_git(&work, &["status", "--porcelain"])
+            .await
+            .expect("status");
+        assert!(
+            status.trim().is_empty(),
+            "rebase --abort should leave worktree clean: {status}"
         );
     }
 }

@@ -148,6 +148,17 @@ git-op-push-binary:
     test -x ~/.local/bin/git-op-push
     echo "git-op-push installed at ~/.local/bin/git-op-push"
 
+# Build git-op-rebase into ~/.local/bin/git-op-rebase for the git-op-rebase
+# role's bind-mount. Operator-invoked; idempotent. Brief 192a of #192 — the
+# rebase phase that #192b will wire into the self-host workflow as a
+# loop-back target on rebase conflict.
+git-op-rebase-binary:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo install --path crates/coder-precommit --bin git-op-rebase --root ~/.local --locked --quiet
+    test -x ~/.local/bin/git-op-rebase
+    echo "git-op-rebase installed at ~/.local/bin/git-op-rebase"
+
 # Build everything
 build:
     cargo build --workspace --release
