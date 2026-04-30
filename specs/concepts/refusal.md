@@ -1,8 +1,13 @@
-# Refusal (draft)
+# Refusal
 
-> Status: **draft**. Ratified when EPIC #231 / #233 wiring lands; today the
-> `EventKind::ToolRefused` variant exists with no producers and no
-> consumers. See #233a for the types-only intro.
+> Status: **ratified**. Code landing PR: #247. The `stream_claude` consumer
+> in `agentry-role-runtime` now parses each transcript line with the
+> JSON-strict `parse_tool_refusal` helper and emits a typed
+> `tool_refused` event via `emit_tool_refused` whenever the line carries
+> a `"type":"tool_use_denied"` or `"permission_denied":true` shape. The
+> `EventKind::ToolRefused` variant from #233a is the producer-side wire
+> form (lifted from `claude --allowedTools` fences); the daemon-side
+> permit-broker producer remains future work.
 
 The bounded context that owns *observation of refused tool invocations*.
 When Claude's `--allowedTools` fence rejects a tool call, or when the

@@ -56,9 +56,9 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 use agentry_role_runtime::{
-    emit_done, emit_event, emit_finding, head_bytes, parse_severity, pointer_str,
-    read_bundle_value, stream_claude, string_array_field, strip_fences, tail_bytes, tail_lines,
-    workspace_is_git_repo, DoneGuard, StreamErr,
+    emit_done, emit_event, emit_finding, head_bytes, parse_allowed_tools, parse_severity,
+    pointer_str, read_bundle_value, stream_claude, string_array_field, strip_fences, tail_bytes,
+    tail_lines, workspace_is_git_repo, DoneGuard, StreamErr,
 };
 use orchestrator_types::{DoneReason, EventVerdict, FindingOrigin, ReviewFinding, Severity};
 use serde_json::{json, Value};
@@ -99,6 +99,13 @@ fn main() {
     let issue_title = pointer_str(&bundle, "/brief/payload/issue_title").to_string();
     let issue_body = pointer_str(&bundle, "/brief/payload/issue_body").to_string();
     let agent_id = pointer_str(&bundle, "/permit/agent_id").to_string();
+    let allowed_tools = parse_allowed_tools(&bundle);
+    if !allowed_tools.is_empty() {
+        emit_event(json!({
+            "msg": "allowed_tools propagated from permit",
+            "patterns": allowed_tools,
+        }));
+    }
 
     if !workspace_is_git_repo(WORKSPACE_DIR) {
         emit_event(json!({

@@ -14,7 +14,7 @@ use std::process::{Command, Stdio};
 
 use serde_json::{json, Value};
 
-use crate::emit_event;
+use crate::{emit_event, emit_tool_refused};
 
 const TRANSCRIPTS_DIR: &str = "/transcripts";
 
@@ -144,6 +144,9 @@ pub fn stream_claude(brief_id: &str, suffix: &str, prompt: &str) -> Result<Strin
             // Transcript write failure is detected post-wait via the
             // empty-file guard below — bash's defence-in-depth.
         }
+        if let Some((tool, command)) = parse_tool_refusal(&line) {
+            emit_tool_refused(&tool, command.as_deref());
+        }
         emit_claude_line(&line);
     }
     let _ = transcript.flush();
@@ -188,6 +191,33 @@ fn emit_claude_line(line: &str) {
     } else {
         emit_event(json!({"claude_raw": line}));
     }
+}
+
+/// JSON-strict parse of a single `claude -p --output-format stream-json`
+/// transcript line for a tool-refusal signal. Returns `Some((tool,
+/// command))` only when the line is a JSON object that carries a
+/// canonical refusal shape:
+///
+/// - top-level `"type":"tool_use_denied"`, OR
+/// - top-level `"permission_denied":true`
+///
+/// `tool` is taken from the top-level `"tool"` field; `command` from the
+/// top-level `"command"` field when present (e.g. the Bash command line),
+/// `None` otherwise. Returns `None` for non-JSON, non-object, or
+/// ambiguous lines — substring-only matches do NOT count.
+fn parse_tool_refusal(line: &str) -> Option<(String, Option<String>)> {
+    let v: Value = serde_json::from_str(line).ok()?;
+    if !v.is_object() {
+        return None;
+    }
+    let is_refusal = v.get("type").and_then(Value::as_str) == Some("tool_use_denied")
+        || v.get("permission_denied").and_then(Value::as_bool) == Some(true);
+    if !is_refusal {
+        return None;
+    }
+    let tool = v.get("tool").and_then(Value::as_str)?.to_string();
+    let command = v.get("command").and_then(Value::as_str).map(str::to_string);
+    Some((tool, command))
 }
 
 /// Walk the transcript, prefer the `result` event's `.result` field; if
@@ -268,5 +298,58 @@ mod tests {
         let path = "/tmp/nonexistent-transcript-bcdef98765.jsonl";
         let _ = fs::remove_file(path);
         assert_eq!(reconstruct_assistant_text(path), "");
+    }
+
+    #[test]
+    fn parse_tool_refusal_accepts_tool_use_denied_with_command() {
+        let line = r#"{"type":"tool_use_denied","tool":"Bash","command":"cargo check"}"#;
+        let r = parse_tool_refusal(line).expect("refusal");
+        assert_eq!(r.0, "Bash");
+        assert_eq!(r.1.as_deref(), Some("cargo check"));
+    }
+
+    #[test]
+    fn parse_tool_refusal_accepts_tool_use_denied_without_command() {
+        let line = r#"{"type":"tool_use_denied","tool":"Read"}"#;
+        let r = parse_tool_refusal(line).expect("refusal");
+        assert_eq!(r.0, "Read");
+        assert!(r.1.is_none());
+    }
+
+    #[test]
+    fn parse_tool_refusal_accepts_permission_denied_flag() {
+        let line = r#"{"permission_denied":true,"tool":"Edit","command":"foo.rs"}"#;
+        let r = parse_tool_refusal(line).expect("refusal");
+        assert_eq!(r.0, "Edit");
+        assert_eq!(r.1.as_deref(), Some("foo.rs"));
+    }
+
+    #[test]
+    fn parse_tool_refusal_returns_none_for_non_json() {
+        assert_eq!(parse_tool_refusal("just prose"), None);
+        assert_eq!(parse_tool_refusal(""), None);
+        assert_eq!(parse_tool_refusal("tool_use_denied: yes"), None);
+    }
+
+    #[test]
+    fn parse_tool_refusal_returns_none_for_non_object_json() {
+        assert_eq!(parse_tool_refusal("[1,2,3]"), None);
+        assert_eq!(parse_tool_refusal("\"tool_use_denied\""), None);
+        assert_eq!(parse_tool_refusal("42"), None);
+    }
+
+    #[test]
+    fn parse_tool_refusal_returns_none_for_unrelated_object() {
+        // Substring-only match must NOT count. The parser is JSON-strict.
+        let line =
+            r#"{"type":"assistant","message":{"content":[{"text":"tool_use_denied somewhere"}]}}"#;
+        assert_eq!(parse_tool_refusal(line), None);
+    }
+
+    #[test]
+    fn parse_tool_refusal_returns_none_when_tool_field_missing() {
+        // Without a `tool` field there's nothing useful to emit — bail out.
+        let line = r#"{"type":"tool_use_denied"}"#;
+        assert_eq!(parse_tool_refusal(line), None);
     }
 }
