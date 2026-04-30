@@ -156,7 +156,25 @@ pub async fn run(cfg: &crate::Config) -> Result<()> {
                             tracing::error!(brief = %brief_id, error = %e, "brief handling failed");
                             let v = Verdict::new(brief_id.clone(), VerdictKind::Failed)
                                 .with_reason(format!("handler error: {e}"));
-                            redis_io::append_verdict(&mut conn_for_brief, &v).await.ok();
+                            match redis_io::append_verdict_idempotent(&mut conn_for_brief, &v).await
+                            {
+                                Ok(Some(stream_id)) => tracing::info!(
+                                    brief = %v.brief.0,
+                                    kind = ?v.kind,
+                                    stream_id = %stream_id,
+                                    "brief verdict emitted"
+                                ),
+                                Ok(None) => tracing::warn!(
+                                    brief = %v.brief.0,
+                                    kind = ?v.kind,
+                                    "duplicate verdict suppressed (SETNX sentinel already set)"
+                                ),
+                                Err(err) => tracing::warn!(
+                                    brief = %v.brief.0,
+                                    error = %err,
+                                    "append_verdict_idempotent failed"
+                                ),
+                            }
                             dol_on_brief_terminal(&mut conn_for_brief, &brief, &v.kind)
                                 .await
                                 .ok();
@@ -373,7 +391,19 @@ async fn handle_brief(
 
         for (run, outcome_res) in runs.iter().zip(outcomes.into_iter()) {
             let outcome = outcome_res?;
-            redis_io::append_verdict(conn, &outcome.verdict).await?;
+            match redis_io::append_verdict_idempotent(conn, &outcome.verdict).await? {
+                Some(stream_id) => tracing::info!(
+                    brief = %outcome.verdict.brief.0,
+                    kind = ?outcome.verdict.kind,
+                    stream_id = %stream_id,
+                    "brief verdict emitted"
+                ),
+                None => tracing::warn!(
+                    brief = %outcome.verdict.brief.0,
+                    kind = ?outcome.verdict.kind,
+                    "duplicate verdict suppressed (SETNX sentinel already set)"
+                ),
+            }
             tracing::info!(
                 brief = %brief.id,
                 role = %run.role_ref.name,
@@ -766,7 +796,14 @@ async fn on_all_children_resolved(conn: &mut ConnectionManager, meta_id: &str) -
 /// concurrent path where multiple terminal-handlers (e.g. three children
 /// resolving in the same tick) all reach this function for the same meta —
 /// only the first arrival wins the SETNX and emits the meta verdict.
+#[tracing::instrument(skip(conn), fields(meta = %meta_id))]
 async fn compose_meta_verdict(conn: &mut ConnectionManager, meta_id: &str) -> Result<()> {
+    // Entry log makes the compose-call observable from production traces so
+    // duplicate-compose incidents can be correlated with the caller's span
+    // chain (#178). The `instrument` attribute carries `meta_id` through
+    // every event emitted by this function.
+    tracing::info!("DOL: compose_meta_verdict entered");
+
     let verdicts_key = format!("agentry:brief:{meta_id}:children_verdicts");
     let pending_key = format!("agentry:brief:{meta_id}:children_pending");
     let verifier_pending_key = format!("agentry:brief:{meta_id}:verifier_pending");
@@ -803,7 +840,19 @@ async fn compose_meta_verdict(conn: &mut ConnectionManager, meta_id: &str) -> Re
     let (final_kind, reason) = compose_verdict_parts(&children, verifier.as_ref());
     let mut final_verdict = Verdict::new(BriefId(meta_id.into()), final_kind.clone());
     final_verdict.reason = reason;
-    redis_io::append_verdict(conn, &final_verdict).await?;
+    match redis_io::append_verdict_idempotent(conn, &final_verdict).await? {
+        Some(stream_id) => tracing::info!(
+            brief = %final_verdict.brief.0,
+            kind = ?final_verdict.kind,
+            stream_id = %stream_id,
+            "brief verdict emitted"
+        ),
+        None => tracing::warn!(
+            brief = %final_verdict.brief.0,
+            kind = ?final_verdict.kind,
+            "duplicate verdict suppressed (SETNX sentinel already set)"
+        ),
+    }
 
     let _: () = conn.del(&verdicts_key).await?;
     let _: () = conn.del(&pending_key).await?;
@@ -1694,6 +1743,11 @@ mod tests {
 
         let _: () = conn.del(&verdicts_key).await.expect("cleanup verdicts");
         let _: () = conn.del(&final_emitted_key).await.expect("cleanup marker");
+        // The new per-brief SETNX sentinel from `append_verdict_idempotent`
+        // (#178). The first compose claimed it; clean up to avoid leaking
+        // keys with 24h TTL across test runs.
+        let sentinel_key = format!("agentry:verdict:emitted:{meta_id}");
+        let _: () = conn.del(&sentinel_key).await.expect("cleanup sentinel");
     }
 
     /// Mock spawner that panics if invoked. The dispatch-time validation
