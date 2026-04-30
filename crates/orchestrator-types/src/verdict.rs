@@ -51,6 +51,9 @@ pub struct Verdict {
     pub trace_stream: String,
     /// Optional short reason for the verdict.
     pub reason: Option<String>,
+    /// Number of refusals observed across the brief's role runs.
+    #[serde(default)]
+    pub refusal_count: u32,
 }
 
 impl Verdict {
@@ -63,6 +66,7 @@ impl Verdict {
             at: now(),
             trace_stream,
             reason: None,
+            refusal_count: 0,
         }
     }
 
@@ -103,6 +107,16 @@ mod tests {
         let s = serde_json::to_string(&v).expect("ser");
         let back: Verdict = serde_json::from_str(&s).expect("de");
         assert_eq!(v, back);
+    }
+
+    #[test]
+    fn refusal_count_roundtrips() {
+        let mut v = Verdict::new(BriefId("brf_xyz".into()), VerdictKind::Failed);
+        v.refusal_count = 5;
+        let s = serde_json::to_string(&v).expect("ser");
+        let back: Verdict = serde_json::from_str(&s).expect("de");
+        assert_eq!(v, back);
+        assert_eq!(back.refusal_count, 5);
     }
 
     #[test]
