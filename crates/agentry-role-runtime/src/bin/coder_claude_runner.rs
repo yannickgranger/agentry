@@ -39,9 +39,9 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 use agentry_role_runtime::{
-    emit_done, emit_event, emit_finding, head_bytes, mech_finding, pointer_str, pointer_str_or,
-    read_bundle_value, stream_claude, string_array_field, strip_fences, tail_bytes, tail_lines,
-    DoneGuard, StreamErr,
+    emit_done, emit_event, emit_finding, head_bytes, mech_finding, parse_allowed_tools,
+    pointer_str, pointer_str_or, read_bundle_value, stream_claude, string_array_field,
+    strip_fences, tail_bytes, tail_lines, DoneGuard, StreamErr,
 };
 use orchestrator_types::{DoneReason, EventVerdict, FindingOrigin, ReviewFinding, Severity};
 use serde_json::{json, Value};
@@ -130,6 +130,13 @@ fn run() -> Result<(), RunErr> {
         "branch": ctx.branch,
     }));
 
+    if !ctx.allowed_tools.is_empty() {
+        emit_event(json!({
+            "msg": "allowed_tools propagated from permit",
+            "patterns": ctx.allowed_tools,
+        }));
+    }
+
     let prompt = build_coder_prompt(
         &ctx.base_branch,
         &ctx.branch,
@@ -199,6 +206,7 @@ struct BriefContext {
     topology_name: String,
     rework_banner: String,
     blocker_findings: Vec<PriorFinding>,
+    allowed_tools: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -222,6 +230,7 @@ fn parse_brief_context(bundle: &Value) -> BriefContext {
         build_rework_banner(&blocker_findings)
     };
     let branch = format!("auto/{brief_id}");
+    let allowed_tools = parse_allowed_tools(bundle);
     BriefContext {
         brief_id,
         base_branch,
@@ -232,6 +241,7 @@ fn parse_brief_context(bundle: &Value) -> BriefContext {
         topology_name,
         rework_banner,
         blocker_findings,
+        allowed_tools,
     }
 }
 
@@ -1175,6 +1185,7 @@ mod tests {
         assert_eq!(ctx.issue_body, "BODY");
         assert!(ctx.rework_banner.is_empty());
         assert!(ctx.blocker_findings.is_empty());
+        assert!(ctx.allowed_tools.is_empty());
     }
 
     #[test]
@@ -1196,5 +1207,19 @@ mod tests {
         assert!(ctx.rework_banner.contains("REWORK iteration"));
         assert!(ctx.rework_banner.contains("rework me"));
         assert_eq!(ctx.blocker_findings.len(), 1);
+    }
+
+    #[test]
+    fn parse_brief_context_pulls_allowed_tools_from_permit() {
+        let bundle = json!({
+            "brief": {"id": "brf_x", "topology": {"name": "agentry-self-host-v0"}, "payload": {}},
+            "permit": {"agent_id": "a", "allowed_tools": ["Read", "Bash(*)"]},
+            "team_context": {"messages": []}
+        });
+        let ctx = parse_brief_context(&bundle);
+        assert_eq!(
+            ctx.allowed_tools,
+            vec!["Read".to_string(), "Bash(*)".to_string()]
+        );
     }
 }

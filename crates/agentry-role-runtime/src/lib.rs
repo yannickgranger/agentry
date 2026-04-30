@@ -86,6 +86,20 @@ pub fn emit_message(to: &str, payload: Value) {
     }));
 }
 
+/// Emit one `tool_refused` event — top-level `type:"tool_refused"` so the
+/// line round-trips into [`orchestrator_types::EventKind::ToolRefused`]
+/// (NOT the freeform `EventKind::Event`). Mirrors `emit_finding` /
+/// `emit_message` in calling [`emit_line`] directly rather than wrapping
+/// the variant in an `event` envelope.
+pub fn emit_tool_refused(tool: &str, command: Option<&str>) {
+    emit_line(json!({
+        "at": Utc::now().to_rfc3339(),
+        "type": "tool_refused",
+        "tool": tool,
+        "command": command,
+    }));
+}
+
 /// Emit the terminal `done` event with verdict and optional structured reason.
 /// Sets the static flag so a `DoneGuard` drop becomes a no-op.
 pub fn emit_done(verdict: EventVerdict, reason: Option<DoneReason>) {
@@ -227,6 +241,25 @@ pub fn parse_severity(opt: Option<&str>) -> Severity {
         "blocker" => Severity::Blocker,
         _ => Severity::Warn,
     }
+}
+
+/// Read the bundle's `/permit/allowed_tools` array as a `Vec<String>` of
+/// `claude --allowedTools` patterns. Empty when missing, null, or not an
+/// array. Non-string entries are silently dropped.
+///
+/// Single source of truth for both `coder_claude_runner` and
+/// `reviewer_claude_runner` — keeps the field name + JSON-pointer path
+/// from drifting per-binary.
+pub fn parse_allowed_tools(bundle: &Value) -> Vec<String> {
+    bundle
+        .pointer("/permit/allowed_tools")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Read an array-of-strings field on `v`. Missing / non-array / non-string
@@ -391,6 +424,83 @@ mod tests {
     fn strip_fences_drops_blank_lines() {
         let raw = "\n[1,2]\n\nmore\n";
         assert_eq!(strip_fences(raw), "[1,2]\nmore\n");
+    }
+
+    #[test]
+    fn emit_tool_refused_round_trips_into_event_kind_tool_refused() {
+        // Build the same JSON object emit_tool_refused writes and parse it
+        // through the typed Event enum — this exercises the wire shape
+        // without touching stdout.
+        let line = json!({
+            "at": Utc::now().to_rfc3339(),
+            "type": "tool_refused",
+            "tool": "Bash",
+            "command": "rm -rf /",
+        });
+        let s = serde_json::to_string(&line).expect("ser");
+        let evt: orchestrator_types::Event = serde_json::from_str(&s).expect("de");
+        match evt.kind {
+            orchestrator_types::EventKind::ToolRefused { tool, command } => {
+                assert_eq!(tool, "Bash");
+                assert_eq!(command.as_deref(), Some("rm -rf /"));
+            }
+            other => panic!("expected ToolRefused, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn emit_tool_refused_with_none_command_round_trips() {
+        let line = json!({
+            "at": Utc::now().to_rfc3339(),
+            "type": "tool_refused",
+            "tool": "Read",
+            "command": Value::Null,
+        });
+        let s = serde_json::to_string(&line).expect("ser");
+        let evt: orchestrator_types::Event = serde_json::from_str(&s).expect("de");
+        match evt.kind {
+            orchestrator_types::EventKind::ToolRefused { tool, command } => {
+                assert_eq!(tool, "Read");
+                assert!(command.is_none());
+            }
+            other => panic!("expected ToolRefused, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_allowed_tools_reads_string_array() {
+        let bundle = json!({
+            "permit": {"allowed_tools": ["Read", "Edit", "Bash(cargo fmt:*)"]},
+        });
+        assert_eq!(
+            parse_allowed_tools(&bundle),
+            vec![
+                "Read".to_string(),
+                "Edit".to_string(),
+                "Bash(cargo fmt:*)".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_allowed_tools_returns_empty_when_missing() {
+        let bundle = json!({"permit": {}});
+        assert!(parse_allowed_tools(&bundle).is_empty());
+    }
+
+    #[test]
+    fn parse_allowed_tools_returns_empty_for_non_array() {
+        let bundle = json!({"permit": {"allowed_tools": "not an array"}});
+        assert!(parse_allowed_tools(&bundle).is_empty());
+    }
+
+    #[test]
+    fn parse_allowed_tools_drops_non_string_entries() {
+        let bundle = json!({"permit": {"allowed_tools": ["Read", 42, null, "Edit"]}});
+        assert_eq!(
+            parse_allowed_tools(&bundle),
+            vec!["Read".to_string(), "Edit".to_string()]
+        );
     }
 
     #[test]
