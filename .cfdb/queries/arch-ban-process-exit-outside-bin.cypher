@@ -15,7 +15,11 @@
 //   the same canonical path).
 // - caller.is_test = false — exclude #[cfg(test)] callers.
 // - cs.is_test = false — exclude #[cfg(test)] call expressions.
-// - NOT cs.file =~ '.*/bin/.*\\.rs' — exclude src/bin/ entry-point files.
+// - NOT caller.qname =~ '.*::main' — exclude binary main functions, which
+//   are the legitimate process::exit call sites. Filtering on qname rather
+//   than cs.file path because cfdb's path normalization differs across
+//   environments (relative on host, absolute /workspace/... on CI), making
+//   path-regex filters fragile.
 //
 // Verified zero violations on develop tip.
 //
@@ -25,5 +29,5 @@ MATCH (caller:Item)-[:INVOKES_AT]->(cs:CallSite)
 WHERE cs.callee_path = 'std::process::exit'
   AND caller.is_test = false
   AND cs.is_test = false
-  AND NOT cs.file =~ '.*/bin/.*\\.rs'
+  AND NOT caller.qname =~ '.*::main'
 RETURN caller.qname, caller.crate, cs.file, cs.line
