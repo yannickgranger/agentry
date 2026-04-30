@@ -21,7 +21,8 @@ pub use permit::{PermitScope, ToolAllowlist, WorkPermit};
 pub use project::{Project, ProjectSlug, StandingOrders};
 pub use review::{FindingOrigin, ReviewFinding, Severity};
 pub use role::{
-    AgentRole, Mount, PackageManager, RoleName, RoleRef, SubstrateClass, WorkspaceMount,
+    AgentRole, AllowedTools, Mount, PackageManager, RoleName, RoleRef, SubstrateClass,
+    WorkspaceMount,
 };
 pub use team::{MessageEdge, PermitOverrides, TeamName, TeamTopology};
 
@@ -99,6 +100,7 @@ mod apply_overrides_tests {
             role: RoleName("x".into()),
             brief: brief::BriefId("x".into()),
             tool_allowlist: ToolAllowlist(vec!["read".into(), "write".into(), "edit".into()]),
+            allowed_tools: None,
             permit_scope: PermitScope(vec![
                 "fs:read:/workspace/**".into(),
                 "fs:write:/workspace/**".into(),

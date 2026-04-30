@@ -1021,6 +1021,7 @@ fn mint_permit(brief: &Brief, role: &AgentRole) -> Result<WorkPermit> {
         role: role.name.clone(),
         brief: brief.id.clone(),
         tool_allowlist: role.tool_allowlist.clone(),
+        allowed_tools: role.allowed_tools.clone(),
         permit_scope: role.permit_scope.clone(),
         max_tokens: brief.budget.max_tokens,
         max_wall_seconds: brief.budget.max_wall_seconds,
@@ -1337,6 +1338,51 @@ mod tests {
         let t = diamond_team();
         let resolved = resolve_rework_target(&rr("scribe"), &t);
         assert_eq!(resolved, None);
+    }
+
+    fn synthetic_role(allowed: Option<orchestrator_types::AllowedTools>) -> AgentRole {
+        use orchestrator_types::{PackageManager, SubstrateClass};
+        AgentRole {
+            name: rn("synth"),
+            version: 1,
+            model: None,
+            system_prompt: None,
+            image: "alpine:3.21".into(),
+            substrate_class: SubstrateClass::Podman,
+            package_manager: PackageManager::Apk,
+            entrypoint_script: "#!/usr/bin/env bash\nexit 0\n".into(),
+            exitpoint_script: None,
+            binaries: vec![],
+            mcp_servers: vec![],
+            tool_allowlist: ToolAllowlist::default(),
+            allowed_tools: allowed,
+            permit_scope: PermitScope::default(),
+            passthru_env: vec![],
+            mounts: vec![],
+            workspace_mount: None,
+            sccache: false,
+            extra_bootstrap: vec![],
+        }
+    }
+
+    #[test]
+    fn mint_permit_propagates_allowed_tools_some() {
+        let role = synthetic_role(Some(orchestrator_types::AllowedTools(vec![
+            "Read".into(),
+            "Bash(*)".into(),
+        ])));
+        let brief = Brief::new("test", VersionedRef::new("t", 1), serde_json::json!({}));
+        let permit = mint_permit(&brief, &role).expect("mint");
+        assert_eq!(permit.allowed_tools, role.allowed_tools);
+        assert_eq!(permit.allowed_tools.as_ref().map(|a| a.0.len()), Some(2));
+    }
+
+    #[test]
+    fn mint_permit_propagates_allowed_tools_none() {
+        let role = synthetic_role(None);
+        let brief = Brief::new("test", VersionedRef::new("t", 1), serde_json::json!({}));
+        let permit = mint_permit(&brief, &role).expect("mint");
+        assert!(permit.allowed_tools.is_none());
     }
 
     fn make_child_brief(id: &str) -> Brief {

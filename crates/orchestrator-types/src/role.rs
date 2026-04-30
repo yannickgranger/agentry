@@ -84,7 +84,7 @@ impl ToolAllowlist {
 ///
 /// The two are intentionally NOT auto-synchronized — they enforce at
 /// different layers with different grammars.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(transparent)]
 pub struct AllowedTools(pub Vec<String>);
 
@@ -181,6 +181,11 @@ pub struct AgentRole {
     /// Whitelist of tool names the agent may call.
     #[serde(default)]
     pub tool_allowlist: ToolAllowlist,
+    /// Pattern strings handed to `claude --allowedTools` at agent spawn time.
+    /// Distinct value domain from `tool_allowlist` and intentionally NOT
+    /// auto-synchronized — see [`AllowedTools`] docs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_tools: Option<AllowedTools>,
     /// Base permit scope — narrowed further per brief.
     #[serde(default)]
     pub permit_scope: PermitScope,
@@ -239,6 +244,7 @@ mod tests {
                 binary: None,
             }],
             tool_allowlist: ToolAllowlist(vec!["read".into(), "edit".into(), "bash:cargo".into()]),
+            allowed_tools: None,
             permit_scope: PermitScope(vec![
                 "fs:read:/workspace/**".into(),
                 "fs:write:/workspace/**".into(),
@@ -273,6 +279,7 @@ mod tests {
             binaries: vec![],
             mcp_servers: vec![],
             tool_allowlist: ToolAllowlist::default(),
+            allowed_tools: None,
             permit_scope: PermitScope::default(),
             passthru_env: vec![],
             mounts: vec![],
@@ -305,6 +312,7 @@ mod tests {
             binaries: vec![],
             mcp_servers: vec![],
             tool_allowlist: ToolAllowlist::default(),
+            allowed_tools: None,
             permit_scope: PermitScope::default(),
             passthru_env: vec![],
             mounts: vec![],
@@ -356,5 +364,52 @@ mod tests {
         let s = serde_json::to_string(&a).expect("ser");
         let back: AllowedTools = serde_json::from_str(&s).expect("de");
         assert_eq!(a, back);
+    }
+
+    fn role_with_allowed_tools(allowed: Option<AllowedTools>) -> AgentRole {
+        AgentRole {
+            name: RoleName("coder-rust".into()),
+            version: 1,
+            model: None,
+            system_prompt: None,
+            image: "alpine:3.21".into(),
+            substrate_class: SubstrateClass::Podman,
+            package_manager: PackageManager::Apk,
+            entrypoint_script: "#!/usr/bin/env bash\nexit 0\n".into(),
+            exitpoint_script: None,
+            binaries: vec![],
+            mcp_servers: vec![],
+            tool_allowlist: ToolAllowlist::default(),
+            allowed_tools: allowed,
+            permit_scope: PermitScope::default(),
+            passthru_env: vec![],
+            mounts: vec![],
+            workspace_mount: None,
+            sccache: false,
+            extra_bootstrap: vec![],
+        }
+    }
+
+    #[test]
+    fn agent_role_roundtrips_with_allowed_tools_some() {
+        let r = role_with_allowed_tools(Some(AllowedTools(vec!["Read".into()])));
+        let s = serde_json::to_string(&r).expect("ser");
+        let back: AgentRole = serde_json::from_str(&s).expect("de");
+        assert_eq!(r, back);
+        assert_eq!(
+            back.allowed_tools.as_ref().map(|a| a.0.as_slice()),
+            Some(&["Read".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn agent_role_roundtrips_with_allowed_tools_none() {
+        let r = role_with_allowed_tools(None);
+        let s = serde_json::to_string(&r).expect("ser");
+        // skip_serializing_if drops the field on the wire when None.
+        assert!(!s.contains("allowed_tools"));
+        let back: AgentRole = serde_json::from_str(&s).expect("de");
+        assert_eq!(r, back);
+        assert!(back.allowed_tools.is_none());
     }
 }

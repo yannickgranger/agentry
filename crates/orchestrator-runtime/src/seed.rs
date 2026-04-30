@@ -1089,6 +1089,7 @@ fn build_planner_claude_agentry_role(home: &str, claude_settings_path: &str) -> 
         binaries: vec![],
         mcp_servers: vec![],
         tool_allowlist: ToolAllowlist(vec![]),
+        allowed_tools: None,
         // Strictly tighter than archaeologist: no agency.lab (no cargo install),
         // no agentry-sccache-redis (no compilation).
         permit_scope: PermitScope(vec![
@@ -1150,6 +1151,7 @@ fn build_archaeologist_claude_agentry_role(home: &str, claude_settings_path: &st
         binaries: vec![],
         mcp_servers: vec![],
         tool_allowlist: ToolAllowlist(vec![]),
+        allowed_tools: None,
         permit_scope: PermitScope(vec![
             "fs:read:/workspace/**".into(),
             "fs:write:/workspace/**".into(),
@@ -1443,6 +1445,7 @@ fn build_auditor_claude_agentry_role(home: &str) -> AgentRole {
         binaries: vec![],
         mcp_servers: vec![],
         tool_allowlist: ToolAllowlist(vec![]),
+        allowed_tools: None,
         permit_scope: PermitScope(vec![
             "fs:read:/workspace/**".into(),
             "fs:write:/workspace/**".into(),
@@ -1494,6 +1497,7 @@ fn build_verifier_claude_agentry_role() -> AgentRole {
         binaries: vec![],
         mcp_servers: vec![],
         tool_allowlist: ToolAllowlist(vec![]),
+        allowed_tools: None,
         // Strictly read-only on workspace (criterion shouldn't mutate). /tmp
         // write for criterion temp files. No net, no git, no claude.
         permit_scope: PermitScope(vec![
@@ -1539,6 +1543,7 @@ fn build_pr_rebaser_agentry_role(_home: &str) -> AgentRole {
         ],
         mcp_servers: vec![],
         tool_allowlist: ToolAllowlist(vec!["git".into(), "curl".into()]),
+        allowed_tools: None,
         permit_scope: PermitScope(vec![
             "fs:read:/workspace/**".into(),
             "fs:write:/workspace/**".into(),
@@ -1660,6 +1665,7 @@ fn build_preflight_criterion_agentry_role(home: &str) -> AgentRole {
         ],
         mcp_servers: vec![],
         tool_allowlist: ToolAllowlist(vec!["bash".into(), "rg".into(), "grep".into(), "wc".into()]),
+        allowed_tools: None,
         permit_scope: PermitScope(vec!["fs:read:/workspace/**".into()]),
         passthru_env: vec![],
         extra_bootstrap: vec![],
@@ -1798,6 +1804,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         binaries: vec![],
         mcp_servers: vec![],
         tool_allowlist: ToolAllowlist(vec![]),
+        allowed_tools: None,
         permit_scope: PermitScope(vec!["net:deny:*".into()]),
         passthru_env: vec![],
         extra_bootstrap: vec![],
@@ -1834,6 +1841,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         binaries: vec![],
         mcp_servers: vec![],
         tool_allowlist: ToolAllowlist(vec!["read".into()]),
+        allowed_tools: None,
         permit_scope: PermitScope(vec!["net:deny:*".into()]),
         passthru_env: vec![],
         extra_bootstrap: vec![],
@@ -1870,6 +1878,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         binaries: vec![],
         mcp_servers: vec![],
         tool_allowlist: ToolAllowlist(vec![]),
+        allowed_tools: None,
         permit_scope: PermitScope(vec!["net:deny:*".into()]),
         passthru_env: vec![],
         extra_bootstrap: vec![],
@@ -1890,6 +1899,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         binaries: vec![],
         mcp_servers: vec![],
         tool_allowlist: ToolAllowlist(vec![]),
+        allowed_tools: None,
         permit_scope: PermitScope(vec!["net:deny:*".into()]),
         passthru_env: vec![],
         extra_bootstrap: vec![],
@@ -1943,6 +1953,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         binaries: vec!["curl".into()],
         mcp_servers: vec![],
         tool_allowlist: ToolAllowlist(vec![]),
+        allowed_tools: None,
         permit_scope: PermitScope(vec!["net:allow:api.x.ai".into()]),
         passthru_env: vec!["XAI_API_KEY".into()],
         extra_bootstrap: vec![],
@@ -1982,6 +1993,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         binaries: vec![],
         mcp_servers: vec![],
         tool_allowlist: ToolAllowlist(vec![]),
+        allowed_tools: None,
         permit_scope: PermitScope(vec![
             "net:allow:api.anthropic.com".into(), // claude CLI authed via OAuth, NOT API key
         ]),
@@ -2041,6 +2053,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         binaries: vec![],
         mcp_servers: vec![],
         tool_allowlist: ToolAllowlist(vec![]),
+        allowed_tools: None,
         permit_scope: PermitScope(vec!["net:deny:*".into()]),
         passthru_env: vec![],
         extra_bootstrap: vec![],
@@ -2062,6 +2075,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         mcp_servers: vec![],
         // Broad base — will be narrowed by synthesizer's Message.
         tool_allowlist: ToolAllowlist(vec!["write".into(), "edit".into(), "read".into()]),
+        allowed_tools: None,
         permit_scope: PermitScope(vec![
             "fs:read:/workspace/**".into(),
             "fs:write:/workspace/**".into(),
@@ -2119,6 +2133,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         binaries: vec!["git".into(), "curl".into()],
         mcp_servers: vec![],
         tool_allowlist: ToolAllowlist(vec![]),
+        allowed_tools: None,
         permit_scope: PermitScope(vec![
             "net:allow:agency.lab".into(),
             "forge:write:yg/agentry-toy".into(), // symbolic (no runtime enforcement yet)
@@ -2158,6 +2173,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         binaries: vec![],
         mcp_servers: vec![],
         tool_allowlist: ToolAllowlist(vec![]),
+        allowed_tools: None,
         permit_scope: PermitScope(vec![
             "fs:read:/workspace/**".into(),
             "fs:write:/workspace/**".into(),
@@ -2202,6 +2218,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         binaries: vec!["rust".into(), "cargo".into()],
         mcp_servers: vec![],
         tool_allowlist: ToolAllowlist(vec![]),
+        allowed_tools: None,
         permit_scope: PermitScope(vec!["net:allow:agentry-sccache-redis".into()]),
         passthru_env: vec![],
         extra_bootstrap: vec![],
@@ -2238,6 +2255,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         binaries: vec![],
         mcp_servers: vec![],
         tool_allowlist: ToolAllowlist(vec![]),
+        allowed_tools: None,
         permit_scope: PermitScope(vec!["net:deny:*".into()]),
         passthru_env: vec![],
         extra_bootstrap: vec![],
@@ -2284,6 +2302,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         binaries: vec!["git".into(), "ca-certificates".into()],
         mcp_servers: vec![],
         tool_allowlist: ToolAllowlist(vec![]),
+        allowed_tools: None,
         permit_scope: PermitScope(vec![
             "fs:read:/workspace/**".into(),
             "net:allow:agency.lab".into(),
@@ -2334,6 +2353,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         binaries: vec!["git".into(), "curl".into(), "ca-certificates".into()],
         mcp_servers: vec![],
         tool_allowlist: ToolAllowlist(vec![]),
+        allowed_tools: None,
         permit_scope: PermitScope(vec![
             "net:allow:agency.lab".into(),
             "forge:write:yg/*".into(),
@@ -2362,6 +2382,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         binaries: vec!["curl".into(), "ca-certificates".into()],
         mcp_servers: vec![],
         tool_allowlist: ToolAllowlist(vec![]),
+        allowed_tools: None,
         permit_scope: PermitScope(vec![
             "net:allow:agency.lab".into(),
             "forge:write:yg/agentry".into(),

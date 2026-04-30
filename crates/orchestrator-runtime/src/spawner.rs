@@ -935,6 +935,7 @@ mod tests {
             binaries: binaries.into_iter().map(String::from).collect(),
             mcp_servers: vec![],
             tool_allowlist: orchestrator_types::ToolAllowlist::default(),
+            allowed_tools: None,
             permit_scope: orchestrator_types::PermitScope::default(),
             passthru_env: vec![],
             mounts: vec![],

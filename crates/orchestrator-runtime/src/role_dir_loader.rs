@@ -181,6 +181,7 @@ mod tests {
             binaries: vec![],
             mcp_servers: vec![],
             tool_allowlist: ToolAllowlist::default(),
+            allowed_tools: None,
             permit_scope: PermitScope::default(),
             passthru_env: vec![],
             mounts: vec![
@@ -241,6 +242,7 @@ mod tests {
             binaries: vec![],
             mcp_servers: vec![],
             tool_allowlist: ToolAllowlist::default(),
+            allowed_tools: None,
             permit_scope: PermitScope::default(),
             passthru_env: vec![],
             mounts: vec![],

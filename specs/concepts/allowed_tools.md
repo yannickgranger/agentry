@@ -1,8 +1,10 @@
-# Allowed tools (draft)
+# Allowed tools
 
-> Status: **draft**. Ratified when EPIC #231 / #233 wiring lands; today the
-> type exists with no consumers (no `AgentRole` field, no `WorkPermit`
-> field, no `stream_claude` consumer). See #233a for the types-only intro.
+> Status: **ratified**. Code landing PR: #233b-1. The type is wired into
+> `AgentRole.allowed_tools` and propagated through `mint_permit` into
+> `WorkPermit.allowed_tools`. The `stream_claude` consumer (typed
+> `emit_tool_refused` + `parse_tool_refusal`, lifting `parse_allowed_tools`)
+> lands in #247 and remains gated by `refusal.md`'s draft status.
 
 The bounded context that owns *pre-spawn tool fencing for Claude-CLI roles*.
 A role spawns the `claude` binary with `--allowedTools <pattern>...`; the

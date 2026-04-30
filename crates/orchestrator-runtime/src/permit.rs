@@ -119,6 +119,7 @@ mod tests {
             role: RoleName("t".into()),
             brief: BriefId("brf_t".into()),
             tool_allowlist: ToolAllowlist(vec!["read".into()]),
+            allowed_tools: None,
             permit_scope: PermitScope::default(),
             max_tokens: None,
             max_wall_seconds: None,
