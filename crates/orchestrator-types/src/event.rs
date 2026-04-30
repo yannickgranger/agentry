@@ -60,6 +60,16 @@ pub enum EventKind {
     Event { payload: serde_json::Value },
     /// Agent is about to call a tool. Permit broker checks against allowlist.
     ToolCall { call: ToolCall },
+    /// A tool invocation the agent attempted was refused — either by
+    /// `claude --allowedTools` pre-spawn fencing or by the daemon's permit
+    /// broker post-hoc audit. `command` carries the concrete invocation
+    /// string when available (e.g. the Bash command), `None` when the
+    /// refusal was on the tool name alone.
+    ToolRefused {
+        tool: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        command: Option<String>,
+    },
     /// Agent has a message for another role — content ends up in `to`'s inbox.
     Message {
         to: String,
@@ -213,6 +223,46 @@ mod tests {
         let line = r#"{"at":"2026-04-23T10:00:01Z","type":"done","verdict":"shipped"}"#;
         let e: Event = serde_json::from_str(line).expect("parse");
         assert_eq!(e.verdict(), Some(EventVerdict::Shipped));
+    }
+
+    #[test]
+    fn tool_refused_event_roundtrips() {
+        let e = Event::new(EventKind::ToolRefused {
+            tool: "Bash".into(),
+            command: Some("cargo check".into()),
+        });
+        let s = serde_json::to_string(&e).expect("ser");
+        let back: Event = serde_json::from_str(&s).expect("de");
+        assert_eq!(e, back);
+        assert!(s.contains("\"type\":\"tool_refused\""));
+        assert!(s.contains("\"tool\":\"Bash\""));
+        assert!(s.contains("\"command\":\"cargo check\""));
+    }
+
+    #[test]
+    fn event_kind_match_is_exhaustive() {
+        // Compile-time check: every variant of `EventKind`, including
+        // `ToolRefused`, is named below. Adding a variant without updating
+        // this test is a hard compile error.
+        fn classify(k: &EventKind) -> &'static str {
+            match k {
+                EventKind::Event { .. } => "event",
+                EventKind::ToolCall { .. } => "tool_call",
+                EventKind::ToolRefused { .. } => "tool_refused",
+                EventKind::Message { .. } => "message",
+                EventKind::Log { .. } => "log",
+                EventKind::Finding { .. } => "finding",
+                EventKind::Status { .. } => "status",
+                EventKind::Done { .. } => "done",
+            }
+        }
+        assert_eq!(
+            classify(&EventKind::ToolRefused {
+                tool: "Read".into(),
+                command: None,
+            }),
+            "tool_refused"
+        );
     }
 
     #[test]
