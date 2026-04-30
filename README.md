@@ -1,129 +1,133 @@
 # agentry
 
-Minimal orchestrator for ephemeral agent containers. Methodology as data, enforcement as physics.
+A controlled system for running AI coding agents.
 
-## What it does
+You describe what you want built. agentry runs a sequence of AI agents
+to build it (a coder, a reviewer, a committer, a verifier — your choice),
+opens a pull request, and watches it through to merge. Automatic checks
+block the merge if the change drifts from the project's declared design.
 
-Reads a `Brief` off a Redis stream. Resolves the named `TeamTopology` from a registry of role-DAGs. For each role in the team: mints + narrows + signs a `WorkPermit`, allocates a per-brief workspace if the role declares one, spawns a fresh container on a user-chosen substrate (Podman today), enforces the permit on every `tool_call` the agent emits, routes inter-role messages per the team's message graph, records a verdict.
+## What it is
 
-Topologies range from full-pipeline (coder + reviewer-mechanical + reviewer-claude + shipper + ci-watcher) down to single-role (offline auditor). The planner role (`agentry-planner-v0`) decomposes a meta-brief into child briefs, picking each child's topology by task signature. The auditor role (`agentry-self-audit-v0`) inspects develop for unused dependencies via cargo-udeps and auto-dispatches fix briefs through the chain-trigger — no human in the loop.
+agentry runs AI coding agents one at a time, each in its own short-lived
+container. Each agent is a **role** that does one job — produce a change,
+review it, commit it, push it, watch CI — and then exits. You assemble
+roles into a **workflow** that describes what runs in what order, who
+hands off to whom, and how failures route back for fixes.
 
-The orchestrator doesn't know what "TDD", "gate", or "review" mean — that's what team topologies encode.
+You submit a **brief** (what to build, where, how it's accepted).
+agentry resolves the named workflow, spawns one container per role,
+hands each one the brief, watches the events they emit, and records
+the outcome. When the workflow opens a pull request, agentry watches
+your CI and either auto-merges on green or routes the failure back to
+the coder for a fix.
 
-## Quickstart
+Workflows are written as small JSON files. Adding a new shape — a
+different role ordering, a different rework strategy — does not require
+releasing a new version of agentry. You author the workflow, register
+it, and dispatch briefs against it.
+
+## Why it exists
+
+AI coding agents produce code that compiles and looks reasonable but
+contains subtle integration bugs: a parameter wired through but read
+under the wrong name, a helper duplicated when one already exists, a
+feature built layer by layer that doesn't connect. Code review catches
+some of this. It misses much, especially when the reviewer isn't an
+expert in the language being produced.
+
+agentry's bet: catch the drift in the build, not in the human eye. You
+declare your architecture once (which concepts exist, how they relate,
+what's banned). The project's CI runs a checker that diffs what the
+agent produced against your declaration. Drift fails the build. The
+agent cannot ship a change that violates the architecture, even if the
+change passes its tests and the reviewer doesn't notice.
+
+## What it isn't
+
+- Not a chatbot framework. Agents don't converse — they take a brief,
+  do the work, and exit.
+- Not a CI runner. Your CI sits underneath; agentry watches it.
+- Not opinionated about which AI to use. Roles can wrap Claude, Grok,
+  Gemini, plain shell scripts, or compiled binaries — anything that
+  reads input and writes structured output.
+- Not a single-shot tool. agentry holds the loop: change → review →
+  commit → push → CI → on-failure route back to coder, repeat.
+
+## Shape
+
+```mermaid
+flowchart LR
+    op([You])
+    cat[(Catalog<br/>roles + workflows)]
+    sub[agentry]
+    agents[Agents in containers]
+    pr[Pull request]
+    fences{{Architecture checks}}
+    merged([Merged])
+
+    op -->|author| cat
+    op -->|submit brief| sub
+    sub -->|read| cat
+    sub -->|run one at a time| agents
+    agents -->|report back| sub
+    agents -->|open| pr
+    pr --> fences
+    fences -->|pass| merged
+    fences -.->|fail, send to coder| sub
+```
+
+The pieces:
+
+1. **The catalog.** Your roles and workflows, stored as JSON. You add
+   to it; agentry reads from it.
+2. **agentry itself.** Reads briefs, runs the workflow, watches the
+   agents, records outcomes.
+3. **The agents.** Short-lived containers, each does one job. Their
+   output is the events you see in the dashboard.
+4. **The architecture checks.** Run on every pull request. Compare
+   what the agent built against the design you declared. Block the
+   merge on disagreement.
+
+## Try it
 
 ```bash
-# 1. Bring up local podman infra (idempotent).
-just dev-redis-up        # agentry's dev Redis on 127.0.0.1:6380
-just agentry-net-up      # bridge network + agentry-sccache-redis
+# Local infrastructure (idempotent — safe to re-run).
+just dev-redis-up
+just agentry-net-up
 
-# 2. Build + seed the registry.
+# Build, generate a signing key, load the starter catalog.
 cargo build --release --workspace
-./target/release/orchestrator key-gen      # one-time ed25519 key
-./target/release/orchestrator seed         # roles + teams → Redis
+./target/release/orchestrator key-gen
+./target/release/orchestrator seed
 
-# 3. Run the daemon + dashboard.
-./target/release/orchestratord &           # XREADs agentry:briefs, spawns containers
+# Run agentry and the dashboard.
+./target/release/orchestratord &
+./target/release/orchestrator-dashboard &   # http://localhost:7800
 
-# 4. Submit a brief.
+# Submit your first brief.
 ./target/release/orchestrator submit examples/verify-M0.json
-
-# 5. Watch it.
-redis-cli -p 6380 -a "$(cat ~/.config/agentry/redis.password)" --no-auth-warning \
-    XREVRANGE agentry:verdicts + - COUNT 1
-# or: http://localhost:7800 for the dashboard SSE view.
 ```
 
-## Architectural shape
+## Day-to-day commands
 
-### Four data records
-
-| Record | Redis key | Purpose |
-|--------|-----------|---------|
-| `Brief` | `agentry:briefs` (stream) | Unit of work: project, topology ref, payload, budget, escalation |
-| `AgentRole` | `agentry:role:{name}:v{N}` | Container spec: image, package manager, inline entrypoint script, binaries, permit scope, mounts, optional `workspace_mount`, optional `sccache` |
-| `TeamTopology` | `agentry:team:{name}:v{N}` | Role list + message graph + terminal role + retry budget |
-| `Project` | `agentry:project:{slug}` | Slug, standing orders, budget, escalation default |
-
-All four are edited via dashboard forms. No YAML files.
-
-### Crates
-
-- `orchestrator-types` — pure data + serde. Brief, AgentRole, TeamTopology, Project, WorkPermit, Event, Verdict, WorkspaceMount.
-- `orchestrator-runtime` — daemon, Spawner trait + Podman adapter, permit broker, workspace lifecycle, inline-script bootstrap, CLI.
-- `orchestrator-dashboard` — Axum + htmx + SSE + webhook intake.
-
-### Topologies
-
-Built-in topologies (in addition to internal probes):
-
-- `agentry-self-host-v0` — full pipeline (coder → reviewer-mechanical + reviewer-claude → shipper → ci-watcher). Default for feature work.
-- `agentry-bugfix-v0` — drops reviewer-claude. For sub-30-LOC mechanical fixes where CI suffices.
-- `agentry-spec-edit-v0` — drops both reviewers. For specs/docs-only changes; merged-PR CI is the only gate.
-- `agentry-discovery-v0` — single-role archaeologist that produces `discovery.json` from cfdb + graph-specs.
-- `agentry-planner-v0` — archaeologist + planner; planner decomposes a meta-brief intent into child briefs and emits `next_brief_refs` for chain-trigger dispatch.
-- `agentry-verify-v0` — single-role verifier; runs the meta-brief's `success_criteria` after children resolve. DOL composer combines child + verifier verdicts into the meta verdict.
-- `agentry-self-audit-v0` — offline auditor. Runs cargo clippy/build/test/udeps against develop, persists findings as trace events, auto-dispatches `agentry-bugfix-v0` fix briefs for each unused-dep finding.
-
-### Spawner behavior
-
-Each role spawns on a stock public base image (`docker.io/library/alpine:3.21` or `docker.io/library/debian:bookworm-slim`). The role's inline `entrypoint_script` is delivered via the `AGENTRY_SCRIPT` env var; the spawner installs the declared `binaries` through `package_manager` (`apk` or `apt`) and execs the script. Every container joins the `agentry-net` podman network so it can reach `agentry-sccache-redis` by DNS name when `sccache=true`.
-
-Enforcements baked into the spawner:
-
-- **Permit broker:** every stdout `tool_call` event is audited and checked against the permit's `tool_allowlist` + `permit_scope`. Violations kill the container and emit `VerdictKind::PermitViolation`.
-- **Wall-clock timeout:** when the brief's `budget.max_wall_seconds` is set, the stdout-read loop is wrapped in `tokio::time::timeout`. On elapse, `podman stop -t 1` runs and the verdict is `Failed` with reason `"wall-clock budget exceeded"`.
-- **Workspace lifecycle:** if any role in the team declares `workspace_mount`, the daemon allocates `/var/mnt/workspaces/agentry-work/briefs/<brief_id>/`, bind-mounts it into each opting-in role, and tears it down only when the brief actually ships (or its diff is already pushed as a PR — `review-blocked*` verdicts). Every other failure mode (`failed: acceptance`, `failed: claude-timeout`, `failed: stalled`, `failed: spawner-error`, anything unrecognized) preserves the dir for forensics.
-
-### Agent contract
-
-Every container's stdout is parsed line-by-line as NDJSON `Event`s. Each is mirrored to `agentry:brief:{id}:trace`. A `Done` event terminates the role. Tool-call events flow to `agentry:brief:{id}:audit` regardless of whether the broker allowed them. This protocol is Published Language between `execution` and any containerised agent, regardless of language — it's a handful of JSON shapes, not a Rust trait.
-
-### Architecture gate
-
-Every PR runs `graph-specs check` (concept-level equivalence between `specs/concepts/*.md` and the pub surface of every crate) plus `cfdb extract` (a full fact-graph dump, archived). Tool revisions pinned in `.cfdb/cfdb.rev` + `.cfdb/graph-specs.rev`. Ban rules land one at a time in `.cfdb/queries/*.cypher`, each with its own justified PR and zero existing violations at introduction. Run the same checks locally with `scripts/arch-check.sh`.
-
-## Workspace lifecycle
-
-Per-brief workspaces live under `/var/mnt/workspaces/agentry-work/briefs/<brief_id>/` (override with `AGENTRY_WORKSPACE_ROOT`). Default teardown policy:
-
-| Verdict | Disposition |
-|---|---|
-| `shipped` | TearDown |
-| `review-blocked*` | TearDown (diff is in the forge as a PR) |
-| `failed: acceptance` / `claude-timeout` / `stalled` / `spawner-error` | Preserve |
-| any other / unknown | Preserve (default safe) |
-
-Preserved workspaces accumulate disk — Rust `target/` is the dominant cost — so they need periodic GC. Use the `agentry-workspace` CLI for triage and lifecycle:
-
-```bash
-agentry-workspace list                       # table: brief_id, branch, age, disk_usage_mb, last_verdict
-agentry-workspace path <brief_id>            # absolute host path; exit 1 if absent
-agentry-workspace gc --older-than 7d         # remove preserved workspaces older than threshold
-agentry-workspace gc --older-than 7d --dry-run   # list targets without removing
-agentry-workspace remove <brief_id> --yes    # manual single-target removal
+```
+orchestrator submit <brief.json>           # send work
+orchestrator team list / register / show   # manage workflows
+orchestrator role list / show              # inspect agents
+orchestrator verdicts                      # last N outcomes
+orchestrator agents trace <agent-id>       # see what an agent did
+agentry-workspace list / gc                # workspace cleanup
 ```
 
-Recommended operator setup: a weekly `agentry-workspace gc --older-than 7d` cron entry. There is no auto-GC daemon — preservation defaults to safe, and reclamation is operator-driven.
+## Where to read next
 
-## Infra prerequisites
-
-Rootless podman on the dev box. Local `agentry-dev-redis` container on `127.0.0.1:6380` with a password at `~/.config/agentry/redis.password`. Local `agentry-sccache-redis` container attached to `agentry-net`. Ed25519 signing key at `~/.config/agentry/signing.key`. Never point agentry at a production Redis — the default config has pin tests to ensure `127.0.0.1` is the only baked-in target.
-
-Claude-using roles (`coder-claude-agentry`, `reviewer-claude-agentry`, `archaeologist-claude-agentry`, `planner-claude-agentry`, plus the `claude-echo` probe) bind-mount a host directory at `/var/lib/agentry/transcripts/` into the container at `/transcripts/`. Each `claude -p` invocation tees its `--output-format stream-json --verbose` output into `/transcripts/${brief_id}<.role-suffix>.jsonl`, so on `timeout`/OOM/crash the partial trace survives container teardown for forensics. Create the host directory once before running:
-
-```bash
-sudo mkdir -p /var/lib/agentry/transcripts && sudo chmod 0755 /var/lib/agentry/transcripts
-```
-
-Operators on systemd setups should add `/var/lib/agentry/transcripts` to the orchestratord unit's `ReadWritePaths=` and rotate/GC the directory periodically — transcripts are ephemeral by design but accumulate one `.jsonl` per `claude -p` call.
-
-## Further reading
-
-- `CLAUDE.md` — project rules for Claude-driven development, including the cutoff.
-- `docs/dogfood-protocol.md` — how to dispatch a brief into `agentry-self-host-v0` once the cutoff is live.
-- `specs/concepts/*.md` — the DDD concept list checked by `graph-specs-rust`.
-- `AGENTRY_RESUME.md` — current state for session resumption.
-- `TODO.md` — tracker-style view of what's next.
-- `docs/PROPOSAL.md` — original design proposal (2026-04-23).
-_poc_v5: 2026-04-25_
+- `docs/architectural-control-loop.md` — how a non-trivial feature gets
+  designed, agreed on, and turned into briefs.
+- `docs/dogfood-protocol.md` — what a brief looks like and how to
+  dispatch one.
+- `specs/concepts/` — the architecture you're enforcing. Each file
+  describes one part of the system; the CI checker reads these.
+- `CLAUDE.md` — house rules for sessions of Claude that work on
+  agentry itself.
+- `AGENTRY_RESUME.md` — current operational state.
