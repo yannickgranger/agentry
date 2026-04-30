@@ -1257,6 +1257,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tower",
+ "trace-query",
  "tracing",
  "tracing-subscriber",
 ]

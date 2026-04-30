@@ -24,6 +24,8 @@
 
 #![forbid(unsafe_code)]
 
+mod metrics;
+
 use orchestrator_dashboard::routes;
 use orchestrator_dashboard::store::DashboardStore;
 
@@ -121,6 +123,10 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/", get(index))
         .route("/brief/{id}", get(brief_detail))
+        .route(
+            "/brief/{brief_id}/metrics",
+            get(metrics::brief_metrics_handler),
+        )
         .route("/sse/verdicts", get(sse_verdicts))
         .route("/sse/brief/{id}/trace", get(sse_brief_trace))
         .route("/healthz", get(healthz))
@@ -229,8 +235,30 @@ async fn index(State(state): State<AppState>) -> Result<Html<String>, AppError> 
     let active = state.store.active_briefs().await?;
     let verdicts = state.store.fetch_recent_verdicts(20).await?;
 
+    // Best-effort per-brief metric badges. Aggregation is sync (blocks
+    // on a fresh redis connection inside spawn_blocking); fan them out
+    // with `join_all` so a slow brief doesn't serialise the page render.
+    // Errors collapse to an empty badge so the listing still renders.
+    let redis_url = state.store.redis_url().to_string();
+    let badge_futs = active.iter().map(|b| {
+        let brief_id = b
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let url = redis_url.clone();
+        async move {
+            if brief_id.is_empty() {
+                String::new()
+            } else {
+                metrics::try_badge(&url, &brief_id).await
+            }
+        }
+    });
+    let badges: Vec<String> = futures::future::join_all(badge_futs).await;
+
     let mut active_items = String::new();
-    for b in &active {
+    for (b, badge) in active.iter().zip(badges.iter()) {
         let brief_id = b.get("id").and_then(Value::as_str).unwrap_or("?");
         let topology = b
             .get("topology")
@@ -243,6 +271,7 @@ async fn index(State(state): State<AppState>) -> Result<Html<String>, AppError> 
   <a class="text-indigo-300 hover:text-indigo-200 font-mono text-sm" href="/brief/{brief_id}">{brief_id}</a>
   <span class="text-slate-400 text-xs mx-2">{topology}</span>
   <span class="text-slate-500 text-xs">{at}</span>
+  {badge}
 </li>"#
         ));
     }
