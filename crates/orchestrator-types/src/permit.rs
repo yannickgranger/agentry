@@ -4,7 +4,7 @@
 //! added in M3; M0 ships an unsigned structural draft so the runtime shape
 //! is fixed early.
 
-pub use crate::role::{PermitScope, ToolAllowlist};
+pub use crate::role::{AllowedTools, PermitScope, ToolAllowlist};
 use crate::{brief::BriefId, role::RoleName, Ts};
 use serde::{Deserialize, Serialize};
 
@@ -20,6 +20,11 @@ pub struct WorkPermit {
     pub brief: BriefId,
     /// Which tools the agent may call.
     pub tool_allowlist: ToolAllowlist,
+    /// Pre-spawn `claude --allowedTools` patterns, copied through from the
+    /// role at mint time. Distinct from `tool_allowlist` and intentionally
+    /// NOT auto-synchronized — see [`AllowedTools`] docs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_tools: Option<AllowedTools>,
     /// Capability scopes (fs, net, …).
     pub permit_scope: PermitScope,
     /// Budget — duplicated from the brief, locked at mint time.
@@ -56,6 +61,7 @@ mod tests {
             role: RoleName("coder-rust".into()),
             brief: BriefId("brf_1".into()),
             tool_allowlist: ToolAllowlist(vec!["read".into(), "edit".into()]),
+            allowed_tools: None,
             permit_scope: PermitScope(vec!["fs:read:/workspace/**".into()]),
             max_tokens: Some(500_000),
             max_wall_seconds: Some(3600),
@@ -77,6 +83,7 @@ mod tests {
             role: RoleName("x".into()),
             brief: BriefId("x".into()),
             tool_allowlist: ToolAllowlist(vec!["read".into()]),
+            allowed_tools: None,
             permit_scope: PermitScope::default(),
             max_tokens: None,
             max_wall_seconds: None,
@@ -87,5 +94,52 @@ mod tests {
         };
         assert!(p.allows("read"));
         assert!(!p.allows("write"));
+    }
+
+    #[test]
+    fn permit_roundtrip_with_allowed_tools_some() {
+        let p = WorkPermit {
+            permit_id: "prm_t".into(),
+            agent_id: "agt_t".into(),
+            role: RoleName("coder".into()),
+            brief: BriefId("brf_t".into()),
+            tool_allowlist: ToolAllowlist(vec!["read".into()]),
+            allowed_tools: Some(AllowedTools(vec!["Read".into(), "Bash(*)".into()])),
+            permit_scope: PermitScope::default(),
+            max_tokens: None,
+            max_wall_seconds: None,
+            max_usd: None,
+            expires_at: now() + chrono::Duration::hours(1),
+            issued_at: now(),
+            signature: None,
+        };
+        let s = serde_json::to_string(&p).expect("ser");
+        let back: WorkPermit = serde_json::from_str(&s).expect("de");
+        assert_eq!(p, back);
+        assert_eq!(back.allowed_tools.as_ref().map(|a| a.0.len()), Some(2));
+    }
+
+    #[test]
+    fn permit_roundtrip_with_allowed_tools_none_omits_field() {
+        let p = WorkPermit {
+            permit_id: "prm_t".into(),
+            agent_id: "agt_t".into(),
+            role: RoleName("coder".into()),
+            brief: BriefId("brf_t".into()),
+            tool_allowlist: ToolAllowlist::default(),
+            allowed_tools: None,
+            permit_scope: PermitScope::default(),
+            max_tokens: None,
+            max_wall_seconds: None,
+            max_usd: None,
+            expires_at: now() + chrono::Duration::hours(1),
+            issued_at: now(),
+            signature: None,
+        };
+        let s = serde_json::to_string(&p).expect("ser");
+        assert!(!s.contains("allowed_tools"));
+        let back: WorkPermit = serde_json::from_str(&s).expect("de");
+        assert_eq!(p, back);
+        assert!(back.allowed_tools.is_none());
     }
 }

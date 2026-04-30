@@ -617,6 +617,7 @@ async fn role_create(
         binaries: split_csv(&f.binaries_csv),
         mcp_servers,
         tool_allowlist: ToolAllowlist(split_csv(&f.tool_allowlist_csv)),
+        allowed_tools: None,
         permit_scope: PermitScope(split_lines(&f.permit_scope_lines)),
         passthru_env: split_csv(&f.passthru_env_csv),
         extra_bootstrap: vec![],

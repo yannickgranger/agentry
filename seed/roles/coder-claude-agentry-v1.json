@@ -10,6 +10,22 @@
   "binaries": ["git", "curl", "ca-certificates"],
   "mcp_servers": [],
   "tool_allowlist": [],
+  "allowed_tools": [
+    "Read",
+    "Edit",
+    "Write",
+    "Bash(*)",
+    "Bash(git status:*)",
+    "Bash(git diff:*)",
+    "Bash(rg:*)",
+    "Bash(jq:*)",
+    "Bash(cat:*)",
+    "Bash(sed:*)",
+    "Bash(grep:*)",
+    "Bash(find:*)",
+    "Bash(ls:*)",
+    "Bash(test:*)"
+  ],
   "permit_scope": [
     "fs:read:/workspace/**",
     "fs:write:/workspace/**",
