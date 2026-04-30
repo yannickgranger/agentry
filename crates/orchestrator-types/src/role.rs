@@ -70,6 +70,24 @@ impl ToolAllowlist {
     }
 }
 
+/// Pattern strings handed to `claude --allowedTools` at agent spawn time. The
+/// grammar is open-ended (`Bash(cargo fmt:*)`, `Read`, `Edit(*.rs)`) and
+/// matches what the Claude CLI accepts directly — no symbolic translation.
+///
+/// Distinct value domain from [`ToolAllowlist`]:
+/// - [`AllowedTools`] fences the Claude process *pre-spawn* by being passed
+///   through to `claude --allowedTools`, so violations never reach the
+///   daemon at all.
+/// - [`ToolAllowlist`] carries exact-match symbolic names (`bash`, `read`,
+///   `edit`) that the daemon's permit broker checks *post-hoc* against
+///   `EventKind::ToolCall` events (see `permits/src/lib.rs`).
+///
+/// The two are intentionally NOT auto-synchronized — they enforce at
+/// different layers with different grammars.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct AllowedTools(pub Vec<String>);
+
 /// An MCP server to mount into the agent's container.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -330,5 +348,13 @@ mod tests {
         let a = ToolAllowlist(vec!["read".into(), "edit".into()]);
         assert!(a.contains("read"));
         assert!(!a.contains("write"));
+    }
+
+    #[test]
+    fn allowed_tools_roundtrip_json() {
+        let a = AllowedTools(vec!["Bash(cargo fmt:*)".into(), "Read".into()]);
+        let s = serde_json::to_string(&a).expect("ser");
+        let back: AllowedTools = serde_json::from_str(&s).expect("de");
+        assert_eq!(a, back);
     }
 }
