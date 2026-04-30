@@ -27,7 +27,7 @@ pub mod claude;
 pub use claude::{stream_claude, StreamErr};
 
 use std::io::{self, Read, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use chrono::Utc;
 use serde::{de::DeserializeOwned, Serialize};
@@ -38,6 +38,11 @@ use orchestrator_types::{DoneReason, EventVerdict, FindingOrigin, ReviewFinding,
 /// Set by `emit_done`. Read by `DoneGuard::drop`. Static so it works across
 /// any task structure inside the role binary.
 static DONE_EMITTED: AtomicBool = AtomicBool::new(false);
+
+/// Incremented at each `emit_tool_refused` call; read once by `emit_done`
+/// and embedded as `refusal_count` on the terminal event so the spawner can
+/// surface the per-run total on the team-level `Verdict`.
+static REFUSAL_COUNT: AtomicU32 = AtomicU32::new(0);
 
 /// Read the startup JSON bundle from stdin and deserialize into `T`.
 pub fn read_bundle<T: DeserializeOwned>() -> anyhow::Result<T> {
@@ -92,6 +97,7 @@ pub fn emit_message(to: &str, payload: Value) {
 /// `emit_message` in calling [`emit_line`] directly rather than wrapping
 /// the variant in an `event` envelope.
 pub fn emit_tool_refused(tool: &str, command: Option<&str>) {
+    REFUSAL_COUNT.fetch_add(1, Ordering::SeqCst);
     emit_line(json!({
         "at": Utc::now().to_rfc3339(),
         "type": "tool_refused",
@@ -104,10 +110,12 @@ pub fn emit_tool_refused(tool: &str, command: Option<&str>) {
 /// Sets the static flag so a `DoneGuard` drop becomes a no-op.
 pub fn emit_done(verdict: EventVerdict, reason: Option<DoneReason>) {
     DONE_EMITTED.store(true, Ordering::SeqCst);
+    let refusal_count = REFUSAL_COUNT.load(Ordering::SeqCst);
     let mut obj = json!({
         "at": Utc::now().to_rfc3339(),
         "type": "done",
         "verdict": verdict_to_str(verdict),
+        "refusal_count": refusal_count,
     });
     if let Some(r) = reason {
         if let Ok(v) = serde_json::to_value(&r) {
@@ -352,6 +360,18 @@ mod tests {
         DONE_EMITTED.store(false, Ordering::SeqCst);
         emit_done(EventVerdict::Shipped, None);
         assert!(DONE_EMITTED.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn emit_tool_refused_increments_static_counter() {
+        // Snapshot rather than reset-to-zero — other tests in this binary
+        // may also call `emit_tool_refused` and the counter is process-wide.
+        let before = REFUSAL_COUNT.load(Ordering::SeqCst);
+        emit_tool_refused("Bash", Some("echo hi"));
+        emit_tool_refused("Read", None);
+        emit_tool_refused("Edit", Some("/tmp/x"));
+        let after = REFUSAL_COUNT.load(Ordering::SeqCst);
+        assert_eq!(after - before, 3);
     }
 
     #[test]

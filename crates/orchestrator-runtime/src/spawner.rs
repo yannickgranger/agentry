@@ -593,7 +593,7 @@ impl Spawner for PodmanSpawner {
             &brief.id,
             timed_out,
             permit_violation.as_deref(),
-            terminal.as_ref().and_then(Event::verdict),
+            terminal.as_ref(),
             status.code(),
             findings,
         );
@@ -631,10 +631,18 @@ fn compute_verdict(
     brief_id: &BriefId,
     timed_out: bool,
     permit_violation: Option<&str>,
-    terminal_event: Option<orchestrator_types::EventVerdict>,
+    terminal_event: Option<&orchestrator_types::Event>,
     exit_code: Option<i32>,
     accumulated_findings: Vec<orchestrator_types::ReviewFinding>,
 ) -> Verdict {
+    let (event_verdict, refusal_count) = match terminal_event.map(|e| &e.kind) {
+        Some(EventKind::Done {
+            verdict,
+            refusal_count,
+            ..
+        }) => (Some(*verdict), *refusal_count),
+        _ => (None, 0),
+    };
     let (kind, reason) = if timed_out {
         (
             VerdictKind::Failed,
@@ -643,7 +651,7 @@ fn compute_verdict(
     } else if let Some(r) = permit_violation {
         (VerdictKind::PermitViolation, Some(r.to_string()))
     } else {
-        match terminal_event {
+        match event_verdict {
             Some(orchestrator_types::EventVerdict::ReworkNeeded) => (
                 VerdictKind::ReworkNeeded {
                     findings: accumulated_findings,
@@ -659,7 +667,8 @@ fn compute_verdict(
             ),
         }
     };
-    let v = Verdict::new(brief_id.clone(), kind);
+    let mut v = Verdict::new(brief_id.clone(), kind);
+    v.refusal_count = refusal_count;
     if let Some(r) = reason {
         v.with_reason(r)
     } else {
@@ -839,6 +848,22 @@ mod tests {
         BriefId("brf_test".into())
     }
 
+    fn done_event(verdict: EventVerdict) -> Event {
+        Event::new(EventKind::Done {
+            verdict,
+            reason: None,
+            refusal_count: 0,
+        })
+    }
+
+    fn done_event_with_refusals(verdict: EventVerdict, refusal_count: u32) -> Event {
+        Event::new(EventKind::Done {
+            verdict,
+            reason: None,
+            refusal_count,
+        })
+    }
+
     #[test]
     fn container_name_format() {
         let n = PodmanSpawner::container_name("agt_abcd");
@@ -850,11 +875,12 @@ mod tests {
         // Even if a permit_violation or terminal event were observed, a
         // timeout signal must dominate — timeouts indicate the agent did not
         // complete within budget, which trumps any partial signal.
+        let ev = done_event(EventVerdict::Shipped);
         let v = compute_verdict(
             &bid(),
             true,
             Some("tried to write denied path"),
-            Some(EventVerdict::Shipped),
+            Some(&ev),
             Some(137),
             Vec::new(),
         );
@@ -878,16 +904,17 @@ mod tests {
 
     #[test]
     fn verdict_from_terminal_event() {
-        let v = compute_verdict(
-            &bid(),
-            false,
-            None,
-            Some(EventVerdict::Shipped),
-            Some(0),
-            Vec::new(),
-        );
+        let ev = done_event(EventVerdict::Shipped);
+        let v = compute_verdict(&bid(), false, None, Some(&ev), Some(0), Vec::new());
         assert!(matches!(v.kind, VerdictKind::Shipped));
         assert!(v.reason.is_none());
+    }
+
+    #[test]
+    fn verdict_carries_refusal_count_from_terminal_event() {
+        let ev = done_event_with_refusals(EventVerdict::Shipped, 7);
+        let v = compute_verdict(&bid(), false, None, Some(&ev), Some(0), Vec::new());
+        assert_eq!(v.refusal_count, 7);
     }
 
     #[test]
@@ -907,14 +934,8 @@ mod tests {
             prohibitions: Vec::new(),
             requirements: Vec::new(),
         }];
-        let v = compute_verdict(
-            &bid(),
-            false,
-            None,
-            Some(EventVerdict::ReworkNeeded),
-            Some(0),
-            findings.clone(),
-        );
+        let ev = done_event(EventVerdict::ReworkNeeded);
+        let v = compute_verdict(&bid(), false, None, Some(&ev), Some(0), findings.clone());
         match v.kind {
             VerdictKind::ReworkNeeded { findings: got } => assert_eq!(got, findings),
             other => panic!("expected ReworkNeeded, got {other:?}"),
