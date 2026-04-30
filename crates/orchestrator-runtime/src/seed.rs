@@ -1558,7 +1558,6 @@ fn build_pr_rebaser_agentry_role(_home: &str) -> AgentRole {
     }
 }
 
-
 /// Pre-flight criterion analyser. Runs `success_criteria` against the current
 /// tip and reports the baseline value, plus heuristic smell-tests for
 /// obviously-broken criteria (issue #84). Read-only on the workspace; surfaces
