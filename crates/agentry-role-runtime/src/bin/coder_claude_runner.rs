@@ -337,6 +337,10 @@ fn build_coder_prompt(
          - Do not commit or push. The orchestrator handles commit and push on your\n  \
            behalf after you exit.\n\
          - The orchestrator may be running you in `agentry-self-host-v1` topology (or a later v1+). In that case: do not commit, do not push. The `/usr/local/bin/ship` tool (when called) runs the validator pipeline against your changes; if it returns ok, exit and the orchestrator's git-operator role takes over. Topology name is in $topology_name.\n\
+         - For mid-session validation, invoke `quality-fast` (no args, scoped to changed\n  \
+           files by default). Do NOT invoke cargo for navigation or speculative\n  \
+           checks; cargo is reserved for `cargo fmt`. The substrate runs full\n  \
+           validators after you exit.\n\
          \n\
          When the transformations are complete and the acceptance passes, simply\n\
          report success and exit.\n"
@@ -1034,6 +1038,7 @@ mod tests {
         assert!(p.contains("Task title: Fix bug"));
         assert!(p.contains("CREATE foo.rs:10"));
         assert!(p.contains("cargo test"));
+        assert!(p.contains("quality-fast"));
     }
 
     #[test]
