@@ -97,6 +97,15 @@ impl DashboardStore {
         Ok(store)
     }
 
+    /// Redis URL the store was constructed with. Exposed so consumers that
+    /// need a sync `redis::Connection` (e.g. the trace-query aggregate which
+    /// is sync-only) can open one without re-discovering the URL through
+    /// config.
+    #[must_use]
+    pub fn redis_url(&self) -> &str {
+        &self.inner.redis_url
+    }
+
     /// Most-recent verdicts (XREVRANGE on `agentry:verdicts`).
     pub async fn fetch_recent_verdicts(&self, count: usize) -> anyhow::Result<Vec<Value>> {
         let _t = std::time::Instant::now();
