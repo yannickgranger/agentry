@@ -103,6 +103,12 @@ pub enum EventKind {
         /// deserialises to `None`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<DoneReason>,
+        /// Total `tool_refused` events the agent emitted during its run, set
+        /// by `emit_done` reading the static atomic counter incremented at each
+        /// `emit_tool_refused` call. Backwards-compatible: missing in JSON
+        /// deserialises to 0.
+        #[serde(default)]
+        refusal_count: u32,
     },
 }
 
@@ -155,6 +161,7 @@ mod tests {
         let e = Event::new(EventKind::Done {
             verdict: EventVerdict::Shipped,
             reason: None,
+            refusal_count: 0,
         });
         assert!(e.is_terminal());
         assert_eq!(e.verdict(), Some(EventVerdict::Shipped));
@@ -168,6 +175,7 @@ mod tests {
                 cause: "unexpected_exit".into(),
                 exit_code: Some(5),
             }),
+            refusal_count: 0,
         });
         let s = serde_json::to_string(&e).expect("ser");
         let back: Event = serde_json::from_str(&s).expect("de");
@@ -182,15 +190,36 @@ mod tests {
         let line = r#"{"at":"2026-04-23T10:00:01Z","type":"done","verdict":"shipped"}"#;
         let e: Event = serde_json::from_str(line).expect("parse");
         match e.kind {
-            EventKind::Done { verdict, reason } => {
+            EventKind::Done {
+                verdict,
+                reason,
+                refusal_count,
+            } => {
                 assert_eq!(verdict, EventVerdict::Shipped);
                 assert!(
                     reason.is_none(),
                     "legacy JSON must deserialize reason as None"
                 );
+                assert_eq!(
+                    refusal_count, 0,
+                    "missing refusal_count field must default to 0"
+                );
             }
             _ => panic!("wrong kind"),
         }
+    }
+
+    #[test]
+    fn done_event_with_refusal_count_roundtrips() {
+        let e = Event::new(EventKind::Done {
+            verdict: EventVerdict::Shipped,
+            reason: None,
+            refusal_count: 5,
+        });
+        let s = serde_json::to_string(&e).expect("ser");
+        let back: Event = serde_json::from_str(&s).expect("de");
+        assert_eq!(e, back);
+        assert!(s.contains("\"refusal_count\":5"));
     }
 
     #[test]
