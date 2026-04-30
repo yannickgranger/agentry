@@ -4,9 +4,33 @@
 
 use axum::extract::{Path, State};
 use axum::response::{Html, IntoResponse};
+use orchestrator_types::{Verdict, VerdictKind};
 use trace_query::{aggregate, TraceMetric};
 
 use crate::AppState;
+
+/// Brief 239 fence: a Shipped verdict that nonetheless carries a non-zero
+/// `refusal_count` is anomalous — the coder couldn't reach tools it wanted
+/// but produced a passing diff anyway, indicating silent quality routing
+/// around denied tools.
+#[must_use]
+pub fn is_refusal_anomaly(verdict: &Verdict) -> bool {
+    matches!(verdict.kind, VerdictKind::Shipped) && verdict.refusal_count > 0
+}
+
+/// Render the operator-facing Blocker badge for a refusal-on-shipped
+/// anomaly. Returns an empty string when the verdict is not anomalous, so
+/// callers can unconditionally splice the result into surrounding markup.
+#[must_use]
+pub fn refusal_anomaly_badge_html(verdict: &Verdict) -> String {
+    if !is_refusal_anomaly(verdict) {
+        return String::new();
+    }
+    let n = verdict.refusal_count;
+    format!(
+        r#"<span class="anomaly-badge ml-2 px-2 py-0.5 rounded text-xs font-semibold bg-rose-700 text-rose-50" title="This brief shipped with {n} tool-permission refusals — the coder may have produced a passing diff while routed-around denied tools. Review needed.">⚠ refusal-on-shipped anomaly</span>"#
+    )
+}
 
 /// GET /brief/:brief_id/metrics — render the folded TraceMetric for a
 /// brief as a small HTML table. Best-effort: a brief with no trace
@@ -24,8 +48,16 @@ pub async fn brief_metrics_handler(
     })
     .await;
 
+    // Best-effort verdict fetch for the refusal-on-shipped fence (brief
+    // 239). A miss (brief not in the recent verdict window, or no verdict
+    // yet) just suppresses the badge — never 500s.
+    let anomaly_badge = match state.store.fetch_verdict_for(&brief_id, 100).await {
+        Ok(Some(v)) => refusal_anomaly_badge_html(&v),
+        _ => String::new(),
+    };
+
     let body = match joined {
-        Ok(Ok(metric)) => render_metrics_table(&metric),
+        Ok(Ok(metric)) => format!("{}{}", anomaly_badge, render_metrics_table(&metric)),
         Ok(Err(e)) => render_error(&brief_id, &format!("aggregate failed: {e}")),
         Err(e) => render_error(&brief_id, &format!("aggregation task failed: {e}")),
     };
@@ -172,5 +204,58 @@ mod tests {
             html_escape("<script>&\"'"),
             "&lt;script&gt;&amp;&quot;&#39;"
         );
+    }
+
+    fn synthetic_verdict(kind: VerdictKind, refusal_count: u32) -> Verdict {
+        let mut v = Verdict::new(orchestrator_types::BriefId("brf_test".into()), kind);
+        v.refusal_count = refusal_count;
+        v
+    }
+
+    #[test]
+    fn is_refusal_anomaly_true_for_shipped_with_refusals() {
+        assert!(is_refusal_anomaly(&synthetic_verdict(
+            VerdictKind::Shipped,
+            3
+        )));
+    }
+
+    #[test]
+    fn is_refusal_anomaly_false_for_failed_with_refusals() {
+        assert!(!is_refusal_anomaly(&synthetic_verdict(
+            VerdictKind::Failed,
+            5
+        )));
+    }
+
+    #[test]
+    fn is_refusal_anomaly_false_for_shipped_without_refusals() {
+        assert!(!is_refusal_anomaly(&synthetic_verdict(
+            VerdictKind::Shipped,
+            0
+        )));
+    }
+
+    #[test]
+    fn refusal_anomaly_badge_html_renders_warning_for_anomaly() {
+        let badge = refusal_anomaly_badge_html(&synthetic_verdict(VerdictKind::Shipped, 4));
+        assert!(
+            badge.contains("⚠ refusal-on-shipped anomaly"),
+            "badge missing warning text: {badge}"
+        );
+        assert!(
+            badge.contains("anomaly-badge"),
+            "badge missing class: {badge}"
+        );
+        assert!(
+            badge.contains("shipped with 4"),
+            "badge missing tooltip count: {badge}"
+        );
+    }
+
+    #[test]
+    fn refusal_anomaly_badge_html_empty_for_non_anomaly() {
+        assert!(refusal_anomaly_badge_html(&synthetic_verdict(VerdictKind::Shipped, 0)).is_empty());
+        assert!(refusal_anomaly_badge_html(&synthetic_verdict(VerdictKind::Failed, 7)).is_empty());
     }
 }

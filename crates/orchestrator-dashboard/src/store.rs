@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use orchestrator_runtime::redis_io;
-use orchestrator_types::Brief;
+use orchestrator_types::{Brief, Verdict};
 use redis::aio::ConnectionManager;
 use redis::streams::{StreamReadOptions, StreamReadReply};
 use redis::AsyncCommands;
@@ -128,6 +128,33 @@ impl DashboardStore {
             "dashboard_store_call"
         );
         Ok(out)
+    }
+
+    /// Fetch the typed `Verdict` for a specific brief by scanning the
+    /// recent verdicts stream (XREVRANGE up to `scan_count`). There is no
+    /// per-brief verdict key, so a small bounded scan is the cheapest
+    /// path. Returns `None` when the brief is outside the scanned window
+    /// or hasn't reached a terminal verdict. Used by the brief-239
+    /// refusal-on-shipped fence in `metrics`.
+    pub async fn fetch_verdict_for(
+        &self,
+        brief_id: &str,
+        scan_count: usize,
+    ) -> anyhow::Result<Option<Verdict>> {
+        let mut conn = self.inner.conn.clone();
+        let reply: redis::streams::StreamRangeReply = conn
+            .xrevrange_count(VERDICTS_STREAM, "+", "-", scan_count)
+            .await?;
+        for entry in reply.ids {
+            if let Some(body) = entry.map.get("verdict").and_then(redis_value_to_str) {
+                if let Ok(v) = serde_json::from_str::<Verdict>(&body) {
+                    if v.brief.0 == brief_id {
+                        return Ok(Some(v));
+                    }
+                }
+            }
+        }
+        Ok(None)
     }
 
     /// Most-recent brief submissions (XREVRANGE on `agentry:briefs`).

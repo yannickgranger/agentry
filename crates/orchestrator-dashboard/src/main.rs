@@ -308,10 +308,17 @@ function renderVerdict(v) {{
             : (kind === "escalated"
                 ? "bg-amber-900 text-amber-200"
                 : "bg-slate-800 text-slate-200"));
+    // Brief 239 fence: surface a Blocker badge when a Shipped verdict
+    // carries a non-zero refusal_count — the coder may have produced a
+    // passing diff while routed-around denied tools.
+    const refusals = (typeof v.refusal_count === "number") ? v.refusal_count : 0;
+    const anomaly = (kind === "shipped" && refusals > 0)
+        ? `<span class="anomaly-badge ml-2 px-2 py-0.5 rounded text-xs font-semibold bg-rose-700 text-rose-50" title="This brief shipped with ${{refusals}} tool-permission refusals — the coder may have produced a passing diff while routed-around denied tools. Review needed.">⚠ refusal-on-shipped anomaly</span>`
+        : "";
     return `<li class="py-1 border-b border-slate-800 last:border-0">
 <a class="text-indigo-300 hover:text-indigo-200 font-mono text-sm" href="/brief/${{brief}}">${{brief}}</a>
 <span class="mx-2 px-2 py-0.5 rounded text-xs ${{badge}}">${{kind}}</span>
-<span class="text-slate-500 text-xs">${{at}}</span></li>`;
+<span class="text-slate-500 text-xs">${{at}}</span>${{anomaly}}</li>`;
 }}
 
 const verdictsList = document.getElementById("verdicts");
