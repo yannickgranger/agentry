@@ -1,0 +1,16 @@
+[package]
+name = "trace-query"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+redis.workspace = true
+anyhow = "1.0.102"
+
+[lints]
+workspace = true

@@ -7,7 +7,10 @@ members = [
     "crates/orchestrator-runtime",
     "crates/orchestrator-types",
     "crates/quality-fast",
+    "crates/trace-query",
+    "crates/trace-rollup-cli",
     "crates/validators",
+    "crates/watchdog-alerts",
 ]
 default-members = [
     "crates/agentry-role-runtime",
