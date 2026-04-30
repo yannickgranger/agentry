@@ -89,6 +89,34 @@ pub async fn append_verdict(conn: &mut ConnectionManager, v: &Verdict) -> Result
     Ok(id)
 }
 
+/// Append a brief verdict to `agentry:verdicts` IF this brief hasn't already
+/// emitted one. Uses a per-brief SETNX sentinel `agentry:verdict:emitted:{brief_id}`
+/// with a 24h TTL. Returns:
+///   - Ok(Some(stream_id)) — first XADD, sentinel claimed, verdict on stream.
+///   - Ok(None)            — duplicate suppressed, sentinel was already set.
+///   - Err(_)              — Redis error.
+pub async fn append_verdict_idempotent(
+    conn: &mut ConnectionManager,
+    v: &Verdict,
+) -> Result<Option<String>> {
+    let sentinel_key = format!("agentry:verdict:emitted:{}", v.brief.0);
+    // SET key 1 NX EX 86400 — atomic claim with 24h TTL.
+    let claimed: Option<String> = redis::cmd("SET")
+        .arg(&sentinel_key)
+        .arg("1")
+        .arg("NX")
+        .arg("EX")
+        .arg(86400)
+        .query_async(conn)
+        .await?;
+    if claimed.is_none() {
+        // Sentinel already set — duplicate suppressed.
+        return Ok(None);
+    }
+    let stream_id = append_verdict(conn, v).await?;
+    Ok(Some(stream_id))
+}
+
 /// Fetch an agent role by versioned ref.
 pub async fn fetch_role(
     conn: &mut ConnectionManager,
@@ -508,5 +536,104 @@ mod tests {
             .del(format!("agentry:role:{}:v2", role_name.0))
             .await
             .expect("cleanup v2");
+    }
+
+    use orchestrator_types::{BriefId, Verdict, VerdictKind};
+
+    fn brief_slug(prefix: &str) -> String {
+        format!(
+            "brf_test_{prefix}_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        )
+    }
+
+    fn shipped(brief_id: &str) -> Verdict {
+        Verdict::new(BriefId(brief_id.into()), VerdictKind::Shipped)
+    }
+
+    /// First call against a fresh brief_id wins the SETNX, returns
+    /// `Ok(Some(stream_id))`, and lands the verdict on `agentry:verdicts`.
+    #[tokio::test]
+    #[ignore = "requires live Redis (AGENTRY_TEST_REDIS_URL)"]
+    async fn append_verdict_idempotent_first_call_wins() {
+        let Some(url) = test_redis_url() else { return };
+        let mut conn = connect(&url).await.expect("connect");
+        let brief_id = brief_slug("idem_first");
+        let v = shipped(&brief_id);
+        let sentinel_key = format!("agentry:verdict:emitted:{brief_id}");
+
+        let before: i64 = conn.xlen(STREAM_VERDICTS).await.expect("xlen before");
+        let outcome = append_verdict_idempotent(&mut conn, &v)
+            .await
+            .expect("first call");
+        let after: i64 = conn.xlen(STREAM_VERDICTS).await.expect("xlen after");
+
+        assert!(outcome.is_some(), "first call must claim and XADD");
+        assert_eq!(after, before + 1, "verdict must be on stream");
+
+        let _: () = conn.del(&sentinel_key).await.expect("cleanup sentinel");
+    }
+
+    /// Second call with the same brief_id is suppressed: returns
+    /// `Ok(None)` and the stream length stays put.
+    #[tokio::test]
+    #[ignore = "requires live Redis (AGENTRY_TEST_REDIS_URL)"]
+    async fn append_verdict_idempotent_second_call_suppressed() {
+        let Some(url) = test_redis_url() else { return };
+        let mut conn = connect(&url).await.expect("connect");
+        let brief_id = brief_slug("idem_second");
+        let v = shipped(&brief_id);
+        let sentinel_key = format!("agentry:verdict:emitted:{brief_id}");
+
+        let before: i64 = conn.xlen(STREAM_VERDICTS).await.expect("xlen before");
+        let first = append_verdict_idempotent(&mut conn, &v)
+            .await
+            .expect("first call");
+        let after_first: i64 = conn.xlen(STREAM_VERDICTS).await.expect("xlen first");
+        let second = append_verdict_idempotent(&mut conn, &v)
+            .await
+            .expect("second call");
+        let after_second: i64 = conn.xlen(STREAM_VERDICTS).await.expect("xlen second");
+
+        assert!(first.is_some(), "first call wins");
+        assert!(second.is_none(), "second call must be suppressed");
+        assert_eq!(after_first, before + 1, "first call increments XLEN by 1");
+        assert_eq!(
+            after_second, after_first,
+            "second call must NOT increment XLEN"
+        );
+
+        let _: () = conn.del(&sentinel_key).await.expect("cleanup sentinel");
+    }
+
+    /// Distinct brief_ids each get their own sentinel; both XADD.
+    #[tokio::test]
+    #[ignore = "requires live Redis (AGENTRY_TEST_REDIS_URL)"]
+    async fn append_verdict_idempotent_distinct_briefs() {
+        let Some(url) = test_redis_url() else { return };
+        let mut conn = connect(&url).await.expect("connect");
+        let id_a = brief_slug("idem_dist_a");
+        let id_b = brief_slug("idem_dist_b");
+        let sentinel_a = format!("agentry:verdict:emitted:{id_a}");
+        let sentinel_b = format!("agentry:verdict:emitted:{id_b}");
+
+        let before: i64 = conn.xlen(STREAM_VERDICTS).await.expect("xlen before");
+        let r_a = append_verdict_idempotent(&mut conn, &shipped(&id_a))
+            .await
+            .expect("call a");
+        let r_b = append_verdict_idempotent(&mut conn, &shipped(&id_b))
+            .await
+            .expect("call b");
+        let after: i64 = conn.xlen(STREAM_VERDICTS).await.expect("xlen after");
+
+        assert!(r_a.is_some(), "brief A must XADD");
+        assert!(r_b.is_some(), "brief B must XADD");
+        assert_eq!(after, before + 2, "two verdicts must be on stream");
+
+        let _: () = conn.del(&sentinel_a).await.expect("cleanup a");
+        let _: () = conn.del(&sentinel_b).await.expect("cleanup b");
     }
 }
