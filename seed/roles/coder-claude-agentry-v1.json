@@ -7,7 +7,7 @@
   "substrate_class": "podman",
   "package_manager": "apt",
   "entrypoint_script": "#!/bin/sh\nexec /usr/local/bin/coder-claude-runner\n",
-  "binaries": ["git", "curl", "ca-certificates"],
+  "binaries": ["git", "curl", "ca-certificates", "quality-fast"],
   "mcp_servers": [],
   "tool_allowlist": [],
   "allowed_tools": [
@@ -24,7 +24,8 @@
     "Bash(grep:*)",
     "Bash(find:*)",
     "Bash(ls:*)",
-    "Bash(test:*)"
+    "Bash(test:*)",
+    "Bash(quality-fast:*)"
   ],
   "permit_scope": [
     "fs:read:/workspace/**",
@@ -72,6 +73,11 @@
     {
       "source": "${HOME}/.local/bin/coder-claude-runner",
       "target": "/usr/local/bin/coder-claude-runner",
+      "readonly": true
+    },
+    {
+      "source": "${HOME}/.local/bin/quality-fast",
+      "target": "/usr/local/bin/quality-fast",
       "readonly": true
     }
   ],
