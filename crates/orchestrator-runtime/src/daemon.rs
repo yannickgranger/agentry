@@ -391,7 +391,19 @@ async fn handle_brief(
 
         for (run, outcome_res) in runs.iter().zip(outcomes.into_iter()) {
             let outcome = outcome_res?;
-            redis_io::append_verdict(conn, &outcome.verdict).await?;
+            match redis_io::append_verdict_idempotent(conn, &outcome.verdict).await? {
+                Some(stream_id) => tracing::info!(
+                    brief = %outcome.verdict.brief.0,
+                    kind = ?outcome.verdict.kind,
+                    stream_id = %stream_id,
+                    "brief verdict emitted"
+                ),
+                None => tracing::warn!(
+                    brief = %outcome.verdict.brief.0,
+                    kind = ?outcome.verdict.kind,
+                    "duplicate verdict suppressed (SETNX sentinel already set)"
+                ),
+            }
             tracing::info!(
                 brief = %brief.id,
                 role = %run.role_ref.name,
