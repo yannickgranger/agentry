@@ -1,0 +1,18 @@
+# Aspirational stub. Exists to ground the Stable Dependencies Principle
+# for `trace-query` — there must be at least one consumer crate so that
+# producer-side changes can be reviewed against a real downstream import
+# rather than against zero. Real implementation lands when per-brief
+# alerting becomes a routine ask.
+[package]
+name = "watchdog-alerts"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+trace-query = { path = "../trace-query" }
+
+[lints]
+workspace = true
