@@ -6,6 +6,15 @@ members = [
     "crates/orchestrator-dashboard",
     "crates/orchestrator-runtime",
     "crates/orchestrator-types",
+    "crates/quality-fast",
+    "crates/validators",
+]
+default-members = [
+    "crates/agentry-role-runtime",
+    "crates/coder-precommit",
+    "crates/orchestrator-dashboard",
+    "crates/orchestrator-runtime",
+    "crates/orchestrator-types",
     "crates/validators",
 ]
 

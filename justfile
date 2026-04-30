@@ -159,6 +159,13 @@ git-op-rebase-binary:
     test -x ~/.local/bin/git-op-rebase
     echo "git-op-rebase installed at ~/.local/bin/git-op-rebase"
 
+# Build quality-fast into ~/.local/bin/quality-fast for the coder-claude
+# bind-mount. Operator-invoked; idempotent. Composes external CLI invocations
+# against pre-paid indices for fast no-compile feedback to the coder.
+quality-fast:
+    cargo build --release -p quality-fast
+    cp target/release/quality-fast ~/.local/bin/quality-fast
+
 # Build everything
 build:
     cargo build --workspace --release
