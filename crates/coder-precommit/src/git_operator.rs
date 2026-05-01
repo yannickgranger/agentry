@@ -12,6 +12,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
@@ -49,19 +50,41 @@ pub struct DoneGuard {
     pub brief_id: String,
 }
 
+impl DoneGuard {
+    /// Writer-based seam for the Drop emission. When `emitted` is false this
+    /// writes the same `done failed` line that `Drop` would write to stdout;
+    /// when `emitted` is true it writes nothing. Exposed so external tests
+    /// can observe the Drop behavior without redirecting stdout and without
+    /// needing a `#[cfg(test)]` hook in `src/`.
+    pub fn emit_drop_event_to<W: Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        if !self.emitted {
+            emit_event_to(
+                writer,
+                &serde_json::json!({
+                    "type": "done",
+                    "verdict": "failed",
+                    "reason": {"unexpected_exit": true, "brief": self.brief_id}
+                }),
+            )?;
+        }
+        Ok(())
+    }
+}
+
 impl Drop for DoneGuard {
     fn drop(&mut self) {
-        if !self.emitted {
-            emit_event(&serde_json::json!({
-                "type": "done",
-                "verdict": "failed",
-                "reason": {"unexpected_exit": true, "brief": self.brief_id}
-            }));
-        }
+        let _ = self.emit_drop_event_to(&mut std::io::stdout().lock());
     }
 }
 
 pub fn emit_event(payload: &serde_json::Value) {
+    let _ = emit_event_to(&mut std::io::stdout().lock(), payload);
+}
+
+/// Writer-based seam for `emit_event`. Injects an `at` RFC3339 timestamp
+/// when the payload lacks one, then writes the JSON line followed by `\n`.
+/// `emit_event` is a thin wrapper that targets stdout.
+pub fn emit_event_to<W: Write>(writer: &mut W, payload: &serde_json::Value) -> std::io::Result<()> {
     let mut value = payload.clone();
     if let Some(obj) = value.as_object_mut() {
         if !obj.contains_key("at") {
@@ -72,7 +95,7 @@ pub fn emit_event(payload: &serde_json::Value) {
         }
     }
     let line = serde_json::to_string(&value).unwrap_or_default();
-    println!("{line}");
+    writeln!(writer, "{line}")
 }
 
 pub async fn run_git(cwd: &Path, args: &[&str]) -> Result<()> {

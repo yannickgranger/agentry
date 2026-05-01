@@ -1,14 +1,93 @@
 use std::path::{Path, PathBuf};
 
 use coder_precommit::git_operator::{
-    auto_branch, capture_git, default_commit_message, git_config_idempotent, rebase_onto, run_git,
-    Bundle,
+    auto_branch, capture_git, default_commit_message, emit_event_to, git_config_idempotent,
+    rebase_onto, run_git, Bundle, DoneGuard,
 };
 use tokio::process::Command;
 
 #[test]
 fn auto_branch_format() {
     assert_eq!(auto_branch("brf_123"), "auto/brf_123");
+}
+
+#[test]
+fn done_guard_emits_on_drop_when_not_emitted() {
+    let mut buf = Vec::<u8>::new();
+    let mut g = DoneGuard {
+        emitted: false,
+        brief_id: "brf_test".into(),
+    };
+    g.emit_drop_event_to(&mut buf)
+        .expect("emit_drop_event_to write");
+    g.emitted = true;
+    drop(g);
+
+    let line = String::from_utf8(buf).expect("utf8");
+    let v: serde_json::Value = serde_json::from_str(line.trim()).expect("parse json line");
+    assert_eq!(v["type"], "done");
+    assert_eq!(v["verdict"], "failed");
+    assert_eq!(v["reason"]["brief"], "brf_test");
+    assert_eq!(v["reason"]["unexpected_exit"], true);
+}
+
+#[test]
+fn done_guard_silent_when_emitted() {
+    let mut buf = Vec::<u8>::new();
+    let g = DoneGuard {
+        emitted: true,
+        brief_id: "brf_test".into(),
+    };
+    g.emit_drop_event_to(&mut buf)
+        .expect("emit_drop_event_to write");
+    drop(g);
+    assert!(
+        buf.is_empty(),
+        "guard with emitted=true must not write any extra event"
+    );
+}
+
+#[test]
+fn emit_event_injects_at_when_absent() {
+    let mut buf = Vec::<u8>::new();
+    emit_event_to(
+        &mut buf,
+        &serde_json::json!({
+            "type": "progress",
+            "message": "no at field here",
+        }),
+    )
+    .expect("emit_event_to write");
+    let line = String::from_utf8(buf).expect("utf8");
+    let v: serde_json::Value = serde_json::from_str(line.trim()).expect("parse json line");
+    let at = v
+        .get("at")
+        .and_then(|v| v.as_str())
+        .expect("emit_event must inject an `at` field when the payload lacks one");
+    chrono::DateTime::parse_from_rfc3339(at)
+        .expect("injected `at` value must be a valid RFC3339 timestamp");
+}
+
+#[test]
+fn emit_event_preserves_existing_at() {
+    const PRESET: &str = "2026-04-29T00:00:00+00:00";
+    let mut buf = Vec::<u8>::new();
+    emit_event_to(
+        &mut buf,
+        &serde_json::json!({
+            "type": "progress",
+            "at": PRESET,
+            "message": "has its own at",
+        }),
+    )
+    .expect("emit_event_to write");
+    let line = String::from_utf8(buf).expect("utf8");
+    let v: serde_json::Value = serde_json::from_str(line.trim()).expect("parse json line");
+    assert_eq!(
+        v.get("at").and_then(|v| v.as_str()),
+        Some(PRESET),
+        "emit_event must NOT overwrite an existing `at` value"
+    );
 }
 
 #[test]
