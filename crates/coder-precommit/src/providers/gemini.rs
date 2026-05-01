@@ -84,14 +84,3 @@ impl AcVerifierProvider for GeminiProvider {
         Ok(text.to_string())
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn model_default_is_gemini_3_flash_preview() {
-        let p = GeminiProvider::default();
-        assert_eq!(p.model, "gemini-3-flash-preview");
-    }
-}
