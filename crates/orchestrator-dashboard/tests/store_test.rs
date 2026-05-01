@@ -182,14 +182,21 @@ async fn next_version_increments_atomically() {
     cleanup(&store, &kind, &["alpha"]).await;
 }
 
-/// End-to-end: subscribe twice, observe that both receivers exist (a
-/// proxy for "one tail loop services both" — observable via `sender_*`
-/// metadata on the broadcast channel held by the second `subscribe`).
-/// This is the public-surface analogue of the original inline test that
-/// reached into `store.inner.fanouts`.
+/// End-to-end: subscribe twice, publish to the underlying trace stream
+/// once, and assert both receivers observe the same payload. If only one
+/// receiver gets the event then `subscribe_trace` did NOT join an
+/// existing fanout — i.e., it spun up an independent tail loop and the
+/// "single tail loop per stream" invariant is broken. This is the
+/// behavioural assertion the original inline test made via
+/// `store.inner.fanouts`; here we drive it through the public surface
+/// instead, paying the cost of a live Redis dependency to keep it
+/// honest.
 #[tokio::test]
 #[ignore = "requires live Redis (AGENTRY_TEST_REDIS_URL)"]
-async fn subscribe_trace_yields_independent_receivers() {
+async fn subscribe_trace_fanout_is_shared_across_subscribers() {
+    use redis::AsyncCommands;
+    use std::time::Duration;
+
     let store = DashboardStore::new(&test_redis_url())
         .await
         .expect("connect");
@@ -200,11 +207,41 @@ async fn subscribe_trace_yields_independent_receivers() {
             .map(|d| d.as_nanos())
             .unwrap_or(0)
     );
-    let rx1 = store.subscribe_trace(&id);
-    let rx2 = store.subscribe_trace(&id);
-    // Both receivers must be alive and independently consumable.
-    assert!(rx1.is_empty());
-    assert!(rx2.is_empty());
-    drop(rx1);
-    drop(rx2);
+    let stream = format!("agentry:brief:{id}:trace");
+
+    let mut rx1 = store.subscribe_trace(&id);
+    let mut rx2 = store.subscribe_trace(&id);
+
+    // Tail loop spawns inside `subscribe_trace`; it needs a moment to
+    // open its own connection and park on XREAD `$` before our XADD
+    // arrives, otherwise the entry pre-dates the tail's read cursor and
+    // is never delivered (the loop is live-only by design).
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let payload = format!(r#"{{"kind":"probe","brief":"{id}"}}"#);
+    let client = redis::Client::open(store.redis_url()).expect("client");
+    let mut conn = client
+        .get_multiplexed_async_connection()
+        .await
+        .expect("conn");
+    let _: String = conn
+        .xadd(&stream, "*", &[("event", payload.as_str())])
+        .await
+        .expect("xadd");
+
+    let got1 = tokio::time::timeout(Duration::from_secs(3), rx1.recv())
+        .await
+        .expect("rx1 timed out")
+        .expect("rx1 recv");
+    let got2 = tokio::time::timeout(Duration::from_secs(3), rx2.recv())
+        .await
+        .expect("rx2 timed out")
+        .expect("rx2 recv");
+    assert_eq!(got1, payload, "rx1 must observe the published event");
+    assert_eq!(
+        got2, payload,
+        "rx2 must observe the same payload, proving one tail loop services both"
+    );
+
+    let _: () = conn.del(&stream).await.unwrap_or(());
 }
