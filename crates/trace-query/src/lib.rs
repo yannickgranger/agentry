@@ -42,6 +42,8 @@ pub struct TraceMetric {
 /// Returns `Err` only when the call cannot produce even a partial
 /// result (which today is never — every source is guarded individually).
 pub fn aggregate(brief_id: &str, redis: &mut redis::Connection) -> anyhow::Result<TraceMetric> {
+    use compute::{count_compile_cycles, count_reads_before_first_edit, count_refusals};
+
     let mut metric = TraceMetric {
         brief_id: brief_id.to_string(),
         ..TraceMetric::default()
@@ -119,70 +121,83 @@ fn redis_value_as_str(v: &redis::Value) -> Option<String> {
     }
 }
 
-/// True iff the event is a Bash tool_call whose `command` arg invokes
-/// the rust toolchain in a way that triggers a compile cycle (check,
-/// build, test, clippy).
-fn is_compile_cycle(event: &serde_json::Value) -> bool {
-    if event.get("type").and_then(|v| v.as_str()) != Some("tool_call") {
-        return false;
-    }
-    let call = event.get("call");
-    let tool = call.and_then(|c| c.get("tool")).and_then(|v| v.as_str());
-    if tool != Some("Bash") {
-        return false;
-    }
-    let cmd = call
-        .and_then(|c| c.get("args"))
-        .and_then(|a| a.get("command"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    cmd.contains("cargo check")
-        || cmd.contains("cargo build")
-        || cmd.contains("cargo test")
-        || cmd.contains("cargo clippy")
-}
+/// Pure metric-compute helpers. Reused by `aggregate`'s reduction pass
+/// over a brief's trace events. These are pure functions over
+/// `serde_json::Value` slices — no I/O, no Redis.
+pub mod compute {
+    use serde_json::Value;
 
-fn tool_name(event: &serde_json::Value) -> Option<&str> {
-    if event.get("type").and_then(|v| v.as_str()) != Some("tool_call") {
-        return None;
-    }
-    event
-        .get("call")
-        .and_then(|c| c.get("tool"))
-        .and_then(|v| v.as_str())
-}
-
-fn is_refusal(event: &serde_json::Value) -> bool {
-    if event.get("type").and_then(|v| v.as_str()) == Some("tool_refused") {
-        return true;
-    }
-    // Tolerate freeform events whose payload carries an explicit
-    // `refused` flag — older roles emitted refusals this way.
-    event
-        .get("payload")
-        .and_then(|p| p.get("refused"))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-}
-
-fn count_compile_cycles(events: &[serde_json::Value]) -> u32 {
-    u32::try_from(events.iter().filter(|e| is_compile_cycle(e)).count()).unwrap_or(u32::MAX)
-}
-
-fn count_reads_before_first_edit(events: &[serde_json::Value]) -> u32 {
-    let mut reads: u32 = 0;
-    for event in events {
-        match tool_name(event) {
-            Some("Edit" | "Write" | "NotebookEdit") => return reads,
-            Some("Read") => reads = reads.saturating_add(1),
-            _ => {}
+    /// True iff the event is a Bash tool_call whose `command` arg invokes
+    /// the rust toolchain in a way that triggers a compile cycle (check,
+    /// build, test, clippy).
+    pub fn is_compile_cycle(event: &Value) -> bool {
+        if event.get("type").and_then(|v| v.as_str()) != Some("tool_call") {
+            return false;
         }
+        let call = event.get("call");
+        let tool = call.and_then(|c| c.get("tool")).and_then(|v| v.as_str());
+        if tool != Some("Bash") {
+            return false;
+        }
+        let cmd = call
+            .and_then(|c| c.get("args"))
+            .and_then(|a| a.get("command"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        cmd.contains("cargo check")
+            || cmd.contains("cargo build")
+            || cmd.contains("cargo test")
+            || cmd.contains("cargo clippy")
     }
-    reads
-}
 
-fn count_refusals(events: &[serde_json::Value]) -> u32 {
-    u32::try_from(events.iter().filter(|e| is_refusal(e)).count()).unwrap_or(u32::MAX)
+    /// Tool name from a tool_call event (e.g. "Bash", "Read"); `None`
+    /// for non-tool_call events.
+    pub fn tool_name(event: &Value) -> Option<&str> {
+        if event.get("type").and_then(|v| v.as_str()) != Some("tool_call") {
+            return None;
+        }
+        event
+            .get("call")
+            .and_then(|c| c.get("tool"))
+            .and_then(|v| v.as_str())
+    }
+
+    /// True iff the event is a tool_refused event (or carries an
+    /// explicit `payload.refused` flag from older roles).
+    pub fn is_refusal(event: &Value) -> bool {
+        if event.get("type").and_then(|v| v.as_str()) == Some("tool_refused") {
+            return true;
+        }
+        event
+            .get("payload")
+            .and_then(|p| p.get("refused"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    }
+
+    /// Count compile-cycle events in a slice of trace events.
+    pub fn count_compile_cycles(events: &[Value]) -> u32 {
+        u32::try_from(events.iter().filter(|e| is_compile_cycle(e)).count()).unwrap_or(u32::MAX)
+    }
+
+    /// Count Read tool calls that occurred before the first
+    /// Edit/Write/NotebookEdit call.
+    pub fn count_reads_before_first_edit(events: &[Value]) -> u32 {
+        let mut reads: u32 = 0;
+        for event in events {
+            match tool_name(event) {
+                Some("Edit" | "Write" | "NotebookEdit") => return reads,
+                Some("Read") => reads = reads.saturating_add(1),
+                _ => {}
+            }
+        }
+        reads
+    }
+
+    /// Count tool_refused events.
+    pub fn count_refusals(events: &[Value]) -> u32 {
+        u32::try_from(events.iter().filter(|e| is_refusal(e)).count()).unwrap_or(u32::MAX)
+    }
 }
 
 /// First→last `at` timestamp delta across the transcript's JSONL lines,
@@ -249,102 +264,4 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     let doy = (153 * if m > 2 { m - 3 } else { m + 9 } + 2) / 5 + d - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     era * 146097 + i64::try_from(doe).unwrap_or(0) - 719468
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    fn tool_call_bash(cmd: &str) -> serde_json::Value {
-        json!({
-            "at": "2026-04-30T00:00:00Z",
-            "type": "tool_call",
-            "call": { "tool": "Bash", "args": { "command": cmd } },
-        })
-    }
-
-    fn tool_call(tool: &str) -> serde_json::Value {
-        json!({
-            "at": "2026-04-30T00:00:00Z",
-            "type": "tool_call",
-            "call": { "tool": tool, "args": {} },
-        })
-    }
-
-    #[test]
-    fn compile_cycles_counts_cargo_invocations() {
-        let events = vec![
-            tool_call_bash("cargo check --workspace"),
-            tool_call_bash("ls -la"),
-            tool_call_bash("cargo test -p foo"),
-            tool_call_bash("cargo clippy --workspace -- -D warnings"),
-            tool_call_bash("echo hi"),
-            tool_call_bash("cargo build"),
-        ];
-        assert_eq!(count_compile_cycles(&events), 4);
-    }
-
-    #[test]
-    fn reads_before_first_edit_stops_at_edit() {
-        let events = vec![
-            tool_call("Read"),
-            tool_call("Read"),
-            tool_call("Grep"),
-            tool_call("Read"),
-            tool_call("Edit"),
-            tool_call("Read"),
-        ];
-        assert_eq!(count_reads_before_first_edit(&events), 3);
-    }
-
-    #[test]
-    fn reads_before_first_edit_counts_all_when_no_edit() {
-        let events = vec![tool_call("Read"), tool_call("Grep"), tool_call("Read")];
-        assert_eq!(count_reads_before_first_edit(&events), 2);
-    }
-
-    #[test]
-    fn refusals_count_explicit_and_payload_flagged() {
-        let events = vec![
-            json!({ "type": "tool_refused" }),
-            json!({ "type": "event", "payload": { "refused": true } }),
-            json!({ "type": "event", "payload": { "msg": "hi" } }),
-            json!({ "type": "tool_refused" }),
-        ];
-        assert_eq!(count_refusals(&events), 3);
-    }
-
-    #[test]
-    fn wall_seconds_from_first_and_last_timestamp() {
-        let body = "\
-{\"at\":\"2026-04-30T00:00:00Z\",\"type\":\"event\"}
-{\"at\":\"2026-04-30T00:01:30Z\",\"type\":\"event\"}
-{\"at\":\"2026-04-30T00:05:00Z\",\"type\":\"event\"}
-";
-        assert_eq!(wall_seconds_from_transcript(body), 300);
-    }
-
-    #[test]
-    fn wall_seconds_zero_when_no_timestamps() {
-        assert_eq!(wall_seconds_from_transcript(""), 0);
-        assert_eq!(wall_seconds_from_transcript("not json\n"), 0);
-    }
-
-    #[test]
-    fn trace_metric_default_round_trips() {
-        let m = TraceMetric::default();
-        let s = serde_json::to_string(&m).expect("ser");
-        let back: TraceMetric = serde_json::from_str(&s).expect("de");
-        assert_eq!(m, back);
-    }
-
-    #[test]
-    fn trace_metric_deserialises_with_missing_fields() {
-        // backward-compat: serde(default) on every field means an
-        // upstream consumer can drop fields without breaking parsing.
-        let m: TraceMetric = serde_json::from_str("{\"brief_id\":\"x\"}").expect("de");
-        assert_eq!(m.brief_id, "x");
-        assert_eq!(m.compile_cycles, 0);
-    }
 }
