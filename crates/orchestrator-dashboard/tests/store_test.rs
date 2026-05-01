@@ -1,16 +1,47 @@
 //! Migrated from `src/store.rs`'s inline `#[cfg(test)]` block (EPIC #256).
 //!
-//! Tests against the public surface of `DashboardStore`. The original
-//! inline block also unit-tested the file-private helpers
-//! `parse_version_from_key`, `record_key`, and the per-stream fanout
-//! map's eviction predicate via direct access to `Inner`. Those tests
-//! cannot be reached through the public surface from a sibling tests/
-//! crate without promoting private items to `pub`, which the migration
-//! brief explicitly forbids ("Do NOT promote private items to `pub` to
-//! satisfy tests"). The eviction predicate itself is exercised
-//! end-to-end by `fanout_auto_evicts_after_idle_grace` below — i.e.,
-//! the observable behaviour is still covered, only the white-box
-//! introspection is dropped.
+//! Tests against the public surface of `DashboardStore`. The migration
+//! dropped three pieces of coverage that the original inline block
+//! reached for via `super::*` / direct `Inner` access:
+//!
+//!   * `parse_version_from_key_extracts_trailing_v_n` — exercised the
+//!     file-private `parse_version_from_key` helper.
+//!   * `record_key_versions_roles_and_teams_only` — exercised the
+//!     file-private `record_key` helper.
+//!   * `fanout_auto_evicts_after_idle_grace` — end-to-end test that
+//!     drove `DashboardStore::new_with` against live Redis with a
+//!     200ms grace, dropped the only receiver, then asserted the
+//!     fanout entry was *removed from `store.inner.fanouts`* within a
+//!     bounded wait. The constructor is already `pub`, but the
+//!     assertion required reading the private `Inner.fanouts` map; no
+//!     public surface exposes whether a given stream still has a
+//!     fanout entry, and the migration brief forbids promoting items
+//!     to `pub` (or adding a new accessor) solely to satisfy this
+//!     test. Receiver-side primitives (`broadcast::Receiver`) do not
+//!     expose enough sender identity to distinguish "entry reaped and
+//!     re-created" from "entry reused" across the eviction boundary,
+//!     so no equivalent public-surface assertion is available.
+//!
+//! `fanout_entry_reaped_when_no_receivers` below is a *hermetic* test
+//! of the eviction *predicate* (the same `receiver_count() == 0` →
+//! remove-under-lock pattern the tail loop runs), not the end-to-end
+//! tail-loop behaviour. The end-to-end coverage gap is on record as
+//! follow-up FIXME below; restoring it requires either a narrowly-
+//! scoped public observability hook (e.g.
+//! `DashboardStore::fanout_len()` exposed under `#[cfg(any(test,
+//! feature = "test-hooks"))]`) or a separate test crate compiled with
+//! the dashboard package itself (e.g. an in-crate `#[cfg(test)]`
+//! integration harness exempted from the EPIC #256 rule). Either
+//! option is a follow-up issue, not in scope for the migration brief.
+//
+// FIXME(EPIC #256 follow-up): end-to-end auto-eviction coverage for
+// `DashboardStore`'s self-reaping fanout map (originally
+// `fanout_auto_evicts_after_idle_grace`) was dropped in the
+// migration to `tests/`. The assertion reads private `Inner` state,
+// and the brief disallows new `pub` surface to satisfy a test. File a
+// follow-up to restore this coverage via a gated test-only hook or a
+// dedicated in-crate harness — until that lands, the auto-reap path
+// is only covered by the hermetic predicate test below.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
