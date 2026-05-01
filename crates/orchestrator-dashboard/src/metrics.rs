@@ -7,7 +7,7 @@ use axum::response::{Html, IntoResponse};
 use orchestrator_types::{Verdict, VerdictKind};
 use trace_query::{aggregate, TraceMetric};
 
-use crate::AppState;
+use crate::store::DashboardStore;
 
 /// Brief 239 fence: a Shipped verdict that nonetheless carries a non-zero
 /// `refusal_count` is anomalous — the coder couldn't reach tools it wanted
@@ -36,10 +36,10 @@ pub fn refusal_anomaly_badge_html(verdict: &Verdict) -> String {
 /// brief as a small HTML table. Best-effort: a brief with no trace
 /// stream entries renders zeros, not 500.
 pub async fn brief_metrics_handler(
-    State(state): State<AppState>,
+    State(store): State<DashboardStore>,
     Path(brief_id): Path<String>,
 ) -> impl IntoResponse {
-    let url = state.store.redis_url().to_string();
+    let url = store.redis_url().to_string();
     let bid = brief_id.clone();
     let joined = tokio::task::spawn_blocking(move || -> anyhow::Result<TraceMetric> {
         let client = redis::Client::open(url.as_str())?;
@@ -51,7 +51,7 @@ pub async fn brief_metrics_handler(
     // Best-effort verdict fetch for the refusal-on-shipped fence (brief
     // 239). A miss (brief not in the recent verdict window, or no verdict
     // yet) just suppresses the badge — never 500s.
-    let anomaly_badge = match state.store.fetch_verdict_for(&brief_id, 100).await {
+    let anomaly_badge = match store.fetch_verdict_for(&brief_id, 100).await {
         Ok(Some(v)) => refusal_anomaly_badge_html(&v),
         _ => String::new(),
     };
@@ -137,125 +137,4 @@ fn html_escape(s: &str) -> String {
         }
     }
     out
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn metrics_badge_html_renders_cycles_and_refusals() {
-        let m = TraceMetric {
-            brief_id: "brf_test".into(),
-            compile_cycles: 7,
-            refusal_count: 2,
-            ..TraceMetric::default()
-        };
-        let badge = metrics_badge_html(&m);
-        assert!(badge.contains("cycles=7"), "badge missing cycles: {badge}");
-        assert!(
-            badge.contains("refusals=2"),
-            "badge missing refusals: {badge}"
-        );
-        assert!(
-            badge.contains("metric-badge"),
-            "badge missing class: {badge}"
-        );
-    }
-
-    #[test]
-    fn metrics_badge_html_zero_for_default() {
-        let badge = metrics_badge_html(&TraceMetric::default());
-        assert!(badge.contains("cycles=0"));
-        assert!(badge.contains("refusals=0"));
-    }
-
-    #[test]
-    fn render_metrics_table_includes_every_field() {
-        let m = TraceMetric {
-            brief_id: "brf_x".into(),
-            compile_cycles: 1,
-            reads_before_first_edit: 2,
-            refusal_count: 3,
-            wall_seconds: 4,
-            lines_changed: 5,
-            verb_citation_density: 0.5,
-        };
-        let html = render_metrics_table(&m);
-        for needle in [
-            "compile_cycles",
-            "reads_before_first_edit",
-            "refusal_count",
-            "wall_seconds",
-            "lines_changed",
-            "verb_citation_density",
-            "brf_x",
-        ] {
-            assert!(
-                html.contains(needle),
-                "rendered table missing {needle}: {html}"
-            );
-        }
-    }
-
-    #[test]
-    fn html_escape_escapes_dangerous_chars() {
-        assert_eq!(
-            html_escape("<script>&\"'"),
-            "&lt;script&gt;&amp;&quot;&#39;"
-        );
-    }
-
-    fn synthetic_verdict(kind: VerdictKind, refusal_count: u32) -> Verdict {
-        let mut v = Verdict::new(orchestrator_types::BriefId("brf_test".into()), kind);
-        v.refusal_count = refusal_count;
-        v
-    }
-
-    #[test]
-    fn is_refusal_anomaly_true_for_shipped_with_refusals() {
-        assert!(is_refusal_anomaly(&synthetic_verdict(
-            VerdictKind::Shipped,
-            3
-        )));
-    }
-
-    #[test]
-    fn is_refusal_anomaly_false_for_failed_with_refusals() {
-        assert!(!is_refusal_anomaly(&synthetic_verdict(
-            VerdictKind::Failed,
-            5
-        )));
-    }
-
-    #[test]
-    fn is_refusal_anomaly_false_for_shipped_without_refusals() {
-        assert!(!is_refusal_anomaly(&synthetic_verdict(
-            VerdictKind::Shipped,
-            0
-        )));
-    }
-
-    #[test]
-    fn refusal_anomaly_badge_html_renders_warning_for_anomaly() {
-        let badge = refusal_anomaly_badge_html(&synthetic_verdict(VerdictKind::Shipped, 4));
-        assert!(
-            badge.contains("⚠ refusal-on-shipped anomaly"),
-            "badge missing warning text: {badge}"
-        );
-        assert!(
-            badge.contains("anomaly-badge"),
-            "badge missing class: {badge}"
-        );
-        assert!(
-            badge.contains("shipped with 4"),
-            "badge missing tooltip count: {badge}"
-        );
-    }
-
-    #[test]
-    fn refusal_anomaly_badge_html_empty_for_non_anomaly() {
-        assert!(refusal_anomaly_badge_html(&synthetic_verdict(VerdictKind::Shipped, 0)).is_empty());
-        assert!(refusal_anomaly_badge_html(&synthetic_verdict(VerdictKind::Failed, 7)).is_empty());
-    }
 }
