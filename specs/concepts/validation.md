@@ -88,6 +88,15 @@ a passing report and a `debug!` log when the binary isn't present —
 mirrors the `dead_pub_check_unavailable` warn-skip in the existing
 reviewer-mechanical seed script.
 
+## AddedPubItem
+
+One newly-added `pub` declaration extracted from a unified-diff hunk by
+the dead-pub-check parser. Records the file path, the new-file line
+number, the kind (`fn` / `struct` / `enum` / `trait` / `type` / `const`
+/ `static`), and the bare item name. The parser
+(`coder_precommit::parse_added_pub_items`) lives in lib so the
+[[bin]] target and integration tests share a single implementation.
+
 Workflow validation is a separate pipeline that runs against
 `TeamTopology` records, not against a coder's diff. Six checks compose
 the union: vocabulary integrity (parse-time, structurally enforced by

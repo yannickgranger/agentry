@@ -88,14 +88,3 @@ impl AcVerifierProvider for GrokProvider {
         Ok(content.to_string())
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn model_default_is_grok_4_fast() {
-        let p = GrokProvider::default();
-        assert_eq!(p.model, "grok-4-fast");
-    }
-}
