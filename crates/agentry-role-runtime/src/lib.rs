@@ -545,17 +545,39 @@ pub const FENCE_MATRIX: &[(FenceKind, Threshold, Severity)] = &[
 /// and folds the JSON output into [`ReviewFinding`]s with
 /// [`FindingOrigin::Mechanical`].
 ///
-/// Subprocess errors surface as a single `ra_query_unavailable` Blocker
-/// finding for the failing call (Y.5 will refine the fail-closed wiring).
+/// Fail-closed (Y.5): if `ra-query` is unavailable in the reviewer container
+/// or any `run_ra_query` invocation fails (spawn error, non-zero exit, parse
+/// error), `run_fence` returns exactly ONE Blocker finding with
+/// `rule = Some("ra_query_unavailable")` and discards any partial findings.
+/// One Blocker is the substrate-broken signal; further findings would be
+/// unreliable. Pre-fence worktree cleanup hiccups after a successful fence
+/// pass are best-effort and do NOT override collected findings.
 pub fn run_fence(workspace: &Path, base_branch: &str) -> Vec<ReviewFinding> {
-    let mut findings = Vec::new();
+    let fail_closed = |reason: &str, detail: &str| -> Vec<ReviewFinding> {
+        vec![ReviewFinding {
+            file: None,
+            line: None,
+            severity: Severity::Blocker,
+            origin: FindingOrigin::Mechanical {
+                tool: "ra-query".into(),
+                rule: Some("ra_query_unavailable".into()),
+            },
+            category: "fence".into(),
+            message: format!(
+                "ra-query unavailable in reviewer container ({reason}): {detail} — substrate must be repaired before briefs can ship"
+            ),
+            suggested_fix: None,
+            prohibitions: Vec::new(),
+            requirements: Vec::new(),
+        }]
+    };
+
     let changed = match changed_rs_files_via_git(workspace, base_branch) {
         Ok(v) => v,
-        Err(e) => {
-            findings.push(ra_query_unavailable_finding(None, &e));
-            return findings;
-        }
+        Err(e) => return fail_closed("git_diff_failed", &e),
     };
+
+    let mut findings = Vec::new();
     for f in &changed {
         let abs = workspace.join(f);
         if !abs.is_file() {
@@ -563,11 +585,13 @@ pub fn run_fence(workspace: &Path, base_branch: &str) -> Vec<ReviewFinding> {
         }
         let abs_s = abs.to_string_lossy().into_owned();
 
-        match run_ra_query(&["clones", &abs_s, "--active-only", "--format", "json"]) {
-            Ok(v) => findings.extend(clones_to_findings(f, &v)),
-            Err(e) => findings.push(ra_query_unavailable_finding(Some(f), &e)),
-        }
-        match run_ra_query(&[
+        let json = match run_ra_query(&["clones", &abs_s, "--active-only", "--format", "json"]) {
+            Ok(v) => v,
+            Err(e) => return fail_closed("clones_query_failed", &e),
+        };
+        findings.extend(clones_to_findings(f, &json));
+
+        let json = match run_ra_query(&[
             "complexity",
             &abs_s,
             "--threshold",
@@ -575,51 +599,62 @@ pub fn run_fence(workspace: &Path, base_branch: &str) -> Vec<ReviewFinding> {
             "--format",
             "json",
         ]) {
-            Ok(v) => findings.extend(complexity_to_findings(f, &v)),
-            Err(e) => findings.push(ra_query_unavailable_finding(Some(f), &e)),
-        }
-        match run_ra_query(&["unwraps", &abs_s, "--severity", "high", "--format", "json"]) {
-            Ok(v) => findings.extend(unwraps_to_findings(f, &v)),
-            Err(e) => findings.push(ra_query_unavailable_finding(Some(f), &e)),
-        }
+            Ok(v) => v,
+            Err(e) => return fail_closed("complexity_query_failed", &e),
+        };
+        findings.extend(complexity_to_findings(f, &json));
+
+        let json =
+            match run_ra_query(&["unwraps", &abs_s, "--severity", "high", "--format", "json"]) {
+                Ok(v) => v,
+                Err(e) => return fail_closed("unwraps_query_failed", &e),
+            };
+        findings.extend(unwraps_to_findings(f, &json));
     }
 
     // Callers fence (Y.4): for each new pub item introduced by the diff,
     // ask ra-query who calls it. Zero callers in workspace is a Blocker
-    // (split-brain candidate). Resolution failures emit a Warn so the
-    // gap is visible rather than silently skipped (v2 review finding).
-    match create_pre_diff_worktree(workspace, base_branch) {
-        Ok(pre) => {
-            for f in &changed {
-                let abs = workspace.join(f);
-                if !abs.is_file() {
-                    continue;
-                }
-                let post = pub_surface_at(workspace, f);
-                let pre_items = pub_surface_at(&pre, f);
-                match classify_new_pub_items(f, post, pre_items) {
-                    Err(meta) => findings.push(*meta),
-                    Ok(new_items) => {
-                        for item in new_items {
-                            let abs_s = workspace.join(f).to_string_lossy().into_owned();
-                            let pos = format!("{}:{}:{}", abs_s, item.line, item.col);
-                            match callers_at(workspace, &pos, item.col) {
-                                Some(0) => findings.push(callers_zero_finding(f, &item)),
-                                Some(_) => {}
-                                None => findings.push(callers_unresolved_finding(f, &item, &pos)),
-                            }
-                        }
-                    }
+    // (split-brain candidate). Pre-diff worktree creation failure and any
+    // ra-query failure inside the fence are fail-closed (Y.5). Cleanup
+    // after the fence is best-effort and does not override findings.
+    let pre = match create_pre_diff_worktree(workspace, base_branch) {
+        Ok(p) => p,
+        Err(e) => return fail_closed("git_worktree_failed", &format!("git worktree add: {e}")),
+    };
+    let callers_result: Result<Vec<ReviewFinding>, (&'static str, String)> = (|| {
+        let mut out = Vec::new();
+        for f in &changed {
+            let abs = workspace.join(f);
+            if !abs.is_file() {
+                continue;
+            }
+            let post = pub_surface_at(workspace, f);
+            let pre_items = pub_surface_at(&pre, f);
+            let new_items = match classify_new_pub_items(f, post, pre_items) {
+                Ok(items) => items,
+                Err(meta) => return Err(("pub_surface_unresolved", meta.message.clone())),
+            };
+            for item in new_items {
+                let abs_s = workspace.join(f).to_string_lossy().into_owned();
+                let pos = format!("{}:{}:{}", abs_s, item.line, item.col);
+                match callers_at(workspace, &pos, item.col) {
+                    Ok(Some(0)) => out.push(callers_zero_finding(f, &item)),
+                    Ok(Some(_)) => {}
+                    Ok(None) => out.push(callers_unresolved_finding(f, &item, &pos)),
+                    Err(e) => return Err(("callers_query_failed", format!("{pos}: {e}"))),
                 }
             }
-            cleanup_pre_diff_worktree(&pre);
         }
-        Err(e) => findings.push(ra_query_unavailable_finding(
-            None,
-            &format!("git worktree add: {e}"),
-        )),
+        Ok(out)
+    })();
+    cleanup_pre_diff_worktree(&pre);
+    match callers_result {
+        Ok(more) => {
+            findings.extend(more);
+            findings
+        }
+        Err((reason, detail)) => fail_closed(reason, &detail),
     }
-    findings
 }
 
 /// Decide how to react to a (post, pre) pub-surface pair for one file.
@@ -660,23 +695,6 @@ fn changed_rs_files_via_git(workspace: &Path, base_branch: &str) -> Result<Vec<S
         })
         .map(|l| l.to_string())
         .collect())
-}
-
-fn ra_query_unavailable_finding(file: Option<&str>, detail: &str) -> ReviewFinding {
-    ReviewFinding {
-        file: file.map(|s| s.to_string()),
-        line: None,
-        severity: Severity::Blocker,
-        origin: FindingOrigin::Mechanical {
-            tool: "ra-query".into(),
-            rule: Some("ra_query_unavailable".into()),
-        },
-        category: "fence".into(),
-        message: format!("ra-query subprocess failed: {detail}"),
-        suggested_fix: None,
-        prohibitions: Vec::new(),
-        requirements: Vec::new(),
-    }
 }
 
 fn fence_severity(kind: FenceKind) -> Severity {
@@ -895,16 +913,16 @@ fn pub_surface_at(dir: &Path, file: &str) -> Result<Vec<PubItem>, String> {
         .collect())
 }
 
-fn callers_at(workspace: &Path, pos: &str, col: usize) -> Option<usize> {
+fn callers_at(workspace: &Path, pos: &str, col: usize) -> Result<Option<usize>, String> {
     if col == 0 {
-        return None;
+        return Ok(None);
     }
     let workspace_s = workspace.to_string_lossy().into_owned();
-    let json = run_ra_query(&["callers", pos, "-p", &workspace_s, "-f", "json"]).ok()?;
+    let json = run_ra_query(&["callers", pos, "-p", &workspace_s, "-f", "json"])?;
     if let Some(arr) = json.get("callers").and_then(Value::as_array) {
-        Some(arr.len())
+        Ok(Some(arr.len()))
     } else {
-        json.as_array().map(|arr| arr.len())
+        Ok(json.as_array().map(|arr| arr.len()))
     }
 }
 
