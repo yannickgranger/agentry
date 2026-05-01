@@ -27,6 +27,7 @@ pub mod claude;
 pub use claude::{stream_claude, StreamErr};
 
 use std::io::{self, Read, Write};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use chrono::Utc;
@@ -332,6 +333,142 @@ pub fn mech_finding(tool: &str, category: &str, message: &str) -> ReviewFinding 
     }
 }
 
+// ---------- reviewer-binary helpers (extracted from reviewer_claude_runner, brief Y.1) ----------
+
+const SALVAGE_BUDGET: usize = 4096;
+
+/// True iff `ra-query --version` succeeds. Used to gate the reviewer's
+/// pre-pass when operators haven't run `just ra-query-binary`.
+pub fn ra_query_present() -> bool {
+    Command::new("ra-query")
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok()
+}
+
+/// Run `ra-query` with the given args and parse stdout as JSON. Returns
+/// `Err` with a short reason on spawn / non-zero exit / unparseable JSON.
+pub fn run_ra_query(args: &[&str]) -> Result<Value, String> {
+    let out = Command::new("ra-query")
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| format!("spawn ra-query: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("ra-query exit {:?}", out.status.code()));
+    }
+    serde_json::from_slice(&out.stdout).map_err(|e| format!("parse ra-query json: {e}"))
+}
+
+/// Extract the set of `*.rs` paths the diff touches by scanning the unified
+/// diff's `+++ b/<path>.rs` headers. Mirrors bash:
+///   `grep -E '^\+\+\+ b/.*\.rs$' /tmp/diff.patch | sed 's|^\+\+\+ b/||'`
+pub fn changed_rs_files(diff_text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in diff_text.lines() {
+        if let Some(rest) = line.strip_prefix("+++ b/") {
+            if rest.ends_with(".rs") {
+                out.push(rest.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Slice the substring between the first `[` and last `]` in `text`, or
+/// `None` if either is missing or `]` precedes `[`.
+pub fn slice_json_array(text: &str) -> Option<&str> {
+    let start = text.find('[')?;
+    let end = text.rfind(']')?;
+    if end < start {
+        return None;
+    }
+    Some(&text[start..=end])
+}
+
+/// Strip optional code fences, slice between first `[` and last `]`, parse
+/// as a JSON array of finding-shape objects. On any failure, salvage the
+/// reply as a single `format_deviation` Blocker finding so the rework loop
+/// has a concrete handle. Returns the emit-ready findings.
+pub fn parse_findings(response: &str, agent_id: &str) -> Vec<ReviewFinding> {
+    let cleaned = strip_fences(response);
+    let sliced = match slice_json_array(&cleaned) {
+        Some(s) => s,
+        None => {
+            return vec![salvage_format_deviation(&cleaned, agent_id)];
+        }
+    };
+    let arr: Vec<Value> = match serde_json::from_str::<Value>(sliced) {
+        Ok(Value::Array(a)) => a,
+        _ => {
+            return vec![salvage_format_deviation(sliced, agent_id)];
+        }
+    };
+    arr.into_iter()
+        .map(|v| convert_finding(&v, agent_id))
+        .collect()
+}
+
+fn salvage_format_deviation(raw: &str, agent_id: &str) -> ReviewFinding {
+    let head = head_bytes(raw, SALVAGE_BUDGET);
+    emit_event(json!({
+        "msg": "reviewer prose-reply salvaged as format_deviation",
+        "bytes": head.len(),
+    }));
+    // PORT NOTE: bash emitted severity:"error" here (not in the Severity
+    // enum). Daemon-side deserialization rejected it, leaving the rework
+    // loop without a blocker handle. The Rust port emits Blocker — same
+    // intent (rework needed because the review couldn't be parsed) but
+    // serializes correctly.
+    ReviewFinding {
+        file: None,
+        line: None,
+        severity: Severity::Blocker,
+        origin: FindingOrigin::Model {
+            reviewer_agent_id: agent_id.to_string(),
+        },
+        category: "format_deviation".into(),
+        message: head,
+        suggested_fix: None,
+        prohibitions: Vec::new(),
+        requirements: Vec::new(),
+    }
+}
+
+fn convert_finding(v: &Value, agent_id: &str) -> ReviewFinding {
+    let severity = parse_severity(v.get("severity").and_then(Value::as_str));
+    let category = v
+        .get("category")
+        .and_then(Value::as_str)
+        .unwrap_or("other")
+        .to_string();
+    let message = v
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let prohibitions = string_array_field(v, "prohibitions");
+    let requirements = string_array_field(v, "requirements");
+    ReviewFinding {
+        file: None,
+        line: None,
+        severity,
+        origin: FindingOrigin::Model {
+            reviewer_agent_id: agent_id.to_string(),
+        },
+        category,
+        message,
+        suggested_fix: None,
+        prohibitions,
+        requirements,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -536,5 +673,108 @@ mod tests {
         }
         assert_eq!(f.category, "fmt");
         assert_eq!(f.message, "boom");
+    }
+
+    #[test]
+    fn slice_json_array_picks_outermost() {
+        assert_eq!(slice_json_array("prefix[1,2]suffix"), Some("[1,2]"));
+        assert_eq!(
+            slice_json_array("garbage [\"a\",\"b\"]"),
+            Some("[\"a\",\"b\"]")
+        );
+    }
+
+    #[test]
+    fn slice_json_array_returns_none_when_missing() {
+        assert_eq!(slice_json_array("no brackets here"), None);
+        assert_eq!(slice_json_array("] only closing"), None);
+        assert_eq!(slice_json_array("[ only opening"), None);
+    }
+
+    #[test]
+    fn parse_findings_empty_array_yields_zero() {
+        let v = parse_findings("[]", "agt-1");
+        assert_eq!(v.len(), 0);
+    }
+
+    #[test]
+    fn parse_findings_extracts_blocker_with_constraints() {
+        let response = r#"
+        ```json
+        [
+          {
+            "severity": "blocker",
+            "category": "invariant",
+            "message": "missing idempotency gate",
+            "prohibitions": ["do not introduce a new abstraction"],
+            "requirements": ["wrap emission in SETNX"]
+          },
+          {
+            "severity": "warn",
+            "category": "naming",
+            "message": "function could be renamed"
+          }
+        ]
+        ```
+        "#;
+        let v = parse_findings(response, "agt-2");
+        assert_eq!(v.len(), 2);
+        assert!(matches!(v[0].severity, Severity::Blocker));
+        assert_eq!(v[0].category, "invariant");
+        assert_eq!(v[0].prohibitions.len(), 1);
+        assert_eq!(v[0].requirements.len(), 1);
+        assert!(matches!(v[1].severity, Severity::Warn));
+        assert_eq!(v[1].prohibitions.len(), 0);
+        match &v[0].origin {
+            FindingOrigin::Model { reviewer_agent_id } => {
+                assert_eq!(reviewer_agent_id, "agt-2");
+            }
+            _ => panic!("expected Model origin"),
+        }
+    }
+
+    #[test]
+    fn parse_findings_salvages_prose_only_reply() {
+        let v = parse_findings("I think this looks fine actually.", "agt-3");
+        assert_eq!(v.len(), 1);
+        assert!(matches!(v[0].severity, Severity::Blocker));
+        assert_eq!(v[0].category, "format_deviation");
+        assert!(v[0].message.contains("looks fine"));
+    }
+
+    #[test]
+    fn parse_findings_salvages_when_brackets_dont_form_array() {
+        // `]xyz[` has both brackets but slice_json_array returns None
+        // because end < start.
+        let v = parse_findings("] not actually an array [", "agt-4");
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].category, "format_deviation");
+    }
+
+    #[test]
+    fn parse_findings_salvages_when_sliced_text_is_not_array() {
+        // First-bracket-to-last-bracket happens to slice an object instead
+        // of an array — ensure salvage fires rather than panicking.
+        let v = parse_findings("prelude [{\"x\":1}] postscript", "agt-5");
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].category, "other"); // {x:1} has no category — defaults
+    }
+
+    #[test]
+    fn changed_rs_files_picks_only_rust() {
+        let diff = "diff --git a/src/lib.rs b/src/lib.rs\n\
+                    --- a/src/lib.rs\n\
+                    +++ b/src/lib.rs\n\
+                    @@ -1 +1 @@\n\
+                    -old\n\
+                    +new\n\
+                    diff --git a/notes.md b/notes.md\n\
+                    --- a/notes.md\n\
+                    +++ b/notes.md\n\
+                    @@ -1 +1 @@\n\
+                    -a\n\
+                    +b\n";
+        let v = changed_rs_files(diff);
+        assert_eq!(v, vec!["src/lib.rs"]);
     }
 }
