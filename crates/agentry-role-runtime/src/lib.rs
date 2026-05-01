@@ -469,6 +469,73 @@ fn convert_finding(v: &Value, agent_id: &str) -> ReviewFinding {
     }
 }
 
+// ---------- fence policy types (brief Y.2) ----------
+
+/// Fence variant — each maps to one ra-query subcommand call and one
+/// rule string in the emitted `FindingOrigin::Mechanical { rule }`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum FenceKind {
+    /// `ra-query clones`, `clones_in_loop` field > threshold
+    ClonesInLoop,
+    /// `ra-query clones`, `clone_calls - arc_rc` outside loop > threshold
+    CloneProd,
+    /// `ra-query complexity`, per-function cognitive complexity > threshold
+    Complexity,
+    /// `ra-query unwraps`, severity at threshold or above
+    Unwraps,
+    /// `ra-query callers <file:line:col>` — zero callers on a new pub item
+    CallersZero,
+}
+
+/// Severity ladder for `ra-query unwraps` output.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum UnwrapSeverity {
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+/// Threshold comparison shape. Three forms cover all current fences.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Threshold {
+    /// Numeric count > N (clones / complexity)
+    GreaterThan(u32),
+    /// Severity at or above N (unwraps)
+    SeverityAtLeast(UnwrapSeverity),
+    /// Numeric count == N (callers zero check)
+    EqualTo(u32),
+}
+
+/// The fence policy table. Adding a sixth fence is one row addition.
+pub const FENCE_MATRIX: &[(FenceKind, Threshold, Severity)] = &[
+    (
+        FenceKind::ClonesInLoop,
+        Threshold::GreaterThan(0),
+        Severity::Blocker,
+    ),
+    (
+        FenceKind::CloneProd,
+        Threshold::GreaterThan(0),
+        Severity::Blocker,
+    ),
+    (
+        FenceKind::Complexity,
+        Threshold::GreaterThan(15),
+        Severity::Blocker,
+    ),
+    (
+        FenceKind::Unwraps,
+        Threshold::SeverityAtLeast(UnwrapSeverity::High),
+        Severity::Blocker,
+    ),
+    (
+        FenceKind::CallersZero,
+        Threshold::EqualTo(0),
+        Severity::Blocker,
+    ),
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
