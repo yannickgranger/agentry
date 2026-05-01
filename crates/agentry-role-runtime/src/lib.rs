@@ -597,13 +597,18 @@ pub fn run_fence(workspace: &Path, base_branch: &str) -> Vec<ReviewFinding> {
                 }
                 let post = pub_surface_at(workspace, f);
                 let pre_items = pub_surface_at(&pre, f);
-                for item in difference(&post, &pre_items) {
-                    let abs_s = workspace.join(f).to_string_lossy().into_owned();
-                    let pos = format!("{}:{}:{}", abs_s, item.line, item.col);
-                    match callers_at(workspace, &pos, item.col) {
-                        Some(0) => findings.push(callers_zero_finding(f, &item)),
-                        Some(_) => {}
-                        None => findings.push(callers_unresolved_finding(f, &item, &pos)),
+                match classify_new_pub_items(f, post, pre_items) {
+                    Err(meta) => findings.push(*meta),
+                    Ok(new_items) => {
+                        for item in new_items {
+                            let abs_s = workspace.join(f).to_string_lossy().into_owned();
+                            let pos = format!("{}:{}:{}", abs_s, item.line, item.col);
+                            match callers_at(workspace, &pos, item.col) {
+                                Some(0) => findings.push(callers_zero_finding(f, &item)),
+                                Some(_) => {}
+                                None => findings.push(callers_unresolved_finding(f, &item, &pos)),
+                            }
+                        }
                     }
                 }
             }
@@ -615,6 +620,23 @@ pub fn run_fence(workspace: &Path, base_branch: &str) -> Vec<ReviewFinding> {
         )),
     }
     findings
+}
+
+/// Decide how to react to a (post, pre) pub-surface pair for one file.
+/// On either-side failure, return the meta-finding the caller must emit
+/// instead of running difference/callers — v3 regression: pre-side failure
+/// must not cascade into N callers_zero false-positives on pre-existing
+/// pub items.
+fn classify_new_pub_items(
+    file: &str,
+    post: Result<Vec<PubItem>, String>,
+    pre: Result<Vec<PubItem>, String>,
+) -> Result<Vec<PubItem>, Box<ReviewFinding>> {
+    match (post, pre) {
+        (Err(e), _) => Err(Box::new(pub_surface_unresolved_finding(file, "post", &e))),
+        (_, Err(e)) => Err(Box::new(pub_surface_unresolved_finding(file, "pre", &e))),
+        (Ok(post_items), Ok(pre_items)) => Ok(difference(&post_items, &pre_items)),
+    }
 }
 
 fn changed_rs_files_via_git(workspace: &Path, base_branch: &str) -> Result<Vec<String>, String> {
@@ -831,23 +853,25 @@ fn column_for_name_at_line(file_abs: &Path, name: &str, line: usize) -> Option<u
     Some(off + 1)
 }
 
-fn pub_surface_at(dir: &Path, file: &str) -> Vec<PubItem> {
+fn pub_surface_at(dir: &Path, file: &str) -> Result<Vec<PubItem>, String> {
     let abs = dir.join(file);
-    let crate_root = match find_crate_root(&abs) {
-        Some(p) => p,
-        None => return Vec::new(),
-    };
+    // A file absent from this side (e.g. new file in post that didn't exist
+    // in pre) is a legitimate "no pub items here" — not a failure. Real
+    // failures (missing crate root, ra-query crash) bubble up below.
+    if !abs.is_file() {
+        return Ok(Vec::new());
+    }
+    let crate_root = find_crate_root(&abs)
+        .ok_or_else(|| format!("no Cargo.toml found walking up from {}", abs.display()))?;
     let crate_root_s = crate_root.to_string_lossy().into_owned();
-    let json = match run_ra_query(&["pub-surface", &crate_root_s]) {
-        Ok(v) => v,
-        Err(_) => return Vec::new(),
-    };
-    let arr = match json.as_array() {
-        Some(a) => a,
-        None => return Vec::new(),
-    };
+    let json = run_ra_query(&["pub-surface", &crate_root_s])
+        .map_err(|e| format!("ra-query pub-surface {}: {e}", crate_root_s))?;
+    let arr = json
+        .as_array()
+        .ok_or_else(|| "ra-query pub-surface response was not a JSON array".to_string())?;
     let abs_canon = abs.canonicalize().unwrap_or_else(|_| abs.clone());
-    arr.iter()
+    Ok(arr
+        .iter()
         .filter_map(|v| {
             let item_file = v.get("file")?.as_str()?;
             let item_path = Path::new(item_file)
@@ -868,7 +892,7 @@ fn pub_surface_at(dir: &Path, file: &str) -> Vec<PubItem> {
                 col,
             })
         })
-        .collect()
+        .collect())
 }
 
 fn callers_at(workspace: &Path, pos: &str, col: usize) -> Option<usize> {
@@ -907,6 +931,25 @@ fn callers_zero_finding(file: &str, item: &PubItem) -> ReviewFinding {
         message: format!(
             "split-brain candidate: new pub item `{}` has zero callers in workspace",
             item.name,
+        ),
+        suggested_fix: None,
+        prohibitions: Vec::new(),
+        requirements: Vec::new(),
+    }
+}
+
+fn pub_surface_unresolved_finding(file: &str, side: &str, detail: &str) -> ReviewFinding {
+    ReviewFinding {
+        file: Some(file.to_string()),
+        line: None,
+        severity: Severity::Warn,
+        origin: FindingOrigin::Mechanical {
+            tool: "ra-query".into(),
+            rule: Some("pub_surface_unresolved".into()),
+        },
+        category: "fence".into(),
+        message: format!(
+            "callers fence skipped for `{file}`: {side}-diff pub-surface unresolved ({detail}) — please verify integration manually",
         ),
         suggested_fix: None,
         prohibitions: Vec::new(),
@@ -1331,6 +1374,83 @@ mod tests {
             _ => panic!("expected Mechanical origin"),
         }
         assert!(f.message.contains("stranded"));
+    }
+
+    #[test]
+    fn classify_new_pub_items_pre_failure_emits_meta_not_callers_zero_cascade() {
+        // Regression for v3 reviewer finding: when the pre-side pub_surface
+        // resolution fails (worktree compile breaks, missing target/, etc.)
+        // every post-side pub item must NOT be reported as new — that is
+        // the v2 cascade we are fixing. The fence emits a single visible
+        // pub_surface_unresolved meta-finding and skips difference()/callers.
+        let preexisting = vec![PubItem {
+            name: "existing".into(),
+            kind: "fn".into(),
+            file: "src/lib.rs".into(),
+            line: 5,
+            col: 8,
+        }];
+        let post = Ok(preexisting.clone());
+        let pre = Err("ra-query failed on pre worktree only".to_string());
+
+        let result = classify_new_pub_items("src/lib.rs", post, pre);
+
+        let meta = result.expect_err("pre-failure should short-circuit to a meta-finding");
+        assert_eq!(meta.severity, Severity::Warn);
+        assert_eq!(meta.file.as_deref(), Some("src/lib.rs"));
+        match &meta.origin {
+            FindingOrigin::Mechanical { tool, rule } => {
+                assert_eq!(tool, "ra-query");
+                assert_eq!(rule.as_deref(), Some("pub_surface_unresolved"));
+            }
+            other => panic!("expected Mechanical origin, got {other:?}"),
+        }
+        assert!(
+            meta.message.contains("pre-diff"),
+            "message should name which side failed, got: {}",
+            meta.message
+        );
+    }
+
+    #[test]
+    fn classify_new_pub_items_post_failure_emits_meta() {
+        // Symmetric: if post-side pub_surface fails, the same meta-finding
+        // shape applies (post-side failure also can't be safely diffed).
+        let pre = Ok(Vec::new());
+        let post: Result<Vec<PubItem>, String> = Err("ra-query crashed".into());
+        let meta = classify_new_pub_items("src/lib.rs", post, pre)
+            .expect_err("post-failure should short-circuit to a meta-finding");
+        match &meta.origin {
+            FindingOrigin::Mechanical { rule, .. } => {
+                assert_eq!(rule.as_deref(), Some("pub_surface_unresolved"));
+            }
+            _ => panic!("expected Mechanical origin"),
+        }
+        assert!(meta.message.contains("post-diff"));
+    }
+
+    #[test]
+    fn classify_new_pub_items_both_ok_returns_difference() {
+        let preexisting = PubItem {
+            name: "existing".into(),
+            kind: "fn".into(),
+            file: "src/lib.rs".into(),
+            line: 5,
+            col: 8,
+        };
+        let new_item = PubItem {
+            name: "fresh".into(),
+            kind: "fn".into(),
+            file: "src/lib.rs".into(),
+            line: 12,
+            col: 8,
+        };
+        let post = Ok(vec![preexisting.clone(), new_item.clone()]);
+        let pre = Ok(vec![preexisting]);
+
+        let diff =
+            classify_new_pub_items("src/lib.rs", post, pre).expect("both-ok path returns diff");
+        assert_eq!(diff, vec![new_item]);
     }
 
     #[test]

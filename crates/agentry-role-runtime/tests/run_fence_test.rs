@@ -275,3 +275,39 @@ fn callers_fence_silent_on_empty_rust_diff() {
         "no callers fence findings expected on non-Rust diff, got {callers_findings:?}"
     );
 }
+
+/// Regression for v3 reviewer blocker: a pure-body modification of an
+/// existing pub fn (3 pre-existing pub items kept, 0 added) must NEVER
+/// produce callers_zero blockers — even if pub-surface resolution fails
+/// on the pre worktree side. The v2 cascade bug emitted N false-positive
+/// callers_zero blockers on pre-existing items when the pre vec came
+/// back silently empty; v3 short-circuits to a single
+/// `pub_surface_unresolved` meta-finding instead.
+#[test]
+fn callers_fence_no_cascade_on_pure_body_modification() {
+    let initial = "pub fn alpha() {}\npub fn beta() {}\npub fn gamma() {}\n";
+    let work = init_synthetic_repo(initial);
+    // Modify only the body of `beta`; alpha/gamma untouched as pub items.
+    std::fs::write(
+        work.join("src/lib.rs"),
+        "pub fn alpha() {}\npub fn beta() -> i32 { 7 }\npub fn gamma() {}\n",
+    )
+    .expect("write");
+    git(&work, &["commit", "-am", "modify beta body"]);
+
+    let v = run_fence(&work, "develop");
+    let zero_count = v
+        .iter()
+        .filter(|f| {
+            matches!(
+                &f.origin,
+                FindingOrigin::Mechanical { rule, .. }
+                    if rule.as_deref() == Some("callers_zero")
+            )
+        })
+        .count();
+    assert_eq!(
+        zero_count, 0,
+        "pre-existing pub items must never produce callers_zero blockers; got {v:?}"
+    );
+}
