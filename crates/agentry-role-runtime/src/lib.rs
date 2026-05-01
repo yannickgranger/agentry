@@ -27,7 +27,7 @@ pub mod claude;
 pub use claude::{stream_claude, StreamErr};
 
 use std::io::{self, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -583,6 +583,37 @@ pub fn run_fence(workspace: &Path, base_branch: &str) -> Vec<ReviewFinding> {
             Err(e) => findings.push(ra_query_unavailable_finding(Some(f), &e)),
         }
     }
+
+    // Callers fence (Y.4): for each new pub item introduced by the diff,
+    // ask ra-query who calls it. Zero callers in workspace is a Blocker
+    // (split-brain candidate). Resolution failures emit a Warn so the
+    // gap is visible rather than silently skipped (v2 review finding).
+    match create_pre_diff_worktree(workspace, base_branch) {
+        Ok(pre) => {
+            for f in &changed {
+                let abs = workspace.join(f);
+                if !abs.is_file() {
+                    continue;
+                }
+                let post = pub_surface_at(workspace, f);
+                let pre_items = pub_surface_at(&pre, f);
+                for item in difference(&post, &pre_items) {
+                    let abs_s = workspace.join(f).to_string_lossy().into_owned();
+                    let pos = format!("{}:{}:{}", abs_s, item.line, item.col);
+                    match callers_at(workspace, &pos, item.col) {
+                        Some(0) => findings.push(callers_zero_finding(f, &item)),
+                        Some(_) => {}
+                        None => findings.push(callers_unresolved_finding(f, &item, &pos)),
+                    }
+                }
+            }
+            cleanup_pre_diff_worktree(&pre);
+        }
+        Err(e) => findings.push(ra_query_unavailable_finding(
+            None,
+            &format!("git worktree add: {e}"),
+        )),
+    }
     findings
 }
 
@@ -725,6 +756,182 @@ pub fn complexity_to_findings(file: &str, json: &Value) -> Vec<ReviewFinding> {
         ));
     }
     out
+}
+
+// ---------- callers fence (Y.4) ----------
+
+/// One pub item from `ra-query pub-surface`, augmented with the column where
+/// `name` appears on `line` (the position-form anchor `ra-query callers`
+/// requires). `col == 0` means column resolution failed — the caller emits
+/// a visible `callers_unresolved` finding rather than silently skipping.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PubItem {
+    name: String,
+    kind: String,
+    file: String,
+    line: usize,
+    col: usize,
+}
+
+fn create_pre_diff_worktree(workspace: &Path, base_branch: &str) -> Result<PathBuf, String> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let path =
+        std::env::temp_dir().join(format!("agentry-pre-diff-{}-{}", std::process::id(), nanos,));
+    let out = Command::new("git")
+        .arg("worktree")
+        .arg("add")
+        .arg("--detach")
+        .arg(&path)
+        .arg(format!("origin/{base_branch}"))
+        .current_dir(workspace)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| format!("spawn git worktree add: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "exit {:?}: {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).trim(),
+        ));
+    }
+    Ok(path)
+}
+
+fn cleanup_pre_diff_worktree(path: &Path) {
+    let _ = Command::new("git")
+        .arg("worktree")
+        .arg("remove")
+        .arg("--force")
+        .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+fn find_crate_root(file_abs: &Path) -> Option<PathBuf> {
+    let mut current = file_abs.parent()?;
+    loop {
+        if current.join("Cargo.toml").is_file() {
+            return Some(current.to_path_buf());
+        }
+        current = current.parent()?;
+    }
+}
+
+fn column_for_name_at_line(file_abs: &Path, name: &str, line: usize) -> Option<usize> {
+    let content = std::fs::read_to_string(file_abs).ok()?;
+    let target = content.lines().nth(line.saturating_sub(1))?;
+    let off = target.find(name)?;
+    Some(off + 1)
+}
+
+fn pub_surface_at(dir: &Path, file: &str) -> Vec<PubItem> {
+    let abs = dir.join(file);
+    let crate_root = match find_crate_root(&abs) {
+        Some(p) => p,
+        None => return Vec::new(),
+    };
+    let crate_root_s = crate_root.to_string_lossy().into_owned();
+    let json = match run_ra_query(&["pub-surface", &crate_root_s]) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let arr = match json.as_array() {
+        Some(a) => a,
+        None => return Vec::new(),
+    };
+    let abs_canon = abs.canonicalize().unwrap_or_else(|_| abs.clone());
+    arr.iter()
+        .filter_map(|v| {
+            let item_file = v.get("file")?.as_str()?;
+            let item_path = Path::new(item_file)
+                .canonicalize()
+                .unwrap_or_else(|_| Path::new(item_file).to_path_buf());
+            if item_path != abs_canon {
+                return None;
+            }
+            let name = v.get("name")?.as_str()?.to_string();
+            let kind = v.get("kind")?.as_str()?.to_string();
+            let line = v.get("line")?.as_u64()? as usize;
+            let col = column_for_name_at_line(&abs, &name, line).unwrap_or(0);
+            Some(PubItem {
+                name,
+                kind,
+                file: file.to_string(),
+                line,
+                col,
+            })
+        })
+        .collect()
+}
+
+fn callers_at(workspace: &Path, pos: &str, col: usize) -> Option<usize> {
+    if col == 0 {
+        return None;
+    }
+    let workspace_s = workspace.to_string_lossy().into_owned();
+    let json = run_ra_query(&["callers", pos, "-p", &workspace_s, "-f", "json"]).ok()?;
+    if let Some(arr) = json.get("callers").and_then(Value::as_array) {
+        Some(arr.len())
+    } else {
+        json.as_array().map(|arr| arr.len())
+    }
+}
+
+fn difference(post: &[PubItem], pre: &[PubItem]) -> Vec<PubItem> {
+    post.iter()
+        .filter(|p| {
+            !pre.iter()
+                .any(|q| q.name == p.name && q.kind == p.kind && q.file == p.file)
+        })
+        .cloned()
+        .collect()
+}
+
+fn callers_zero_finding(file: &str, item: &PubItem) -> ReviewFinding {
+    ReviewFinding {
+        file: Some(file.to_string()),
+        line: Some(item.line as u32),
+        severity: fence_severity(FenceKind::CallersZero),
+        origin: FindingOrigin::Mechanical {
+            tool: "ra-query".into(),
+            rule: Some("callers_zero".into()),
+        },
+        category: "fence".into(),
+        message: format!(
+            "split-brain candidate: new pub item `{}` has zero callers in workspace",
+            item.name,
+        ),
+        suggested_fix: None,
+        prohibitions: Vec::new(),
+        requirements: Vec::new(),
+    }
+}
+
+fn callers_unresolved_finding(file: &str, item: &PubItem, pos: &str) -> ReviewFinding {
+    ReviewFinding {
+        file: Some(file.to_string()),
+        line: Some(item.line as u32),
+        severity: Severity::Warn,
+        origin: FindingOrigin::Mechanical {
+            tool: "ra-query".into(),
+            rule: Some("callers_unresolved".into()),
+        },
+        category: "fence".into(),
+        message: format!(
+            "callers query could not resolve `{}` at {pos} — please verify integration manually",
+            item.name,
+        ),
+        suggested_fix: None,
+        prohibitions: Vec::new(),
+        requirements: Vec::new(),
+    }
 }
 
 /// Fold a `ra-query unwraps --severity high --format json` response into
@@ -1040,6 +1247,111 @@ mod tests {
         let v = parse_findings("prelude [{\"x\":1}] postscript", "agt-5");
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].category, "other"); // {x:1} has no category — defaults
+    }
+
+    #[test]
+    fn difference_set_diff_by_name_kind_file() {
+        let a = PubItem {
+            name: "old".into(),
+            kind: "fn".into(),
+            file: "src/lib.rs".into(),
+            line: 1,
+            col: 8,
+        };
+        let b = PubItem {
+            name: "new".into(),
+            kind: "fn".into(),
+            file: "src/lib.rs".into(),
+            line: 5,
+            col: 8,
+        };
+        let pre = vec![a.clone()];
+        let post = vec![a.clone(), b.clone()];
+        let diff = difference(&post, &pre);
+        assert_eq!(diff, vec![b]);
+    }
+
+    #[test]
+    fn difference_ignores_line_col_drift() {
+        // Same name/kind/file but different line — NOT a new item.
+        let pre_a = PubItem {
+            name: "thing".into(),
+            kind: "fn".into(),
+            file: "src/lib.rs".into(),
+            line: 10,
+            col: 8,
+        };
+        let post_a = PubItem {
+            line: 42,
+            col: 8,
+            ..pre_a.clone()
+        };
+        assert!(difference(&[post_a], &[pre_a]).is_empty());
+    }
+
+    #[test]
+    fn column_for_name_at_line_locates_pub_fn() {
+        // Write a tiny synthetic source file and resolve the column of a
+        // known symbol on a known line.
+        let dir = std::env::temp_dir().join(format!(
+            "agentry-col-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("x.rs");
+        std::fs::write(&path, "// hdr\npub fn helper() {}\n").expect("write");
+        // Line 2: `pub fn helper() {}` — `helper` starts at byte 7 (0-based)
+        // → column 8 (1-based).
+        assert_eq!(column_for_name_at_line(&path, "helper", 2), Some(8));
+        assert_eq!(column_for_name_at_line(&path, "missing", 2), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn callers_zero_finding_carries_blocker_and_rule() {
+        let item = PubItem {
+            name: "stranded".into(),
+            kind: "fn".into(),
+            file: "src/lib.rs".into(),
+            line: 99,
+            col: 8,
+        };
+        let f = callers_zero_finding("src/lib.rs", &item);
+        assert_eq!(f.severity, Severity::Blocker);
+        assert_eq!(f.line, Some(99));
+        match &f.origin {
+            FindingOrigin::Mechanical { tool, rule } => {
+                assert_eq!(tool, "ra-query");
+                assert_eq!(rule.as_deref(), Some("callers_zero"));
+            }
+            _ => panic!("expected Mechanical origin"),
+        }
+        assert!(f.message.contains("stranded"));
+    }
+
+    #[test]
+    fn callers_unresolved_finding_is_visible_warning() {
+        // The v2 reviewer found that resolution failures were silently
+        // skipped; v3 must emit a visible Finding instead.
+        let item = PubItem {
+            name: "thing".into(),
+            kind: "fn".into(),
+            file: "src/lib.rs".into(),
+            line: 12,
+            col: 0,
+        };
+        let f = callers_unresolved_finding("src/lib.rs", &item, "src/lib.rs:12:0");
+        assert_eq!(f.severity, Severity::Warn);
+        match &f.origin {
+            FindingOrigin::Mechanical { rule, .. } => {
+                assert_eq!(rule.as_deref(), Some("callers_unresolved"));
+            }
+            _ => panic!("expected Mechanical origin"),
+        }
     }
 
     #[test]

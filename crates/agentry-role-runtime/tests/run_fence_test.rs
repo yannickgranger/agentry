@@ -133,3 +133,145 @@ fn missing_functions_field_is_handled() {
     assert!(complexity_to_findings("x.rs", &v).is_empty());
     assert!(unwraps_to_findings("x.rs", &v).is_empty());
 }
+
+// ---------- callers fence (Y.4) — synthetic git-repo integration ----------
+
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
+
+fn unique_tempdir(tag: &str) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let p = std::env::temp_dir().join(format!(
+        "agentry-fence-test-{tag}-{}-{nanos}",
+        std::process::id(),
+    ));
+    std::fs::create_dir_all(&p).expect("mkdir");
+    p
+}
+
+fn run(cmd: &mut Command) {
+    let out = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("spawn");
+    assert!(
+        out.status.success(),
+        "{:?} failed: {}",
+        cmd,
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+fn git(dir: &Path, args: &[&str]) {
+    run(Command::new("git").args(args).current_dir(dir));
+}
+
+fn init_synthetic_repo(initial_lib: &str) -> PathBuf {
+    let bare = unique_tempdir("bare");
+    run(Command::new("git").args(["init", "--bare"]).arg(&bare));
+
+    let work = unique_tempdir("work");
+    git(&work, &["init", "-b", "develop"]);
+    git(&work, &["config", "user.email", "test@example.com"]);
+    git(&work, &["config", "user.name", "Test"]);
+    let bare_url = bare.to_string_lossy().into_owned();
+    git(&work, &["remote", "add", "origin", &bare_url]);
+
+    std::fs::create_dir_all(work.join("src")).expect("mkdir src");
+    std::fs::write(
+        work.join("Cargo.toml"),
+        "[package]\nname = \"synth\"\nversion = \"0.0.0\"\nedition = \"2021\"\n[lib]\npath = \"src/lib.rs\"\n",
+    )
+    .expect("write toml");
+    std::fs::write(work.join("src/lib.rs"), initial_lib).expect("write lib");
+
+    git(&work, &["add", "."]);
+    git(&work, &["commit", "-m", "base"]);
+    git(&work, &["push", "-u", "origin", "develop"]);
+
+    git(&work, &["checkout", "-b", "feature"]);
+    work
+}
+
+/// run_fence must not panic when the workspace lacks `origin/<base>` — the
+/// pre-diff worktree creation surfaces as a Blocker finding instead. This
+/// is the one stable behaviour we can assert without ra-query backing it.
+#[test]
+fn callers_fence_emits_finding_when_pre_diff_worktree_unavailable() {
+    let scratch = unique_tempdir("noorigin");
+    git(&scratch, &["init", "-b", "develop"]);
+    git(&scratch, &["config", "user.email", "test@example.com"]);
+    git(&scratch, &["config", "user.name", "Test"]);
+    std::fs::write(scratch.join("README"), "x").expect("write");
+    git(&scratch, &["add", "."]);
+    git(&scratch, &["commit", "-m", "init"]);
+
+    // No origin remote → worktree add origin/develop must fail. The fence
+    // turns that into an ra_query_unavailable / git-worktree finding.
+    let v = run_fence(&scratch, "develop");
+    assert!(
+        v.iter().any(|f| matches!(
+            &f.origin,
+            FindingOrigin::Mechanical { rule, .. } if rule.as_deref() == Some("ra_query_unavailable")
+        )),
+        "expected ra_query_unavailable finding, got {v:?}"
+    );
+}
+
+/// Diff that modifies an existing pub fn (no addition) must not synthesise
+/// a `callers_zero` finding, regardless of whether ra-query callers
+/// resolves anything. Verifies the difference()-by-(name,kind,file) shape:
+/// line/col drift on an unchanged symbol does not count as a new pub item.
+#[test]
+fn callers_fence_does_not_fire_on_pub_fn_modification() {
+    let work = init_synthetic_repo("pub fn unchanged() -> i32 { 1 }\n");
+    // Modify in place — same pub item, different body line offset.
+    std::fs::write(
+        work.join("src/lib.rs"),
+        "// added comment shifts the body\npub fn unchanged() -> i32 { 2 }\n",
+    )
+    .expect("write");
+    git(&work, &["commit", "-am", "modify body"]);
+
+    let v = run_fence(&work, "develop");
+    assert!(
+        !v.iter().any(|f| matches!(
+            &f.origin,
+            FindingOrigin::Mechanical { rule, .. } if rule.as_deref() == Some("callers_zero")
+        )),
+        "no callers_zero finding expected for pure-modification diff, got {v:?}"
+    );
+}
+
+/// Diff that does NOT touch any `*.rs` file outside tests/ has no changed
+/// files → callers fence has nothing to check → run_fence returns no
+/// callers_zero / callers_unresolved findings.
+#[test]
+fn callers_fence_silent_on_empty_rust_diff() {
+    let work = init_synthetic_repo("pub fn already() {}\n");
+    // Add only a non-Rust file.
+    std::fs::write(work.join("notes.md"), "hello").expect("write");
+    git(&work, &["add", "notes.md"]);
+    git(&work, &["commit", "-m", "docs"]);
+
+    let v = run_fence(&work, "develop");
+    let callers_findings: Vec<_> = v
+        .iter()
+        .filter(|f| {
+            matches!(
+                &f.origin,
+                FindingOrigin::Mechanical { rule, .. }
+                    if matches!(rule.as_deref(), Some("callers_zero") | Some("callers_unresolved"))
+            )
+        })
+        .collect();
+    assert!(
+        callers_findings.is_empty(),
+        "no callers fence findings expected on non-Rust diff, got {callers_findings:?}"
+    );
+}
