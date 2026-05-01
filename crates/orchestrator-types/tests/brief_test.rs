@@ -1,0 +1,77 @@
+use orchestrator_types::{now, Brief, BriefId, BriefKind, EscalationMode, VersionedRef};
+use serde_json::json;
+
+#[test]
+fn brief_roundtrip_json() {
+    let b = Brief::new(
+        "user@example.com",
+        VersionedRef::new("echo-team", 1),
+        json!({"kind": "echo", "msg": "hello"}),
+    )
+    .with_project("qbot-core")
+    .with_escalation(EscalationMode::Autonomous);
+    let s = serde_json::to_string(&b).expect("serialize");
+    let back: Brief = serde_json::from_str(&s).expect("deserialize");
+    assert_eq!(b, back);
+    assert!(s.contains("brf_"), "brief id should have prefix");
+}
+
+#[test]
+fn brief_id_is_prefixed() {
+    let id = BriefId::fresh();
+    assert!(id.0.starts_with("brf_"));
+}
+
+#[test]
+fn default_escalation_is_supervised() {
+    assert_eq!(EscalationMode::default(), EscalationMode::Supervised);
+}
+
+#[test]
+fn brief_kind_roundtrip_serializes_snake_case() {
+    let mut b = Brief::new(
+        "user@example.com",
+        VersionedRef::new("echo-team", 1),
+        json!({"msg": "hi"}),
+    );
+    b.kind = Some(BriefKind::Refactor);
+    let s = serde_json::to_string(&b).expect("serialize");
+    assert!(
+        s.contains("\"kind\":\"refactor\""),
+        "expected snake_case kind in {s}"
+    );
+    let back: Brief = serde_json::from_str(&s).expect("deserialize");
+    assert_eq!(back.kind, Some(BriefKind::Refactor));
+}
+
+#[test]
+fn brief_without_kind_field_deserializes_to_none() {
+    let raw = json!({
+        "id": "brf_test",
+        "project": null,
+        "topology": { "name": "echo-team", "version": 1 },
+        "payload": { "msg": "hi" },
+        "submitted_by": "tester",
+        "submitted_at": now(),
+    });
+    let s = serde_json::to_string(&raw).expect("serialize value");
+    let b: Brief = serde_json::from_str(&s).expect("deserialize");
+    assert_eq!(b.kind, None);
+}
+
+#[test]
+fn brief_kind_variants_serialize_snake_case() {
+    let cases = [
+        (BriefKind::Refactor, "\"refactor\""),
+        (BriefKind::Debug, "\"debug\""),
+        (BriefKind::Mechanical, "\"mechanical\""),
+        (BriefKind::NewFeature, "\"new_feature\""),
+        (BriefKind::Substrate, "\"substrate\""),
+        (BriefKind::Audit, "\"audit\""),
+        (BriefKind::Doc, "\"doc\""),
+    ];
+    for (k, want) in cases {
+        let s = serde_json::to_string(&k).expect("serialize");
+        assert_eq!(s, want, "variant {k:?}");
+    }
+}
