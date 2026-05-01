@@ -27,6 +27,7 @@ pub mod claude;
 pub use claude::{stream_claude, StreamErr};
 
 use std::io::{self, Read, Write};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -535,6 +536,220 @@ pub const FENCE_MATRIX: &[(FenceKind, Threshold, Severity)] = &[
         Severity::Blocker,
     ),
 ];
+
+// ---------- run_fence pipeline (brief Y.3) ----------
+
+/// Run the deterministic mechanical fence pipeline against the diff between
+/// `origin/<base_branch>` and `HEAD` in `workspace`. For each changed `*.rs`
+/// file outside `tests/`, invokes `ra-query clones | complexity | unwraps`
+/// and folds the JSON output into [`ReviewFinding`]s with
+/// [`FindingOrigin::Mechanical`].
+///
+/// Subprocess errors surface as a single `ra_query_unavailable` Blocker
+/// finding for the failing call (Y.5 will refine the fail-closed wiring).
+pub fn run_fence(workspace: &Path, base_branch: &str) -> Vec<ReviewFinding> {
+    let mut findings = Vec::new();
+    let changed = match changed_rs_files_via_git(workspace, base_branch) {
+        Ok(v) => v,
+        Err(e) => {
+            findings.push(ra_query_unavailable_finding(None, &e));
+            return findings;
+        }
+    };
+    for f in &changed {
+        let abs = workspace.join(f);
+        if !abs.is_file() {
+            continue;
+        }
+        let abs_s = abs.to_string_lossy().into_owned();
+
+        match run_ra_query(&["clones", &abs_s, "--active-only", "--format", "json"]) {
+            Ok(v) => findings.extend(clones_to_findings(f, &v)),
+            Err(e) => findings.push(ra_query_unavailable_finding(Some(f), &e)),
+        }
+        match run_ra_query(&[
+            "complexity",
+            &abs_s,
+            "--threshold",
+            "15",
+            "--format",
+            "json",
+        ]) {
+            Ok(v) => findings.extend(complexity_to_findings(f, &v)),
+            Err(e) => findings.push(ra_query_unavailable_finding(Some(f), &e)),
+        }
+        match run_ra_query(&["unwraps", &abs_s, "--severity", "high", "--format", "json"]) {
+            Ok(v) => findings.extend(unwraps_to_findings(f, &v)),
+            Err(e) => findings.push(ra_query_unavailable_finding(Some(f), &e)),
+        }
+    }
+    findings
+}
+
+fn changed_rs_files_via_git(workspace: &Path, base_branch: &str) -> Result<Vec<String>, String> {
+    let out = Command::new("git")
+        .arg("diff")
+        .arg("--name-only")
+        .arg(format!("origin/{base_branch}...HEAD"))
+        .current_dir(workspace)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| format!("spawn git diff: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("git diff exit {:?}", out.status.code()));
+    }
+    let s = String::from_utf8_lossy(&out.stdout);
+    Ok(s.lines()
+        .filter(|line| {
+            line.ends_with(".rs") && !line.starts_with("tests/") && !line.contains("/tests/")
+        })
+        .map(|l| l.to_string())
+        .collect())
+}
+
+fn ra_query_unavailable_finding(file: Option<&str>, detail: &str) -> ReviewFinding {
+    ReviewFinding {
+        file: file.map(|s| s.to_string()),
+        line: None,
+        severity: Severity::Blocker,
+        origin: FindingOrigin::Mechanical {
+            tool: "ra-query".into(),
+            rule: Some("ra_query_unavailable".into()),
+        },
+        category: "fence".into(),
+        message: format!("ra-query subprocess failed: {detail}"),
+        suggested_fix: None,
+        prohibitions: Vec::new(),
+        requirements: Vec::new(),
+    }
+}
+
+fn fence_severity(kind: FenceKind) -> Severity {
+    FENCE_MATRIX
+        .iter()
+        .find(|(k, _, _)| *k == kind)
+        .map(|(_, _, s)| s.clone())
+        .unwrap_or(Severity::Blocker)
+}
+
+fn mechanical_fence_finding(
+    file: &str,
+    line: Option<u32>,
+    rule: &str,
+    kind: FenceKind,
+    message: String,
+) -> ReviewFinding {
+    ReviewFinding {
+        file: Some(file.to_string()),
+        line,
+        severity: fence_severity(kind),
+        origin: FindingOrigin::Mechanical {
+            tool: "ra-query".into(),
+            rule: Some(rule.into()),
+        },
+        category: "fence".into(),
+        message,
+        suggested_fix: None,
+        prohibitions: Vec::new(),
+        requirements: Vec::new(),
+    }
+}
+
+/// Fold a `ra-query clones --format json` response into Mechanical findings.
+/// Emits one `clones_in_loop` finding per function with `clones_in_loop > 0`,
+/// and one `clone_prod` finding per function with non-loop, non-Arc/Rc clones.
+pub fn clones_to_findings(file: &str, json: &Value) -> Vec<ReviewFinding> {
+    let mut out = Vec::new();
+    let functions = match json.get("functions").and_then(Value::as_array) {
+        Some(a) => a,
+        None => return out,
+    };
+    for fn_v in functions {
+        let name = fn_v.get("name").and_then(Value::as_str).unwrap_or("");
+        let line = fn_v.get("line").and_then(Value::as_u64).map(|n| n as u32);
+        let clones_in_loop = fn_v
+            .get("clones_in_loop")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let clone_calls = fn_v.get("clone_calls").and_then(Value::as_u64).unwrap_or(0);
+        let arc_rc = fn_v
+            .get("arc_rc_pattern")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        if clones_in_loop > 0 {
+            out.push(mechanical_fence_finding(
+                file,
+                line,
+                "clones_in_loop",
+                FenceKind::ClonesInLoop,
+                format!("{name}: {clones_in_loop} clone call(s) inside loop"),
+            ));
+        }
+        let prod_clones = clone_calls
+            .saturating_sub(clones_in_loop)
+            .saturating_sub(arc_rc);
+        if prod_clones > 0 {
+            out.push(mechanical_fence_finding(
+                file,
+                line,
+                "clone_prod",
+                FenceKind::CloneProd,
+                format!("{name}: {prod_clones} non-Arc/Rc clone call(s) in production code"),
+            ));
+        }
+    }
+    out
+}
+
+/// Fold a `ra-query complexity --threshold 15 --format json` response into
+/// Mechanical findings. The CLI flag does the threshold filtering, so every
+/// function present in the output is over-budget.
+pub fn complexity_to_findings(file: &str, json: &Value) -> Vec<ReviewFinding> {
+    let mut out = Vec::new();
+    let functions = match json.get("functions").and_then(Value::as_array) {
+        Some(a) => a,
+        None => return out,
+    };
+    for fn_v in functions {
+        let name = fn_v.get("name").and_then(Value::as_str).unwrap_or("");
+        let line = fn_v.get("line").and_then(Value::as_u64).map(|n| n as u32);
+        let cognitive = fn_v.get("cognitive").and_then(Value::as_u64).unwrap_or(0);
+        out.push(mechanical_fence_finding(
+            file,
+            line,
+            "complexity",
+            FenceKind::Complexity,
+            format!("{name}: cognitive complexity {cognitive} exceeds threshold"),
+        ));
+    }
+    out
+}
+
+/// Fold a `ra-query unwraps --severity high --format json` response into
+/// Mechanical findings. The CLI flag does severity gating; every function
+/// present in the output has at least one high-or-critical unwrap/expect.
+pub fn unwraps_to_findings(file: &str, json: &Value) -> Vec<ReviewFinding> {
+    let mut out = Vec::new();
+    let functions = match json.get("functions").and_then(Value::as_array) {
+        Some(a) => a,
+        None => return out,
+    };
+    for fn_v in functions {
+        let name = fn_v.get("name").and_then(Value::as_str).unwrap_or("");
+        let line = fn_v.get("line").and_then(Value::as_u64).map(|n| n as u32);
+        let total = fn_v.get("total").and_then(Value::as_u64).unwrap_or(0);
+        out.push(mechanical_fence_finding(
+            file,
+            line,
+            "unwraps",
+            FenceKind::Unwraps,
+            format!("{name}: {total} high-severity unwrap/expect call(s)"),
+        ));
+    }
+    out
+}
 
 #[cfg(test)]
 mod tests {
