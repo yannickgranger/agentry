@@ -32,42 +32,10 @@ use std::process::{Command, Stdio};
 
 use agentry_role_runtime::{
     emit_done, emit_event, emit_finding, parse_severity, read_bundle_value, tail_bytes, tail_lines,
-    workspace_is_git_repo, DoneGuard,
+    workspace_is_git_repo, DoneGuard, Provider,
 };
 use orchestrator_types::{EventVerdict, FindingOrigin, ReviewFinding};
 use serde_json::{json, Value};
-
-/// Which AC verifier provider this invocation runs.
-///
-/// Each variant maps 1:1 to a bind-mounted host binary on `PATH` inside the
-/// container. The string returned by `binary_name` is used both for `Command`
-/// dispatch and for human-readable msg prefixes in degradation events
-/// (preserving the bash scripts' wording).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Provider {
-    Claude,
-    Gemini,
-    Grok,
-}
-
-impl Provider {
-    fn binary_name(self) -> &'static str {
-        match self {
-            Provider::Claude => "ac-verifier",
-            Provider::Gemini => "ac-verifier-gemini",
-            Provider::Grok => "ac-verifier-grok",
-        }
-    }
-
-    fn parse(s: &str) -> Option<Self> {
-        match s {
-            "claude" => Some(Provider::Claude),
-            "gemini" => Some(Provider::Gemini),
-            "grok" => Some(Provider::Grok),
-            _ => None,
-        }
-    }
-}
 
 fn main() {
     let _guard = DoneGuard::new();
@@ -393,32 +361,4 @@ fn dispatch_outcome(provider: Provider, agent_id: &str, outcome_text: &str) {
     }
 
     emit_done(EventVerdict::ReworkNeeded, None);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn provider_parse_known_values() {
-        assert_eq!(Provider::parse("claude"), Some(Provider::Claude));
-        assert_eq!(Provider::parse("gemini"), Some(Provider::Gemini));
-        assert_eq!(Provider::parse("grok"), Some(Provider::Grok));
-    }
-
-    #[test]
-    fn provider_parse_unknown_returns_none() {
-        assert_eq!(Provider::parse("openai"), None);
-        assert_eq!(Provider::parse(""), None);
-    }
-
-    #[test]
-    fn provider_binary_name_matches_bash_command_v_target() {
-        // These exact strings appear in the bash `command -v` checks of the
-        // three AC_VERIFIER_*_AGENTRY_SCRIPT consts — keeping the Rust port
-        // wire-compatible with the host bind-mounts.
-        assert_eq!(Provider::Claude.binary_name(), "ac-verifier");
-        assert_eq!(Provider::Gemini.binary_name(), "ac-verifier-gemini");
-        assert_eq!(Provider::Grok.binary_name(), "ac-verifier-grok");
-    }
 }
