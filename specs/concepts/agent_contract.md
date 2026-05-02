@@ -107,3 +107,35 @@ checks looked for, kept wire-compatible by `binary_name`. `parse(&str)`
 accepts the lowercase `--provider` flag value and returns `None` for
 anything outside the closed set, surfaced by the binary as a "bad
 --provider flag" degradation event.
+
+## PriorFinding
+
+A reviewer-emitted blocker harvested from the bundle's
+`team_context.messages[].payload.findings[]` and reshaped into the small
+triple the coder runner needs at prompt-build time: `message`,
+`prohibitions`, `requirements`. Constructed by `collect_blocker_findings`
+and consumed by `build_rework_banner` to compose the rework injection
+banner that prefaces a re-iteration of the brief. Strictly an internal
+shape — no on-wire form, no daemon-side counterpart.
+
+## BriefContext
+
+The parsed, role-local view of a startup bundle as the coder runner
+consumes it: `brief_id`, `base_branch`, `issue_title`, `issue_body`,
+`acceptance`, derived `branch` (`auto/<brief_id>`), `topology_name`,
+prebuilt `rework_banner`, the harvested `blocker_findings`, and
+`allowed_tools` propagated from the permit. Built by
+`parse_brief_context` once at the top of `run()` so subsequent prompt
+assembly, topology gating, and exitpoint-phase steps share the same
+materialised context rather than re-walking JSON pointers per call site.
+
+## SelfReviewResult
+
+Parsed shape of the coder's optional self-review claude reply
+(`{all_applied, unapplied}`). `parse_self_review_object` strips fences,
+slices between the first `{` and last `}`, and decodes the object —
+returning `None` when the reply is not a parseable JSON object so the
+caller can apply the soft-fail tolerance (degrade to `all_applied: true`
+and proceed). When `all_applied: false`, the runner emits one
+`completeness` blocker per entry in `unapplied` and `done failed` with
+cause `self_review_unapplied`.

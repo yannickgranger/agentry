@@ -1050,3 +1050,438 @@ pub fn unwraps_to_findings(file: &str, json: &Value) -> Vec<ReviewFinding> {
     }
     out
 }
+
+// ---------- reviewer prompt builder (extracted from reviewer_claude_runner, brief X.7c) ----------
+
+const REVIEW_ISSUE_BODY_BUDGET: usize = 2000;
+
+/// Build the strict reviewer prompt — verbatim from
+/// `REVIEWER_CLAUDE_AGENTRY_SCRIPT`, including the strict output-format
+/// guidance, scope guardrail, verb-completeness check, and the four
+/// CRITICAL audits (role-spec, bootstrap-command, daemon-lifecycle,
+/// state-machine idempotency). Any prose drift here changes reviewer
+/// behaviour mid-port.
+pub fn build_review_prompt(
+    base_branch: &str,
+    issue_title: &str,
+    issue_body: &str,
+    diff_text: &str,
+) -> String {
+    let issue_body_head = head_bytes(issue_body, REVIEW_ISSUE_BODY_BUDGET);
+    let mut s = String::new();
+    s.push_str(&format!(
+        "You are a senior code reviewer for the agentry project — a Rust workspace\n\
+         that orchestrates short-lived agent containers. Review the following diff\n\
+         produced against branch \"{base_branch}\" in response to this task:\n\
+         \n\
+         TITLE: {issue_title}\n\
+         \n\
+         BODY (first 2000 chars):\n\
+         {issue_body_head}\n\
+         \n\
+         --- DIFF ---\n\
+         {diff_text}\n\
+         --- END DIFF ---\n"
+    ));
+    s.push_str(
+        "\nOutput EXACTLY a JSON array of findings — nothing else. No markdown fences,\n\
+         no prose, no preamble, no explanation. Each element:\n\
+         \n\
+         {\n\
+           \"severity\": \"blocker\" | \"warn\",\n\
+           \"category\": \"design\" | \"naming\" | \"clarity\" | \"invariant\" | \"other\",\n\
+           \"message\": \"one-sentence human-readable description (max 200 chars)\",\n\
+           \"prohibitions\": [\"...\"],   // for blockers, what the rework must NOT do\n\
+           \"requirements\": [\"...\"]    // for blockers, what the rework MUST do\n\
+         }\n\
+         \n\
+         Guidance:\n\
+         - `blocker` = ships-broken, security-risk, invariant-violation, wrong abstraction.\n\
+         - `warn` = minor cleanup, non-load-bearing style.\n\
+         - If the diff is acceptable as-is, output exactly: []\n\
+         - Maximum 6 findings. Prefer a single Blocker over many Warns.\n\
+         - Do not comment on fmt/clippy/test — those are mechanical-reviewer scope.\n\
+         - For each Blocker, populate `prohibitions` (things the next coder pass\n\
+           MUST NOT do) and `requirements` (things the next coder pass MUST do).\n\
+           These anchor the rework so the coder does not solve the wrong problem.\n\
+         - For Warns, both arrays SHOULD be empty — a warn is informational, not\n\
+           a rework constraint.\n\
+         \n\
+         Scope guardrail (CRITICAL):\n\
+         - ONLY flag changes INSIDE the DIFF. Pre-existing inconsistencies in the\n\
+           repo that the diff did not touch are OUT of scope for blocker-level\n\
+           findings.\n\
+         - If you notice a pre-existing concern adjacent to the diff, you MAY emit\n\
+           at most ONE warn-level finding with category \"scope\" describing it, so\n\
+           it is on-record for a follow-up brief — but NEVER emit a blocker for\n\
+           something the diff did not change.\n\
+         - The unit of review is \"did THIS diff ship broken/unsafe/wrong?\", not\n\
+           \"is the whole repo now consistent?\".\n\
+         \n\
+         Verb-completeness check (CRITICAL):\n\
+         - The TASK BODY above may contain explicit verbs: CREATE, UPDATE, REPLACE,\n\
+           DELETE, MOVE — usually headed as \"### N. <VERB> <file:line>\" or the bare\n\
+           form \"<VERB> <file:line>\".\n\
+         - For EACH such verb in the body, verify the diff contains the corresponding\n\
+           change at the named location (file path and approximate area).\n\
+         - An unapplied verb is a blocker with category \"invariant\" and message\n\
+           \"unapplied verb: <short description of what was missed>\".\n\
+         - If the body contains no verb syntax (legacy free-form brief), skip this\n\
+           check and apply only the design/naming/clarity/invariant guidance above.\n\
+         - Applied-but-incomplete counts as unapplied (e.g. the verb asked to change\n\
+           three sites and only two were touched — the remaining one is unapplied).\n\
+         \n\
+         Role-spec audit (CRITICAL):\n\
+         - If the diff adds or modifies an `AgentRole` (i.e. introduces a `RoleName(...)` registration in seed.rs or changes the fields of an existing one), verify each of:\n\
+           (a) `permit_scope` is minimal for the stated job — no fs:write outside the workspace, no net access unless justified, no git tools on roles that do not ship code.\n\
+           (b) `tool_allowlist` matches what the role's entrypoint actually does (a read-only role must not be allowed to write arbitrary streams).\n\
+           (c) the deny-list is explicit for the categories of tool the role does not need.\n\
+           (d) any `binaries` or `mcp_servers` named are justified by the role's job.\n\
+         - Mismatches are blockers with category \"invariant\" and a message starting with \"role-spec audit:\".\n\
+         - This complements (does not replace) the scope-guardrail and verb-completeness checks above.\n\
+         \n\
+         Bootstrap-command audit (CRITICAL):\n\
+         - If the diff modifies any role's `extra_bootstrap` shell strings, verify each shell command:\n\
+           (a) `cargo install --git URL --bin <name>` is rejected when the target is a workspace with multiple binaries — must use positional package name (e.g. `cfdb-cli`, `application`) or `--package`.\n\
+           (b) Bootstrap commands that may transiently fail must end with `|| true` for fault tolerance, matching the existing `reviewer-mechanical-agentry` quality-hygiene install pattern.\n\
+           Mismatch is a blocker with category \"invariant\".\n\
+         \n\
+         Daemon-lifecycle ordering (CRITICAL):\n\
+         - If the diff modifies the daemon's `handle_brief` shipping flow (workspace teardown, chain-trigger, terminal-handler), verify the ORDER:\n\
+           chain-trigger MUST read `next_brief_refs` and submit children to Redis BEFORE workspace destruction.\n\
+           Reason: planner-emitted child JSONs live IN the workspace; destroyed-before-read = lost children.\n\
+           Wrong order is a blocker with category \"invariant\".\n\
+         \n\
+         State-machine emission idempotency (CRITICAL):\n\
+         - If the diff adds or modifies a state-machine compose/finalize function (DOL `compose_meta_verdict`, future composers in recursive sub-planning, etc.), verify exactly-once semantics:\n\
+           guard the emission with SETNX on a Redis marker key, OR a Redis transaction, OR an equivalent atomic check.\n\
+           Concurrent terminal handlers can re-enter; without the gate, duplicate verdicts will fire (observed in A7v3: 3× duplicate failed-verdicts for one meta-brief).\n\
+           Missing idempotency gate is a blocker with category \"invariant\".\n\
+         \n\
+         Your response, right now, starting with [ and ending with ]:\n",
+    );
+    s
+}
+
+// ---------- coder-binary helpers (extracted from coder_claude_runner, brief X.7c) ----------
+
+/// Issue-body byte budget used by [`build_self_review_prompt`].
+pub const SELF_REVIEW_ISSUE_BODY_BUDGET: usize = 3000;
+
+/// Prior-iteration blocker finding extracted from the bundle's
+/// `team_context.messages[].payload.findings[]`. Carries just enough to
+/// rebuild the rework banner and stamp self-review findings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PriorFinding {
+    pub message: String,
+    pub prohibitions: Vec<String>,
+    pub requirements: Vec<String>,
+}
+
+/// Parsed brief-bundle context as consumed by the coder runner.
+#[derive(Debug)]
+pub struct BriefContext {
+    pub brief_id: String,
+    pub base_branch: String,
+    pub issue_title: String,
+    pub issue_body: String,
+    pub acceptance: String,
+    pub branch: String,
+    pub topology_name: String,
+    pub rework_banner: String,
+    pub blocker_findings: Vec<PriorFinding>,
+    pub allowed_tools: Vec<String>,
+}
+
+/// Parsed self-review JSON object (`{all_applied, unapplied}`).
+#[derive(Debug, PartialEq, Eq)]
+pub struct SelfReviewResult {
+    pub all_applied: bool,
+    pub unapplied: Vec<String>,
+}
+
+/// Build a [`BriefContext`] from a startup bundle JSON value.
+pub fn parse_brief_context(bundle: &Value) -> BriefContext {
+    let brief_id = pointer_str(bundle, "/brief/id").to_string();
+    let base_branch = pointer_str_or(bundle, "/brief/payload/base_branch", "develop");
+    let issue_title = pointer_str(bundle, "/brief/payload/issue_title").to_string();
+    let issue_body = pointer_str(bundle, "/brief/payload/issue_body").to_string();
+    let acceptance = pointer_str_or(bundle, "/brief/payload/acceptance", "true");
+    let topology_name = pointer_str(bundle, "/brief/topology/name").to_string();
+    let blocker_findings = collect_blocker_findings(bundle);
+    let rework_banner = if blocker_findings.is_empty() {
+        String::new()
+    } else {
+        build_rework_banner(&blocker_findings)
+    };
+    let branch = format!("auto/{brief_id}");
+    let allowed_tools = parse_allowed_tools(bundle);
+    BriefContext {
+        brief_id,
+        base_branch,
+        issue_title,
+        issue_body,
+        acceptance,
+        branch,
+        topology_name,
+        rework_banner,
+        blocker_findings,
+        allowed_tools,
+    }
+}
+
+/// Walk `team_context.messages[].payload.findings[]` and collect all
+/// `severity == "blocker"` entries.
+pub fn collect_blocker_findings(bundle: &Value) -> Vec<PriorFinding> {
+    let messages = bundle
+        .pointer("/team_context/messages")
+        .and_then(Value::as_array);
+    let Some(messages) = messages else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for m in messages {
+        let findings = m.pointer("/payload/findings").and_then(Value::as_array);
+        let Some(findings) = findings else { continue };
+        for f in findings {
+            if f.get("severity").and_then(Value::as_str) != Some("blocker") {
+                continue;
+            }
+            out.push(PriorFinding {
+                message: f
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                prohibitions: string_array_field(f, "prohibitions"),
+                requirements: string_array_field(f, "requirements"),
+            });
+        }
+    }
+    out
+}
+
+/// Compose the rework banner injected into the coder prompt when the
+/// reviewer flagged blockers on a prior iteration.
+pub fn build_rework_banner(findings: &[PriorFinding]) -> String {
+    let mut feedback_block = String::new();
+    for (i, f) in findings.iter().enumerate() {
+        if i > 0 {
+            feedback_block.push('\n');
+        }
+        feedback_block.push_str(&format!(
+            "- BLOCKER: {}\n  Prohibitions: {}\n  Requirements: {}",
+            f.message,
+            f.prohibitions.join("; "),
+            f.requirements.join("; "),
+        ));
+    }
+    format!(
+        "**This is a REWORK iteration.**\n\
+         \n\
+         A prior coder pass on this brief shipped a commit that is already on HEAD of this worktree. \
+         The reviewer flagged the following BLOCKER findings against that commit. Read the existing \
+         diff with `git diff ${{base_branch}}...HEAD`, identify the sites the findings name, and edit \
+         those sites to satisfy each requirement and avoid each prohibition. Do NOT replan from \
+         scratch and do NOT recreate files that already exist.\n\
+         \n\
+         --- Prior reviewer findings ---\n\
+         {feedback_block}\n\
+         --- End findings ---"
+    )
+}
+
+/// Build the coder-claude prompt — verb-structured task description,
+/// branch context, acceptance command, mid-session validation guidance.
+pub fn build_coder_prompt(
+    base_branch: &str,
+    branch: &str,
+    rework_banner: &str,
+    issue_title: &str,
+    issue_body: &str,
+    acceptance: &str,
+) -> String {
+    format!(
+        "You are the coder role inside the agentry autonomous team, operating in the\n\
+         container-local working directory /workspace. The repo is cloned at\n\
+         branch \"{base_branch}\"; you are on a fresh branch \"{branch}\".\n\
+         \n\
+         Your task is described in verb-structured form below. Follow it literally:\n\
+         each verb (CREATE / UPDATE / REPLACE / DELETE / MOVE) names a transformation\n\
+         on a specific file:line target. Do NOT invent additional changes.\n\
+         \n\
+         # /usr/local/bin/ship — runs the brief.kind's validator pipeline against /workspace and prints a JSON report. Calling it is OPTIONAL in this brief; brief 6 makes it the only path to publication. Use it as a self-check before git commit if you want.\n\
+         \n\
+         {rework_banner}\n\
+         \n\
+         Task title: {issue_title}\n\
+         \n\
+         Task body:\n\
+         {issue_body}\n\
+         \n\
+         Constraints:\n\
+         - Operate only inside /workspace. Never touch files outside it.\n\
+         - When you are done editing, the acceptance command below must pass. You\n  \
+           may run it yourself to check. The orchestrator will re-run it before\n  \
+           accepting the diff:\n    \
+           {acceptance}\n\
+         - Do not commit or push. The orchestrator handles commit and push on your\n  \
+           behalf after you exit.\n\
+         - The orchestrator may be running you in `agentry-self-host-v1` topology (or a later v1+). In that case: do not commit, do not push. The `/usr/local/bin/ship` tool (when called) runs the validator pipeline against your changes; if it returns ok, exit and the orchestrator's git-operator role takes over. Topology name is in $topology_name.\n\
+         - For mid-session validation, invoke `quality-fast` (no args, scoped to changed\n  \
+           files by default). Do NOT invoke cargo for navigation or speculative\n  \
+           checks; cargo is reserved for `cargo fmt`. The substrate runs full\n  \
+           validators after you exit.\n\
+         \n\
+         When the transformations are complete and the acceptance passes, simply\n\
+         report success and exit.\n"
+    )
+}
+
+/// Bash regex `-v[1-9][0-9]*$` — true for `agentry-self-host-v1`,
+/// `agentry-self-host-v12`, etc. False for v0 (the v0 topology runs the
+/// local commit/push exitpoint path).
+pub fn is_v1_plus_topology(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    if bytes.len() < 3 {
+        return false;
+    }
+    let mut digit_start = bytes.len();
+    while digit_start > 0 && bytes[digit_start - 1].is_ascii_digit() {
+        digit_start -= 1;
+    }
+    if digit_start == bytes.len() {
+        return false;
+    }
+    if digit_start < 2 || bytes[digit_start - 1] != b'v' || bytes[digit_start - 2] != b'-' {
+        return false;
+    }
+    let digits = &bytes[digit_start..];
+    let first = digits[0];
+    (b'1'..=b'9').contains(&first) && digits[1..].iter().all(|b| b.is_ascii_digit())
+}
+
+/// Bash: `grep -qE '^(### [0-9]+\. |CREATE |UPDATE |REPLACE |DELETE |MOVE )'`.
+/// True when the issue body contains explicit verb syntax somewhere on a
+/// line — bare `CREATE foo`, `### 12. UPDATE foo`, etc.
+pub fn body_has_verb_syntax(body: &str) -> bool {
+    body.lines().any(line_starts_with_verb)
+}
+
+fn line_starts_with_verb(line: &str) -> bool {
+    if line.starts_with("CREATE ")
+        || line.starts_with("UPDATE ")
+        || line.starts_with("REPLACE ")
+        || line.starts_with("DELETE ")
+        || line.starts_with("MOVE ")
+    {
+        return true;
+    }
+    if let Some(rest) = line.strip_prefix("### ") {
+        let mut digit_count = 0usize;
+        for c in rest.chars() {
+            if c.is_ascii_digit() {
+                digit_count += 1;
+            } else {
+                break;
+            }
+        }
+        if digit_count == 0 {
+            return false;
+        }
+        let after_digits = &rest[digit_count..];
+        return after_digits.starts_with(". ");
+    }
+    false
+}
+
+/// Build the self-review prompt asking claude to verify each verb in the
+/// body has a matching change in the staged diff.
+pub fn build_self_review_prompt(issue_body: &str, staged_diff: &str) -> String {
+    let body_head = head_bytes(issue_body, SELF_REVIEW_ISSUE_BODY_BUDGET);
+    format!(
+        "You are a self-review check for the agentry project. Below is the TASK\n\
+         BODY (with explicit verbs — CREATE/UPDATE/REPLACE/DELETE/MOVE) and the\n\
+         STAGED DIFF you are about to commit.\n\
+         \n\
+         TASK BODY:\n\
+         {body_head}\n\
+         \n\
+         STAGED DIFF:\n\
+         {staged_diff}\n\
+         \n\
+         For each verb declared in the task body, check whether it has been applied\n\
+         in the diff at the named location. Output EXACTLY a JSON object — no\n\
+         markdown fences, no prose:\n\
+         \n\
+         {{\n\
+         \x20\x20\"all_applied\": true,\n\
+         \x20\x20\"unapplied\": []\n\
+         }}\n\
+         \n\
+         If any verb is missing, set all_applied:false and list each missing verb\n\
+         as a short description (max 200 chars each, max 6 entries).\n\
+         \n\
+         Your response, right now, starting with {{ and ending with }}:\n",
+    )
+}
+
+/// Parse the self-review claude reply into a [`SelfReviewResult`]. Strips
+/// optional code fences and slices between the first `{` and last `}`.
+/// Returns `None` when the reply does not contain a parseable JSON object.
+pub fn parse_self_review_object(raw: &str) -> Option<SelfReviewResult> {
+    let cleaned = strip_fences(raw);
+    let sliced = slice_json_object(&cleaned)?;
+    let v: Value = serde_json::from_str(sliced).ok()?;
+    if !v.is_object() {
+        return None;
+    }
+    let all_applied = v
+        .get("all_applied")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let unapplied = v
+        .get("unapplied")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(SelfReviewResult {
+        all_applied,
+        unapplied,
+    })
+}
+
+/// Slice the substring between the first `{` and last `}` in `text`, or
+/// `None` if either is missing or `}` precedes `{`.
+pub fn slice_json_object(text: &str) -> Option<&str> {
+    let start = text.find('{')?;
+    let end = text.rfind('}')?;
+    if end < start {
+        return None;
+    }
+    Some(&text[start..=end])
+}
+
+/// Build a Warn-severity mechanical-origin [`ReviewFinding`] (mirrors
+/// [`mech_finding`] but at Warn severity). Used by the coder's
+/// dead-pub-check phase to surface JSONL findings without blocking.
+pub fn mech_finding_warn(tool: &str, category: &str, message: &str) -> ReviewFinding {
+    ReviewFinding {
+        file: None,
+        line: None,
+        severity: Severity::Warn,
+        origin: FindingOrigin::Mechanical {
+            tool: tool.into(),
+            rule: None,
+        },
+        category: category.into(),
+        message: message.into(),
+        suggested_fix: None,
+        prohibitions: Vec::new(),
+        requirements: Vec::new(),
+    }
+}

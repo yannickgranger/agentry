@@ -63,7 +63,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 use agentry_role_runtime::{
-    emit_done, emit_event, emit_finding, head_bytes, parse_allowed_tools, parse_findings,
+    build_review_prompt, emit_done, emit_event, emit_finding, parse_allowed_tools, parse_findings,
     pointer_str, read_bundle_value, run_fence, stream_claude, tail_lines, workspace_is_git_repo,
     DoneGuard, StreamErr,
 };
@@ -71,7 +71,6 @@ use orchestrator_types::{DoneReason, EventVerdict, Severity};
 use serde_json::json;
 
 const WORKSPACE_DIR: &str = "/workspace";
-const ISSUE_BODY_BUDGET: usize = 2000;
 
 fn main() {
     let _guard = DoneGuard::new();
@@ -243,125 +242,4 @@ fn git_diff_3dot(base_branch: &str) -> Result<String, String> {
         return Err(tail_lines(&combined, 20));
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-}
-
-fn build_review_prompt(
-    base_branch: &str,
-    issue_title: &str,
-    issue_body: &str,
-    diff_text: &str,
-) -> String {
-    // Verbatim from REVIEWER_CLAUDE_AGENTRY_SCRIPT — including the strict
-    // output-format guidance, scope guardrail, verb-completeness check, and
-    // the four CRITICAL audits (role-spec, bootstrap-command,
-    // daemon-lifecycle, state-machine idempotency). Any prose drift here
-    // changes reviewer behaviour mid-port.
-    let issue_body_head = head_bytes(issue_body, ISSUE_BODY_BUDGET);
-    let mut s = String::new();
-    s.push_str(&format!(
-        "You are a senior code reviewer for the agentry project — a Rust workspace\n\
-         that orchestrates short-lived agent containers. Review the following diff\n\
-         produced against branch \"{base_branch}\" in response to this task:\n\
-         \n\
-         TITLE: {issue_title}\n\
-         \n\
-         BODY (first 2000 chars):\n\
-         {issue_body_head}\n\
-         \n\
-         --- DIFF ---\n\
-         {diff_text}\n\
-         --- END DIFF ---\n"
-    ));
-    s.push_str(
-        "\nOutput EXACTLY a JSON array of findings — nothing else. No markdown fences,\n\
-         no prose, no preamble, no explanation. Each element:\n\
-         \n\
-         {\n\
-           \"severity\": \"blocker\" | \"warn\",\n\
-           \"category\": \"design\" | \"naming\" | \"clarity\" | \"invariant\" | \"other\",\n\
-           \"message\": \"one-sentence human-readable description (max 200 chars)\",\n\
-           \"prohibitions\": [\"...\"],   // for blockers, what the rework must NOT do\n\
-           \"requirements\": [\"...\"]    // for blockers, what the rework MUST do\n\
-         }\n\
-         \n\
-         Guidance:\n\
-         - `blocker` = ships-broken, security-risk, invariant-violation, wrong abstraction.\n\
-         - `warn` = minor cleanup, non-load-bearing style.\n\
-         - If the diff is acceptable as-is, output exactly: []\n\
-         - Maximum 6 findings. Prefer a single Blocker over many Warns.\n\
-         - Do not comment on fmt/clippy/test — those are mechanical-reviewer scope.\n\
-         - For each Blocker, populate `prohibitions` (things the next coder pass\n\
-           MUST NOT do) and `requirements` (things the next coder pass MUST do).\n\
-           These anchor the rework so the coder does not solve the wrong problem.\n\
-         - For Warns, both arrays SHOULD be empty — a warn is informational, not\n\
-           a rework constraint.\n\
-         \n\
-         Scope guardrail (CRITICAL):\n\
-         - ONLY flag changes INSIDE the DIFF. Pre-existing inconsistencies in the\n\
-           repo that the diff did not touch are OUT of scope for blocker-level\n\
-           findings.\n\
-         - If you notice a pre-existing concern adjacent to the diff, you MAY emit\n\
-           at most ONE warn-level finding with category \"scope\" describing it, so\n\
-           it is on-record for a follow-up brief — but NEVER emit a blocker for\n\
-           something the diff did not change.\n\
-         - The unit of review is \"did THIS diff ship broken/unsafe/wrong?\", not\n\
-           \"is the whole repo now consistent?\".\n\
-         \n\
-         Verb-completeness check (CRITICAL):\n\
-         - The TASK BODY above may contain explicit verbs: CREATE, UPDATE, REPLACE,\n\
-           DELETE, MOVE — usually headed as \"### N. <VERB> <file:line>\" or the bare\n\
-           form \"<VERB> <file:line>\".\n\
-         - For EACH such verb in the body, verify the diff contains the corresponding\n\
-           change at the named location (file path and approximate area).\n\
-         - An unapplied verb is a blocker with category \"invariant\" and message\n\
-           \"unapplied verb: <short description of what was missed>\".\n\
-         - If the body contains no verb syntax (legacy free-form brief), skip this\n\
-           check and apply only the design/naming/clarity/invariant guidance above.\n\
-         - Applied-but-incomplete counts as unapplied (e.g. the verb asked to change\n\
-           three sites and only two were touched — the remaining one is unapplied).\n\
-         \n\
-         Role-spec audit (CRITICAL):\n\
-         - If the diff adds or modifies an `AgentRole` (i.e. introduces a `RoleName(...)` registration in seed.rs or changes the fields of an existing one), verify each of:\n\
-           (a) `permit_scope` is minimal for the stated job — no fs:write outside the workspace, no net access unless justified, no git tools on roles that do not ship code.\n\
-           (b) `tool_allowlist` matches what the role's entrypoint actually does (a read-only role must not be allowed to write arbitrary streams).\n\
-           (c) the deny-list is explicit for the categories of tool the role does not need.\n\
-           (d) any `binaries` or `mcp_servers` named are justified by the role's job.\n\
-         - Mismatches are blockers with category \"invariant\" and a message starting with \"role-spec audit:\".\n\
-         - This complements (does not replace) the scope-guardrail and verb-completeness checks above.\n\
-         \n\
-         Bootstrap-command audit (CRITICAL):\n\
-         - If the diff modifies any role's `extra_bootstrap` shell strings, verify each shell command:\n\
-           (a) `cargo install --git URL --bin <name>` is rejected when the target is a workspace with multiple binaries — must use positional package name (e.g. `cfdb-cli`, `application`) or `--package`.\n\
-           (b) Bootstrap commands that may transiently fail must end with `|| true` for fault tolerance, matching the existing `reviewer-mechanical-agentry` quality-hygiene install pattern.\n\
-           Mismatch is a blocker with category \"invariant\".\n\
-         \n\
-         Daemon-lifecycle ordering (CRITICAL):\n\
-         - If the diff modifies the daemon's `handle_brief` shipping flow (workspace teardown, chain-trigger, terminal-handler), verify the ORDER:\n\
-           chain-trigger MUST read `next_brief_refs` and submit children to Redis BEFORE workspace destruction.\n\
-           Reason: planner-emitted child JSONs live IN the workspace; destroyed-before-read = lost children.\n\
-           Wrong order is a blocker with category \"invariant\".\n\
-         \n\
-         State-machine emission idempotency (CRITICAL):\n\
-         - If the diff adds or modifies a state-machine compose/finalize function (DOL `compose_meta_verdict`, future composers in recursive sub-planning, etc.), verify exactly-once semantics:\n\
-           guard the emission with SETNX on a Redis marker key, OR a Redis transaction, OR an equivalent atomic check.\n\
-           Concurrent terminal handlers can re-enter; without the gate, duplicate verdicts will fire (observed in A7v3: 3× duplicate failed-verdicts for one meta-brief).\n\
-           Missing idempotency gate is a blocker with category \"invariant\".\n\
-         \n\
-         Your response, right now, starting with [ and ending with ]:\n",
-    );
-    s
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn build_review_prompt_includes_diff_and_title() {
-        let prompt = build_review_prompt("develop", "Fix bug", "BODY", "DIFF_TEXT");
-        assert!(prompt.contains("TITLE: Fix bug"));
-        assert!(prompt.contains("DIFF_TEXT"));
-        assert!(prompt.contains("Output EXACTLY a JSON array"));
-        assert!(!prompt.contains("--- Mechanical findings"));
-    }
 }
