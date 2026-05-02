@@ -9,7 +9,8 @@
 //! re-fire once the upstream re-ships.
 
 use crate::{
-    permit as permit_mod, projector, redis_io,
+    lifecycle::{EventSource, StateProjector},
+    lifecycle_driver, permit as permit_mod, projector, redis_io,
     spawner::{PodmanSpawner, RoutedMessage, RunAgentCtx, Spawner, TeamContext},
     state,
     workspace::{self, BriefWorkspace},
@@ -33,7 +34,22 @@ use tokio::sync::Semaphore;
 const ACTIVE_BRIEFS_SET: &str = "agentry:active_briefs";
 
 /// Run the daemon loop forever using the given `Config`.
-pub async fn run(cfg: &crate::Config) -> Result<()> {
+///
+/// `event_source_factory` and `state_projector_factory` are invoked
+/// once per dispatched brief; the resulting [`EventSource`] and
+/// [`StateProjector`] are handed to a per-brief
+/// `lifecycle_driver::projector_task` that runs in parallel with the
+/// existing orchestrator role-chain (see L.3a / EPIC #246). Production
+/// callers wire the Redis adapters from `crate::lifecycle`; tests can
+/// inject in-memory adapters.
+///
+/// [`EventSource`]: crate::lifecycle::EventSource
+/// [`StateProjector`]: crate::lifecycle::StateProjector
+pub async fn run(
+    cfg: &crate::Config,
+    event_source_factory: Arc<dyn Fn(BriefId) -> Box<dyn EventSource + Send> + Send + Sync>,
+    state_projector_factory: Arc<dyn Fn(BriefId) -> Box<dyn StateProjector + Send> + Send + Sync>,
+) -> Result<()> {
     let mut conn = redis_io::connect(&cfg.redis.url).await?;
     tracing::info!(url = %cfg.redis.url.rsplit('@').next().unwrap_or("?"), "connected to Redis");
 
@@ -132,18 +148,45 @@ pub async fn run(cfg: &crate::Config) -> Result<()> {
                 if waited > std::time::Duration::from_secs(1) {
                     tracing::info!(brief = %brief.id, project = %slug, cap = cap, waited_ms = waited.as_millis() as u64, "brief waited for project concurrency slot");
                 }
+                let event_source_factory_clone = event_source_factory.clone();
+                let state_projector_factory_clone = state_projector_factory.clone();
+                let conn_for_verdict_emit = conn.clone();
                 tokio::spawn(async move {
                     let _permit = permit; // released on drop, after SREM
                     let mut conn_for_brief = conn_clone;
-                    match handle_brief(
+
+                    // L.3a: parallel-run FSM driver. Spawn the per-brief
+                    // projector task ALONGSIDE the orchestrator role-chain
+                    // below — both paths run concurrently. The legacy
+                    // verdict emission (handle_brief / role-outcomes) and
+                    // the FSM emission both XADD to agentry:verdicts;
+                    // SETNX dedup keeps only the first arrival.
+                    let event_source = (event_source_factory_clone)(brief_id.clone());
+                    let state_projector = (state_projector_factory_clone)(brief_id.clone());
+                    let projector_handle = tokio::spawn(lifecycle_driver::projector_task(
+                        brief_id.clone(),
+                        event_source,
+                        state_projector,
+                        Some(conn_for_verdict_emit),
+                    ));
+
+                    let outcome = handle_brief(
                         &mut conn_for_brief,
                         &spawner_clone,
                         &brief,
                         &signing_clone,
                         &verifying_clone,
                     )
-                    .await
-                    {
+                    .await;
+
+                    // The projector task tails the brief's trace stream;
+                    // when handle_brief returns, the agents have all done
+                    // their final XADDs but the projector may still be
+                    // catching up. Detach the join handle — the task
+                    // self-terminates on terminal-state transition.
+                    drop(projector_handle);
+
+                    match outcome {
                         Ok(brief_kind) => {
                             if let Err(e) =
                                 dol_on_brief_terminal(&mut conn_for_brief, &brief, &brief_kind)
