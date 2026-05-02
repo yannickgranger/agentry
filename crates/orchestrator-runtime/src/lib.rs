@@ -15,6 +15,7 @@ pub mod daemon;
 pub mod delivery;
 pub mod errors;
 pub mod lifecycle;
+pub mod lifecycle_driver;
 pub mod permit;
 pub mod projector;
 pub mod redis_io;
