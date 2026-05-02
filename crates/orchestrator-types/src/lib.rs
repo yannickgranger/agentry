@@ -8,6 +8,7 @@
 
 pub mod brief;
 pub mod event;
+pub mod lifecycle;
 pub mod permit;
 pub mod project;
 pub mod review;
