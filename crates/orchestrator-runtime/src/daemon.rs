@@ -28,11 +28,6 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
-/// Redis set tracking briefs currently in flight. The dashboard reads this
-/// via `DashboardStore::active_briefs` instead of XREVRANGE-ing the briefs
-/// stream and filtering against verdicts.
-const ACTIVE_BRIEFS_SET: &str = "agentry:active_briefs";
-
 /// Run the daemon loop forever using the given `Config`.
 ///
 /// `event_source_factory` and `state_projector_factory` are invoked
@@ -108,12 +103,6 @@ pub async fn run(
             Ok(Some((sid, brief))) => {
                 last_id = sid;
                 tracing::info!(brief = %brief.id, "received brief");
-                if let Err(e) = conn
-                    .sadd::<_, _, ()>(ACTIVE_BRIEFS_SET, brief.id.0.as_str())
-                    .await
-                {
-                    tracing::warn!(brief = %brief.id, error = %e, "active_briefs SADD failed");
-                }
                 let conn_clone = conn.clone();
                 let signing_clone = signing_key.clone();
                 let verifying_clone = verifying_key.clone();
@@ -152,15 +141,13 @@ pub async fn run(
                 let state_projector_factory_clone = state_projector_factory.clone();
                 let conn_for_verdict_emit = conn.clone();
                 tokio::spawn(async move {
-                    let _permit = permit; // released on drop, after SREM
+                    let _permit = permit; // released on drop
                     let mut conn_for_brief = conn_clone;
 
-                    // L.3a: parallel-run FSM driver. Spawn the per-brief
-                    // projector task ALONGSIDE the orchestrator role-chain
-                    // below — both paths run concurrently. The legacy
-                    // verdict emission (handle_brief / role-outcomes) and
-                    // the FSM emission both XADD to agentry:verdicts;
-                    // SETNX dedup keeps only the first arrival.
+                    // FSM projector: drives the brief lifecycle and is
+                    // the sole writer to `agentry:verdicts`. The role
+                    // chain below produces the trace events the
+                    // projector consumes.
                     let event_source = (event_source_factory_clone)(brief_id.clone());
                     let state_projector = (state_projector_factory_clone)(brief_id.clone());
                     let projector_handle = tokio::spawn(lifecycle_driver::projector_task(
@@ -197,37 +184,38 @@ pub async fn run(
                         }
                         Err(e) => {
                             tracing::error!(brief = %brief_id, error = %e, "brief handling failed");
-                            let v = Verdict::new(brief_id.clone(), VerdictKind::Failed)
-                                .with_reason(format!("handler error: {e}"));
-                            match redis_io::append_verdict_idempotent(&mut conn_for_brief, &v).await
+                            let abort_event =
+                                orchestrator_types::lifecycle::BriefEvent::AbortRequested {
+                                    actor: "daemon".into(),
+                                    message: format!("handler error: {e}"),
+                                };
+                            let payload = serde_json::to_value(&abort_event)
+                                .unwrap_or_else(|_| serde_json::json!({}));
+                            let event = orchestrator_types::Event::new(
+                                orchestrator_types::EventKind::Event { payload },
+                            );
+                            if let Err(emit_err) = redis_io::append_trace(
+                                &mut conn_for_brief,
+                                &brief_id,
+                                "daemon",
+                                &event,
+                            )
+                            .await
                             {
-                                Ok(Some(stream_id)) => tracing::info!(
-                                    brief = %v.brief.0,
-                                    kind = ?v.kind,
-                                    stream_id = %stream_id,
-                                    "brief verdict emitted"
-                                ),
-                                Ok(None) => tracing::warn!(
-                                    brief = %v.brief.0,
-                                    kind = ?v.kind,
-                                    "duplicate verdict suppressed (SETNX sentinel already set)"
-                                ),
-                                Err(err) => tracing::warn!(
-                                    brief = %v.brief.0,
-                                    error = %err,
-                                    "append_verdict_idempotent failed"
-                                ),
+                                tracing::warn!(
+                                    brief = %brief_id,
+                                    error = %emit_err,
+                                    "append_trace AbortRequested failed"
+                                );
                             }
-                            dol_on_brief_terminal(&mut conn_for_brief, &brief, &v.kind)
-                                .await
-                                .ok();
+                            dol_on_brief_terminal(
+                                &mut conn_for_brief,
+                                &brief,
+                                &VerdictKind::Failed,
+                            )
+                            .await
+                            .ok();
                         }
-                    }
-                    if let Err(e) = conn_for_brief
-                        .srem::<_, _, ()>(ACTIVE_BRIEFS_SET, brief_id.0.as_str())
-                        .await
-                    {
-                        tracing::warn!(brief = %brief_id, error = %e, "active_briefs SREM failed");
                     }
                 });
             }
@@ -240,15 +228,6 @@ pub async fn run(
             }
         }
     }
-}
-
-/// Per-role state in the DAG walker.
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum RoleState {
-    Pending,
-    Running,
-    Shipped,
-    Failed,
 }
 
 /// Setup-phase bundle: one entry per role about to fire in the current batch.
@@ -318,25 +297,22 @@ async fn handle_brief(
     let mut team_shipped = true;
     // Per-brief rework budget.
     let mut reworks_used: u32 = 0;
-    // Per-role state in the DAG. All roles start Pending.
-    let mut state: HashMap<RoleRef, RoleState> = team
-        .roles
-        .iter()
-        .map(|r| (r.clone(), RoleState::Pending))
-        .collect();
+    // Roles whose Shipped outcome has appeared in the trace stream so
+    // far. The single source of truth for DAG progress is the trace —
+    // this local accumulator is the loop's slice of it. Reworks remove
+    // the rewound role and its downstream sub-DAG so they re-fire once
+    // the upstream re-ships.
+    let mut shipped_roles: Vec<RoleRef> = Vec::new();
 
     'outer: loop {
-        // Ready set: roles in Pending whose upstream roles are all Shipped.
-        // Roles with zero inbound edges are immediately ready.
-        let shipped_set: HashSet<RoleRef> = state
-            .iter()
-            .filter(|(_, s)| **s == RoleState::Shipped)
-            .map(|(r, _)| r.clone())
-            .collect();
+        // Ready set: roles whose upstream roles are all shipped and that
+        // have not yet shipped themselves. Roles with zero inbound edges
+        // are immediately ready.
+        let shipped_set: HashSet<RoleRef> = shipped_roles.iter().cloned().collect();
         let ready: Vec<RoleRef> = team
             .roles
             .iter()
-            .filter(|r| state.get(*r) == Some(&RoleState::Pending))
+            .filter(|r| !shipped_set.contains(*r))
             .filter(|r| inbound_satisfied(r, &team, &shipped_set))
             .cloned()
             .collect();
@@ -395,11 +371,6 @@ async fn handle_brief(
             });
         }
 
-        // Mark batch as Running.
-        for r in &ready {
-            state.insert(r.clone(), RoleState::Running);
-        }
-
         // Concurrent fan-out: each role gets its own ConnectionManager clone
         // so the spawner's `&mut ConnectionManager` borrows are disjoint.
         // ConnectionManager is Arc-internal; clones share the underlying
@@ -434,19 +405,6 @@ async fn handle_brief(
 
         for (run, outcome_res) in runs.iter().zip(outcomes.into_iter()) {
             let outcome = outcome_res?;
-            match redis_io::append_verdict_idempotent(conn, &outcome.verdict).await? {
-                Some(stream_id) => tracing::info!(
-                    brief = %outcome.verdict.brief.0,
-                    kind = ?outcome.verdict.kind,
-                    stream_id = %stream_id,
-                    "brief verdict emitted"
-                ),
-                None => tracing::warn!(
-                    brief = %outcome.verdict.brief.0,
-                    kind = ?outcome.verdict.kind,
-                    "duplicate verdict suppressed (SETNX sentinel already set)"
-                ),
-            }
             tracing::info!(
                 brief = %brief.id,
                 role = %run.role_ref.name,
@@ -493,14 +451,14 @@ async fn handle_brief(
             }
         }
 
-        // Apply Shipped state.
+        // Record this batch's Shipped outcomes.
         for r in &shipped_in_batch {
-            state.insert(r.clone(), RoleState::Shipped);
+            shipped_roles.push(r.clone());
         }
 
         // Reworks: each rewinds to its single upstream and resets that
-        // upstream + its downstream sub-DAG to Pending so the slice re-fires
-        // once the upstream re-ships.
+        // upstream + its downstream sub-DAG so the slice re-fires once
+        // the upstream re-ships.
         let mut rewound_subdags: HashSet<RoleRef> = HashSet::new();
         for (from_ref, findings) in reworks {
             let upstream = resolve_rework_target(&from_ref, &team);
@@ -532,10 +490,10 @@ async fn handle_brief(
                         route_kind = %route_kind,
                         "rework requested — resetting upstream sub-DAG"
                     );
-                    state.insert(up.clone(), RoleState::Pending);
+                    shipped_roles.retain(|r| r != &up);
                     rewound_subdags.insert(up.clone());
                     for r in downstream_subdag(&up, &team) {
-                        state.insert(r.clone(), RoleState::Pending);
+                        shipped_roles.retain(|x| x != &r);
                         rewound_subdags.insert(r);
                     }
                 }
@@ -565,12 +523,9 @@ async fn handle_brief(
 
         // Failures: only fatal if not already part of an active rewind
         // sub-DAG (in which case the failure is squashed and the role
-        // re-enters Pending to fire again on the next upstream reship).
+        // re-fires once its upstream re-ships).
         for failed in &failures {
-            if rewound_subdags.contains(failed) {
-                state.insert(failed.clone(), RoleState::Pending);
-            } else {
-                state.insert(failed.clone(), RoleState::Failed);
+            if !rewound_subdags.contains(failed) {
                 team_shipped = false;
                 break 'outer;
             }
@@ -578,7 +533,7 @@ async fn handle_brief(
     }
 
     // Success requires the terminal role to have shipped.
-    if team_shipped && state.get(&team.terminal_role) != Some(&RoleState::Shipped) {
+    if team_shipped && !shipped_roles.contains(&team.terminal_role) {
         team_shipped = false;
     }
 
@@ -883,19 +838,13 @@ async fn compose_meta_verdict(conn: &mut ConnectionManager, meta_id: &str) -> Re
     let (final_kind, reason) = compose_verdict_parts(&children, verifier.as_ref());
     let mut final_verdict = Verdict::new(BriefId(meta_id.into()), final_kind.clone());
     final_verdict.reason = reason;
-    match redis_io::append_verdict_idempotent(conn, &final_verdict).await? {
-        Some(stream_id) => tracing::info!(
-            brief = %final_verdict.brief.0,
-            kind = ?final_verdict.kind,
-            stream_id = %stream_id,
-            "brief verdict emitted"
-        ),
-        None => tracing::warn!(
-            brief = %final_verdict.brief.0,
-            kind = ?final_verdict.kind,
-            "duplicate verdict suppressed (SETNX sentinel already set)"
-        ),
-    }
+    let stream_id = redis_io::append_verdict(conn, &final_verdict).await?;
+    tracing::info!(
+        brief = %final_verdict.brief.0,
+        kind = ?final_verdict.kind,
+        stream_id = %stream_id,
+        "meta verdict emitted"
+    );
 
     let _: () = conn.del(&verdicts_key).await?;
     let _: () = conn.del(&pending_key).await?;
