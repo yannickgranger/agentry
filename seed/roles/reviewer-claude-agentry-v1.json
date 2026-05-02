@@ -52,5 +52,8 @@
     "container_path": "/workspace",
     "readonly": true
   },
-  "sccache": false
+  "sccache": false,
+  "extra_bootstrap": [
+    "ra-query crate-health . || true"
+  ]
 }
