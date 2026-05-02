@@ -96,3 +96,14 @@ proceed.
 
 A timestamped event: `Ts` + `EventKind`. The unit that the spawner reads
 off stdout, writes to the trace stream, and (for `ToolCall`) audits.
+
+## Provider
+
+Which AC verifier provider an `ac-verifier-runner` invocation runs:
+`Claude`, `Gemini`, or `Grok`. Each variant maps 1:1 to a bind-mounted host
+binary on `PATH` inside the container (`ac-verifier`, `ac-verifier-gemini`,
+`ac-verifier-grok`) — the strings the bash port's `command -v` pre-flight
+checks looked for, kept wire-compatible by `binary_name`. `parse(&str)`
+accepts the lowercase `--provider` flag value and returns `None` for
+anything outside the closed set, surfaced by the binary as a "bad
+--provider flag" degradation event.

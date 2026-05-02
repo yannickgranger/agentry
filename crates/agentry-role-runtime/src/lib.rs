@@ -311,6 +311,38 @@ pub fn workspace_is_git_repo(workspace: &str) -> bool {
     dot_git.is_dir() || dot_git.is_file()
 }
 
+/// Which AC verifier provider an `ac-verifier-runner` invocation runs.
+///
+/// Each variant maps 1:1 to a bind-mounted host binary on `PATH` inside the
+/// container. The string returned by `binary_name` is used both for `Command`
+/// dispatch and for human-readable msg prefixes in degradation events
+/// (preserving the bash scripts' wording).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Provider {
+    Claude,
+    Gemini,
+    Grok,
+}
+
+impl Provider {
+    pub fn binary_name(self) -> &'static str {
+        match self {
+            Provider::Claude => "ac-verifier",
+            Provider::Gemini => "ac-verifier-gemini",
+            Provider::Grok => "ac-verifier-grok",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "claude" => Some(Provider::Claude),
+            "gemini" => Some(Provider::Gemini),
+            "grok" => Some(Provider::Grok),
+            _ => None,
+        }
+    }
+}
+
 /// Build a mechanical-origin Blocker [`ReviewFinding`].
 ///
 /// Promoted from `coder_claude_runner.rs` — the only binary with this
