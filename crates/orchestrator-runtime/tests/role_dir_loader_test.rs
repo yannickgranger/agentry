@@ -1,7 +1,11 @@
 //! Integration tests for the role-directory JSON loader.
+//!
+//! Malformed-JSON propagation is covered by the pre-existing
+//! `integration_role_loader_malformed.rs` against the same public surface;
+//! we don't duplicate it here.
 
-use orchestrator_runtime::role_dir_loader::{load_roles_from_dir, read_and_parse_role};
-use orchestrator_runtime::{redis_io, Error};
+use orchestrator_runtime::redis_io;
+use orchestrator_runtime::role_dir_loader::load_roles_from_dir;
 use orchestrator_types::{
     AgentRole, PackageManager, PermitScope, RoleName, SubstrateClass, ToolAllowlist,
 };
@@ -51,27 +55,6 @@ fn write_role(dir: &Path, file_name: &str, role: &AgentRole) -> PathBuf {
     let body = serde_json::to_string_pretty(role).expect("ser role");
     std::fs::write(&p, body).expect("write role");
     p
-}
-
-#[tokio::test]
-async fn malformed_json_propagates_as_role_load_failed() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let path = dir.path().join("bogus.json");
-    std::fs::write(&path, b"{ not valid json").expect("write bogus");
-
-    let err = read_and_parse_role(&path)
-        .await
-        .expect_err("malformed JSON must propagate as Err");
-
-    match err {
-        Error::RoleLoadFailed { path: reported, .. } => {
-            assert_eq!(
-                reported.file_name().and_then(|s| s.to_str()),
-                Some("bogus.json"),
-            );
-        }
-        other => panic!("expected RoleLoadFailed, got {other:?}"),
-    }
 }
 
 /// Brief 190b of #182: the seed/roles directory at the workspace root must
