@@ -14,10 +14,13 @@
 //! - `git diff <base_branch>...HEAD` (3-dot, symmetric range — what HEAD
 //!   added vs the branchpoint) — failure or empty diff → `done failed`
 //! - emit `reviewing diff` event with `diff_bytes`
-//! - optional ra-query pre-pass: walk `*.rs` files in the diff, run
-//!   `ra-query unwraps --severity high` and `ra-query complexity --threshold 15`,
-//!   emit a panel event, and prepend a short summary to the prompt
-//! - build the strict review prompt (verbatim copy from bash)
+//! - run `agentry_role_runtime::run_fence` against the diff: deterministic
+//!   `ra-query` fence (clones / complexity / unwraps + callers fence) emits
+//!   findings as Mechanical-origin `ReviewFinding`s. Findings are emitted to
+//!   the trace BEFORE Claude runs so they cannot be downgraded by the LLM
+//!   verdict. Y.5 fail-closed: substrate failure → single Blocker.
+//! - build the strict review prompt (diff-only — structural concerns are
+//!   covered deterministically by the fence; Claude does semantic review)
 //! - stream `claude -p --output-format stream-json --verbose <prompt>` to
 //!   `/transcripts/<brief_id>.reviewer.jsonl`, mirroring each line as a
 //!   trace event (`{claude:<obj>}` for parseable lines, `{claude_raw:<str>}`
@@ -34,7 +37,9 @@
 //!   anyway — see PORT NOTES below)
 //! - emit one `Finding` per parsed finding (model origin, agent_id from
 //!   permit, prohibitions/requirements arrays preserved)
-//! - any blocker → `done rework_needed`; otherwise → `done shipped`
+//! - verdict: fence-Blocker OR claude-Blocker → `done rework_needed`. The
+//!   deterministic fence overrides Claude — Claude cannot downgrade a
+//!   fence Blocker to a Shipped verdict. Otherwise → `done shipped`.
 //!
 //! ## PORT NOTES
 //!
@@ -45,8 +50,10 @@
 //!   was produced, the rework loop must fire) so blocker is the closest
 //!   correct mapping. This is the only intentional semantic departure.
 //!
-//! - Bash kept the `ra-query` pre-pass tolerant of missing binary; Rust
-//!   port mirrors via `Command::spawn` returning `ErrorKind::NotFound`.
+//! - The bash `ra-query` pre-pass was tolerant of a missing binary (skipped
+//!   silently). The Y.6 fence is fail-closed: missing or broken `ra-query`
+//!   is a substrate problem and emits one Blocker. Tolerance moved upstream
+//!   to container warm-up (Y.7).
 //!
 //! - `DoneGuard` (EPIC #161 B0) covers any unwound path (panic, abrupt
 //!   return) so the daemon always sees a terminal `done` event.
@@ -56,16 +63,14 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 use agentry_role_runtime::{
-    changed_rs_files, emit_done, emit_event, emit_finding, head_bytes, parse_allowed_tools,
-    parse_findings, pointer_str, ra_query_present, read_bundle_value, run_ra_query, stream_claude,
-    tail_bytes, tail_lines, workspace_is_git_repo, DoneGuard, StreamErr,
+    emit_done, emit_event, emit_finding, head_bytes, parse_allowed_tools, parse_findings,
+    pointer_str, read_bundle_value, run_fence, stream_claude, tail_lines, workspace_is_git_repo,
+    DoneGuard, StreamErr,
 };
 use orchestrator_types::{DoneReason, EventVerdict, Severity};
-use serde_json::{json, Value};
+use serde_json::json;
 
 const WORKSPACE_DIR: &str = "/workspace";
-const PANEL_TAIL_BUDGET: usize = 8192;
-const PANEL_SUMMARY_BUDGET: usize = 512;
 const ISSUE_BODY_BUDGET: usize = 2000;
 
 fn main() {
@@ -141,14 +146,22 @@ fn main() {
         "diff_bytes": diff_text.len(),
     }));
 
-    let panel_summary = run_ra_query_pre_pass(&diff_text);
-    let prompt = build_review_prompt(
-        &base_branch,
-        &issue_title,
-        &issue_body,
-        &diff_text,
-        &panel_summary,
-    );
+    // Deterministic fence runs FIRST, before Claude. Findings are emitted to
+    // the trace immediately so they cannot be downgraded by Claude's verdict.
+    let fence_findings = run_fence(Path::new(WORKSPACE_DIR), &base_branch);
+    let fence_has_blocker = fence_findings
+        .iter()
+        .any(|f| matches!(f.severity, Severity::Blocker));
+    for f in &fence_findings {
+        emit_finding(f);
+    }
+    emit_event(json!({
+        "msg": "fence pass complete",
+        "findings_count": fence_findings.len(),
+        "has_blocker": fence_has_blocker,
+    }));
+
+    let prompt = build_review_prompt(&base_branch, &issue_title, &issue_body, &diff_text);
 
     let response = match stream_claude(&brief_id, ".reviewer", &prompt) {
         Ok(r) => r,
@@ -174,27 +187,30 @@ fn main() {
         }
     };
 
-    let findings = parse_findings(&response, &agent_id);
-
-    let count = findings.len();
+    let claude_findings = parse_findings(&response, &agent_id);
+    let claude_has_blocker = claude_findings
+        .iter()
+        .any(|f| matches!(f.severity, Severity::Blocker));
     emit_event(json!({
         "msg": "claude review parsed",
-        "findings_count": count,
+        "findings_count": claude_findings.len(),
     }));
-
-    let mut has_blocker = false;
-    for f in &findings {
-        if matches!(f.severity, Severity::Blocker) {
-            has_blocker = true;
-        }
+    for f in &claude_findings {
         emit_finding(f);
     }
 
+    // Verdict: fence-Blocker OR claude-Blocker → ReworkNeeded.
+    // Fence findings are deterministic and cannot be downgraded by Claude.
+    let has_blocker = fence_has_blocker || claude_has_blocker;
     if has_blocker {
-        emit_event(json!({"msg": "blockers present — requesting rework"}));
+        emit_event(json!({
+            "msg": "blockers present — requesting rework",
+            "fence_blockers": fence_findings.iter().filter(|f| matches!(f.severity, Severity::Blocker)).count(),
+            "claude_blockers": claude_findings.iter().filter(|f| matches!(f.severity, Severity::Blocker)).count(),
+        }));
         emit_done(EventVerdict::ReworkNeeded, None);
     } else {
-        emit_event(json!({"msg": "no blockers — claude-reviewer passes"}));
+        emit_event(json!({"msg": "no blockers — reviewer passes"}));
         emit_done(EventVerdict::Shipped, None);
     }
 }
@@ -229,95 +245,11 @@ fn git_diff_3dot(base_branch: &str) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// Walk the `*.rs` files touched by the diff, run `ra-query unwraps` and
-/// `ra-query complexity` against each, emit a panel event, return a short
-/// human-readable summary string for prompt embedding.
-///
-/// Tolerates missing `ra-query` binary: emits one `ra_query_unavailable`
-/// event and returns empty string. Mirrors the bash `command -v ra-query`
-/// guard — operators who haven't run `just ra-query-binary` still get a
-/// usable review, just without the pre-pass anchors.
-fn run_ra_query_pre_pass(diff_text: &str) -> String {
-    if !ra_query_present() {
-        emit_event(json!({
-            "msg": "ra_query_unavailable",
-            "detail": "skipping reviewer pre-pass",
-        }));
-        return String::new();
-    }
-
-    let changed = changed_rs_files(diff_text);
-    let mut panel = Vec::with_capacity(changed.len());
-    for f in &changed {
-        let abs = Path::new(WORKSPACE_DIR).join(f);
-        if !abs.is_file() {
-            continue;
-        }
-        let abs_s = abs.to_string_lossy().into_owned();
-        let unwraps = run_ra_query(&["unwraps", &abs_s, "--severity", "high", "--format", "json"])
-            .unwrap_or_else(|_| json!({"functions": []}));
-        let complexity = run_ra_query(&[
-            "complexity",
-            &abs_s,
-            "--threshold",
-            "15",
-            "--format",
-            "json",
-        ])
-        .unwrap_or_else(|_| json!({"functions": []}));
-        panel.push(json!({
-            "file": f,
-            "unwraps": unwraps,
-            "complexity": complexity,
-        }));
-    }
-
-    let panel_value = Value::Array(panel.clone());
-    let panel_text = serde_json::to_string(&panel_value).unwrap_or_else(|_| "[]".into());
-    let panel_tail = tail_bytes(panel_text.as_bytes(), PANEL_TAIL_BUDGET);
-    emit_event(json!({
-        "msg": "ra_query_review_panel",
-        "findings_json_tail": panel_tail,
-    }));
-
-    let mut lines: Vec<String> = Vec::new();
-    for entry in &panel {
-        let unwraps_total = entry
-            .pointer("/unwraps/summary/total")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        let complexity_total = entry
-            .pointer("/complexity/summary/total")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        if unwraps_total + complexity_total == 0 {
-            continue;
-        }
-        let file = entry.get("file").and_then(Value::as_str).unwrap_or("");
-        lines.push(format!(
-            "{file}: unwraps={unwraps_total} complexity_hot={complexity_total}"
-        ));
-    }
-    let summary = lines.join("\n");
-    if summary.len() > PANEL_SUMMARY_BUDGET {
-        // Match `head -c 512` truncation. Cut on a UTF-8 char boundary to
-        // avoid panics on multi-byte boundary slices.
-        let mut cut = PANEL_SUMMARY_BUDGET;
-        while !summary.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        summary[..cut].to_string()
-    } else {
-        summary
-    }
-}
-
 fn build_review_prompt(
     base_branch: &str,
     issue_title: &str,
     issue_body: &str,
     diff_text: &str,
-    panel_summary: &str,
 ) -> String {
     // Verbatim from REVIEWER_CLAUDE_AGENTRY_SCRIPT — including the strict
     // output-format guidance, scope guardrail, verb-completeness check, and
@@ -340,13 +272,6 @@ fn build_review_prompt(
          {diff_text}\n\
          --- END DIFF ---\n"
     ));
-    if !panel_summary.is_empty() {
-        s.push_str(&format!(
-            "\n--- Mechanical findings from ra-query (unwraps>=high, complexity>=15) ---\n\
-             {panel_summary}\n\
-             --- End mechanical findings ---\n"
-        ));
-    }
     s.push_str(
         "\nOutput EXACTLY a JSON array of findings — nothing else. No markdown fences,\n\
          no prose, no preamble, no explanation. Each element:\n\
@@ -433,23 +358,10 @@ mod tests {
 
     #[test]
     fn build_review_prompt_includes_diff_and_title() {
-        let prompt = build_review_prompt("develop", "Fix bug", "BODY", "DIFF_TEXT", "");
+        let prompt = build_review_prompt("develop", "Fix bug", "BODY", "DIFF_TEXT");
         assert!(prompt.contains("TITLE: Fix bug"));
         assert!(prompt.contains("DIFF_TEXT"));
         assert!(prompt.contains("Output EXACTLY a JSON array"));
         assert!(!prompt.contains("--- Mechanical findings"));
-    }
-
-    #[test]
-    fn build_review_prompt_includes_panel_summary_when_present() {
-        let prompt = build_review_prompt(
-            "develop",
-            "T",
-            "B",
-            "D",
-            "src/x.rs: unwraps=2 complexity_hot=0",
-        );
-        assert!(prompt.contains("--- Mechanical findings"));
-        assert!(prompt.contains("unwraps=2"));
     }
 }
