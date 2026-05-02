@@ -88,8 +88,6 @@ pub enum BriefState {
         retry: RetryBudget,
     },
     Reworking {
-        iteration: u32,
-        max: u32,
         target: ReworkTarget,
         retry: RetryBudget,
     },
@@ -245,8 +243,6 @@ pub fn handle(state: &BriefState, event: &BriefEvent) -> Result<BriefState, Inva
                 EventVerdict::Shipped => Ok(BriefState::Reviewing { retry: *retry }),
                 EventVerdict::ReworkNeeded | EventVerdict::Failed => {
                     Ok(increment_or_fail(*retry, |next| BriefState::Reworking {
-                        iteration: 1,
-                        max: next.max,
                         target: ReworkTarget::Coder,
                         retry: next,
                     }))
@@ -279,8 +275,6 @@ pub fn handle(state: &BriefState, event: &BriefEvent) -> Result<BriefState, Inva
             }),
             EventVerdict::ReworkNeeded => {
                 Ok(increment_or_fail(*retry, |next| BriefState::Reworking {
-                    iteration: 1,
-                    max: next.max,
                     target: ReworkTarget::Coder,
                     retry: next,
                 }))
@@ -331,8 +325,6 @@ pub fn handle(state: &BriefState, event: &BriefEvent) -> Result<BriefState, Inva
             BriefEvent::CiResult { state: ci, .. } => match ci {
                 CiState::Success => Ok(BriefState::Shipped),
                 CiState::Failed => Ok(increment_or_fail(*retry, |next| BriefState::Reworking {
-                    iteration: 1,
-                    max: next.max,
                     target: ReworkTarget::Coder,
                     retry: next,
                 })),

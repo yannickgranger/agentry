@@ -158,14 +158,7 @@ fn verifier_failed_pushes_to_reworking_and_increments_retry() {
     )
     .expect("ok");
     match next {
-        BriefState::Reworking {
-            iteration,
-            max,
-            target,
-            retry,
-        } => {
-            assert_eq!(iteration, 1);
-            assert_eq!(max, 3);
+        BriefState::Reworking { target, retry } => {
             assert_eq!(target, ReworkTarget::Coder);
             assert_eq!(retry, RetryBudget { attempt: 2, max: 3 });
         }
@@ -189,7 +182,7 @@ fn reviewer_rework_increments_retry() {
     )
     .expect("ok");
     match next {
-        BriefState::Reworking { retry, target, .. } => {
+        BriefState::Reworking { retry, target } => {
             assert_eq!(retry, RetryBudget { attempt: 2, max: 3 });
             assert_eq!(target, ReworkTarget::Coder);
         }
@@ -224,8 +217,6 @@ fn reviewer_rejected_goes_to_failed() {
 fn reworking_coder_started_returns_to_authoring_with_same_retry() {
     let retry = RetryBudget { attempt: 2, max: 3 };
     let s = BriefState::Reworking {
-        iteration: 1,
-        max: 3,
         target: ReworkTarget::Coder,
         retry,
     };
@@ -378,8 +369,6 @@ fn abort_from_every_non_terminal_state_yields_failed_abort() {
             retry: fresh_retry(),
         },
         BriefState::Reworking {
-            iteration: 1,
-            max: 3,
             target: ReworkTarget::Coder,
             retry: fresh_retry(),
         },
@@ -723,8 +712,6 @@ fn brief_state_roundtrip_every_variant() {
             retry: fresh_retry(),
         },
         BriefState::Reworking {
-            iteration: 2,
-            max: 4,
             target: ReworkTarget::Reviewer,
             retry: RetryBudget { attempt: 2, max: 4 },
         },
