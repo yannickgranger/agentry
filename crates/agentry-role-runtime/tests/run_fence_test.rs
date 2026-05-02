@@ -276,6 +276,61 @@ fn callers_fence_silent_on_empty_rust_diff() {
     );
 }
 
+// ---------- fail-closed wiring (Y.5) ----------
+
+fn assert_single_ra_query_unavailable_blocker(v: &[orchestrator_types::ReviewFinding]) {
+    assert_eq!(
+        v.len(),
+        1,
+        "fail-closed must emit exactly ONE finding, got {v:?}"
+    );
+    assert_eq!(v[0].severity, Severity::Blocker);
+    match &v[0].origin {
+        FindingOrigin::Mechanical { tool, rule } => {
+            assert_eq!(tool, "ra-query");
+            assert_eq!(rule.as_deref(), Some("ra_query_unavailable"));
+        }
+        other => panic!("expected Mechanical origin, got {other:?}"),
+    }
+}
+
+/// Y.5 fail-closed: when `git diff origin/<base>...HEAD` fails (no `origin`
+/// remote configured), `run_fence` must return exactly ONE Blocker finding
+/// with `rule = ra_query_unavailable` — substrate failure suppresses any
+/// other findings.
+#[test]
+fn fail_closed_emits_single_blocker_when_git_diff_fails() {
+    let scratch = unique_tempdir("fc-git");
+    git(&scratch, &["init", "-b", "develop"]);
+    git(&scratch, &["config", "user.email", "test@example.com"]);
+    git(&scratch, &["config", "user.name", "Test"]);
+    std::fs::write(scratch.join("README"), "x").expect("write");
+    git(&scratch, &["add", "."]);
+    git(&scratch, &["commit", "-m", "init"]);
+
+    let v = run_fence(&scratch, "develop");
+    assert_single_ra_query_unavailable_blocker(&v);
+}
+
+/// Y.5 fail-closed: when `run_ra_query` fails for any reason (here: ra-query
+/// can't parse a bogus Rust file in the diff, OR ra-query isn't installed
+/// at all and the spawn errors), `run_fence` returns exactly ONE Blocker
+/// finding with `rule = ra_query_unavailable`. Both paths route through
+/// the same fail-closed branch.
+#[test]
+fn fail_closed_emits_single_blocker_when_ra_query_fails() {
+    let work = init_synthetic_repo("// base\n");
+    // Replace lib.rs with content ra-query cannot parse. If ra-query is
+    // installed, it exits non-zero (parse error). If it isn't installed,
+    // the spawn errors. Either way, run_ra_query returns Err and run_fence
+    // routes through the fail-closed branch.
+    std::fs::write(work.join("src/lib.rs"), "this is not valid rust @@ &&\n").expect("write");
+    git(&work, &["commit", "-am", "garbage"]);
+
+    let v = run_fence(&work, "develop");
+    assert_single_ra_query_unavailable_blocker(&v);
+}
+
 /// Regression for v3 reviewer blocker: a pure-body modification of an
 /// existing pub fn (3 pre-existing pub items kept, 0 added) must NEVER
 /// produce callers_zero blockers — even if pub-surface resolution fails
