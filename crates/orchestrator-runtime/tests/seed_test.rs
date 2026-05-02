@@ -498,3 +498,46 @@ fn agentry_self_host_v0_topology_has_all_three_ac_verifiers_wired_in_parallel() 
         "each ac-verifier variant must signal both reviewers (3 verifiers × 2 reviewers = 6)"
     );
 }
+
+/// Brief 137b: ci-watcher chain-triggers `pr-rebaser-agentry` on a fresh
+/// brief targeting topology `agentry-pr-rebaser-v0`. Mirror of the topology
+/// block in seed_m0 — keep in sync. The brief carries `target_repo`,
+/// `pr_number`, `branch`, `base_branch`, `forge_host` in its payload; the
+/// rebaser is the sole and terminal role.
+#[test]
+fn agentry_pr_rebaser_v0_topology_has_pr_rebaser_as_sole_terminal_role() {
+    let pr_rebaser_ref = RoleRef {
+        name: RoleName("pr-rebaser-agentry".into()),
+        version: 1,
+    };
+    let topology = TeamTopology {
+        name: TeamName("agentry-pr-rebaser-v0".into()),
+        version: 1,
+        roles: vec![pr_rebaser_ref.clone()],
+        message_graph: Vec::<MessageEdge>::new(),
+        terminal_role: pr_rebaser_ref.clone(),
+        max_retries: 0,
+    };
+
+    assert_eq!(
+        topology.roles.len(),
+        1,
+        "agentry-pr-rebaser-v0 must contain exactly one role"
+    );
+    assert!(
+        topology.roles.contains(&pr_rebaser_ref),
+        "pr-rebaser-agentry must be in roles"
+    );
+    assert_eq!(
+        topology.terminal_role, pr_rebaser_ref,
+        "pr-rebaser-agentry must be the terminal role"
+    );
+    assert!(
+        topology.message_graph.is_empty(),
+        "single-role rebaser team has no internal edges"
+    );
+    assert_eq!(
+        topology.max_retries, 0,
+        "rebaser is run-once: rebase conflicts surface as findings, not rework loops"
+    );
+}

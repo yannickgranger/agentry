@@ -516,15 +516,25 @@ emit_done "shipped"
 /// Ci-watcher role for the `agentry-self-host-v0` team. Reads the shipper's
 /// Message payload from `TeamContext.messages` (pr_number + head_sha), polls
 /// the forge's commit-status endpoint every 15s, merges the PR on CI green,
-/// emits Failed with CI context on CI red.
+/// emits Failed with CI context on CI red. Brief 137b adds a parallel
+/// mergeable poll (`/pulls/<num>`): when `mergeable: false` (develop advanced
+/// past the PR's base) the loop chain-triggers a `pr-rebaser-agentry` brief
+/// and exits — the rebaser force-pushes the rebased branch on a separate
+/// brief instance.
 const CI_WATCHER_AGENTRY_SCRIPT: &str = r##"#!/usr/bin/env bash
 set -euo pipefail
 bundle="$(cat)"
 
+brief_id=$(jq -r '.brief.id' <<<"$bundle")
 target_repo=$(jq -r '.brief.payload.target_repo // "yg/agentry"' <<<"$bundle")
 forge_host=$(jq -r '.brief.payload.forge_host // "agency.lab:3000"' <<<"$bundle")
 owner="${target_repo%%/*}"
 repo_name="${target_repo##*/}"
+
+# Host workspace path mirrors workspace::DEFAULT_ROOT in the runtime; the
+# daemon's chain-trigger reads brief JSON files off-container, so paths
+# emitted in next_brief_refs MUST be absolute host paths.
+host_workspace="/var/mnt/workspaces/agentry-work/briefs/${brief_id}"
 
 # Pull pr_number + head_sha from the shipper's routed message. message_graph
 # puts the shipper's payload in TeamContext.messages where from=shipper-agentry.
@@ -555,8 +565,85 @@ fi
 # wall-clock budget from permit.max_wall_seconds is the authoritative cap;
 # this loop gives up earlier only if the budget is small.
 max_polls=120
+pr_url_api="https://${forge_host}/api/v1/repos/${owner}/${repo_name}/pulls/${pr_number}"
 status_url="https://${forge_host}/api/v1/repos/${owner}/${repo_name}/commits/${head_sha}/status"
 for i in $(seq 1 "$max_polls"); do
+    # Mergeable check (Brief 137b). The forge populates `mergeable`
+    # asynchronously after PR creation — `null` means "still computing",
+    # `false` means develop moved under us. Only treat literal `false` as
+    # a chain-trigger signal; `null` falls through to the CI poll which
+    # gives gitea time to settle. `state == "closed"` means the PR was
+    # merged or closed externally — common after a rebase iteration where
+    # a new PR replaced this one.
+    pr_resp=$(curl -sS -k -H "Authorization: token ${GITEA_TOKEN}" "$pr_url_api" 2>/tmp/pr.err) || {
+        err=$(tail -5 /tmp/pr.err)
+        emit_event "$(jq -nc --arg err "$err" '{error:"pr GET failed",detail:$err}')"
+        sleep 15; continue
+    }
+    pr_mergeable=$(jq -r '.mergeable // "unknown"' <<<"$pr_resp")
+    pr_state=$(jq -r '.state // "open"' <<<"$pr_resp")
+    pr_branch=$(jq -r '.head.ref // ""' <<<"$pr_resp")
+    pr_base=$(jq -r '.base.ref // "develop"' <<<"$pr_resp")
+
+    if [ "$pr_state" = "closed" ]; then
+        # Already merged or closed externally — common after a rebase
+        # iteration replaced this PR. Treat as success-equivalent for this
+        # brief instance; the new PR (if any) has its own ci-watcher.
+        emit_event "$(jq -nc --argjson n "$pr_number" '{msg:"pr closed externally",pr_number:$n}')"
+        emit_done "shipped"; exit 0
+    fi
+
+    if [ "$pr_mergeable" = "false" ]; then
+        # Develop moved under us — chain-trigger pr-rebaser-agentry on a
+        # fresh brief and end this ci-watcher. The rebaser force-pushes
+        # the rebased branch (or surfaces conflicts as findings); the
+        # forge re-runs CI on the new head, which is observed by a
+        # subsequent ci-watcher dispatch.
+        if [ -z "$pr_branch" ]; then
+            emit_event '{"error":"pr_resp missing .head.ref — cannot chain-trigger rebaser without branch"}'
+            emit_done "failed"; exit 0
+        fi
+        rebaser_brief_id="brf_rebaser_${brief_id}_pr${pr_number}"
+        rebaser_path="/workspace/pr_rebaser_brief.json"
+        submitted_at=$(date -Iseconds)
+        jq -nc \
+            --arg id "$rebaser_brief_id" \
+            --arg target_repo "$target_repo" \
+            --argjson pr_number "$pr_number" \
+            --arg branch "$pr_branch" \
+            --arg base_branch "$pr_base" \
+            --arg forge_host "$forge_host" \
+            --arg parent "$brief_id" \
+            --arg submitted_by "ci-watcher-agentry-${brief_id}" \
+            --arg submitted_at "$submitted_at" \
+            '{
+                id: $id,
+                project: null,
+                topology: { name: "agentry-pr-rebaser-v0", version: 1 },
+                payload: {
+                    target_repo: $target_repo,
+                    pr_number: $pr_number,
+                    branch: $branch,
+                    base_branch: $base_branch,
+                    forge_host: $forge_host
+                },
+                budget: { max_wall_seconds: 600 },
+                escalation: "autonomous",
+                parent_brief: $parent,
+                submitted_by: $submitted_by,
+                submitted_at: $submitted_at
+            }' > "$rebaser_path"
+        host_path="${host_workspace}/pr_rebaser_brief.json"
+        emit_event "$(jq -nc --argjson n "$pr_number" --arg b "$pr_branch" --arg base "$pr_base" --arg p "$host_path" \
+            '{msg:"pr not mergeable — chain-triggering pr-rebaser-agentry",pr_number:$n,branch:$b,base_branch:$base,next_brief_ref:$p}')"
+        # Sentinel target `_chain_trigger`: there is no role by that name on
+        # the topology — the daemon's chain-trigger scans every accumulated
+        # outbox payload for next_brief_refs regardless of `to`, so this
+        # message carries the dispatch list without targeting any sibling.
+        emit_message "_chain_trigger" "$(jq -nc --arg p "$host_path" '{next_brief_refs:[$p]}')"
+        emit_done "shipped"; exit 0
+    fi
+
     resp=$(curl -sS -k -H "Authorization: token ${GITEA_TOKEN}" "$status_url" 2>/tmp/ci.err) || {
         err=$(tail -5 /tmp/ci.err)
         emit_event "$(jq -nc --arg err "$err" '{error:"status GET failed",detail:$err}')"
@@ -2359,27 +2446,47 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         package_manager: PackageManager::Apk,
         entrypoint_script: format!("{BASH_PRELUDE}{CI_WATCHER_AGENTRY_SCRIPT}"),
         exitpoint_script: None,
-        binaries: vec!["curl".into(), "ca-certificates".into()],
+        binaries: vec!["curl".into(), "jq".into(), "ca-certificates".into()],
         mcp_servers: vec![],
         tool_allowlist: ToolAllowlist(vec![]),
         allowed_tools: None,
         permit_scope: PermitScope(vec![
+            "fs:write:/workspace/**".into(),
             "net:allow:agency.lab".into(),
             "forge:write:yg/agentry".into(),
         ]),
         passthru_env: vec!["GITEA_TOKEN".into()],
         extra_bootstrap: vec![],
         mounts: vec![],
-        // ci-watcher doesn't need the repo — all inputs come via the
-        // shipper's routed Message payload. Skipping workspace_mount means
-        // this role doesn't extend workspace lifetime beyond shipper.
-        workspace_mount: None,
+        // Brief 137b: ci-watcher writes /workspace/pr_rebaser_brief.json
+        // when chain-triggering pr-rebaser-agentry on a `mergeable: false`
+        // PR; the daemon's chain-trigger reads that file off-host once
+        // ci-watcher ships, so the workspace mount must be writable.
+        workspace_mount: Some(WorkspaceMount {
+            container_path: "/workspace".into(),
+            readonly: false,
+        }),
         sccache: false,
     };
-    // pr-rebaser-agentry — substrate auto-rebaser (#137). Registered here
-    // but not yet wired into any topology; brief 137b will extend ci-watcher
-    // to chain-trigger this role when a PR's mergeable flag flips false.
+    // pr-rebaser-agentry — substrate auto-rebaser (#137). Brief 137b wires
+    // ci-watcher to chain-trigger a brief on this single-role topology when
+    // a PR's `mergeable` flag flips false; the rebaser force-pushes the
+    // rebased branch (or surfaces conflicts as findings).
     let pr_rebaser_agentry = build_pr_rebaser_agentry_role(&home);
+    let agentry_pr_rebaser_v0 = TeamTopology {
+        name: TeamName("agentry-pr-rebaser-v0".into()),
+        version: 1,
+        roles: vec![RoleRef {
+            name: pr_rebaser_agentry.name.clone(),
+            version: pr_rebaser_agentry.version,
+        }],
+        message_graph: Vec::<MessageEdge>::new(),
+        terminal_role: RoleRef {
+            name: pr_rebaser_agentry.name.clone(),
+            version: pr_rebaser_agentry.version,
+        },
+        max_retries: 0,
+    };
     // ---- agentry-null-v0 team (shake-down for role-introduction pipeline) ----
     // null-agent emits one event then `done shipped`. Zero work — exercises
     // the reviewer-claude Role-spec audit clause, permit broker, and spawner
@@ -2881,6 +2988,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
     redis_io::save_role(&mut conn, &shipper_agentry).await?;
     redis_io::save_role(&mut conn, &ci_watcher_agentry).await?;
     redis_io::save_role(&mut conn, &pr_rebaser_agentry).await?;
+    redis_io::save_team(&mut conn, &agentry_pr_rebaser_v0).await?;
     redis_io::save_team(&mut conn, &agentry_self_host_v0).await?;
     redis_io::save_team(&mut conn, &agentry_bugfix_v0).await?;
     redis_io::save_team(&mut conn, &agentry_spec_edit_v0).await?;
@@ -2911,7 +3019,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
     }
 
     tracing::info!(
-        "seeded: roles [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker, listener, grok-echo, claude-echo, synthesizer, narrowed-coder, shipper, coder-claude-agentry, ac-verifier-claude-agentry, ac-verifier-gemini-agentry, ac-verifier-grok-agentry, reviewer-mechanical-agentry, shipper-agentry, ci-watcher-agentry, pr-rebaser-agentry, reviewer-claude-agentry, auditor-claude-agentry, null-agent-agentry, archaeologist-claude-agentry, planner-claude-agentry, verifier-claude-agentry] (inline entrypoint scripts); teams [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker-listener, grok-echo, claude-echo, narrowed-team, shipper-solo-team, agentry-self-host-v0, agentry-self-audit-v0, agentry-null-v0, agentry-discovery-v0, agentry-planner-v0, agentry-verify-v0]"
+        "seeded: roles [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker, listener, grok-echo, claude-echo, synthesizer, narrowed-coder, shipper, coder-claude-agentry, ac-verifier-claude-agentry, ac-verifier-gemini-agentry, ac-verifier-grok-agentry, reviewer-mechanical-agentry, shipper-agentry, ci-watcher-agentry, pr-rebaser-agentry, reviewer-claude-agentry, auditor-claude-agentry, null-agent-agentry, archaeologist-claude-agentry, planner-claude-agentry, verifier-claude-agentry] (inline entrypoint scripts); teams [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker-listener, grok-echo, claude-echo, narrowed-team, shipper-solo-team, agentry-self-host-v0, agentry-pr-rebaser-v0, agentry-self-audit-v0, agentry-null-v0, agentry-discovery-v0, agentry-planner-v0, agentry-verify-v0]"
     );
     Ok(())
 }
