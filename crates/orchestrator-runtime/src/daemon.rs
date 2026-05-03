@@ -115,6 +115,7 @@ pub async fn run(
                 let signing_clone = signing_key.clone();
                 let verifying_clone = verifying_key.clone();
                 let spawner_clone = spawner.clone();
+                let cfg_clone = cfg.clone();
                 let brief_id = brief.id.clone();
                 let slug = brief.project.as_deref().unwrap_or("_global").to_string();
                 let cap: u32 = if let Some(s) = brief.project.as_deref() {
@@ -169,6 +170,7 @@ pub async fn run(
                         &mut conn_for_brief,
                         &spawner_clone,
                         &brief,
+                        &cfg_clone,
                         &signing_clone,
                         &verifying_clone,
                     )
@@ -254,6 +256,7 @@ async fn handle_brief(
     conn: &mut ConnectionManager,
     spawner: &impl Spawner,
     brief: &Brief,
+    cfg: &crate::Config,
     signing_key: &SigningKey,
     verifying_key: &VerifyingKey,
 ) -> Result<VerdictKind> {
@@ -336,7 +339,7 @@ async fn handle_brief(
             let role = redis_io::fetch_role(conn, &role_ref.name, role_ref.version).await?;
 
             if role.workspace_mount.is_some() && workspace.is_none() {
-                let repo = resolve_repo_for_brief(brief, conn).await?;
+                let repo = resolve_repo_for_brief(brief, conn, cfg).await?;
                 let ws = workspace::allocate(
                     &brief.id,
                     repo.as_ref().map(|(u, b)| (u.as_str(), b.as_str())),
@@ -1142,6 +1145,7 @@ fn mint_permit(brief: &Brief, role: &AgentRole) -> Result<WorkPermit> {
 async fn resolve_repo_for_brief(
     brief: &Brief,
     conn: &mut ConnectionManager,
+    cfg: &crate::Config,
 ) -> Result<Option<(String, String)>> {
     if let Some(slug) = brief.project.as_deref() {
         match redis_io::fetch_project(conn, slug).await {
@@ -1167,12 +1171,18 @@ async fn resolve_repo_for_brief(
         .get("base_branch")
         .and_then(|v| v.as_str())
         .map(str::to_string);
-    let forge_host = brief
-        .payload
-        .get("forge_host")
-        .and_then(|v| v.as_str())
-        .unwrap_or("agency.lab:3000")
-        .to_string();
+    let forge_host = match brief.payload.get("forge_host").and_then(|v| v.as_str()) {
+        Some(h) => h.to_string(),
+        None => match cfg.forge.default_host.as_deref() {
+            Some(h) => h.to_string(),
+            None => {
+                return Err(Error::Config(
+                    "forge_host required: set brief.payload.forge_host or [forge] default_host in agentry.toml"
+                        .into(),
+                ));
+            }
+        },
+    };
 
     if let (Some(repo), Some(branch)) = (target_repo, base_branch) {
         let url = forge_url(&repo, &forge_host)?;
