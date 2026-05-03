@@ -513,222 +513,6 @@ emit_message "ci-watcher-agentry" "$(jq -nc \
 emit_done "shipped"
 "##;
 
-/// Ci-watcher role for the `agentry-self-host-v0` team. Reads the shipper's
-/// Message payload from `TeamContext.messages` (pr_number + head_sha), polls
-/// the forge's commit-status endpoint every 15s, merges the PR on CI green,
-/// emits Failed with CI context on CI red. Brief 137b adds a parallel
-/// mergeable poll (`/pulls/<num>`): when `mergeable: false` (develop advanced
-/// past the PR's base) the loop chain-triggers a `pr-rebaser-agentry` brief
-/// and exits — the rebaser force-pushes the rebased branch on a separate
-/// brief instance.
-const CI_WATCHER_AGENTRY_SCRIPT: &str = r##"#!/usr/bin/env bash
-set -euo pipefail
-bundle="$(cat)"
-
-brief_id=$(jq -r '.brief.id' <<<"$bundle")
-target_repo=$(jq -r '.brief.payload.target_repo // "yg/agentry"' <<<"$bundle")
-forge_host=$(jq -r '.brief.payload.forge_host // "agency.lab:3000"' <<<"$bundle")
-owner="${target_repo%%/*}"
-repo_name="${target_repo##*/}"
-
-# Host workspace path mirrors workspace::DEFAULT_ROOT in the runtime; the
-# daemon's chain-trigger reads brief JSON files off-container, so paths
-# emitted in next_brief_refs MUST be absolute host paths.
-host_workspace="/var/mnt/workspaces/agentry-work/briefs/${brief_id}"
-
-# Pull pr_number + head_sha from the shipper's routed message. message_graph
-# puts the shipper's payload in TeamContext.messages where from=shipper-agentry.
-msg=$(jq -c '[.team_context.messages[] | select(.from=="shipper-agentry")] | last // empty' <<<"$bundle")
-if [ -z "$msg" ] || [ "$msg" = "null" ]; then
-    emit_event '{"error":"no shipper-agentry message in team_context — cannot locate PR to watch"}'
-    emit_done "failed"; exit 0
-fi
-
-pr_number=$(jq -r '.payload.pr_number' <<<"$msg")
-head_sha=$(jq -r '.payload.head_sha' <<<"$msg")
-pr_url=$(jq -r '.payload.pr_url' <<<"$msg")
-
-if [ -z "$pr_number" ] || [ "$pr_number" = "null" ] || [ -z "$head_sha" ] || [ "$head_sha" = "null" ]; then
-    emit_event "$(jq -nc --arg m "$msg" '{error:"shipper message missing pr_number or head_sha",detail:$m}')"
-    emit_done "failed"; exit 0
-fi
-
-emit_event "$(jq -nc --argjson n "$pr_number" --arg s "$head_sha" --arg u "$pr_url" \
-    '{msg:"ci-watcher starting",pr_number:$n,head_sha:$s,pr_url:$u}')"
-
-if [ -z "${GITEA_TOKEN:-}" ]; then
-    emit_event '{"error":"GITEA_TOKEN not in env"}'
-    emit_done "failed"; exit 0
-fi
-
-# Poll the combined status. Max 120 iterations × 15s = 30 min. The daemon's
-# wall-clock budget from permit.max_wall_seconds is the authoritative cap;
-# this loop gives up earlier only if the budget is small.
-max_polls=120
-pr_url_api="https://${forge_host}/api/v1/repos/${owner}/${repo_name}/pulls/${pr_number}"
-status_url="https://${forge_host}/api/v1/repos/${owner}/${repo_name}/commits/${head_sha}/status"
-for i in $(seq 1 "$max_polls"); do
-    # Mergeable check (Brief 137b). The forge populates `mergeable`
-    # asynchronously after PR creation — `null` means "still computing",
-    # `false` means develop moved under us. Only treat literal `false` as
-    # a chain-trigger signal; `null` falls through to the CI poll which
-    # gives gitea time to settle. `state == "closed"` means the PR was
-    # merged or closed externally — common after a rebase iteration where
-    # a new PR replaced this one.
-    pr_resp=$(curl -sS -k -H "Authorization: token ${GITEA_TOKEN}" "$pr_url_api" 2>/tmp/pr.err) || {
-        err=$(tail -5 /tmp/pr.err)
-        emit_event "$(jq -nc --arg err "$err" '{error:"pr GET failed",detail:$err}')"
-        sleep 15; continue
-    }
-    pr_mergeable=$(jq -r '.mergeable // "unknown"' <<<"$pr_resp")
-    pr_state=$(jq -r '.state // "open"' <<<"$pr_resp")
-    pr_branch=$(jq -r '.head.ref // ""' <<<"$pr_resp")
-    pr_base=$(jq -r '.base.ref // "develop"' <<<"$pr_resp")
-
-    if [ "$pr_state" = "closed" ]; then
-        # Already merged or closed externally — common after a rebase
-        # iteration replaced this PR. Treat as success-equivalent for this
-        # brief instance; the new PR (if any) has its own ci-watcher.
-        emit_event "$(jq -nc --argjson n "$pr_number" '{msg:"pr closed externally",pr_number:$n}')"
-        emit_done "shipped"; exit 0
-    fi
-
-    if [ "$pr_mergeable" = "false" ]; then
-        # Develop moved under us — chain-trigger pr-rebaser-agentry on a
-        # fresh brief and end this ci-watcher. The rebaser force-pushes
-        # the rebased branch (or surfaces conflicts as findings); the
-        # forge re-runs CI on the new head, which is observed by a
-        # subsequent ci-watcher dispatch.
-        if [ -z "$pr_branch" ]; then
-            emit_event '{"error":"pr_resp missing .head.ref — cannot chain-trigger rebaser without branch"}'
-            emit_done "failed"; exit 0
-        fi
-        rebaser_brief_id="brf_rebaser_${brief_id}_pr${pr_number}"
-        rebaser_path="/workspace/pr_rebaser_brief.json"
-        submitted_at=$(date -Iseconds)
-        jq -nc \
-            --arg id "$rebaser_brief_id" \
-            --arg target_repo "$target_repo" \
-            --argjson pr_number "$pr_number" \
-            --arg branch "$pr_branch" \
-            --arg base_branch "$pr_base" \
-            --arg forge_host "$forge_host" \
-            --arg parent "$brief_id" \
-            --arg submitted_by "ci-watcher-agentry-${brief_id}" \
-            --arg submitted_at "$submitted_at" \
-            '{
-                id: $id,
-                project: null,
-                topology: { name: "agentry-pr-rebaser-v0", version: 1 },
-                payload: {
-                    target_repo: $target_repo,
-                    pr_number: $pr_number,
-                    branch: $branch,
-                    base_branch: $base_branch,
-                    forge_host: $forge_host
-                },
-                budget: { max_wall_seconds: 600 },
-                escalation: "autonomous",
-                parent_brief: $parent,
-                submitted_by: $submitted_by,
-                submitted_at: $submitted_at
-            }' > "$rebaser_path"
-        host_path="${host_workspace}/pr_rebaser_brief.json"
-        emit_event "$(jq -nc --argjson n "$pr_number" --arg b "$pr_branch" --arg base "$pr_base" --arg p "$host_path" \
-            '{msg:"pr not mergeable — chain-triggering pr-rebaser-agentry",pr_number:$n,branch:$b,base_branch:$base,next_brief_ref:$p}')"
-        # Sentinel target `_chain_trigger`: there is no role by that name on
-        # the topology — the daemon's chain-trigger scans every accumulated
-        # outbox payload for next_brief_refs regardless of `to`, so this
-        # message carries the dispatch list without targeting any sibling.
-        emit_message "_chain_trigger" "$(jq -nc --arg p "$host_path" '{next_brief_refs:[$p]}')"
-        emit_done "shipped"; exit 0
-    fi
-
-    resp=$(curl -sS -k -H "Authorization: token ${GITEA_TOKEN}" "$status_url" 2>/tmp/ci.err) || {
-        err=$(tail -5 /tmp/ci.err)
-        emit_event "$(jq -nc --arg err "$err" '{error:"status GET failed",detail:$err}')"
-        sleep 15; continue
-    }
-    state=$(jq -r '.state // "unknown"' <<<"$resp")
-    emit_event "$(jq -nc --arg s "$state" --argjson i "$i" \
-        '{msg:"polling CI",state:$s,iteration:$i}')"
-    case "$state" in
-        success)
-            # Merge with retry on transient 405/409. When N parallel children
-            # all turn CI-green within the same second, the forge serialises
-            # merges: only the first lands cleanly. The losers see 405
-            # ("Please try again later" — rate-limit / mergeability still
-            # recomputing) or 409 ("refusing to merge unrelated histories" —
-            # ref moved under us). Both clear once the leader's merge lands;
-            # retry with backoff + jitter unblocks the squad. Other codes
-            # (401, 422, ...) are non-transient — fail fast to preserve
-            # diagnostics.
-            merge_body='{"Do":"merge"}'
-            merge_max_retries=6
-            merge_attempt=0
-            merge_http_code=""
-            merge_detail=""
-            while [ "$merge_attempt" -lt "$merge_max_retries" ]; do
-                merge_attempt=$((merge_attempt + 1))
-                merge_http_code=$(curl -sS -k -X POST \
-                    "https://${forge_host}/api/v1/repos/${owner}/${repo_name}/pulls/${pr_number}/merge" \
-                    -H "Authorization: token ${GITEA_TOKEN}" \
-                    -H "Content-Type: application/json" \
-                    -d "$merge_body" \
-                    -o /tmp/merge.body -w '%{http_code}')
-                merge_detail=$(cat /tmp/merge.body 2>/dev/null || echo "")
-                if [ "$merge_http_code" = "200" ] || [ "$merge_http_code" = "204" ]; then
-                    emit_event "$(jq -nc --argjson n "$pr_number" --arg u "$pr_url" --argjson a "$merge_attempt" \
-                        '{msg:"merged",pr_number:$n,pr_url:$u,merge_attempt:$a}')"
-                    emit_done "shipped"; exit 0
-                fi
-                if [ "$merge_http_code" = "405" ] || [ "$merge_http_code" = "409" ]; then
-                    if [ "$merge_attempt" -lt "$merge_max_retries" ]; then
-                        merge_backoff=$((10 * merge_attempt))
-                        if [ "$merge_backoff" -gt 60 ]; then
-                            merge_backoff=60
-                        fi
-                        merge_jitter=$((RANDOM % 10))
-                        merge_sleep=$((merge_backoff + merge_jitter))
-                        emit_event "$(jq -nc --arg code "$merge_http_code" --arg d "$merge_detail" --argjson a "$merge_attempt" --argjson s "$merge_sleep" \
-                            '{msg:"merge transient failure — retrying",http_code:$code,detail:$d,merge_attempt:$a,sleep_seconds:$s}')"
-                        sleep "$merge_sleep"
-                        continue
-                    fi
-                    # transient but budget exhausted — falls through to post-loop branch
-                    break
-                fi
-                # Non-transient: fail immediately, preserves diagnostics.
-                emit_event "$(jq -nc --arg code "$merge_http_code" --arg d "$merge_detail" --argjson a "$merge_attempt" \
-                    '{error:"merge API call failed (non-transient)",http_code:$code,detail:$d,merge_attempt:$a}')"
-                emit_done "failed"; exit 0
-            done
-            emit_event "$(jq -nc --arg code "$merge_http_code" --arg d "$merge_detail" --argjson a "$merge_attempt" --argjson m "$merge_max_retries" \
-                '{error:"merge retry budget exhausted (transient)",http_code:$code,detail:$d,merge_attempt:$a,merge_max_retries:$m}')"
-            emit_done "failed"; exit 0
-            ;;
-        failure|error)
-            # Pull the first failing context for reason.
-            ctx=$(jq -r '[.statuses[]? | select(.state=="failure" or .state=="error") | .context] | .[0] // "(no context)"' <<<"$resp")
-            emit_event "$(jq -nc --arg s "$state" --arg ctx "$ctx" \
-                '{msg:"CI red — emitting rework_needed for coder loop-back",state:$s,failing_context:$ctx}')"
-            emit_finding "blocker" "ci-watcher" "ci" "CI red on $ctx"
-            emit_done "rework_needed"; exit 0
-            ;;
-        pending|unknown|"")
-            sleep 15
-            ;;
-        *)
-            emit_event "$(jq -nc --arg s "$state" '{error:"unexpected CI state",state:$s}')"
-            emit_done "failed"; exit 0
-            ;;
-    esac
-done
-
-emit_event '{"error":"CI poll exhausted 30min without success — giving up"}'
-emit_done "failed"
-"##;
-
 /// Bash entrypoint for `pr-rebaser-agentry`. Substrate auto-rebaser (#137):
 /// fetches the PR's base + head branches, attempts `git rebase
 /// origin/<base>`, and either force-pushes the rebased branch or surfaces
@@ -2143,17 +1927,25 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         }),
         sccache: false,
     };
+    // EPIC #161 Wave 2: bash heredoc CI_WATCHER_AGENTRY_SCRIPT ported to a
+    // Rust runner at crates/agentry-role-runtime/src/bin/ci_watcher_runner.rs.
+    // The role bind-mounts the host-built binary at
+    // /usr/local/bin/ci-watcher-runner (operator runs `just
+    // ci-watcher-runner-binary`) and execs it directly. Image switched from
+    // alpine to debian:bookworm-slim per #320 v1 reviewer Warn — the runtime
+    // role no longer cargo-installs anything (it just polls a forge API), so
+    // the rust:1.93 / alpine cargo toolchain is overkill.
     let ci_watcher_agentry = AgentRole {
         name: RoleName("ci-watcher-agentry".into()),
         version: 1,
         model: None,
         system_prompt: None,
-        image: ALPINE.into(),
+        image: "docker.io/library/debian:bookworm-slim".into(),
         substrate_class: SubstrateClass::Podman,
-        package_manager: PackageManager::Apk,
-        entrypoint_script: format!("{BASH_PRELUDE}{CI_WATCHER_AGENTRY_SCRIPT}"),
+        package_manager: PackageManager::Apt,
+        entrypoint_script: "#!/bin/sh\nexec /usr/local/bin/ci-watcher-runner\n".into(),
         exitpoint_script: None,
-        binaries: vec!["curl".into(), "jq".into(), "ca-certificates".into()],
+        binaries: vec!["curl".into(), "ca-certificates".into()],
         mcp_servers: vec![],
         tool_allowlist: ToolAllowlist(vec![]),
         allowed_tools: None,
@@ -2164,7 +1956,11 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         ]),
         passthru_env: vec!["GITEA_TOKEN".into()],
         extra_bootstrap: vec![],
-        mounts: vec![],
+        mounts: vec![Mount {
+            source: format!("{home}/.local/bin/ci-watcher-runner"),
+            target: "/usr/local/bin/ci-watcher-runner".into(),
+            readonly: true,
+        }],
         // Brief 137b: ci-watcher writes /workspace/pr_rebaser_brief.json
         // when chain-triggering pr-rebaser-agentry on a `mergeable: false`
         // PR; the daemon's chain-trigger reads that file off-host once

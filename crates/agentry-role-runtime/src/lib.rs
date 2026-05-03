@@ -24,6 +24,7 @@
 //! ```
 
 pub mod archaeologist;
+pub mod ci_watcher_runner;
 pub mod claude;
 pub use claude::{stream_claude, StreamErr};
 
