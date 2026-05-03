@@ -103,6 +103,14 @@ pub async fn run(
             Ok(Some((sid, brief))) => {
                 last_id = sid;
                 tracing::info!(brief = %brief.id, "received brief");
+                // Defensive backfill of agentry:brief:<id>:body so the
+                // dashboard's SMEMBERS+MGET render path doesn't depend
+                // on intake going through `submit_brief` (raw XADD,
+                // operator tooling, replay/recovery all bypass it).
+                // Idempotent overwrite of submit_brief's pre-write.
+                if let Err(e) = backfill_body_key(&mut conn, &brief).await {
+                    tracing::warn!(brief = %brief.id, error = %e, "body key backfill failed");
+                }
                 let conn_clone = conn.clone();
                 let signing_clone = signing_key.clone();
                 let verifying_clone = verifying_key.clone();
@@ -639,6 +647,35 @@ async fn finalize_shipped_team(
 // kind+reason via the pure `compose_verdict_parts`, emits one Verdict for the
 // meta-brief on `agentry:verdicts`, and deletes the four helper keys.
 // ---------------------------------------------------------------------------
+
+/// Write `agentry:brief:<id>:body <json>` for the given brief.
+///
+/// The dashboard's `active_briefs()` does SMEMBERS+MGET against this
+/// key, so its render path depends on the body key being present.
+/// `redis_io::submit_brief` writes it on the API path; this helper is
+/// the daemon-side defensive backfill called from the stream-intake
+/// loop so direct-XADD callers (operator tooling, captain scripts,
+/// replay/recovery) don't leave the dashboard reading 'No briefs in
+/// flight' while the daemon happily processes the brief.
+///
+/// Idempotent: SET overwrites whatever `submit_brief` wrote with the
+/// identical body. The SET error is swallowed and logged at WARN —
+/// the body key is render-side, not correctness-side, so a transient
+/// Redis hiccup must not abort intake. A serialization failure does
+/// propagate (it would indicate a Brief that can't round-trip JSON).
+///
+/// `pub` so the integration test in
+/// `tests/daemon_intake_body_backfill.rs` can drive it directly with
+/// a real Redis connection (matches the `compose_meta_verdict`
+/// pattern in `tests/daemon_test.rs`).
+pub async fn backfill_body_key(conn: &mut ConnectionManager, brief: &Brief) -> Result<()> {
+    let body_json = serde_json::to_string(brief)?;
+    let body_key = format!("agentry:brief:{}:body", brief.id.0);
+    if let Err(e) = conn.set::<_, _, ()>(&body_key, &body_json).await {
+        tracing::warn!(brief = %brief.id.0, error = %e, "failed to backfill body key");
+    }
+    Ok(())
+}
 
 const DOL_VERIFIER_TOPOLOGY: &str = "agentry-verify-v0";
 
