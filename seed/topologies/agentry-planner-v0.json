@@ -1,0 +1,33 @@
+{
+  "name": "agentry-planner-v0",
+  "version": 1,
+  "roles": [
+    {
+      "name": "archaeologist-claude-agentry",
+      "version": 1
+    },
+    {
+      "name": "planner-claude-agentry",
+      "version": 1
+    }
+  ],
+  "message_graph": [
+    {
+      "from": {
+        "name": "archaeologist-claude-agentry",
+        "version": 1
+      },
+      "to": {
+        "name": "planner-claude-agentry",
+        "version": 1
+      },
+      "permit_overrides_from": null,
+      "rework_target": null
+    }
+  ],
+  "terminal_role": {
+    "name": "planner-claude-agentry",
+    "version": 1
+  },
+  "max_retries": 0
+}
