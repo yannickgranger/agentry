@@ -788,14 +788,19 @@ async fn on_all_children_resolved(conn: &mut ConnectionManager, meta_id: &str) -
 /// Read children + verifier state from Redis, compose the meta-brief's final
 /// verdict, append it to `agentry:verdicts`, and clean up the helper keys.
 ///
-/// Idempotency: at the start, atomically claims
-/// `agentry:brief:<meta_id>:final_emitted` via `SET ... NX EX 86400`. If the
+/// Idempotency: atomically claims `agentry:meta_verdict:emitted:<meta_id>`
+/// via `SET ... NX EX 86400` immediately before the verdict XADD. If the
 /// marker is already set, returns early without emitting. This guards the
 /// concurrent path where multiple terminal-handlers (e.g. three children
-/// resolving in the same tick) all reach this function for the same meta —
-/// only the first arrival wins the SETNX and emits the meta verdict.
+/// resolving in the same tick) all reach this function for the same meta;
+/// it also guards stale re-entries that arrive AFTER the helper-key
+/// cleanup below, since the marker is intentionally not cleaned up — the
+/// 24h TTL is its retention.
+///
+/// `pub` so the integration test in `tests/daemon_test.rs` can drive the
+/// gate directly with a real Redis connection.
 #[tracing::instrument(skip(conn), fields(meta = %meta_id))]
-async fn compose_meta_verdict(conn: &mut ConnectionManager, meta_id: &str) -> Result<()> {
+pub async fn compose_meta_verdict(conn: &mut ConnectionManager, meta_id: &str) -> Result<()> {
     // Entry log makes the compose-call observable from production traces so
     // duplicate-compose incidents can be correlated with the caller's span
     // chain (#178). The `instrument` attribute carries `meta_id` through
@@ -806,23 +811,7 @@ async fn compose_meta_verdict(conn: &mut ConnectionManager, meta_id: &str) -> Re
     let pending_key = format!("agentry:brief:{meta_id}:children_pending");
     let verifier_pending_key = format!("agentry:brief:{meta_id}:verifier_pending");
     let verifier_verdict_key = format!("agentry:brief:{meta_id}:verifier_verdict");
-    let final_emitted_key = format!("agentry:brief:{meta_id}:final_emitted");
-
-    let acquired: bool = redis::cmd("SET")
-        .arg(&final_emitted_key)
-        .arg("1")
-        .arg("NX")
-        .arg("EX")
-        .arg(86400)
-        .query_async(conn)
-        .await?;
-    if !acquired {
-        tracing::info!(
-            meta = %meta_id,
-            "DOL: meta verdict already emitted (idempotency gate); skipping"
-        );
-        return Ok(());
-    }
+    let xadd_emitted_key = format!("agentry:meta_verdict:emitted:{meta_id}");
 
     let raw_children: Vec<String> = conn.lrange(&verdicts_key, 0, -1).await?;
     let children: Vec<Verdict> = raw_children
@@ -838,6 +827,28 @@ async fn compose_meta_verdict(conn: &mut ConnectionManager, meta_id: &str) -> Re
     let (final_kind, reason) = compose_verdict_parts(&children, verifier.as_ref());
     let mut final_verdict = Verdict::new(BriefId(meta_id.into()), final_kind.clone());
     final_verdict.reason = reason;
+
+    // Atomic claim immediately before the XADD: only the first arrival
+    // for a given meta_id wins SET NX and emits the verdict. The marker
+    // is NOT deleted in the cleanup block below — its 24h TTL is the
+    // retention. Concurrent terminal callbacks have been observed
+    // re-entering this function (A7v3 reproducer); 'composer is called
+    // once' is not a safe argument.
+    let claimed: bool = redis::cmd("SET")
+        .arg(&xadd_emitted_key)
+        .arg("1")
+        .arg("NX")
+        .arg("EX")
+        .arg(86400)
+        .query_async(conn)
+        .await?;
+    if !claimed {
+        tracing::info!(
+            meta = %meta_id,
+            "DOL: meta verdict XADD already emitted (idempotency gate); skipping"
+        );
+        return Ok(());
+    }
     let stream_id = redis_io::append_verdict(conn, &final_verdict).await?;
     tracing::info!(
         brief = %final_verdict.brief.0,
@@ -850,7 +861,6 @@ async fn compose_meta_verdict(conn: &mut ConnectionManager, meta_id: &str) -> Re
     let _: () = conn.del(&pending_key).await?;
     let _: () = conn.del(&verifier_pending_key).await?;
     let _: () = conn.del(&verifier_verdict_key).await?;
-    let _: () = conn.del(&final_emitted_key).await?;
 
     tracing::info!(
         meta = %meta_id,
