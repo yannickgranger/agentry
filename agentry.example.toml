@@ -29,3 +29,14 @@ key_path = "/home/YOU/.config/agentry/signing.key"
 # to construct a https://oauth2:${GITEA_TOKEN}@<host>/<owner>/<repo>.git URL.
 # Required for brief dispatch unless every brief sets forge_host explicitly.
 # default_host = "agency.lab:3000"
+# Bare forge owner names this team is allowed to push to / open PRs on.
+# seed.rs expands each entry to a `forge:write:<owner>/*` permit on the
+# shipper / pr-rebaser roles. Empty list rejects all forge writes.
+# allowed_owners = ["yg"]
+
+[sccache]
+# Network alias or DNS name (with optional ":port") of the shared
+# sccache-redis backend. seed.rs strips any port and expands this to a
+# `net:allow:<host>` permit on roles that compile Rust, plus flips
+# their `sccache: true` flag. Unset = roles run without sccache.
+# endpoint = "agentry-sccache-redis:6379"

@@ -8,8 +8,9 @@ every other context; it consumes none.
 
 ## Config
 
-The root configuration record: Redis, dashboard, signing, webhook, forge
-sections. Loaded at binary startup; held immutably for the process lifetime.
+The root configuration record: Redis, dashboard, signing, webhook, forge,
+sccache sections. Loaded at binary startup; held immutably for the process
+lifetime.
 
 ## RedisConfig
 
@@ -39,4 +40,15 @@ Forge defaults applied when a brief's payload does not carry its own
 it is combined with the brief's `target_repo` to construct the token-bearing
 clone URL. When neither the payload nor this default is set, brief dispatch
 fails with a clear configuration error rather than falling back to a
-hardcoded literal.
+hardcoded literal. The `allowed_owners` field lists bare forge owner names
+this team may push to / open PRs on; the seed context expands each to a
+`forge:write:<owner>/*` permit on roles that touch the forge. Empty list
+rejects all forge writes.
+
+## SccacheConfig
+
+Optional shared sccache backend used by roles that compile Rust. The
+`endpoint` field is the network alias or DNS name of the sccache-redis
+container, with optional `:port` suffix; the seed context strips any port
+and expands it to a `net:allow:<host>` permit, plus enables the role's
+`sccache` flag. Unset means roles run without sccache.
