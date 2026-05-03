@@ -1,0 +1,16 @@
+{
+  "name": "agentry-discovery-v0",
+  "version": 1,
+  "roles": [
+    {
+      "name": "archaeologist-claude-agentry",
+      "version": 1
+    }
+  ],
+  "message_graph": [],
+  "terminal_role": {
+    "name": "archaeologist-claude-agentry",
+    "version": 1
+  },
+  "max_retries": 0
+}
