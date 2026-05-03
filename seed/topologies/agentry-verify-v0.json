@@ -1,0 +1,16 @@
+{
+  "name": "agentry-verify-v0",
+  "version": 1,
+  "roles": [
+    {
+      "name": "verifier-claude-agentry",
+      "version": 1
+    }
+  ],
+  "message_graph": [],
+  "terminal_role": {
+    "name": "verifier-claude-agentry",
+    "version": 1
+  },
+  "max_retries": 0
+}
