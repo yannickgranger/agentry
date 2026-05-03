@@ -835,6 +835,21 @@ pub async fn compose_meta_verdict(conn: &mut ConnectionManager, meta_id: &str) -
     let mut final_verdict = Verdict::new(BriefId(meta_id.into()), final_kind.clone());
     final_verdict.reason = reason;
 
+    // #311 fence (last-line-of-defense): if every finding on a
+    // ReworkNeeded verdict has empty message+requirements+prohibitions,
+    // an upstream reviewer produced parse-failure noise rather than a
+    // real defect — downgrade to Shipped so the rework loop doesn't
+    // churn. Belt + suspenders alongside the reviewer-side fence in
+    // `agentry-role-runtime`.
+    let n_dropped = downgrade_empty_rework(&mut final_verdict.kind);
+    if n_dropped > 0 {
+        tracing::warn!(
+            brief = %final_verdict.brief.0,
+            n_dropped,
+            "compose_meta_verdict downgraded ReworkNeeded->Shipped (all findings empty)"
+        );
+    }
+
     // Atomic claim immediately before the XADD: only the first arrival
     // for a given meta_id wins SET NX and emits the verdict. The marker
     // is NOT deleted in the cleanup block below — its 24h TTL is the
@@ -900,6 +915,40 @@ fn compose_verdict_parts(
         return (v.kind.clone(), Some(format!("verifier: {suffix}")));
     }
     (VerdictKind::Shipped, None)
+}
+
+/// Daemon-side last-line-of-defense for #311: if `kind` is
+/// `ReworkNeeded` whose findings are non-empty but every entry has
+/// all-empty content (`message`, `requirements`, AND `prohibitions`),
+/// downgrade it to `Shipped` and return the count of dropped findings.
+/// Otherwise leave `kind` untouched and return 0.
+///
+/// Empty-Blocker findings are a parse failure upstream (reviewer-claude
+/// emitted nominally-structured output that decodes to a hollow
+/// finding); publishing them as `ReworkNeeded` produces a respawned
+/// coder with no actionable signal and drains the retry budget on
+/// noise. Belt + suspenders alongside the reviewer-side fence in
+/// `agentry_role_runtime::drop_empty_blocker_findings`.
+///
+/// Crate-private; the existing live-Redis test in `tests/daemon_test.rs`
+/// exercises it through `compose_meta_verdict`.
+fn downgrade_empty_rework(kind: &mut VerdictKind) -> usize {
+    let findings = match kind {
+        VerdictKind::ReworkNeeded { findings } => findings,
+        _ => return 0,
+    };
+    if findings.is_empty() {
+        return 0;
+    }
+    let all_empty = findings
+        .iter()
+        .all(|f| f.message.is_empty() && f.requirements.is_empty() && f.prohibitions.is_empty());
+    if !all_empty {
+        return 0;
+    }
+    let n = findings.len();
+    *kind = VerdictKind::Shipped;
+    n
 }
 
 /// Read the meta-brief's children_verdicts list and return true iff every

@@ -10,8 +10,9 @@
 //! synthetic-repo integration tests in `tests/run_fence_test.rs`.
 
 use agentry_role_runtime::{
-    changed_rs_files, head_bytes, mech_finding, parse_allowed_tools, parse_findings,
-    parse_severity, pointer_str_or, slice_json_array, strip_fences, tail_bytes, tail_lines,
+    changed_rs_files, drop_empty_blocker_findings, head_bytes, mech_finding, parse_allowed_tools,
+    parse_findings, parse_severity, pointer_str_or, slice_json_array, strip_fences, tail_bytes,
+    tail_lines,
 };
 use chrono::Utc;
 use orchestrator_types::{Event, EventKind, FindingOrigin, Severity};
@@ -253,6 +254,103 @@ fn parse_findings_salvages_when_sliced_text_is_not_array() {
     let v = parse_findings("prelude [{\"x\":1}] postscript", "agt-5");
     assert_eq!(v.len(), 1);
     assert_eq!(v[0].category, "other"); // {x:1} has no category — defaults
+}
+
+#[test]
+fn drop_empty_blocker_findings_drops_only_all_empty_blockers() {
+    // #311 fence: a Blocker whose message+requirements+prohibitions are
+    // all empty is a parse failure (no actionable signal), so the
+    // reviewer must drop it; the surviving verdict downgrades to
+    // Shipped because no real Blockers remain.
+    let response = r#"
+    [
+      {
+        "severity": "blocker",
+        "category": "other",
+        "message": "",
+        "prohibitions": [],
+        "requirements": []
+      }
+    ]
+    "#;
+    let mut findings = parse_findings(response, "agt-empty");
+    assert_eq!(findings.len(), 1);
+    assert!(matches!(findings[0].severity, Severity::Blocker));
+    let dropped = drop_empty_blocker_findings(&mut findings);
+    assert_eq!(dropped, 1, "the all-empty Blocker must be dropped");
+    assert_eq!(findings.len(), 0, "no findings should survive");
+    // With no surviving Blocker, the runner emits Shipped — pinning the
+    // downgrade contract: empty Blocker -> ReworkNeeded -> Shipped.
+    let still_has_blocker = findings
+        .iter()
+        .any(|f| matches!(f.severity, Severity::Blocker));
+    assert!(
+        !still_has_blocker,
+        "Shipped path requires no surviving Blocker"
+    );
+}
+
+#[test]
+fn drop_empty_blocker_findings_keeps_real_blockers_and_warns() {
+    // A Blocker with a non-empty message stays. A Warn with all-empty
+    // fields stays — the fence only targets empty BLOCKERS, not Warns.
+    let response = r#"
+    [
+      {
+        "severity": "blocker",
+        "category": "invariant",
+        "message": "real defect",
+        "prohibitions": [],
+        "requirements": []
+      },
+      {
+        "severity": "warn",
+        "category": "naming",
+        "message": "",
+        "prohibitions": [],
+        "requirements": []
+      },
+      {
+        "severity": "blocker",
+        "category": "other",
+        "message": "",
+        "prohibitions": [],
+        "requirements": []
+      }
+    ]
+    "#;
+    let mut findings = parse_findings(response, "agt-mixed");
+    assert_eq!(findings.len(), 3);
+    let dropped = drop_empty_blocker_findings(&mut findings);
+    assert_eq!(dropped, 1, "only the all-empty Blocker should be dropped");
+    assert_eq!(findings.len(), 2);
+    let still_has_blocker = findings
+        .iter()
+        .any(|f| matches!(f.severity, Severity::Blocker));
+    assert!(still_has_blocker, "real Blocker must survive");
+}
+
+#[test]
+fn drop_empty_blocker_findings_keeps_blocker_with_only_requirements() {
+    // Any one of message / requirements / prohibitions being non-empty
+    // is enough to keep the Blocker — only the all-three-empty case is
+    // a parse failure.
+    let response = r#"
+    [
+      {
+        "severity": "blocker",
+        "category": "other",
+        "message": "",
+        "prohibitions": [],
+        "requirements": ["use SETNX"]
+      }
+    ]
+    "#;
+    let mut findings = parse_findings(response, "agt-req-only");
+    assert_eq!(findings.len(), 1);
+    let dropped = drop_empty_blocker_findings(&mut findings);
+    assert_eq!(dropped, 0);
+    assert_eq!(findings.len(), 1);
 }
 
 #[test]
