@@ -28,6 +28,8 @@ pub struct Config {
     pub signing: SigningConfig,
     #[serde(default)]
     pub webhook: WebhookConfig,
+    #[serde(default)]
+    pub forge: ForgeConfig,
     #[serde(default = "default_max_concurrent_briefs")]
     pub max_concurrent_briefs: u32,
 }
@@ -58,6 +60,16 @@ pub struct WebhookConfig {
     pub secret: Option<String>,
 }
 
+/// Forge defaults applied when a brief's payload does not override them.
+/// `default_host` is the `host:port` (no scheme) used to construct the
+/// token-bearing clone URL. Unset means every brief must carry its own
+/// `forge_host` in the payload.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ForgeConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_host: Option<String>,
+}
+
 impl Default for Config {
     fn default() -> Self {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
@@ -72,6 +84,7 @@ impl Default for Config {
                 key_path: PathBuf::from(format!("{home}/.config/agentry/signing.key")),
             },
             webhook: WebhookConfig::default(),
+            forge: ForgeConfig::default(),
             max_concurrent_briefs: 4,
         }
     }

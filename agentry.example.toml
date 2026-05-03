@@ -22,3 +22,10 @@ key_path = "/home/YOU/.config/agentry/signing.key"
 # disabled (every call returns 401). Also settable via env:
 # AGENTRY_WEBHOOK__SECRET=<random-hex>.
 # secret = "replace-with-openssl-rand-hex-16"
+
+[forge]
+# Default forge host used when a brief's payload does not set forge_host.
+# Format: "host:port" (no scheme). Combined with brief.payload.target_repo
+# to construct a https://oauth2:${GITEA_TOKEN}@<host>/<owner>/<repo>.git URL.
+# Required for brief dispatch unless every brief sets forge_host explicitly.
+# default_host = "agency.lab:3000"
