@@ -927,38 +927,13 @@ fn build_archaeologist_claude_agentry_role(home: &str, claude_settings_path: &st
     }
 }
 
-/// Verifier role for the `agentry-verify-v0` team. The DOL composer
-/// (daemon-side, see `daemon.rs::on_all_children_resolved`) auto-dispatches a
-/// verifier brief whenever a meta-brief's children all reach terminal verdict
-/// AND the meta-brief carried a `success_criteria`. The verifier runs the
-/// criterion as a shell command on a read-only snapshot of the workspace and
-/// emits `done shipped` / `done failed`. The daemon composes that with the
-/// children's verdicts to produce the meta-brief's terminal verdict.
-const VERIFIER_CLAUDE_AGENTRY_SCRIPT: &str = r##"#!/usr/bin/env bash
-set -uo pipefail
-bundle="$(cat)"
-criterion=$(jq -r '.brief.payload.success_criteria // ""' <<<"$bundle")
-verifies=$(jq -r '.brief.payload.verifies_brief_id // ""' <<<"$bundle")
-
-if [ -z "$criterion" ]; then
-    emit_event '{"error":"verifier missing success_criteria in payload"}'
-    emit_done "failed"; exit 0
-fi
-
-cd /workspace
-emit_event "$(jq -nc --arg c "$criterion" --arg v "$verifies" '{msg:"running success_criteria",criterion:$c,verifies:$v}')"
-
-if bash -c "$criterion" > /tmp/criterion.out 2>&1; then
-    out=$(tail -c 4096 /tmp/criterion.out)
-    emit_event "$(jq -nc --arg o "$out" '{msg:"criterion passed",output:$o}')"
-    emit_done "shipped"
-else
-    rc=$?
-    out=$(tail -c 4096 /tmp/criterion.out)
-    emit_event "$(jq -nc --arg o "$out" --argjson rc "$rc" '{msg:"criterion failed",exit_code:$rc,output:$o}')"
-    emit_done "failed"
-fi
-"##;
+// EPIC #161 Wave 3: VERIFIER_CLAUDE_AGENTRY_SCRIPT bash heredoc that used to
+// live here (the DOL verifier — runs the meta-brief's success_criteria as a
+// shell command and maps exit code to verdict) has been ported to a Rust
+// runner — `crates/agentry-role-runtime/src/bin/verifier_dol_runner.rs`.
+// The role's entrypoint_script now just `exec /usr/local/bin/verifier-dol-runner`.
+// The runner has its own unit-test coverage for success_criteria parsing,
+// exit-code → verdict mapping, and the output-tail constant.
 
 // EPIC #161 Wave 1.3: the three AC_VERIFIER_*_AGENTRY_SCRIPT bash heredocs
 // that used to live here have been ported to one Rust runner —
@@ -1037,8 +1012,10 @@ fn build_auditor_claude_agentry_role(home: &str) -> AgentRole {
 /// verifier never invokes claude; it just runs `success_criteria` as a
 /// shell command on a read-only snapshot of the workspace. Strictest
 /// permits in the registry: fs:read on /workspace, fs:write on /tmp only,
-/// no net, no git, no claude.
-fn build_verifier_claude_agentry_role() -> AgentRole {
+/// no net, no git, no claude. Bind-mounts the host-built verifier-dol-runner
+/// at /usr/local/bin/verifier-dol-runner (operator runs
+/// `just verifier-dol-runner-binary`).
+fn build_verifier_claude_agentry_role(home: &str) -> AgentRole {
     AgentRole {
         name: RoleName("verifier-claude-agentry".into()),
         version: 1,
@@ -1050,7 +1027,7 @@ fn build_verifier_claude_agentry_role() -> AgentRole {
         image: "docker.io/library/rust:1.93".into(),
         substrate_class: SubstrateClass::Podman,
         package_manager: PackageManager::Apt,
-        entrypoint_script: format!("{BASH_PRELUDE}{VERIFIER_CLAUDE_AGENTRY_SCRIPT}"),
+        entrypoint_script: "#!/bin/sh\nexec /usr/local/bin/verifier-dol-runner\n".into(),
         exitpoint_script: None,
         binaries: vec![],
         mcp_servers: vec![],
@@ -1064,7 +1041,11 @@ fn build_verifier_claude_agentry_role() -> AgentRole {
         ]),
         passthru_env: vec![],
         extra_bootstrap: vec![],
-        mounts: vec![],
+        mounts: vec![Mount {
+            source: format!("{home}/.local/bin/verifier-dol-runner"),
+            target: "/usr/local/bin/verifier-dol-runner".into(),
+            readonly: true,
+        }],
         workspace_mount: Some(WorkspaceMount {
             container_path: "/workspace".into(),
             readonly: true,
@@ -2084,7 +2065,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
     // terminal verdict, the daemon auto-dispatches a verifier brief that runs
     // the meta-brief's success_criteria. The verifier's verdict composes with
     // the children's verdicts to produce the meta-brief's terminal verdict.
-    let verifier_claude_agentry = build_verifier_claude_agentry_role();
+    let verifier_claude_agentry = build_verifier_claude_agentry_role(&home);
     let preflight_criterion_agentry = build_preflight_criterion_agentry_role(&home);
     let agentry_verify_v0 = TeamTopology {
         name: TeamName("agentry-verify-v0".into()),

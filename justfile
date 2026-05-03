@@ -155,6 +155,19 @@ archaeologist-runner-binary:
 ci-watcher-runner-binary:
     cargo install --path crates/agentry-role-runtime --bin ci-watcher-runner --root ~/.local --locked
 
+# Build verifier-dol-runner into ~/.local/bin/verifier-dol-runner — the
+# full lifecycle runner for the verifier-claude-agentry role (EPIC #161
+# Wave 3 port of VERIFIER_CLAUDE_AGENTRY_SCRIPT — the DOL verifier that
+# runs the brief's success_criteria and maps exit code to verdict).
+# Operator-invoked; idempotent. The role bind-mounts this binary at
+# /usr/local/bin/verifier-dol-runner.
+verifier-dol-runner-binary:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo install --path crates/agentry-role-runtime --bin verifier-dol-runner --root ~/.local --locked --quiet
+    test -x ~/.local/bin/verifier-dol-runner
+    echo "verifier-dol-runner installed at ~/.local/bin/verifier-dol-runner"
+
 # Build git-op-commit into ~/.local/bin/git-op-commit for the git-op-commit
 # role's bind-mount. Operator-invoked; idempotent. Brief 190b of #182 — the
 # commit half of the git-operator split.

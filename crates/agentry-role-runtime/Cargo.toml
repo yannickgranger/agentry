@@ -66,6 +66,14 @@ path = "src/bin/archaeologist_runner.rs"
 name = "ci-watcher-runner"
 path = "src/bin/ci_watcher_runner.rs"
 
+# verifier-dol-runner: full lifecycle for the verifier-claude-agentry role
+# (the DOL verifier — runs the brief's success_criteria as a shell command,
+# maps exit code to verdict). EPIC #161 Wave 3 final slice; ports
+# VERIFIER_CLAUDE_AGENTRY_SCRIPT to Rust.
+[[bin]]
+name = "verifier-dol-runner"
+path = "src/bin/verifier_dol_runner.rs"
+
 [dependencies]
 orchestrator-types = { path = "../orchestrator-types" }
 serde.workspace = true
