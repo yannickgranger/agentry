@@ -71,7 +71,7 @@ pub async fn load_roles_from_dir(
     }
     json_files.sort();
 
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/var/home/yg".into());
+    let home = std::env::var("HOME").expect("HOME env var must be set to derive role-dir paths");
 
     let mut out: Vec<RoleName> = Vec::with_capacity(json_files.len());
     for path in json_files {
