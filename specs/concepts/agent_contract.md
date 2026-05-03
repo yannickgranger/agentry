@@ -188,3 +188,25 @@ the exit is non-zero with no unmerged paths (substrate failure such as
 a missing ref or detached worktree). The pr-rebaser-runner's
 `classify_rebase` returns this so the success / push and conflict /
 abort branches stay separately testable from the I/O around them.
+
+## ShipperPayload
+
+The parsed, role-local view of a brief startup bundle as the shipper
+runner consumes it: `brief_id`, `target_repo` (default `yg/agentry`),
+`base_branch` (default `develop`), `pr_title` (default `auto(<brief_id>)`),
+`pr_body` (default `Agentry-produced PR. See brief trace stream.`), and
+`forge_host` (default `agency.lab:3000`). Built by `parse_shipper_payload`
+once at the top of the runner's `main` so the subsequent push, PR-create,
+and ci-watcher hand-off share one materialised context rather than
+re-walking JSON pointers per call site. Defaults mirror the bash
+`jq -r '... // "..."'` fall-throughs of the legacy
+`SHIPPER_AGENTRY_SCRIPT` bash heredoc.
+
+## PrCreateResponse
+
+Parsed shape of the forge `POST /repos/.../pulls` response — the bits the
+shipper hands off to `ci-watcher-agentry` via `emit_message`: `pr_number`
+and `pr_url`. `parse_pr_response` returns `None` when `html_url` is
+missing or empty (the bash `[ -z "$pr_url" ] || [ "$pr_url" = "null" ]`
+failure check), which the runner treats as a fatal `done failed` so a
+malformed forge response cannot ship a brief that has no PR to watch.
