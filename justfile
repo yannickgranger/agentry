@@ -35,6 +35,13 @@ ra-query-binary:
     test -x ~/.local/bin/ra-query
     echo "ra-query installed at ~/.local/bin/ra-query"
 
+# Build/install rtk into ~/.local/bin/rtk — CLI-output compression layer
+# that reduces LLM token consumption on bash tool-call outputs (60-90%
+# on common dev commands per upstream). Operator-invoked; idempotent.
+# Subsequent phases of #138 add the bind-mount on the agent containers.
+rtk-binary:
+    cargo install --git https://github.com/rtk-ai/rtk --locked --root ~/.local
+
 # Build dead-pub-check into ~/.local/bin/dead-pub-check for the coder-claude
 # bind-mount. Operator-invoked; idempotent. Coder-claude container expects the
 # binary at this path (matches the existing ~/.local/bin/ra-query pattern).
