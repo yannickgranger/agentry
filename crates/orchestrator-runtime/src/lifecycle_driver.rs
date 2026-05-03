@@ -11,10 +11,12 @@
 
 use crate::lifecycle::{EventSource, StateProjector};
 use crate::redis_io;
+use crate::workspace::{self, BriefWorkspace, TerminationDisposition};
 use crate::{Error, Result};
 use orchestrator_types::lifecycle::{handle, BriefState, BriefStateRecord};
-use orchestrator_types::{now, BriefId, Verdict, VerdictKind};
+use orchestrator_types::{now, BriefId, Event, EventKind, Verdict, VerdictKind};
 use redis::aio::ConnectionManager;
+use std::path::Path;
 
 // The daemon's per-brief lifecycle factories are spelled out inline in
 // `daemon::run`'s parameter list — type-aliasing them here would surface
@@ -80,6 +82,9 @@ pub async fn projector_task(
                     if let Some(ref mut conn) = verdict_conn {
                         emit_terminal_verdict(conn, &brief_id, &state).await?;
                     }
+                    if matches!(state, BriefState::Failed { .. }) {
+                        cleanup_failed_brief(&brief_id, verdict_conn.as_mut()).await;
+                    }
                     break;
                 }
             }
@@ -121,4 +126,71 @@ async fn emit_terminal_verdict(
         "fsm: terminal verdict emitted"
     );
     Ok(())
+}
+
+/// On terminal `BriefState::Failed`, tear down the brief's worktree dir
+/// and the associated `auto/<brief_id>` branch in the bare clone, and
+/// (when `conn` is provided) append a trace event recording the cleanup.
+///
+/// Replaces the prior "retain on failure for audit" rule: failures are
+/// reconstructable from Redis (the trace stream and state log are the
+/// audit log), and retained worktrees produced ~6 dispatch-blocking
+/// stale-worktree incidents in the EPIC #255/#256 drain.
+///
+/// Idempotent — `workspace::destroy` treats a missing worktree dir as a
+/// no-op and `git branch -D` on a non-existent branch is logged at debug
+/// only. Errors are logged and swallowed: cleanup failure must not crash
+/// the projector_task at the terminal step.
+///
+/// The thin wrapper resolves the workspace root from the
+/// `AGENTRY_WORKSPACE_ROOT` env var (or its compiled-in default) and
+/// delegates to [`cleanup_failed_brief_at`]. Tests should call
+/// [`cleanup_failed_brief_at`] directly with an explicit root so they
+/// don't race other tests on the process-wide env var.
+pub async fn cleanup_failed_brief(brief_id: &BriefId, conn: Option<&mut ConnectionManager>) {
+    cleanup_failed_brief_at(brief_id, &BriefWorkspace::root(), conn).await;
+}
+
+/// Test-friendly variant of [`cleanup_failed_brief`] that takes an
+/// explicit workspace root rather than reading
+/// `AGENTRY_WORKSPACE_ROOT`. Production code should call the wrapper.
+pub async fn cleanup_failed_brief_at(
+    brief_id: &BriefId,
+    root: &Path,
+    conn: Option<&mut ConnectionManager>,
+) {
+    let host_path = root.join("briefs").join(&brief_id.0);
+    let ws = BriefWorkspace {
+        brief_id: brief_id.clone(),
+        host_path,
+    };
+    if let Err(e) = workspace::destroy_with_disposition(&ws, TerminationDisposition::TearDown).await
+    {
+        tracing::warn!(
+            brief = %brief_id.0,
+            error = %e,
+            "workspace cleanup on terminal Failed failed"
+        );
+    } else {
+        tracing::info!(
+            brief = %brief_id.0,
+            path = %ws.host_path.display(),
+            "workspace cleaned (terminal Failed)"
+        );
+    }
+    if let Some(conn) = conn {
+        let event = Event::new(EventKind::Event {
+            payload: serde_json::json!({
+                "msg": "workspace cleaned (terminal Failed)",
+                "brief_id": brief_id.0,
+            }),
+        });
+        if let Err(e) = redis_io::append_trace(conn, brief_id, "lifecycle-driver", &event).await {
+            tracing::warn!(
+                brief = %brief_id.0,
+                error = %e,
+                "trace append for workspace-cleanup event failed"
+            );
+        }
+    }
 }

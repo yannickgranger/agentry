@@ -537,13 +537,20 @@ async fn handle_brief(
         team_shipped = false;
     }
 
-    // Bail early on team failure — keep workspace for audit, no chain-trigger.
+    // Bail early on team failure — no chain-trigger. The workspace is
+    // intentionally NOT torn down here: the lifecycle FSM's
+    // `lifecycle_driver::cleanup_failed_brief` is the canonical
+    // terminal-Failed cleanup site (see L.4 / EPIC #246). It removes
+    // both the worktree dir and the `auto/<brief_id>` branch once the
+    // FSM observes the terminal Failed transition. The log message here
+    // names that handoff so an operator grepping the log still finds a
+    // pointer to where cleanup actually runs.
     if !team_shipped {
         if let Some(ws) = workspace.take() {
             tracing::info!(
                 brief = %brief.id,
                 path = %ws.host_path.display(),
-                "workspace retained for audit (team did not ship)"
+                "workspace handoff: lifecycle FSM driver cleans up on terminal Failed"
             );
         }
         return Ok(VerdictKind::Failed);
