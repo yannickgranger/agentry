@@ -1413,10 +1413,6 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
     let home = std::env::var("HOME").expect(
         "HOME env var must be set to bind claude credentials into the reviewer-mechanical role",
     );
-    let coder_claude_agentry = RoleRef {
-        name: RoleName("coder-claude-agentry".into()),
-        version: 1,
-    };
     let reviewer_mechanical_agentry = AgentRole {
         name: RoleName("reviewer-mechanical-agentry".into()),
         version: 1,
@@ -1571,72 +1567,6 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
     let verifier_claude_agentry = build_verifier_claude_agentry_role(&home);
     let preflight_criterion_agentry = build_preflight_criterion_agentry_role(&home);
 
-    let agentry_bugfix_v0 = TeamTopology {
-        name: TeamName("agentry-bugfix-v0".into()),
-        version: 1,
-        roles: vec![
-            RoleRef {
-                name: coder_claude_agentry.name.clone(),
-                version: coder_claude_agentry.version,
-            },
-            RoleRef {
-                name: reviewer_mechanical_agentry.name.clone(),
-                version: reviewer_mechanical_agentry.version,
-            },
-            RoleRef {
-                name: shipper_agentry.name.clone(),
-                version: shipper_agentry.version,
-            },
-            RoleRef {
-                name: ci_watcher_agentry.name.clone(),
-                version: ci_watcher_agentry.version,
-            },
-        ],
-        message_graph: vec![
-            MessageEdge {
-                from: RoleRef {
-                    name: coder_claude_agentry.name.clone(),
-                    version: coder_claude_agentry.version,
-                },
-                to: RoleRef {
-                    name: reviewer_mechanical_agentry.name.clone(),
-                    version: reviewer_mechanical_agentry.version,
-                },
-                permit_overrides_from: None,
-                rework_target: None,
-            },
-            MessageEdge {
-                from: RoleRef {
-                    name: reviewer_mechanical_agentry.name.clone(),
-                    version: reviewer_mechanical_agentry.version,
-                },
-                to: RoleRef {
-                    name: shipper_agentry.name.clone(),
-                    version: shipper_agentry.version,
-                },
-                permit_overrides_from: None,
-                rework_target: None,
-            },
-            MessageEdge {
-                from: RoleRef {
-                    name: shipper_agentry.name.clone(),
-                    version: shipper_agentry.version,
-                },
-                to: RoleRef {
-                    name: ci_watcher_agentry.name.clone(),
-                    version: ci_watcher_agentry.version,
-                },
-                permit_overrides_from: None,
-                rework_target: None,
-            },
-        ],
-        terminal_role: RoleRef {
-            name: ci_watcher_agentry.name.clone(),
-            version: ci_watcher_agentry.version,
-        },
-        max_retries: 2,
-    };
-
     let auditor_claude_agentry =
         build_auditor_claude_agentry_role(&home, sccache_net_allow.as_deref());
     let agentry_self_audit_v0 = TeamTopology {
@@ -1679,7 +1609,6 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
     redis_io::save_role(&mut conn, &shipper_agentry).await?;
     redis_io::save_role(&mut conn, &ci_watcher_agentry).await?;
     redis_io::save_role(&mut conn, &pr_rebaser_agentry).await?;
-    redis_io::save_team(&mut conn, &agentry_bugfix_v0).await?;
     redis_io::save_role(&mut conn, &auditor_claude_agentry).await?;
     redis_io::save_team(&mut conn, &agentry_self_audit_v0).await?;
     redis_io::save_role(&mut conn, &archaeologist_claude_agentry).await?;
