@@ -1,0 +1,16 @@
+{
+  "name": "agentry-pr-rebaser-v0",
+  "version": 1,
+  "roles": [
+    {
+      "name": "pr-rebaser-agentry",
+      "version": 1
+    }
+  ],
+  "message_graph": [],
+  "terminal_role": {
+    "name": "pr-rebaser-agentry",
+    "version": 1
+  },
+  "max_retries": 0
+}

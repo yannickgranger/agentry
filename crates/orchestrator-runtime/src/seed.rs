@@ -1558,20 +1558,6 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
     // rebased branch (or surfaces conflicts as findings).
     let pr_rebaser_agentry =
         build_pr_rebaser_agentry_role(&home, &forge_net_allow, &forge_write_permits);
-    let agentry_pr_rebaser_v0 = TeamTopology {
-        name: TeamName("agentry-pr-rebaser-v0".into()),
-        version: 1,
-        roles: vec![RoleRef {
-            name: pr_rebaser_agentry.name.clone(),
-            version: pr_rebaser_agentry.version,
-        }],
-        message_graph: Vec::<MessageEdge>::new(),
-        terminal_role: RoleRef {
-            name: pr_rebaser_agentry.name.clone(),
-            version: pr_rebaser_agentry.version,
-        },
-        max_retries: 0,
-    };
     // ---- agentry-discovery-v0 team (first stage of the planner pipeline) ----
     // archaeologist-claude-agentry runs cfdb extract + graph-specs check, then
     // synthesizes a discovery.json via `claude -p`.
@@ -2048,7 +2034,6 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
     redis_io::save_role(&mut conn, &shipper_agentry).await?;
     redis_io::save_role(&mut conn, &ci_watcher_agentry).await?;
     redis_io::save_role(&mut conn, &pr_rebaser_agentry).await?;
-    redis_io::save_team(&mut conn, &agentry_pr_rebaser_v0).await?;
     redis_io::save_team(&mut conn, &agentry_self_host_v0).await?;
     redis_io::save_team(&mut conn, &agentry_bugfix_v0).await?;
     redis_io::save_team(&mut conn, &agentry_spec_edit_v0).await?;
@@ -2093,7 +2078,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
     }
 
     tracing::info!(
-        "seeded: roles [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker, listener, grok-echo, claude-echo, synthesizer, narrowed-coder, coder-claude-agentry, ac-verifier-claude-agentry, ac-verifier-gemini-agentry, ac-verifier-grok-agentry, reviewer-mechanical-agentry, shipper-agentry, ci-watcher-agentry, pr-rebaser-agentry, reviewer-claude-agentry, auditor-claude-agentry, null-agent-agentry, archaeologist-claude-agentry, planner-claude-agentry, verifier-claude-agentry] (inline entrypoint scripts); teams [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker-listener, grok-echo, claude-echo, narrowed-team, agentry-self-host-v0, agentry-pr-rebaser-v0, agentry-self-audit-v0, agentry-discovery-v0, agentry-planner-v0, agentry-verify-v0] (Rust literals); teams [agentry-null-v0] (loaded from seed/topologies/*.json)"
+        "seeded: roles [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker, listener, grok-echo, claude-echo, synthesizer, narrowed-coder, coder-claude-agentry, ac-verifier-claude-agentry, ac-verifier-gemini-agentry, ac-verifier-grok-agentry, reviewer-mechanical-agentry, shipper-agentry, ci-watcher-agentry, pr-rebaser-agentry, reviewer-claude-agentry, auditor-claude-agentry, null-agent-agentry, archaeologist-claude-agentry, planner-claude-agentry, verifier-claude-agentry] (inline entrypoint scripts); teams [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker-listener, grok-echo, claude-echo, narrowed-team, agentry-self-host-v0, agentry-self-audit-v0, agentry-discovery-v0, agentry-planner-v0, agentry-verify-v0] (Rust literals); teams [agentry-null-v0, agentry-pr-rebaser-v0] (loaded from seed/topologies/*.json)"
     );
     Ok(())
 }
