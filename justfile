@@ -175,6 +175,12 @@ verifier-dol-runner-binary:
 planner-runner-binary:
     cargo install --path crates/agentry-role-runtime --bin planner-runner --root ~/.local --locked
 
+# Build pr-rebaser-runner into ~/.local/bin/pr-rebaser-runner — the full
+# lifecycle runner for the pr-rebaser-agentry role (EPIC #161 port of
+# PR_REBASER_AGENTRY_SCRIPT). Operator-invoked; idempotent.
+pr-rebaser-runner-binary:
+    cargo install --path crates/agentry-role-runtime --bin pr-rebaser-runner --root ~/.local --locked
+
 # Build git-op-commit into ~/.local/bin/git-op-commit for the git-op-commit
 # role's bind-mount. Operator-invoked; idempotent. Brief 190b of #182 — the
 # commit half of the git-operator split.

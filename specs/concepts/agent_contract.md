@@ -152,3 +152,39 @@ child-brief construction share the same materialised context rather than
 re-walking JSON pointers per call site. Defaults mirror the bash
 `jq -r '... // "..."'` fall-throughs of the legacy
 `PLANNER_CLAUDE_AGENTRY_SCRIPT` bash heredoc.
+
+## RebaserPayload
+
+The parsed, role-local view of a chained rebaser brief as the
+pr-rebaser-runner consumes it: `target_repo` (default `yg/agentry`),
+`pr_number`, `branch` (required), `base_branch` (default `develop`),
+`forge_host` (default `agency.lab:3000`, but in normal operation arrives
+populated via the daemon's phase-3 cascade through `agentry.toml [forge]
+default_host`). Built by `parse_rebaser_payload` once at the top of the
+runner's `main` so subsequent fetch / checkout / rebase / push commands
+share the same materialised context. Defaults mirror the bash
+`jq -r '... // "..."'` fall-throughs of the legacy
+`PR_REBASER_AGENTRY_SCRIPT` bash heredoc, with the inline
+`agency.lab:3000` literal eliminated in favor of the daemon-injected
+value.
+
+## PayloadError
+
+Reason a `parse_rebaser_payload` call rejected a startup bundle. Today
+the only variant is `MissingBranch` (an absent or empty
+`brief.payload.branch` cannot be rebased). The runner maps each variant
+to an error event and `done failed` so misrouted briefs surface a
+diagnostic instead of silently no-op'ing. Sibling type to
+`SelfReviewResult` and `BriefContext` — a structured, exhaustive error
+domain rather than `String`.
+
+## RebaseOutcome
+
+Tri-state classification of a `git rebase origin/<base>` invocation:
+`Success` when the rebase exit code is 0; `Conflict` when the exit is
+non-zero AND `git status --porcelain=v2 -uno` reports unmerged paths
+(human-resolvable merge conflicts surfaced as findings); `Fatal` when
+the exit is non-zero with no unmerged paths (substrate failure such as
+a missing ref or detached worktree). The pr-rebaser-runner's
+`classify_rebase` returns this so the success / push and conflict /
+abort branches stay separately testable from the I/O around them.
