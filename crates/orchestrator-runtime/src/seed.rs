@@ -1587,41 +1587,10 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
     // planner reads it and emits an outbox Message whose payload carries
     // `next_brief_refs` — a list of absolute host paths to child brief JSONs.
     // The daemon's chain-trigger auto-dispatches each child via submit_brief
-    // once the planner ships.
+    // once the planner ships. The team topology lives in
+    // `seed/topologies/agentry-planner-v0.json` and is loaded by the
+    // seed-time topology walker.
     let planner_claude_agentry = build_planner_claude_agentry_role(&home, &claude_settings_path);
-    let agentry_planner_v0 = TeamTopology {
-        name: TeamName("agentry-planner-v0".into()),
-        version: 1,
-        roles: vec![
-            RoleRef {
-                name: archaeologist_claude_agentry.name.clone(),
-                version: archaeologist_claude_agentry.version,
-            },
-            RoleRef {
-                name: planner_claude_agentry.name.clone(),
-                version: planner_claude_agentry.version,
-            },
-        ],
-        // discovery.json is on the shared workspace, not message-borne — the
-        // edge exists only to gate the planner on the archaeologist shipping.
-        message_graph: vec![MessageEdge {
-            from: RoleRef {
-                name: archaeologist_claude_agentry.name.clone(),
-                version: archaeologist_claude_agentry.version,
-            },
-            to: RoleRef {
-                name: planner_claude_agentry.name.clone(),
-                version: planner_claude_agentry.version,
-            },
-            permit_overrides_from: None,
-            rework_target: None,
-        }],
-        terminal_role: RoleRef {
-            name: planner_claude_agentry.name.clone(),
-            version: planner_claude_agentry.version,
-        },
-        max_retries: 0,
-    };
 
     // ---- agentry-verify-v0 team (DOL verifier — runs success_criteria) ----
     // Daemon-Orchestrated Lifecycle: when all children of a meta-brief reach
@@ -2028,7 +1997,6 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
     redis_io::save_role(&mut conn, &archaeologist_claude_agentry).await?;
     redis_io::save_team(&mut conn, &agentry_discovery_v0).await?;
     redis_io::save_role(&mut conn, &planner_claude_agentry).await?;
-    redis_io::save_team(&mut conn, &agentry_planner_v0).await?;
     redis_io::save_role(&mut conn, &verifier_claude_agentry).await?;
     redis_io::save_role(&mut conn, &preflight_criterion_agentry).await?;
 
@@ -2063,7 +2031,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
     }
 
     tracing::info!(
-        "seeded: roles [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker, listener, grok-echo, claude-echo, synthesizer, narrowed-coder, coder-claude-agentry, ac-verifier-claude-agentry, ac-verifier-gemini-agentry, ac-verifier-grok-agentry, reviewer-mechanical-agentry, shipper-agentry, ci-watcher-agentry, pr-rebaser-agentry, reviewer-claude-agentry, auditor-claude-agentry, null-agent-agentry, archaeologist-claude-agentry, planner-claude-agentry, verifier-claude-agentry] (inline entrypoint scripts); teams [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker-listener, grok-echo, claude-echo, narrowed-team, agentry-self-host-v0, agentry-self-audit-v0, agentry-discovery-v0, agentry-planner-v0] (Rust literals); teams [agentry-null-v0, agentry-pr-rebaser-v0, agentry-verify-v0] (loaded from seed/topologies/*.json)"
+        "seeded: roles [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker, listener, grok-echo, claude-echo, synthesizer, narrowed-coder, coder-claude-agentry, ac-verifier-claude-agentry, ac-verifier-gemini-agentry, ac-verifier-grok-agentry, reviewer-mechanical-agentry, shipper-agentry, ci-watcher-agentry, pr-rebaser-agentry, reviewer-claude-agentry, auditor-claude-agentry, null-agent-agentry, archaeologist-claude-agentry, planner-claude-agentry, verifier-claude-agentry] (inline entrypoint scripts); teams [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker-listener, grok-echo, claude-echo, narrowed-team, agentry-self-host-v0, agentry-self-audit-v0, agentry-discovery-v0] (Rust literals); teams [agentry-null-v0, agentry-pr-rebaser-v0, agentry-verify-v0, agentry-planner-v0] (loaded from seed/topologies/*.json)"
     );
     Ok(())
 }
