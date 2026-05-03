@@ -1,0 +1,16 @@
+{
+  "name": "agentry-null-v0",
+  "version": 1,
+  "roles": [
+    {
+      "name": "null-agent-agentry",
+      "version": 1
+    }
+  ],
+  "message_graph": [],
+  "terminal_role": {
+    "name": "null-agent-agentry",
+    "version": 1
+  },
+  "max_retries": 0
+}
