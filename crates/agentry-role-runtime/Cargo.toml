@@ -91,6 +91,17 @@ path = "src/bin/planner_runner.rs"
 name = "pr-rebaser-runner"
 path = "src/bin/pr_rebaser_runner.rs"
 
+# shipper-runner: full lifecycle for the shipper-agentry role. Ports
+# SHIPPER_AGENTRY_SCRIPT (git push via http.extraheader + forge PR creation)
+# to Rust under EPIC #161 wave-bash. v2 fixes the v1 reviewer Blocker on
+# credential leakage by keeping the token out of every URL — auth flows
+# only via `-c http.extraheader` (git) and `Authorization:` header (curl).
+# Operator-invoked via `just shipper-runner-binary`; the role bind-mounts
+# this binary at /usr/local/bin/shipper-runner.
+[[bin]]
+name = "shipper-runner"
+path = "src/bin/shipper_runner.rs"
+
 [dependencies]
 orchestrator-types = { path = "../orchestrator-types" }
 serde.workspace = true

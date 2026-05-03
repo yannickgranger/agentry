@@ -487,78 +487,13 @@ fi
 // stripping, JSON salvage, severity mapping, and assistant-text reconstruction
 // from claude stream-json transcripts.
 
-/// Shipper role for the `agentry-self-host-v0` team. Pushes the branch
-/// already committed in the brief's workspace (by the coder) and opens a
-/// PR on the forge. Emits the PR URL and number in its terminal event.
-const SHIPPER_AGENTRY_SCRIPT: &str = r##"#!/usr/bin/env bash
-set -euo pipefail
-bundle="$(cat)"
-
-brief_id=$(jq -r '.brief.id' <<<"$bundle")
-target_repo=$(jq -r '.brief.payload.target_repo // "yg/agentry"' <<<"$bundle")
-base_branch=$(jq -r '.brief.payload.base_branch // "develop"' <<<"$bundle")
-pr_title=$(jq -r '.brief.payload.pr_title // ("auto(" + .brief.id + ")")' <<<"$bundle")
-pr_body=$(jq -r '.brief.payload.pr_body // "Agentry-produced PR. See brief trace stream."' <<<"$bundle")
-forge_host=$(jq -r '.brief.payload.forge_host // "agency.lab:3000"' <<<"$bundle")
-branch="auto/${brief_id}"
-
-if [ -z "${GITEA_TOKEN:-}" ]; then
-    emit_event '{"error":"GITEA_TOKEN not in env"}'
-    emit_done "failed"; exit 0
-fi
-
-if [ ! -d /workspace/.git ] && [ ! -f /workspace/.git ]; then
-    emit_event '{"error":"workspace missing — coder did not produce it"}'
-    emit_done "failed"; exit 0
-fi
-
-cd /workspace
-git config http.sslVerify false
-git config user.email "shipper-agentry@agentry.lab"
-git config user.name "shipper-agentry"
-
-# DO NOT `git remote set-url` to a token-bearing URL: this is a worktree
-# off a shared bare clone, and `set-url` would write the token into the
-# bare clone's config — visible to every other brief that reuses this
-# bare. Instead, pass the Authorization header on this single push only,
-# via `-c http.extraheader`. Security-clean: the header is in the
-# command's argv, not on disk.
-emit_event "$(jq -nc --arg b "$branch" '{msg:"pushing branch",branch:$b}')"
-if ! git -c http.sslVerify=false \
-        -c http.extraheader="Authorization: token ${GITEA_TOKEN}" \
-        push -u origin "$branch" 2>/tmp/push.err; then
-    err=$(tail -20 /tmp/push.err)
-    emit_event "$(jq -nc --arg err "$err" '{error:"git push failed",detail:$err}')"
-    emit_done "failed"; exit 0
-fi
-
-owner="${target_repo%%/*}"
-repo_name="${target_repo##*/}"
-emit_event "$(jq -nc --arg r "$target_repo" --arg b "$branch" '{msg:"opening PR",repo:$r,head:$b}')"
-
-pr_body_json=$(jq -n --arg t "$pr_title" --arg b "$pr_body" --arg h "$branch" --arg base "$base_branch" \
-    '{title:$t,body:$b,head:$h,base:$base}')
-pr_resp=$(curl -sS -k -X POST "https://${forge_host}/api/v1/repos/${owner}/${repo_name}/pulls" \
-    -H "Authorization: token ${GITEA_TOKEN}" \
-    -H "Content-Type: application/json" \
-    -d "$pr_body_json")
-
-pr_url=$(jq -r '.html_url // ""' <<<"$pr_resp")
-pr_number=$(jq -r '.number // 0' <<<"$pr_resp")
-if [ -z "$pr_url" ] || [ "$pr_url" = "null" ]; then
-    emit_event "$(jq -nc --arg err "$pr_resp" '{error:"PR API call failed",detail:$err}')"
-    emit_done "failed"; exit 0
-fi
-
-emit_event "$(jq -nc --arg u "$pr_url" --argjson n "$pr_number" '{msg:"PR opened",url:$u,number:$n}')"
-
-head_sha=$(git rev-parse HEAD)
-emit_message "ci-watcher-agentry" "$(jq -nc \
-    --argjson n "$pr_number" --arg u "$pr_url" --arg s "$head_sha" \
-    '{pr_number:$n, pr_url:$u, head_sha:$s}')"
-
-emit_done "shipped"
-"##;
+// EPIC #161 wave-bash: SHIPPER_AGENTRY_SCRIPT bash heredoc that used to live
+// here has been ported to a Rust runner —
+// `crates/agentry-role-runtime/src/bin/shipper_runner.rs`. The role's
+// entrypoint_script now just `exec /usr/local/bin/shipper-runner`. v2 of
+// the port fixes the v1 reviewer Blocker on credential leakage by keeping
+// the token out of every URL the runner builds — auth flows only via
+// `-c http.extraheader` (git) and the `Authorization:` header (curl).
 
 // EPIC #161 wave-bash port: PR_REBASER_AGENTRY_SCRIPT bash heredoc that
 // used to live here has been ported to a Rust runner —
@@ -1597,6 +1532,13 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         name: RoleName("ac-verifier-grok-agentry".into()),
         version: 1,
     };
+    // EPIC #161 wave-bash: bash heredoc SHIPPER_AGENTRY_SCRIPT ported to a
+    // Rust runner at crates/agentry-role-runtime/src/bin/shipper_runner.rs.
+    // The role bind-mounts the host-built binary at
+    // /usr/local/bin/shipper-runner (operator runs `just
+    // shipper-runner-binary`) and execs it directly. Image switched from
+    // alpine to debian:bookworm-slim for parity with the other ported
+    // runtime roles (ci-watcher-agentry).
     let mut shipper_permits = vec![forge_net_allow.clone()];
     shipper_permits.extend(forge_write_permits.iter().cloned());
     let shipper_agentry = AgentRole {
@@ -1604,10 +1546,10 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         version: 1,
         model: None,
         system_prompt: None,
-        image: ALPINE.into(),
+        image: "docker.io/library/debian:bookworm-slim".into(),
         substrate_class: SubstrateClass::Podman,
-        package_manager: PackageManager::Apk,
-        entrypoint_script: format!("{BASH_PRELUDE}{SHIPPER_AGENTRY_SCRIPT}"),
+        package_manager: PackageManager::Apt,
+        entrypoint_script: "#!/bin/sh\nexec /usr/local/bin/shipper-runner\n".into(),
         exitpoint_script: None,
         binaries: vec!["git".into(), "curl".into(), "ca-certificates".into()],
         mcp_servers: vec![],
@@ -1616,7 +1558,11 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         permit_scope: PermitScope(shipper_permits),
         passthru_env: vec!["GITEA_TOKEN".into()],
         extra_bootstrap: vec![],
-        mounts: vec![],
+        mounts: vec![Mount {
+            source: format!("{home}/.local/bin/shipper-runner"),
+            target: "/usr/local/bin/shipper-runner".into(),
+            readonly: true,
+        }],
         // Shipper writes to /workspace/.git during `git push` (reflog,
         // FETCH_HEAD), so the workspace mount must be writable.
         workspace_mount: Some(WorkspaceMount {

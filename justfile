@@ -155,6 +155,15 @@ archaeologist-runner-binary:
 ci-watcher-runner-binary:
     cargo install --path crates/agentry-role-runtime --bin ci-watcher-runner --root ~/.local --locked
 
+# Build shipper-runner into ~/.local/bin/shipper-runner — the full lifecycle
+# runner for the shipper-agentry role (EPIC #161 wave-bash port of
+# SHIPPER_AGENTRY_SCRIPT). v2 keeps the GITEA_TOKEN out of every URL —
+# auth flows only via `-c http.extraheader` (git) and the `Authorization:`
+# header (curl). Operator-invoked; idempotent. The role bind-mounts this
+# binary at /usr/local/bin/shipper-runner.
+shipper-runner-binary:
+    cargo install --path crates/agentry-role-runtime --bin shipper-runner --root ~/.local --locked
+
 # Build verifier-dol-runner into ~/.local/bin/verifier-dol-runner — the
 # full lifecycle runner for the verifier-claude-agentry role (EPIC #161
 # Wave 3 port of VERIFIER_CLAUDE_AGENTRY_SCRIPT — the DOL verifier that
