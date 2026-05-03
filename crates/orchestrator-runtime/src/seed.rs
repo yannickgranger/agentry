@@ -1897,56 +1897,6 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         max_retries: 2,
     };
 
-    let agentry_spec_edit_v0 = TeamTopology {
-        name: TeamName("agentry-spec-edit-v0".into()),
-        version: 1,
-        roles: vec![
-            RoleRef {
-                name: coder_claude_agentry.name.clone(),
-                version: coder_claude_agentry.version,
-            },
-            RoleRef {
-                name: shipper_agentry.name.clone(),
-                version: shipper_agentry.version,
-            },
-            RoleRef {
-                name: ci_watcher_agentry.name.clone(),
-                version: ci_watcher_agentry.version,
-            },
-        ],
-        message_graph: vec![
-            MessageEdge {
-                from: RoleRef {
-                    name: coder_claude_agentry.name.clone(),
-                    version: coder_claude_agentry.version,
-                },
-                to: RoleRef {
-                    name: shipper_agentry.name.clone(),
-                    version: shipper_agentry.version,
-                },
-                permit_overrides_from: None,
-                rework_target: None,
-            },
-            MessageEdge {
-                from: RoleRef {
-                    name: shipper_agentry.name.clone(),
-                    version: shipper_agentry.version,
-                },
-                to: RoleRef {
-                    name: ci_watcher_agentry.name.clone(),
-                    version: ci_watcher_agentry.version,
-                },
-                permit_overrides_from: None,
-                rework_target: None,
-            },
-        ],
-        terminal_role: RoleRef {
-            name: ci_watcher_agentry.name.clone(),
-            version: ci_watcher_agentry.version,
-        },
-        max_retries: 1,
-    };
-
     let auditor_claude_agentry =
         build_auditor_claude_agentry_role(&home, sccache_net_allow.as_deref());
     let agentry_self_audit_v0 = TeamTopology {
@@ -1991,7 +1941,6 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
     redis_io::save_role(&mut conn, &pr_rebaser_agentry).await?;
     redis_io::save_team(&mut conn, &agentry_self_host_v0).await?;
     redis_io::save_team(&mut conn, &agentry_bugfix_v0).await?;
-    redis_io::save_team(&mut conn, &agentry_spec_edit_v0).await?;
     redis_io::save_role(&mut conn, &auditor_claude_agentry).await?;
     redis_io::save_team(&mut conn, &agentry_self_audit_v0).await?;
     redis_io::save_role(&mut conn, &archaeologist_claude_agentry).await?;
