@@ -36,7 +36,8 @@ use std::thread;
 use std::time::Duration;
 
 use agentry_role_runtime::ci_watcher_runner::{
-    find_shipper_message, first_failing_context, rand_jitter,
+    find_shipper_message, first_failing_context, rand_jitter, run_merge_retry_loop, AttemptResult,
+    MergeRetryOutcome,
 };
 use agentry_role_runtime::{
     emit_done, emit_event, emit_finding, emit_message, mech_finding, pointer_str_or,
@@ -179,51 +180,15 @@ fn main() {
         // Bash treats only literal `false` as "develop moved under us";
         // `null` (still computing) falls through to the CI poll.
         if matches!(pr_mergeable_raw, Some(Value::Bool(false))) {
-            if pr_branch.is_empty() {
-                emit_event(json!({
-                    "error": "pr_resp missing .head.ref — cannot chain-trigger rebaser without branch",
-                }));
-                emit_done(EventVerdict::Failed, None);
-                return;
-            }
-            let rebaser_path = "/workspace/pr_rebaser_brief.json";
-            let rebaser_brief_id = format!("brf_rebaser_{brief_id}_pr{pr_number}");
-            let submitted_at = Utc::now().to_rfc3339();
-            let child = json!({
-                "id": rebaser_brief_id,
-                "project": Value::Null,
-                "topology": {"name": "agentry-pr-rebaser-v0", "version": 1},
-                "payload": {
-                    "target_repo": target_repo,
-                    "pr_number": pr_number,
-                    "branch": pr_branch,
-                    "base_branch": pr_base,
-                    "forge_host": forge_host,
-                },
-                "budget": {"max_wall_seconds": 600},
-                "escalation": "autonomous",
-                "parent_brief": brief_id,
-                "submitted_by": format!("ci-watcher-agentry-{brief_id}"),
-                "submitted_at": submitted_at,
-            });
-            if let Err(e) = std::fs::write(rebaser_path, child.to_string()) {
-                emit_event(json!({
-                    "error": "failed to write pr_rebaser_brief.json",
-                    "detail": e.to_string(),
-                }));
-                emit_done(EventVerdict::Failed, None);
-                return;
-            }
-            let host_path = format!("{host_workspace}/pr_rebaser_brief.json");
-            emit_event(json!({
-                "msg": "pr not mergeable — chain-triggering pr-rebaser-agentry",
-                "pr_number": pr_number,
-                "branch": pr_branch,
-                "base_branch": pr_base,
-                "next_brief_ref": host_path,
-            }));
-            emit_message("_chain_trigger", json!({"next_brief_refs": [host_path]}));
-            emit_done(EventVerdict::Shipped, None);
+            chain_trigger_pr_rebaser(
+                &brief_id,
+                pr_number,
+                &pr_branch,
+                &pr_base,
+                &target_repo,
+                &forge_host,
+                &host_workspace,
+            );
             return;
         }
 
@@ -251,7 +216,18 @@ fn main() {
                 let merge_url = format!(
                     "https://{forge_host}/api/v1/repos/{owner}/{repo_name}/pulls/{pr_number}/merge"
                 );
-                merge_with_retry(&merge_url, &token, pr_number, &pr_url);
+                merge_with_retry(
+                    &merge_url,
+                    &token,
+                    pr_number,
+                    &pr_url,
+                    &brief_id,
+                    &pr_branch,
+                    &pr_base,
+                    &target_repo,
+                    &forge_host,
+                    &host_workspace,
+                );
                 return;
             }
             "failure" | "error" => {
@@ -376,81 +352,152 @@ fn http_post(url: &str, token: &str, body: &str) -> Result<(String, String), Str
 /// POST `{"Do":"merge"}` to the merge URL, retrying transient 405/409 up
 /// to `MERGE_MAX_RETRIES` times with `10*attempt`-sec backoff capped at
 /// 60s plus `rand_jitter()` jitter. Emits `done shipped` on 200/204,
-/// `done failed` on retry-budget exhaustion or non-transient errors.
-fn merge_with_retry(merge_url: &str, token: &str, pr_number: i64, pr_url: &str) {
+/// chain-triggers pr-rebaser-agentry on retry-budget exhaustion (the
+/// merge-POST race against develop advancing — same condition the
+/// GET-side `mergeable=false` branch handles), and `done failed` only
+/// on non-transient HTTP codes pr-rebaser cannot fix.
+#[allow(clippy::too_many_arguments)]
+fn merge_with_retry(
+    merge_url: &str,
+    token: &str,
+    pr_number: i64,
+    pr_url: &str,
+    brief_id: &str,
+    pr_branch: &str,
+    pr_base: &str,
+    target_repo: &str,
+    forge_host: &str,
+    host_workspace: &str,
+) {
     let body = r#"{"Do":"merge"}"#;
-    let mut last_code = String::new();
-    let mut last_detail = String::new();
-
-    for attempt in 1..=MERGE_MAX_RETRIES {
-        match http_post(merge_url, token, body) {
-            Ok((code, detail)) => {
-                last_code = code.clone();
-                last_detail = detail.clone();
-                if code == "200" || code == "204" {
-                    emit_event(json!({
-                        "msg": "merged",
-                        "pr_number": pr_number,
-                        "pr_url": pr_url,
-                        "merge_attempt": attempt,
-                    }));
-                    emit_done(EventVerdict::Shipped, None);
-                    return;
-                }
-                if code == "405" || code == "409" {
-                    if attempt < MERGE_MAX_RETRIES {
-                        let backoff = (10u64 * attempt as u64).min(MERGE_BACKOFF_CAP_SECS);
-                        let sleep_seconds = backoff + rand_jitter();
-                        emit_event(json!({
-                            "msg": "merge transient failure — retrying",
-                            "http_code": code,
-                            "detail": detail,
-                            "merge_attempt": attempt,
-                            "sleep_seconds": sleep_seconds,
-                        }));
-                        sleep_secs(sleep_seconds);
-                        continue;
-                    }
-                    break;
-                }
-                emit_event(json!({
-                    "error": "merge API call failed (non-transient)",
-                    "http_code": code,
-                    "detail": detail,
-                    "merge_attempt": attempt,
-                }));
-                emit_done(EventVerdict::Failed, None);
-                return;
-            }
-            Err(e) => {
-                last_detail = e;
-                last_code = "(spawn-error)".into();
-                if attempt < MERGE_MAX_RETRIES {
-                    let backoff = (10u64 * attempt as u64).min(MERGE_BACKOFF_CAP_SECS);
-                    let sleep_seconds = backoff + rand_jitter();
-                    emit_event(json!({
-                        "msg": "merge transient failure — retrying",
-                        "http_code": last_code,
-                        "detail": last_detail,
-                        "merge_attempt": attempt,
-                        "sleep_seconds": sleep_seconds,
-                    }));
-                    sleep_secs(sleep_seconds);
-                    continue;
-                }
-                break;
-            }
+    let outcome = run_merge_retry_loop(
+        MERGE_MAX_RETRIES,
+        |_attempt| match http_post(merge_url, token, body) {
+            Ok((code, detail)) => AttemptResult::Ok(code, detail),
+            Err(e) => AttemptResult::Err(e),
+        },
+        |attempt, code, detail| {
+            let backoff = (10u64 * attempt as u64).min(MERGE_BACKOFF_CAP_SECS);
+            let sleep_seconds = backoff + rand_jitter();
+            emit_event(json!({
+                "msg": "merge transient failure — retrying",
+                "http_code": code,
+                "detail": detail,
+                "merge_attempt": attempt,
+                "sleep_seconds": sleep_seconds,
+            }));
+            sleep_secs(sleep_seconds);
+        },
+    );
+    match outcome {
+        MergeRetryOutcome::Merged { attempt } => {
+            emit_event(json!({
+                "msg": "merged",
+                "pr_number": pr_number,
+                "pr_url": pr_url,
+                "merge_attempt": attempt,
+            }));
+            emit_done(EventVerdict::Shipped, None);
+        }
+        MergeRetryOutcome::NonTransientFail {
+            code,
+            detail,
+            attempt,
+        } => {
+            emit_event(json!({
+                "error": "merge API call failed (non-transient)",
+                "http_code": code,
+                "detail": detail,
+                "merge_attempt": attempt,
+            }));
+            emit_done(EventVerdict::Failed, None);
+        }
+        MergeRetryOutcome::ExhaustedTransient { code, detail } => {
+            emit_event(json!({
+                "msg": "merge retry budget exhausted on transient 405/409 — chain-triggering pr-rebaser",
+                "http_code": code,
+                "detail": detail,
+                "merge_attempt": MERGE_MAX_RETRIES,
+            }));
+            chain_trigger_pr_rebaser(
+                brief_id,
+                pr_number,
+                pr_branch,
+                pr_base,
+                target_repo,
+                forge_host,
+                host_workspace,
+            );
         }
     }
+}
 
+/// Write `/workspace/pr_rebaser_brief.json`, emit the `_chain_trigger`
+/// message, and finalize with `done shipped`. Both the GET-side
+/// `mergeable=false` branch and the POST-side merge-retry-exhaustion
+/// branch route through this helper — the contract pr-rebaser-agentry
+/// reacts to is identical (the brief filename, the message envelope,
+/// and the parent's terminal verdict).
+///
+/// `pr_branch.is_empty()` is treated as a hard error: without the head
+/// ref we cannot construct a rebaser brief, so we fall back to
+/// `done failed`. This used to be guarded only at the GET-side call
+/// site; folding it into the helper keeps the new POST-side caller
+/// honest too.
+fn chain_trigger_pr_rebaser(
+    brief_id: &str,
+    pr_number: i64,
+    pr_branch: &str,
+    pr_base: &str,
+    target_repo: &str,
+    forge_host: &str,
+    host_workspace: &str,
+) {
+    if pr_branch.is_empty() {
+        emit_event(json!({
+            "error": "pr_resp missing .head.ref — cannot chain-trigger rebaser without branch",
+        }));
+        emit_done(EventVerdict::Failed, None);
+        return;
+    }
+    let rebaser_path = "/workspace/pr_rebaser_brief.json";
+    let rebaser_brief_id = format!("brf_rebaser_{brief_id}_pr{pr_number}");
+    let submitted_at = Utc::now().to_rfc3339();
+    let child = json!({
+        "id": rebaser_brief_id,
+        "project": Value::Null,
+        "topology": {"name": "agentry-pr-rebaser-v0", "version": 1},
+        "payload": {
+            "target_repo": target_repo,
+            "pr_number": pr_number,
+            "branch": pr_branch,
+            "base_branch": pr_base,
+            "forge_host": forge_host,
+        },
+        "budget": {"max_wall_seconds": 600},
+        "escalation": "autonomous",
+        "parent_brief": brief_id,
+        "submitted_by": format!("ci-watcher-agentry-{brief_id}"),
+        "submitted_at": submitted_at,
+    });
+    if let Err(e) = std::fs::write(rebaser_path, child.to_string()) {
+        emit_event(json!({
+            "error": "failed to write pr_rebaser_brief.json",
+            "detail": e.to_string(),
+        }));
+        emit_done(EventVerdict::Failed, None);
+        return;
+    }
+    let host_path = format!("{host_workspace}/pr_rebaser_brief.json");
     emit_event(json!({
-        "error": "merge retry budget exhausted (transient)",
-        "http_code": last_code,
-        "detail": last_detail,
-        "merge_attempt": MERGE_MAX_RETRIES,
-        "merge_max_retries": MERGE_MAX_RETRIES,
+        "msg": "pr not mergeable — chain-triggering pr-rebaser-agentry",
+        "pr_number": pr_number,
+        "branch": pr_branch,
+        "base_branch": pr_base,
+        "next_brief_ref": host_path,
     }));
-    emit_done(EventVerdict::Failed, None);
+    emit_message("_chain_trigger", json!({"next_brief_refs": [host_path]}));
+    emit_done(EventVerdict::Shipped, None);
 }
 
 fn sleep_secs(secs: u64) {
