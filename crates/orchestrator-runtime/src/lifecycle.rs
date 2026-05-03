@@ -11,13 +11,25 @@
 
 use async_trait::async_trait;
 use orchestrator_types::lifecycle::{BriefEvent, BriefStateRecord};
-use orchestrator_types::{BriefId, Event, EventKind};
+use orchestrator_types::{BriefId, Event, EventKind, EventVerdict};
 use redis::aio::ConnectionManager;
 use redis::streams::{StreamReadOptions, StreamReadReply};
 use redis::AsyncCommands;
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use thiserror::Error;
+
+/// `DoneReason.cause` sentinel that the coder runner emits on the
+/// terminal Shipped event when its acceptance check passed against an
+/// empty diff (work was already on the base branch). The translator
+/// folds this into a [`BriefEvent::CoderDoneNoOp`] so the FSM
+/// short-circuits Authoring → Shipped instead of walking the full
+/// Verifying / Reviewing / Shipping / Watching trail.
+pub const NO_OP_SHORT_CIRCUIT_CAUSE: &str = "no_op_short_circuit";
+
+/// Operator-visible reason text written to `agentry:verdicts` when the
+/// FSM short-circuits to Shipped via [`NO_OP_SHORT_CIRCUIT_CAUSE`].
+pub const NO_OP_VERDICT_REASON: &str = "no-op brief — coder produced no diff against base";
 
 /// Errors surfaced by [`EventSource`] implementations. Production adapters
 /// can hit [`Self::Redis`] on connection or read failures, and
@@ -134,10 +146,22 @@ fn translate_trace_entry(
             }
             Ok(None)
         }
-        EventKind::Done { verdict, .. } => {
+        EventKind::Done {
+            verdict, reason, ..
+        } => {
             let role = role_by_agent.get(&agent_id).cloned();
             match role.as_deref() {
-                Some("coder") => Ok(Some(BriefEvent::CoderDone { verdict })),
+                Some("coder") => {
+                    if verdict == EventVerdict::Shipped
+                        && reason.as_ref().map(|r| r.cause.as_str())
+                            == Some(NO_OP_SHORT_CIRCUIT_CAUSE)
+                    {
+                        return Ok(Some(BriefEvent::CoderDoneNoOp {
+                            reason: NO_OP_VERDICT_REASON.to_string(),
+                        }));
+                    }
+                    Ok(Some(BriefEvent::CoderDone { verdict }))
+                }
                 Some("ac-verifier") | Some("verifier") => {
                     Ok(Some(BriefEvent::AcVerifierDone { verdict }))
                 }
