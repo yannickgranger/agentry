@@ -858,99 +858,32 @@ fn build_pr_rebaser_agentry_role(
     }
 }
 
-/// Pre-flight criterion analyser. Runs `success_criteria` against the current
-/// tip and reports the baseline value, plus heuristic smell-tests for
-/// obviously-broken criteria (issue #84). Read-only on the workspace; surfaces
-/// signal via `Finding` events. Does not gate — gating is the planner's job in
-/// brief 84b.
-const PREFLIGHT_CRITERION_AGENTRY_SCRIPT: &str = r##"#!/usr/bin/env bash
-set -uo pipefail
-bundle="$(cat)"
-criterion=$(jq -r '.brief.payload.success_criteria // ""' <<<"$bundle")
-target_repo=$(jq -r '.brief.payload.target_repo // ""' <<<"$bundle")
-
-if [ -z "$criterion" ]; then
-    emit_event '{"error":"preflight-criterion missing success_criteria in payload"}'
-    emit_done "failed"; exit 0
-fi
-
-# Split on the FIRST occurrence of " : " (space-colon-space).
-case "$criterion" in
-    *' : '*) ;;
-    *)
-        emit_event "$(jq -nc --arg c "$criterion" '{error:"success_criteria missing space-colon-space separator",criterion:$c}')"
-        emit_done "failed"; exit 0
-        ;;
-esac
-cmd="${criterion%% : *}"
-expected_raw="${criterion#* : }"
-expected=$(printf '%s' "$expected_raw" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-
-cd /workspace || { emit_event '{"error":"cd /workspace failed"}'; emit_done "failed"; exit 0; }
-emit_event "$(jq -nc --arg c "$cmd" --arg e "$expected" --arg t "$target_repo" '{msg:"running preflight criterion",cmd:$c,expected:$e,target_repo:$t}')"
-
-stdout_file=$(mktemp)
-stderr_file=$(mktemp)
-exit_code=0
-bash -c "$cmd" >"$stdout_file" 2>"$stderr_file" || exit_code=$?
-baseline_raw=$(cat "$stdout_file")
-baseline=$(printf '%s' "$baseline_raw" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-err_tail=$(tail -c 4096 "$stderr_file")
-
-if [ "$baseline" = "$expected" ]; then
-    is_match=true
-else
-    is_match=false
-fi
-
-emit_event "$(jq -nc --arg b "$baseline" --arg e "$expected" --argjson m "$is_match" --argjson rc "$exit_code" --arg err "$err_tail" '{msg:"baseline_match",baseline:$b,expected:$e,match:$m,exit_code:$rc,stderr_tail:$err}')"
-
-# Smell heuristics — conservative; surface signal, don't reject. Operator (or
-# planner in 84b) decides what to do. False positives on warnings are fine;
-# false negatives let real broken criteria slip through, which is the bug.
-
-# Smell 1: huge baseline vs zero expected on a wc -l style count.
-if printf '%s' "$expected" | grep -qE '^[0-9]+$' \
-    && printf '%s' "$baseline" | grep -qE '^[0-9]+$' \
-    && [ "$expected" = "0" ] \
-    && [ "$baseline" -gt 100 ] \
-    && printf '%s' "$cmd" | grep -qF 'wc -l'; then
-    emit_finding warn preflight-criterion criterion-quality \
-        "criterion baseline ($baseline) is far from expected ($expected) — likely false positives if filter is naive"
-fi
-
-# Smell 2: canonical broken filter from #51.
-if printf '%s' "$cmd" | grep -qF "grep -v 'mod tests'"; then
-    emit_finding warn preflight-criterion criterion-quality \
-        "grep -v 'mod tests' filters lines containing literal text but not #[cfg(test)] scopes; use a Rust-aware tool like ra-query or cfdb instead"
-fi
-
-# Smell 3: counting via wc -l without a #[cfg(test)] filter.
-if printf '%s' "$cmd" | grep -qF 'wc -l' \
-    && ! printf '%s' "$cmd" | grep -qF '#[cfg(test)]'; then
-    emit_finding warn preflight-criterion criterion-quality \
-        "counting via wc -l without test-scope exclusion may include test code"
-fi
-
-emit_done "shipped"
-"##;
-
 /// Build the preflight-criterion-agentry role (issue #84). Runs the brief's
 /// `success_criteria` against the current workspace tip and reports the
 /// baseline + heuristic smells; does not gate. Brief 84b wires the planner to
 /// consume the baseline; until then the role is invoked manually for
 /// diagnosis.
+///
+/// EPIC #161 wave-bash port: bash heredoc PREFLIGHT_CRITERION_AGENTRY_SCRIPT
+/// ported to a Rust runner at
+/// crates/agentry-role-runtime/src/bin/preflight_criterion_runner.rs. The
+/// role bind-mounts the host-built binary at
+/// /usr/local/bin/preflight-criterion-runner (operator runs `just
+/// preflight-criterion-runner-binary`) and execs it directly. Image switched
+/// from alpine to debian:bookworm-slim for parity with the other ported
+/// runners; permit_scope and workspace_mount stay UNCHANGED — preflight is
+/// deliberately read-only on /workspace, has no net access, and no forge
+/// auth.
 fn build_preflight_criterion_agentry_role(home: &str) -> AgentRole {
-    let _ = home;
     AgentRole {
         name: RoleName("preflight-criterion-agentry".into()),
         version: 1,
         model: None,
         system_prompt: None,
-        image: ALPINE.into(),
+        image: "docker.io/library/debian:bookworm-slim".into(),
         substrate_class: SubstrateClass::Podman,
-        package_manager: PackageManager::Apk,
-        entrypoint_script: format!("{BASH_PRELUDE}{PREFLIGHT_CRITERION_AGENTRY_SCRIPT}"),
+        package_manager: PackageManager::Apt,
+        entrypoint_script: "#!/bin/sh\nexec /usr/local/bin/preflight-criterion-runner\n".into(),
         exitpoint_script: None,
         binaries: vec![
             "bash".into(),
@@ -964,7 +897,11 @@ fn build_preflight_criterion_agentry_role(home: &str) -> AgentRole {
         permit_scope: PermitScope(vec!["fs:read:/workspace/**".into()]),
         passthru_env: vec![],
         extra_bootstrap: vec![],
-        mounts: vec![],
+        mounts: vec![Mount {
+            source: format!("{home}/.local/bin/preflight-criterion-runner"),
+            target: "/usr/local/bin/preflight-criterion-runner".into(),
+            readonly: true,
+        }],
         workspace_mount: Some(WorkspaceMount {
             container_path: "/workspace".into(),
             readonly: true,

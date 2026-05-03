@@ -190,6 +190,15 @@ planner-runner-binary:
 pr-rebaser-runner-binary:
     cargo install --path crates/agentry-role-runtime --bin pr-rebaser-runner --root ~/.local --locked
 
+# Build preflight-criterion-runner into ~/.local/bin/preflight-criterion-runner
+# — the full lifecycle runner for the preflight-criterion-agentry role
+# (EPIC #161 wave-bash port of PREFLIGHT_CRITERION_AGENTRY_SCRIPT — issue #84
+# baseline analyser that runs the brief's success_criteria and emits Warn
+# findings for canonical broken patterns). Operator-invoked; idempotent. The
+# role bind-mounts this binary at /usr/local/bin/preflight-criterion-runner.
+preflight-criterion-runner-binary:
+    cargo install --path crates/agentry-role-runtime --bin preflight-criterion-runner --root ~/.local --locked
+
 # Build git-op-commit into ~/.local/bin/git-op-commit for the git-op-commit
 # role's bind-mount. Operator-invoked; idempotent. Brief 190b of #182 — the
 # commit half of the git-operator split.
