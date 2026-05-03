@@ -1,6 +1,7 @@
 //! Redis operations: brief submission, stream reads, verdict appends, trace writes.
 
 use crate::{Error, Result};
+use orchestrator_types::lifecycle::MAXIMUM_ATTEMPT_CAP;
 use orchestrator_types::{
     AgentRole, Brief, BriefId, Event, Project, RoleName, TeamName, TeamTopology, Verdict,
     VersionedRef,
@@ -156,10 +157,20 @@ pub enum RegisterOutcome {
 /// key, `AlreadyExists` if the key was already present (the existing body is
 /// untouched). Coexists with [`save_team`], which is overwriting and intended
 /// for seed-time use.
+///
+/// Dispatch-time fence: rejects topologies whose `max_retries` exceeds
+/// [`MAXIMUM_ATTEMPT_CAP`] BEFORE any Redis write, so an over-budget
+/// topology never lands in the catalog.
 pub async fn register_team_strict(
     conn: &mut ConnectionManager,
     t: &TeamTopology,
 ) -> Result<RegisterOutcome> {
+    if t.max_retries > MAXIMUM_ATTEMPT_CAP {
+        return Err(Error::Config(format!(
+            "team {}:v{} declares max_retries={} which exceeds MAXIMUM_ATTEMPT_CAP={}",
+            t.name.0, t.version, t.max_retries, MAXIMUM_ATTEMPT_CAP
+        )));
+    }
     let key = format!("agentry:team:{}:v{}", t.name.0, t.version);
     let body = serde_json::to_string(t)?;
     let acquired: bool = redis::cmd("SET")
