@@ -128,6 +128,18 @@ coder-claude-runner-binary:
     test -x ~/.local/bin/coder-claude-runner
     echo "coder-claude-runner installed at ~/.local/bin/coder-claude-runner"
 
+# Build auditor-claude-runner into ~/.local/bin/auditor-claude-runner — the
+# full lifecycle runner for the auditor-claude-agentry role (EPIC #161
+# Wave 2 port of AUDITOR_CLAUDE_AGENTRY_SCRIPT). Operator-invoked;
+# idempotent. The role bind-mounts this binary at
+# /usr/local/bin/auditor-claude-runner.
+auditor-claude-runner-binary:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo install --path crates/agentry-role-runtime --bin auditor-claude-runner --root ~/.local --locked --quiet
+    test -x ~/.local/bin/auditor-claude-runner
+    echo "auditor-claude-runner installed at ~/.local/bin/auditor-claude-runner"
+
 # Build git-op-commit into ~/.local/bin/git-op-commit for the git-op-commit
 # role's bind-mount. Operator-invoked; idempotent. Brief 190b of #182 — the
 # commit half of the git-operator split.

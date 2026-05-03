@@ -40,6 +40,15 @@ path = "src/bin/reviewer_claude_runner.rs"
 name = "coder-claude-runner"
 path = "src/bin/coder_claude_runner.rs"
 
+# auditor-claude-runner: full lifecycle for the auditor-claude-agentry role.
+# Ports AUDITOR_CLAUDE_AGENTRY_SCRIPT (~180 LoC bash heredoc) to Rust under
+# EPIC #161 Wave 2. Runs the cargo report stages (clippy/build/test/udeps),
+# the three ra-query stages (unwraps/complexity/pub-surface+callers), and
+# emits self-heal child briefs via the daemon's _chain_trigger pathway.
+[[bin]]
+name = "auditor-claude-runner"
+path = "src/bin/auditor_claude_runner.rs"
+
 [dependencies]
 orchestrator-types = { path = "../orchestrator-types" }
 serde.workspace = true
