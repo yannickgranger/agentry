@@ -10,9 +10,10 @@
 //! invariants so the regression cannot recur.
 
 use agentry_role_runtime::shipper_runner::{
-    build_pr_create_body, git_push_argv, parse_pr_response, parse_shipper_payload,
-    push_url_credential_free, scrub_token, split_target_repo, tail_stderr_scrubbed,
-    PrCreateResponse, ShipperPayload,
+    build_pr_create_body, classify_pre_push_rebase, git_fetch_argv, git_push_argv,
+    parse_pr_response, parse_shipper_payload, push_url_credential_free, scrub_token,
+    split_target_repo, tail_stderr_scrubbed, PrCreateResponse, PrePushRebaseDecision,
+    ShipperPayload,
 };
 use serde_json::json;
 
@@ -222,4 +223,61 @@ fn parse_pr_response_defaults_number_to_zero() {
     let resp = json!({"html_url": "https://x/y/pulls/1"});
     let parsed = parse_pr_response(&resp).expect("html_url present");
     assert_eq!(parsed.pr_number, 0);
+}
+
+#[test]
+fn pre_push_fetch_argv_uses_extraheader() {
+    // Pre-push fetch uses the same `-c http.extraheader=Authorization: token <T>`
+    // mechanism as push — token NEVER in the URL. Closes the same v1
+    // BLOCKER class for the new fetch step.
+    let url = push_url_credential_free("agency.lab:3000", "yg/agentry");
+    let argv = git_fetch_argv(FAKE_TOKEN, &url, "develop");
+
+    let extraheader = format!("http.extraheader=Authorization: token {FAKE_TOKEN}");
+    let mut found_extraheader = false;
+    for window in argv.windows(2) {
+        if window[0] == "-c" && window[1] == extraheader {
+            found_extraheader = true;
+        }
+    }
+    assert!(
+        found_extraheader,
+        "fetch argv must contain `-c http.extraheader=Authorization: token <TOKEN>` pair: {argv:?}",
+    );
+
+    let url_entry = argv
+        .iter()
+        .find(|s| s.starts_with("https://"))
+        .expect("argv must include the fetch URL");
+    assert_eq!(url_entry, "https://agency.lab:3000/yg/agentry.git");
+    assert!(
+        !url_entry.contains(FAKE_TOKEN),
+        "fetch URL argv entry must not contain the token: {url_entry}",
+    );
+    assert!(
+        !url_entry.contains('@'),
+        "fetch URL argv entry must not contain `@`: {url_entry}",
+    );
+
+    assert!(argv.iter().any(|s| s == "fetch"));
+    assert!(argv.iter().any(|s| s == "develop"));
+}
+
+#[test]
+fn pre_push_rebase_conflict_emits_done_failed() {
+    // Non-zero rebase exit + porcelain output with unmerged paths must
+    // route to AbortConflict — the runner translates that into
+    // emit_done(Failed) and skips the push step. Test asserts the
+    // classifier behaviour the runner depends on.
+    let porcelain = "UU crates/agentry-role-runtime/src/bin/shipper_runner.rs\n";
+    let decision = classify_pre_push_rebase(1, porcelain);
+    assert_eq!(decision, PrePushRebaseDecision::AbortConflict);
+    assert_ne!(decision, PrePushRebaseDecision::Proceed);
+}
+
+#[test]
+fn pre_push_clean_rebase_proceeds_to_push() {
+    // Rebase exit 0 with empty porcelain -> Proceed (push step is reached).
+    let decision = classify_pre_push_rebase(0, "");
+    assert_eq!(decision, PrePushRebaseDecision::Proceed);
 }
