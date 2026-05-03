@@ -6,7 +6,7 @@
   "image": "docker.io/library/rust:1.93",
   "substrate_class": "podman",
   "package_manager": "apt",
-  "entrypoint_script": "#!/bin/sh\nexec /usr/local/bin/coder-claude-runner\n",
+  "entrypoint_script": "#!/bin/sh\nexport CARGO_NET_GIT_FETCH_WITH_CLI=true\nexec /usr/local/bin/coder-claude-runner\n",
   "binaries": ["git", "curl", "ca-certificates", "quality-fast"],
   "mcp_servers": [],
   "tool_allowlist": [],
