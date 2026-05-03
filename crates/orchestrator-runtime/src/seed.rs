@@ -1151,7 +1151,8 @@ const CONTAINER_CLAUDE_SETTINGS: &str =
 /// return it. Idempotent — overwrites on every call so the materialized
 /// file always matches the checked-in source.
 fn materialize_container_claude_settings() -> Result<String> {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/var/home/yg".into());
+    let home = std::env::var("HOME")
+        .expect("HOME env var must be set to materialize container claude settings");
     let dir = format!("{home}/.config/agentry");
     std::fs::create_dir_all(&dir)?;
     let path = format!("{dir}/claude-container-settings.json");
@@ -1353,7 +1354,8 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
     // ---- claude-echo (Claude Max via host CLI) ----
     // The `claude` binary is static glibc — alpine's musl can't run it, so
     // this role uses debian as its base.
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/var/home/yg".into());
+    let home = std::env::var("HOME")
+        .expect("HOME env var must be set to bind claude credentials into the claude-echo role");
     let claude_echo = AgentRole {
         name: RoleName("claude-echo".into()),
         version: 1,
@@ -1657,7 +1659,9 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
     // Reviewer re-runs acceptance in isolation on the coder's workspace.
     // Shipper pushes the branch and opens a PR on the forge.
     // Ci-watcher polls forge CI on the PR's head sha and merges on green.
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/var/home/yg".into());
+    let home = std::env::var("HOME").expect(
+        "HOME env var must be set to bind claude credentials into the reviewer-mechanical role",
+    );
     let coder_claude_agentry = RoleRef {
         name: RoleName("coder-claude-agentry".into()),
         version: 1,
