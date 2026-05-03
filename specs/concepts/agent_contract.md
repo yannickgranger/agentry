@@ -210,3 +210,29 @@ and `pr_url`. `parse_pr_response` returns `None` when `html_url` is
 missing or empty (the bash `[ -z "$pr_url" ] || [ "$pr_url" = "null" ]`
 failure check), which the runner treats as a fatal `done failed` so a
 malformed forge response cannot ship a brief that has no PR to watch.
+
+## AttemptResult
+
+The outcome of one merge-POST attempt as the ci-watcher's retry loop
+classifies it: `Ok(http_code, body)` when curl returned an HTTP code,
+or `Err(detail)` when the curl invocation itself failed before any
+code was received. Sibling input type to `MergeRetryOutcome` — the
+caller-supplied `do_post` closure into `run_merge_retry_loop` returns
+one per attempt, decoupling the loop's decision logic from the actual
+HTTP transport so the test crate exercises the loop without a live
+forge.
+
+## MergeRetryOutcome
+
+Terminal classification the ci-watcher's `run_merge_retry_loop` reaches
+after exhausting attempts or hitting a definitive HTTP code. `Merged
+{ attempt }` maps to `done shipped`. `NonTransientFail { code, detail,
+attempt }` maps to `done failed` — these are real merge errors
+(authorization, malformed body, server fault) that the rebaser cannot
+fix. `ExhaustedTransient { code, detail }` is the dominant
+concurrent-dispatch race: persistent 405/409 from the merge POST
+because `develop` advanced between the GET-mergeability check and the
+POST attempt. The runner routes that variant through the same
+`chain_trigger_pr_rebaser` helper the GET-side `mergeable=false`
+branch uses, eliminating the manual-rebase requirement for the
+post-merge-POST race.
