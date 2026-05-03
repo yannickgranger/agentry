@@ -74,6 +74,15 @@ path = "src/bin/ci_watcher_runner.rs"
 name = "verifier-dol-runner"
 path = "src/bin/verifier_dol_runner.rs"
 
+# planner-runner: full lifecycle for the planner-claude-agentry role. Ports
+# PLANNER_CLAUDE_AGENTRY_SCRIPT (discovery.json + claude → child briefs +
+# _chain_trigger) to Rust under EPIC #161 Wave 3. Operator-invoked via
+# `just planner-runner-binary`; the role bind-mounts this binary at
+# /usr/local/bin/planner-runner.
+[[bin]]
+name = "planner-runner"
+path = "src/bin/planner_runner.rs"
+
 [dependencies]
 orchestrator-types = { path = "../orchestrator-types" }
 serde.workspace = true

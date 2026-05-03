@@ -613,182 +613,12 @@ emit_done "failed"
 // The runner has its own unit-test coverage for cfdb-counts parsing,
 // discovery-seed extraction, prompt assembly, and JSON-object slicing.
 
-/// Planner role for the `agentry-planner-v0` team. Reads the
-/// `discovery.json` synthesized by the upstream archaeologist, asks
-/// `claude -p` to decompose the meta-brief intent into a JSON ARRAY of
-/// child-brief descriptors, materializes each as a Brief JSON file under
-/// `/workspace/planner-children/`, then emits a single outbox `Message`
-/// whose payload carries `next_brief_refs` — a list of ABSOLUTE host paths
-/// to those child files. The daemon's chain-trigger (extended to scan
-/// accumulated role-outbox messages) auto-dispatches each child via
-/// `submit_brief` once this brief ships. Planner never calls the
-/// orchestrator CLI directly and never touches the forge.
-const PLANNER_CLAUDE_AGENTRY_SCRIPT: &str = r##"#!/usr/bin/env bash
-set -euo pipefail
-bundle="$(cat)"
-
-brief_id=$(jq -r '.brief.id' <<<"$bundle")
-intent=$(jq -r '.brief.payload.intent // ""' <<<"$bundle")
-success_criteria=$(jq -r '.brief.payload.success_criteria // ""' <<<"$bundle")
-child_topology=$(jq -r '.brief.payload.child_topology // "agentry-self-host-v0"' <<<"$bundle")
-max_children=$(jq -r '.brief.payload.max_children // 10' <<<"$bundle")
-base_branch=$(jq -r '.brief.payload.base_branch // "develop"' <<<"$bundle")
-target_repo=$(jq -r '.brief.payload.target_repo // "yg/agentry"' <<<"$bundle")
-
-# Children's brief JSON files live on the shared workspace under the brief's
-# host directory. The daemon's chain-trigger reads them off-container, so the
-# paths emitted in next_brief_refs MUST be absolute host paths.
-host_workspace="/var/mnt/workspaces/agentry-work/briefs/${brief_id}"
-
-if [ ! -f /workspace/discovery.json ]; then
-    emit_event '{"error":"discovery.json missing — upstream archaeologist must produce it at /workspace/discovery.json"}'
-    emit_done "failed"; exit 0
-fi
-
-mkdir -p /workspace/planner-children
-
-# Bound the inline discovery slice in the prompt to ~50KB.
-discovery_size=$(wc -c < /workspace/discovery.json)
-if [ "$discovery_size" -gt 51200 ]; then
-    discovery_excerpt=$(head -c 51200 /workspace/discovery.json)
-    discovery_truncated="true"
-else
-    discovery_excerpt=$(cat /workspace/discovery.json)
-    discovery_truncated="false"
-fi
-
-cat > /tmp/planner_prompt.txt <<PROMPT
-You are the planner role for the agentry project. Decompose the META-BRIEF
-intent into a JSON ARRAY of child briefs. Each child must be a focused,
-verifiable transformation expressed as verbs (CREATE/UPDATE/REPLACE/DELETE/MOVE)
-on specific file:line targets — NOT freeform "fix this issue" prose.
-
-META-BRIEF INTENT:
-$intent
-
-SUCCESS CRITERIA:
-$success_criteria
-
-DISCOVERY (size=${discovery_size} bytes, truncated=${discovery_truncated}):
-$discovery_excerpt
-
-CHILD BOILERPLATE (apply to every element):
-- target_repo: $target_repo
-- base_branch: $base_branch
-- budget.max_wall_seconds: 900
-- escalation: autonomous
-
-TOPOLOGY SELECTION — pick per child by task signature:
-- agentry-spec-edit-v0  → specs/* or docs/* changes only, no Rust code touched
-- agentry-bugfix-v0     → sub-30-LOC bug fix in Rust, no new types/traits, no spec change
-- agentry-self-host-v0  → everything else (default; new features, schema changes, multi-file refactors)
-
-Output EXACTLY one JSON array — no markdown fences, no prose. Cap at
-$max_children elements. Schema per element:
-
-{
-  "title": "<short verb-payload title>",
-  "topology": "agentry-self-host-v0" | "agentry-bugfix-v0" | "agentry-spec-edit-v0",
-  "verbs": "<full verb-payload markdown using CREATE/UPDATE/REPLACE/DELETE/MOVE>",
-  "acceptance": "<bash command, e.g. cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace>",
-  "estimated_files": ["<crate>:<file>"]
-}
-
-Your response, right now, starting with [ and ending with ]:
-PROMPT
-
-emit_event "$(jq -nc --arg len "$(wc -c < /tmp/planner_prompt.txt)" '{msg:"calling claude -p",prompt_bytes:$len}')"
-
-stream_claude response ".planner" "$(cat /tmp/planner_prompt.txt)"
-
-# Same fence-stripping + bracket-slice pattern as REVIEWER_CLAUDE_AGENTRY_SCRIPT.
-cleaned=$(printf '%s' "$response" | sed -e 's/^```json$//' -e 's/^```$//' -e '/^$/d' | tr -d '\r')
-start=$(printf '%s' "$cleaned" | grep -b -m1 '\[' | head -1 | cut -d: -f1)
-end=$(printf '%s' "$cleaned" | grep -bo '\]' | tail -1 | cut -d: -f1)
-if [ -z "$start" ] || [ -z "$end" ]; then
-    emit_event "$(jq -nc --arg r "$(printf '%s' "$cleaned" | head -c 300)" '{error:"claude response missing JSON array brackets",head:$r}')"
-    emit_done "failed"; exit 0
-fi
-payload=$(printf '%s' "$cleaned" | tail -c +$((start+1)) | head -c $((end-start+1)))
-
-if ! printf '%s' "$payload" | jq -e 'type == "array"' >/dev/null 2>&1; then
-    emit_event "$(jq -nc --arg r "$(printf '%s' "$payload" | head -c 300)" '{error:"claude response not a JSON array",head:$r}')"
-    emit_done "failed"; exit 0
-fi
-
-count=$(printf '%s' "$payload" | jq 'length')
-if [ "$count" -gt "$max_children" ]; then
-    payload=$(printf '%s' "$payload" | jq --argjson n "$max_children" '.[:$n]')
-    count=$max_children
-fi
-
-submitted_at=$(date -Iseconds)
-host_paths='[]'
-i=0
-while [ "$i" -lt "$count" ]; do
-    elem=$(printf '%s' "$payload" | jq -c ".[$i]")
-    title=$(printf '%s' "$elem" | jq -r '.title // ""')
-    verbs=$(printf '%s' "$elem" | jq -r '.verbs // ""')
-    acceptance=$(printf '%s' "$elem" | jq -r '.acceptance // ""')
-    elem_topology=$(printf '%s' "$elem" | jq -r '.topology // empty')
-    if [ -z "$elem_topology" ] || [ "$elem_topology" = "null" ]; then
-        elem_topology="$child_topology"
-    fi
-
-    pr_title="auto(planner-${brief_id}): ${title}"
-    pr_body="Authored by planner-claude-agentry from meta-brief ${brief_id}. Verbs:
-
-${verbs}"
-
-    child_path="/workspace/planner-children/child-${i}.json"
-    jq -nc \
-        --arg id "brf_planner_${brief_id}_child_${i}" \
-        --arg topology "$elem_topology" \
-        --arg title "$title" \
-        --arg verbs "$verbs" \
-        --arg acceptance "$acceptance" \
-        --arg target_repo "$target_repo" \
-        --arg base_branch "$base_branch" \
-        --arg pr_title "$pr_title" \
-        --arg pr_body "$pr_body" \
-        --arg parent "$brief_id" \
-        --arg submitted_by "planner-claude-agentry-${brief_id}" \
-        --arg submitted_at "$submitted_at" \
-        '{
-            id: $id,
-            project: null,
-            topology: { name: $topology, version: 1 },
-            payload: {
-                issue_number: 0,
-                issue_title: $title,
-                issue_body: $verbs,
-                acceptance: $acceptance,
-                target_repo: $target_repo,
-                base_branch: $base_branch,
-                pr_title: $pr_title,
-                pr_body: $pr_body
-            },
-            budget: { max_wall_seconds: 900 },
-            escalation: "autonomous",
-            parent_brief: $parent,
-            submitted_by: $submitted_by,
-            submitted_at: $submitted_at
-        }' > "$child_path"
-
-    host_paths=$(jq -nc --argjson cur "$host_paths" \
-        --arg p "${host_workspace}/planner-children/child-${i}.json" \
-        '$cur + [$p]')
-    i=$((i+1))
-done
-
-# Sentinel target `_chain_trigger`: there is no role by that name on the
-# planner topology — the daemon's chain-trigger scans every accumulated
-# outbox payload for next_brief_refs regardless of `to`, so this Message
-# carries the dispatch list without targeting any sibling role.
-emit_message "_chain_trigger" "$(jq -nc --argjson refs "$host_paths" '{next_brief_refs:$refs}')"
-emit_event "$(jq -nc --argjson n "$count" --arg m "/workspace/planner-children/" '{msg:"planner produced N children",count:$n,manifest:$m}')"
-emit_done "shipped"
-"##;
+// EPIC #161 Wave 3: PLANNER_CLAUDE_AGENTRY_SCRIPT bash heredoc that used to
+// live here has been ported to a Rust runner —
+// `crates/agentry-role-runtime/src/bin/planner_runner.rs`. The role's
+// entrypoint_script now just `exec /usr/local/bin/planner-runner`. The
+// runner has its own unit-test coverage for payload parsing, prompt
+// assembly, response parsing, and child-brief construction.
 
 /// Build the planner-claude-agentry role. Extracted from `seed_m0` so the
 /// permit-scope invariants can be asserted in a unit test without rebuilding
@@ -804,7 +634,7 @@ fn build_planner_claude_agentry_role(home: &str, claude_settings_path: &str) -> 
         image: "docker.io/library/rust:1.93".into(),
         substrate_class: SubstrateClass::Podman,
         package_manager: PackageManager::Apt,
-        entrypoint_script: format!("{BASH_PRELUDE}{PLANNER_CLAUDE_AGENTRY_SCRIPT}"),
+        entrypoint_script: "#!/bin/sh\nexec /usr/local/bin/planner-runner\n".into(),
         exitpoint_script: None,
         binaries: vec![],
         mcp_servers: vec![],
@@ -840,6 +670,11 @@ fn build_planner_claude_agentry_role(home: &str, claude_settings_path: &str) -> 
                 source: "/var/lib/agentry/transcripts".into(),
                 target: "/transcripts".into(),
                 readonly: false,
+            },
+            Mount {
+                source: format!("{home}/.local/bin/planner-runner"),
+                target: "/usr/local/bin/planner-runner".into(),
+                readonly: true,
             },
         ],
         workspace_mount: Some(WorkspaceMount {

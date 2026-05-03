@@ -139,3 +139,16 @@ caller can apply the soft-fail tolerance (degrade to `all_applied: true`
 and proceed). When `all_applied: false`, the runner emits one
 `completeness` blocker per entry in `unapplied` and `done failed` with
 cause `self_review_unapplied`.
+
+## PlannerPayload
+
+The parsed, role-local view of a meta-brief startup bundle as the planner
+runner consumes it: `brief_id`, `intent`, `success_criteria`,
+`child_topology` (default `agentry-self-host-v0`), `max_children` (default
+10), `base_branch` (default `develop`), `target_repo` (default
+`yg/agentry`). Built by `parse_planner_payload` once at the top of the
+runner's `main` so subsequent prompt assembly, response capping, and
+child-brief construction share the same materialised context rather than
+re-walking JSON pointers per call site. Defaults mirror the bash
+`jq -r '... // "..."'` fall-throughs of the legacy
+`PLANNER_CLAUDE_AGENTRY_SCRIPT` bash heredoc.
