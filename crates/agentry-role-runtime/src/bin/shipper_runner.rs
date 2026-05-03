@@ -42,8 +42,9 @@
 use std::process::{Command, Stdio};
 
 use agentry_role_runtime::shipper_runner::{
-    build_pr_create_body, git_push_argv, parse_pr_response, parse_shipper_payload,
-    push_url_credential_free, split_target_repo, tail_stderr_scrubbed, ShipperPayload,
+    build_pr_create_body, classify_pre_push_rebase, git_fetch_argv, git_push_argv,
+    parse_pr_response, parse_shipper_payload, push_url_credential_free, split_target_repo,
+    tail_stderr_scrubbed, PrePushRebaseDecision, ShipperPayload,
 };
 use agentry_role_runtime::{
     emit_done, emit_event, emit_message, read_bundle_value, workspace_is_git_repo, DoneGuard,
@@ -127,6 +128,142 @@ fn main() {
     }
 
     let push_url = push_url_credential_free(forge_host, target_repo);
+
+    // Pre-push fetch + rebase: catch develop drift between coder run and
+    // shipper push. Eliminates the dominant race window that
+    // pr-rebaser-agentry would otherwise have to recover from later
+    // (cf. ci-watcher's chained pr-rebaser fallback for the
+    // develop-advances-during-CI-poll case).
+    emit_event(json!({
+        "msg": "pre-push fetch",
+        "base_branch": base_branch,
+    }));
+    let fetch_argv = git_fetch_argv(&token, &push_url, base_branch);
+    let fetch_out = match Command::new("git")
+        .args(&fetch_argv)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+    {
+        Ok(o) => o,
+        Err(e) => {
+            emit_event(json!({
+                "error": "pre-push fetch failed",
+                "detail": format!("spawn git: {e}"),
+            }));
+            emit_done(
+                EventVerdict::Failed,
+                Some(DoneReason {
+                    cause: "pre-push fetch failed".into(),
+                    exit_code: None,
+                }),
+            );
+            return;
+        }
+    };
+    if !fetch_out.status.success() {
+        let detail = tail_stderr_scrubbed(&fetch_out.stderr, PUSH_STDERR_TAIL, &token);
+        emit_event(json!({
+            "error": "pre-push fetch failed",
+            "detail": detail,
+        }));
+        emit_done(
+            EventVerdict::Failed,
+            Some(DoneReason {
+                cause: "pre-push fetch failed".into(),
+                exit_code: fetch_out.status.code(),
+            }),
+        );
+        return;
+    }
+
+    emit_event(json!({"msg": "pre-push rebase on FETCH_HEAD"}));
+    let rebase_out = match Command::new("git")
+        .args(["rebase", "FETCH_HEAD"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+    {
+        Ok(o) => o,
+        Err(e) => {
+            emit_event(json!({
+                "error": "pre-push rebase spawn failed",
+                "detail": format!("spawn git: {e}"),
+            }));
+            emit_done(
+                EventVerdict::Failed,
+                Some(DoneReason {
+                    cause: "pre-push rebase spawn failed".into(),
+                    exit_code: None,
+                }),
+            );
+            return;
+        }
+    };
+    let rebase_rc = rebase_out.status.code().unwrap_or(-1);
+
+    let status_porcelain = match Command::new("git")
+        .args(["status", "--porcelain"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+    {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+        _ => String::new(),
+    };
+
+    match classify_pre_push_rebase(rebase_rc, &status_porcelain) {
+        PrePushRebaseDecision::Proceed => {}
+        PrePushRebaseDecision::AbortConflict => {
+            // Best-effort cleanup; ignore exit status.
+            let _ = Command::new("git")
+                .args(["rebase", "--abort"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            let detail = tail_stderr_scrubbed(&rebase_out.stderr, PUSH_STDERR_TAIL, &token);
+            emit_event(json!({
+                "error": "pre-push rebase conflict",
+                "detail": detail,
+            }));
+            emit_done(
+                EventVerdict::Failed,
+                Some(DoneReason {
+                    cause:
+                        "pre-push rebase conflict — coder branch diverged from base unresolvably"
+                            .into(),
+                    exit_code: Some(rebase_rc),
+                }),
+            );
+            return;
+        }
+        PrePushRebaseDecision::AbortFatal => {
+            let _ = Command::new("git")
+                .args(["rebase", "--abort"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            let detail = tail_stderr_scrubbed(&rebase_out.stderr, PUSH_STDERR_TAIL, &token);
+            emit_event(json!({
+                "error": "pre-push rebase failed",
+                "detail": detail,
+            }));
+            emit_done(
+                EventVerdict::Failed,
+                Some(DoneReason {
+                    cause: "pre-push rebase failed".into(),
+                    exit_code: Some(rebase_rc),
+                }),
+            );
+            return;
+        }
+    }
+
     emit_event(json!({
         "msg": "pushing branch",
         "branch": branch,

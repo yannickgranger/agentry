@@ -47,6 +47,69 @@ pub fn git_push_argv(token: &str, push_url: &str, branch: &str) -> Vec<String> {
     ]
 }
 
+/// Build the argv for the authenticated pre-push `git fetch <base_branch>`.
+///
+/// Same auth mechanism as [`git_push_argv`]: token lives in
+/// `-c http.extraheader=Authorization: token <T>`, NEVER in the URL.
+/// `fetch_url` is the credential-free https URL produced by
+/// [`push_url_credential_free`].
+pub fn git_fetch_argv(token: &str, fetch_url: &str, base_branch: &str) -> Vec<String> {
+    vec![
+        "-c".to_string(),
+        "http.sslVerify=false".to_string(),
+        "-c".to_string(),
+        format!("http.extraheader=Authorization: token {token}"),
+        "fetch".to_string(),
+        fetch_url.to_string(),
+        base_branch.to_string(),
+    ]
+}
+
+/// Decision the shipper-runner reaches for the pre-push rebase given the
+/// rebase exit code and `git status --porcelain` output. `Proceed` only
+/// when the rebase exited cleanly. `AbortConflict` covers the dominant
+/// failure (non-zero exit + unmerged paths — coder branch diverged
+/// unresolvably from the freshly fetched base). `AbortFatal` covers any
+/// other non-zero exit (spawn failure inside git, missing FETCH_HEAD,
+/// etc.) — distinct from conflict so the emitted cause is accurate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrePushRebaseDecision {
+    Proceed,
+    AbortConflict,
+    AbortFatal,
+}
+
+/// Classify the pre-push rebase outcome from the rebase exit code and
+/// `git status --porcelain` (v1) output.
+///
+/// `exit_code == 0` → [`PrePushRebaseDecision::Proceed`]. Non-zero with
+/// any unmerged-path code in the porcelain output (`UU`, `AA`, `DD`,
+/// `AU`, `UA`, `UD`, `DU`) → [`PrePushRebaseDecision::AbortConflict`].
+/// Non-zero with no unmerged paths → [`PrePushRebaseDecision::AbortFatal`].
+pub fn classify_pre_push_rebase(exit_code: i32, status_porcelain: &str) -> PrePushRebaseDecision {
+    if exit_code == 0 {
+        return PrePushRebaseDecision::Proceed;
+    }
+    if porcelain_v1_has_unmerged(status_porcelain) {
+        PrePushRebaseDecision::AbortConflict
+    } else {
+        PrePushRebaseDecision::AbortFatal
+    }
+}
+
+fn porcelain_v1_has_unmerged(status_porcelain: &str) -> bool {
+    status_porcelain.lines().any(|line| {
+        let bytes = line.as_bytes();
+        if bytes.len() < 2 {
+            return false;
+        }
+        matches!(
+            &bytes[..2],
+            b"DD" | b"AU" | b"UD" | b"UA" | b"DU" | b"AA" | b"UU"
+        )
+    })
+}
+
 /// Replace every occurrence of `token` in `text` with `[REDACTED]`.
 /// No-op when `token` is empty.
 ///

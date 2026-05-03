@@ -189,6 +189,23 @@ a missing ref or detached worktree). The pr-rebaser-runner's
 `classify_rebase` returns this so the success / push and conflict /
 abort branches stay separately testable from the I/O around them.
 
+## PrePushRebaseDecision
+
+Tri-state classification of the shipper-runner's pre-push `git rebase
+FETCH_HEAD` invocation: `Proceed` when the rebase exit code is 0 (push
+step is reached); `AbortConflict` when the exit is non-zero AND
+`git status --porcelain` reports unmerged paths (the coder branch has
+diverged from the freshly-fetched base unresolvably); `AbortFatal` when
+the exit is non-zero with no unmerged paths (substrate failure such as a
+missing FETCH_HEAD or git spawn error). `classify_pre_push_rebase`
+returns this so the proceed / abort branches stay separately testable
+from the I/O around them. Pre-push fetch + rebase closes the
+develop-advances-during-coder-run race window that would otherwise
+produce a stale-base PR with `mergeable=false` once the forge recomputes
+mergeability against the current develop tip; sibling fix to
+ci-watcher's chained pr-rebaser fallback for the
+develop-advances-during-CI-poll case.
+
 ## ShipperPayload
 
 The parsed, role-local view of a brief startup bundle as the shipper
