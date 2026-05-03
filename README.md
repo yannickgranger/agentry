@@ -82,7 +82,7 @@ flowchart LR
     council -->|declarations| cat
     council -->|briefs| sub
     sub -->|read| cat
-    sub -->|run one at a time| agents
+    sub -->|spawn| agents
     agents -->|report back| sub
     agents -->|open| pr
     pr --> fences
@@ -100,7 +100,10 @@ The pieces:
 3. **The catalog.** Roles, workflows, and specs as data. Authored by
    the council and the lead agent.
 4. **agentry itself.** Reads briefs, runs the workflow, watches the
-   agents, records outcomes.
+   agents, records outcomes. The dispatcher runs multiple briefs in
+   parallel — capped per project (default 4) so one noisy project can't
+   starve another. Within a single brief the roles run sequentially:
+   each role's container exits before the next one starts.
 5. **The agents.** Short-lived containers, each does one job. Their
    output is the events you see in the dashboard.
 6. **The architecture checks.** Run on every pull request. Compare
