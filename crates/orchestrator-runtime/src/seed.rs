@@ -513,98 +513,13 @@ emit_message "ci-watcher-agentry" "$(jq -nc \
 emit_done "shipped"
 "##;
 
-/// Bash entrypoint for `pr-rebaser-agentry`. Substrate auto-rebaser (#137):
-/// fetches the PR's base + head branches, attempts `git rebase
-/// origin/<base>`, and either force-pushes the rebased branch or surfaces
-/// the conflicts as findings so the coder can re-roll the PR. Brief 137b
-/// will wire this role into ci-watcher's chain-trigger so a stale PR
-/// auto-rebases without operator intervention.
-const PR_REBASER_AGENTRY_SCRIPT: &str = r##"#!/usr/bin/env bash
-set -euo pipefail
-bundle="$(cat)"
-
-target_repo=$(jq -r '.brief.payload.target_repo // "yg/agentry"' <<<"$bundle")
-pr_number=$(jq -r '.brief.payload.pr_number // ""' <<<"$bundle")
-branch=$(jq -r '.brief.payload.branch // ""' <<<"$bundle")
-base_branch=$(jq -r '.brief.payload.base_branch // "develop"' <<<"$bundle")
-forge_host=$(jq -r '.brief.payload.forge_host // "agency.lab:3000"' <<<"$bundle")
-
-if [ -z "$branch" ] || [ "$branch" = "null" ]; then
-    emit_event '{"error":"branch missing in brief.payload"}'
-    emit_done "failed"; exit 0
-fi
-
-if [ ! -d /workspace/.git ] && [ ! -f /workspace/.git ]; then
-    emit_event '{"error":"workspace missing — no .git found at /workspace"}'
-    emit_done "failed"; exit 0
-fi
-
-cd /workspace
-
-# Idempotent — `git config` overwrites the existing value rather than appending.
-git config user.email "pr-rebaser@agentry.lab"
-git config user.name "pr-rebaser"
-
-emit_event "$(jq -nc --arg b "$branch" --arg base "$base_branch" --arg pr "$pr_number" --arg repo "$target_repo" --arg fh "$forge_host" \
-    '{msg:"pr-rebaser starting",branch:$b,base_branch:$base,pr_number:$pr,target_repo:$repo,forge_host:$fh}')"
-
-if ! git fetch origin "$base_branch" 2>/tmp/fetch.err; then
-    err=$(tail -10 /tmp/fetch.err)
-    emit_event "$(jq -nc --arg base "$base_branch" --arg err "$err" '{error:"git fetch base failed",base:$base,detail:$err}')"
-    emit_done "failed"; exit 0
-fi
-
-if ! git fetch origin "$branch" 2>/tmp/fetch.err; then
-    err=$(tail -10 /tmp/fetch.err)
-    emit_event "$(jq -nc --arg b "$branch" --arg err "$err" '{error:"git fetch branch failed",branch:$b,detail:$err}')"
-    emit_done "failed"; exit 0
-fi
-
-if ! git checkout "$branch" 2>/tmp/co.err; then
-    err=$(tail -10 /tmp/co.err)
-    emit_event "$(jq -nc --arg b "$branch" --arg err "$err" '{error:"git checkout failed",branch:$b,detail:$err}')"
-    emit_done "failed"; exit 0
-fi
-
-base_sha=$(git rev-parse "origin/${base_branch}")
-
-rebase_rc=0
-git rebase "origin/${base_branch}" >/tmp/rebase.out 2>&1 || rebase_rc=$?
-
-if [ "$rebase_rc" = "0" ]; then
-    new_sha=$(git rev-parse HEAD)
-    if ! git push --force-with-lease origin "$branch" 2>/tmp/push.err; then
-        err=$(tail -10 /tmp/push.err)
-        emit_event "$(jq -nc --arg b "$branch" --arg err "$err" '{error:"git push --force-with-lease failed",branch:$b,detail:$err}')"
-        emit_done "failed"; exit 0
-    fi
-    emit_event "$(jq -nc --arg b "$branch" --arg base "$base_sha" --arg new "$new_sha" \
-        '{msg:"rebased and pushed",rebased:true,branch:$b,base_sha:$base,new_sha:$new}')"
-    emit_done "shipped"; exit 0
-fi
-
-# Non-zero exit. Distinguish conflict (unmerged paths in `git status
-# --porcelain=v2 -uno`) from any other failure.
-status_out=$(git status --porcelain=v2 -uno 2>/tmp/status.err || true)
-unmerged_files=$(printf '%s\n' "$status_out" | awk '/^u / {print $NF}')
-
-if [ -n "$unmerged_files" ]; then
-    while IFS= read -r f; do
-        [ -z "$f" ] && continue
-        emit_finding "blocker" "pr-rebaser" "rebase-conflict" "rebase conflict in $f"
-    done <<<"$unmerged_files"
-    git rebase --abort >/dev/null 2>&1 || true
-    emit_event "$(jq -nc --arg b "$branch" '{msg:"rebase conflicts — aborted, requesting rework",branch:$b}')"
-    emit_done "rework_needed"; exit 0
-fi
-
-# Non-conflict failure (e.g. detached worktree, missing ref). Abort any
-# in-progress rebase and surface the captured stdout+stderr.
-detail=$(tail -30 /tmp/rebase.out)
-git rebase --abort >/dev/null 2>&1 || true
-emit_event "$(jq -nc --arg b "$branch" --arg err "$detail" '{error:"git rebase failed (non-conflict)",branch:$b,detail:$err}')"
-emit_done "failed"
-"##;
+// EPIC #161 wave-bash port: PR_REBASER_AGENTRY_SCRIPT bash heredoc that
+// used to live here has been ported to a Rust runner —
+// `crates/agentry-role-runtime/src/bin/pr_rebaser_runner.rs`. The role's
+// entrypoint_script now just `exec /usr/local/bin/pr-rebaser-runner`. The
+// runner has its own unit-test coverage for payload parsing, remote-URL
+// composition, porcelain-v2 unmerged-file extraction, push argv shape,
+// and rebase-outcome classification.
 
 // EPIC #161 Wave 3: ARCHAEOLOGIST_CLAUDE_AGENTRY_SCRIPT bash heredoc that
 // used to live here has been ported to a Rust runner —
@@ -890,24 +805,25 @@ fn build_verifier_claude_agentry_role(home: &str) -> AgentRole {
 }
 
 /// PR rebaser role for the substrate auto-rebaser (#137). Triggered by a
-/// future ci-watcher chain-trigger when a PR's `mergeable` flag flips
-/// false because `develop` advanced past the PR's base. Reads the PR
+/// ci-watcher chain-trigger when a PR's `mergeable` flag flips false
+/// because `develop` advanced past the PR's base. Reads the PR
 /// coordinates from the brief payload, rebases the branch onto
 /// `origin/<base>`, and either force-pushes the rebased head or surfaces
-/// each conflict as a `Finding` so the coder can re-roll. Bash-only
-/// (`git` + `curl` + `jq` from apk), no LLM. Brief 137a — registered but
-/// unused until brief 137b wires it into ci-watcher's polling loop.
-fn build_pr_rebaser_agentry_role(_home: &str) -> AgentRole {
+/// each conflict as a `Finding` so the coder can re-roll. EPIC #161
+/// wave-bash port: the bash heredoc is now a Rust runner bind-mounted
+/// at `/usr/local/bin/pr-rebaser-runner`; image switched from alpine to
+/// debian:bookworm-slim (the runtime no longer needs cargo — just `git`
+/// + `curl` + `jq` from apt).
+fn build_pr_rebaser_agentry_role(home: &str) -> AgentRole {
     AgentRole {
         name: RoleName("pr-rebaser-agentry".into()),
         version: 1,
         model: None,
         system_prompt: None,
-        // Mirrors ci-watcher's image — both are bash-only forge interactors.
-        image: ALPINE.into(),
+        image: "docker.io/library/debian:bookworm-slim".into(),
         substrate_class: SubstrateClass::Podman,
-        package_manager: PackageManager::Apk,
-        entrypoint_script: format!("{BASH_PRELUDE}{PR_REBASER_AGENTRY_SCRIPT}"),
+        package_manager: PackageManager::Apt,
+        entrypoint_script: "#!/bin/sh\nexec /usr/local/bin/pr-rebaser-runner\n".into(),
         exitpoint_script: None,
         binaries: vec![
             "git".into(),
@@ -926,7 +842,11 @@ fn build_pr_rebaser_agentry_role(_home: &str) -> AgentRole {
         ]),
         passthru_env: vec!["GITEA_TOKEN".into()],
         extra_bootstrap: vec![],
-        mounts: vec![],
+        mounts: vec![Mount {
+            source: format!("{home}/.local/bin/pr-rebaser-runner"),
+            target: "/usr/local/bin/pr-rebaser-runner".into(),
+            readonly: true,
+        }],
         // Rebaser mutates /workspace/.git during fetch/checkout/rebase/push,
         // so the workspace mount must be writable (parallel to shipper-agentry).
         workspace_mount: Some(WorkspaceMount {

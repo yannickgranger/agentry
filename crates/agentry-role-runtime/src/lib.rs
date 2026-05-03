@@ -27,6 +27,7 @@ pub mod archaeologist;
 pub mod ci_watcher_runner;
 pub mod claude;
 pub mod planner;
+pub mod pr_rebaser;
 pub use claude::{stream_claude, StreamErr};
 
 use std::io::{self, Read, Write};
