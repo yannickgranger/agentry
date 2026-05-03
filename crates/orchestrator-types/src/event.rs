@@ -94,6 +94,14 @@ pub enum EventKind {
         selector_name: String,
         evidence_event_ids: Vec<String>,
     },
+    /// Operator-initiated retry signal: surfaces on the brief's trace
+    /// stream as `{"type":"retry_requested","actor":"...","reason":"..."}`
+    /// and is decoded by the lifecycle EventSource into
+    /// `BriefEvent::RetryRequested`. The producer (operator CLI,
+    /// dashboard button, external script) is out of scope here — this
+    /// variant exists so the EventSource can decode the entry when
+    /// something else writes it.
+    RetryRequested { actor: String, reason: String },
     /// Agent is done; terminal.
     Done {
         verdict: EventVerdict,

@@ -280,3 +280,53 @@ async fn redis_round_trip_writes_three_keys_atomically() {
     let _: () = conn.del(&state_key).await.expect("cleanup state");
     let _: () = conn.del(&cursor_key).await.expect("cleanup cursor");
 }
+
+/// Live-Redis: a trace-stream entry of the shape
+/// `{"type":"retry_requested","actor":"...","reason":"..."}` is decoded
+/// by `RedisEventSource::next` into `BriefEvent::RetryRequested {actor,
+/// reason}`. The producer (operator CLI / dashboard / external script)
+/// is out of scope; this test only pins the EventSource decoding rule.
+#[tokio::test]
+#[ignore = "requires live Redis (AGENTRY_TEST_REDIS_URL)"]
+async fn redis_event_source_translates_retry_requested() {
+    use redis::AsyncCommands;
+
+    let Some(url) = test_redis_url() else {
+        return;
+    };
+    let client = redis::Client::open(url).expect("client");
+    let mut conn = redis::aio::ConnectionManager::new(client)
+        .await
+        .expect("conn");
+
+    let id_str = brief_slug("retry_requested");
+    let brief_id = BriefId(id_str.clone());
+    let trace_key = format!("agentry:brief:{id_str}:trace");
+
+    let entry = serde_json::json!({
+        "at": Utc::now().to_rfc3339(),
+        "type": "retry_requested",
+        "actor": "alice",
+        "reason": "flake on CI"
+    })
+    .to_string();
+    let _: String = conn
+        .xadd(
+            &trace_key,
+            "*",
+            &[("agent", "operator-cli"), ("event", entry.as_str())],
+        )
+        .await
+        .expect("xadd retry_requested");
+
+    let mut source = RedisEventSource::new(conn.clone(), brief_id.clone());
+    match source.next().await.expect("next") {
+        Some(BriefEvent::RetryRequested { actor, reason }) => {
+            assert_eq!(actor, "alice");
+            assert_eq!(reason, "flake on CI");
+        }
+        other => panic!("expected BriefEvent::RetryRequested, got {other:?}"),
+    }
+
+    let _: () = conn.del(&trace_key).await.expect("cleanup trace");
+}

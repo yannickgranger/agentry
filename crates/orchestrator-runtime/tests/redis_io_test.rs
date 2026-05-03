@@ -50,6 +50,37 @@ fn topo(name: &str, version: u32, role: &str) -> TeamTopology {
     }
 }
 
+/// Dispatch-time fence: a topology with `max_retries` above
+/// `MAXIMUM_ATTEMPT_CAP` is rejected BEFORE any Redis write — the
+/// validation runs at the top of `register_team_strict`, ahead of the
+/// `SET ... NX` call. Live-Redis like the rest of this file: when
+/// `AGENTRY_TEST_REDIS_URL` is unset the test no-ops (matches the file's
+/// existing pattern); under CI the rejection is genuinely exercised.
+#[tokio::test]
+async fn register_team_strict_rejects_over_cap_max_retries() {
+    let Some(url) = test_redis_url() else { return };
+    let mut conn = connect(&url).await.expect("connect");
+    let mut t = topo("zz-rio-cap-fence", 1, "echo-agent");
+    t.max_retries = 999;
+
+    let err = register_team_strict(&mut conn, &t)
+        .await
+        .expect_err("over-cap topology must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("999"),
+        "rejection message must mention the offending value 999, got: {msg}"
+    );
+    assert!(
+        msg.contains("MAXIMUM_ATTEMPT_CAP"),
+        "rejection message must name MAXIMUM_ATTEMPT_CAP, got: {msg}"
+    );
+
+    let key = "agentry:team:zz-rio-cap-fence:v1";
+    let raw: Option<String> = conn.get(key).await.expect("get");
+    assert!(raw.is_none(), "rejected topology must not be persisted");
+}
+
 #[tokio::test]
 #[ignore = "requires live Redis (AGENTRY_TEST_REDIS_URL)"]
 async fn register_team_strict_first_writer_wins() {

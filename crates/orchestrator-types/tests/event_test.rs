@@ -138,6 +138,7 @@ fn event_kind_match_is_exhaustive() {
             EventKind::Log { .. } => "log",
             EventKind::Finding { .. } => "finding",
             EventKind::Status { .. } => "status",
+            EventKind::RetryRequested { .. } => "retry_requested",
             EventKind::Done { .. } => "done",
         }
     }
@@ -148,6 +149,39 @@ fn event_kind_match_is_exhaustive() {
         }),
         "tool_refused"
     );
+}
+
+/// Operator-initiated retry signal: a trace-stream entry of the
+/// shape `{"type":"retry_requested","actor":"...","reason":"..."}`
+/// (top-level) decodes into `EventKind::RetryRequested` with the
+/// fields populated. The lifecycle EventSource adapter consumes
+/// this shape; the producer (operator CLI / dashboard) is out of
+/// scope here.
+#[test]
+fn retry_requested_event_decodes_top_level_shape() {
+    let line = r#"{"at":"2026-04-23T10:00:00Z","type":"retry_requested","actor":"alice","reason":"flake on CI"}"#;
+    let e: Event = serde_json::from_str(line).expect("parse retry_requested");
+    match &e.kind {
+        EventKind::RetryRequested { actor, reason } => {
+            assert_eq!(actor, "alice");
+            assert_eq!(reason, "flake on CI");
+        }
+        other => panic!("expected EventKind::RetryRequested, got {other:?}"),
+    }
+    assert!(!e.is_terminal());
+    assert_eq!(e.verdict(), None);
+}
+
+#[test]
+fn retry_requested_event_roundtrips() {
+    let e = Event::new(EventKind::RetryRequested {
+        actor: "ops".into(),
+        reason: "rerun".into(),
+    });
+    let s = serde_json::to_string(&e).expect("ser");
+    assert!(s.contains("\"type\":\"retry_requested\""), "got: {s}");
+    let back: Event = serde_json::from_str(&s).expect("de");
+    assert_eq!(e, back);
 }
 
 #[test]

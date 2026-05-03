@@ -111,41 +111,47 @@ impl RedisEventSource {
             role_by_agent: HashMap::new(),
         }
     }
+}
 
-    fn translate(
-        &mut self,
-        agent_id: String,
-        event: Event,
-    ) -> Result<Option<BriefEvent>, EventSourceError> {
-        match event.kind {
-            EventKind::Event { payload } => {
-                if payload.get("agent_event").and_then(JsonValue::as_str) == Some("spawned") {
-                    if let Some(role) = payload.get("role_name").and_then(JsonValue::as_str) {
-                        self.role_by_agent
-                            .insert(agent_id.clone(), role.to_string());
-                        if role == "coder" {
-                            return Ok(Some(BriefEvent::CoderStarted { agent_id }));
-                        }
+/// Translate one trace-stream `(agent_id, Event)` pair into the matching
+/// `BriefEvent`, threading the per-source agent-id → role-name memo.
+/// Free function so unit tests can drive it without standing up a
+/// `ConnectionManager`.
+fn translate_trace_entry(
+    role_by_agent: &mut HashMap<String, String>,
+    agent_id: String,
+    event: Event,
+) -> Result<Option<BriefEvent>, EventSourceError> {
+    match event.kind {
+        EventKind::Event { payload } => {
+            if payload.get("agent_event").and_then(JsonValue::as_str) == Some("spawned") {
+                if let Some(role) = payload.get("role_name").and_then(JsonValue::as_str) {
+                    role_by_agent.insert(agent_id.clone(), role.to_string());
+                    if role == "coder" {
+                        return Ok(Some(BriefEvent::CoderStarted { agent_id }));
                     }
                 }
-                Ok(None)
             }
-            EventKind::Done { verdict, .. } => {
-                let role = self.role_by_agent.get(&agent_id).cloned();
-                match role.as_deref() {
-                    Some("coder") => Ok(Some(BriefEvent::CoderDone { verdict })),
-                    Some("ac-verifier") | Some("verifier") => {
-                        Ok(Some(BriefEvent::AcVerifierDone { verdict }))
-                    }
-                    Some("reviewer") => Ok(Some(BriefEvent::ReviewerDone {
-                        verdict,
-                        findings: vec![],
-                    })),
-                    _ => Ok(None),
-                }
-            }
-            _ => Ok(None),
+            Ok(None)
         }
+        EventKind::Done { verdict, .. } => {
+            let role = role_by_agent.get(&agent_id).cloned();
+            match role.as_deref() {
+                Some("coder") => Ok(Some(BriefEvent::CoderDone { verdict })),
+                Some("ac-verifier") | Some("verifier") => {
+                    Ok(Some(BriefEvent::AcVerifierDone { verdict }))
+                }
+                Some("reviewer") => Ok(Some(BriefEvent::ReviewerDone {
+                    verdict,
+                    findings: vec![],
+                })),
+                _ => Ok(None),
+            }
+        }
+        EventKind::RetryRequested { actor, reason } => {
+            Ok(Some(BriefEvent::RetryRequested { actor, reason }))
+        }
+        _ => Ok(None),
     }
 }
 
@@ -183,7 +189,9 @@ impl EventSource for RedisEventSource {
                         serde_json::from_str(&body).map_err(|e| EventSourceError::Parse {
                             detail: e.to_string(),
                         })?;
-                    if let Some(brief_event) = self.translate(agent_id, event)? {
+                    if let Some(brief_event) =
+                        translate_trace_entry(&mut self.role_by_agent, agent_id, event)?
+                    {
                         return Ok(Some(brief_event));
                     }
                 }
