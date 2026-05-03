@@ -12,13 +12,12 @@
 //! `cargo test --package orchestrator-runtime --test redis_io_test -- --ignored`.
 
 use orchestrator_runtime::redis_io::{
-    append_verdict_idempotent, connect, fetch_role, list_roles, list_teams, register_team_strict,
-    save_role, RegisterOutcome, STREAM_VERDICTS,
+    connect, fetch_role, list_roles, list_teams, register_team_strict, save_role, RegisterOutcome,
 };
 use orchestrator_runtime::Error;
 use orchestrator_types::{
-    AgentRole, BriefId, PackageManager, PermitScope, RoleName, RoleRef, SubstrateClass, TeamName,
-    TeamTopology, ToolAllowlist, Verdict, VerdictKind,
+    AgentRole, PackageManager, PermitScope, RoleName, RoleRef, SubstrateClass, TeamName,
+    TeamTopology, ToolAllowlist,
 };
 use redis::AsyncCommands;
 
@@ -224,155 +223,4 @@ async fn fetch_role_resolves_exact_version() {
         .del(format!("agentry:role:{}:v2", role_name.0))
         .await
         .expect("cleanup v2");
-}
-
-fn brief_slug(prefix: &str) -> String {
-    format!(
-        "brf_test_{prefix}_{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    )
-}
-
-fn shipped(brief_id: &str) -> Verdict {
-    Verdict::new(BriefId(brief_id.into()), VerdictKind::Shipped)
-}
-
-/// First call against a fresh brief_id wins the SETNX, returns
-/// `Ok(Some(stream_id))`, and lands the verdict on `agentry:verdicts`.
-#[tokio::test]
-#[ignore = "requires live Redis (AGENTRY_TEST_REDIS_URL)"]
-async fn append_verdict_idempotent_first_call_wins() {
-    let Some(url) = test_redis_url() else { return };
-    let mut conn = connect(&url).await.expect("connect");
-    let brief_id = brief_slug("idem_first");
-    let v = shipped(&brief_id);
-    let sentinel_key = format!("agentry:verdict:emitted:{brief_id}");
-
-    let before: i64 = conn.xlen(STREAM_VERDICTS).await.expect("xlen before");
-    let outcome = append_verdict_idempotent(&mut conn, &v)
-        .await
-        .expect("first call");
-    let after: i64 = conn.xlen(STREAM_VERDICTS).await.expect("xlen after");
-
-    assert!(outcome.is_some(), "first call must claim and XADD");
-    assert_eq!(after, before + 1, "verdict must be on stream");
-
-    let _: () = conn.del(&sentinel_key).await.expect("cleanup sentinel");
-}
-
-/// Second call with the same brief_id is suppressed: returns
-/// `Ok(None)` and the stream length stays put.
-#[tokio::test]
-#[ignore = "requires live Redis (AGENTRY_TEST_REDIS_URL)"]
-async fn append_verdict_idempotent_second_call_suppressed() {
-    let Some(url) = test_redis_url() else { return };
-    let mut conn = connect(&url).await.expect("connect");
-    let brief_id = brief_slug("idem_second");
-    let v = shipped(&brief_id);
-    let sentinel_key = format!("agentry:verdict:emitted:{brief_id}");
-
-    let before: i64 = conn.xlen(STREAM_VERDICTS).await.expect("xlen before");
-    let first = append_verdict_idempotent(&mut conn, &v)
-        .await
-        .expect("first call");
-    let after_first: i64 = conn.xlen(STREAM_VERDICTS).await.expect("xlen first");
-    let second = append_verdict_idempotent(&mut conn, &v)
-        .await
-        .expect("second call");
-    let after_second: i64 = conn.xlen(STREAM_VERDICTS).await.expect("xlen second");
-
-    assert!(first.is_some(), "first call wins");
-    assert!(second.is_none(), "second call must be suppressed");
-    assert_eq!(after_first, before + 1, "first call increments XLEN by 1");
-    assert_eq!(
-        after_second, after_first,
-        "second call must NOT increment XLEN"
-    );
-
-    let _: () = conn.del(&sentinel_key).await.expect("cleanup sentinel");
-}
-
-/// Lock-down for the #178 success/role-outcome reproducer: a brief with
-/// multiple roles completes, each role producing its own `Verdict` whose
-/// `brief.0` carries the same brief_id. Without the gate, every per-role
-/// `append_verdict` call XADDs onto `agentry:verdicts`, so the operator
-/// sees N entries for one brief. The gate must collapse the sequence to a
-/// single XADD: the first arriving role wins, the rest report `Ok(None)`
-/// and the kind reported on stream is the first arrival's kind.
-#[tokio::test]
-#[ignore = "requires live Redis (AGENTRY_TEST_REDIS_URL)"]
-async fn append_verdict_idempotent_role_outcome_path_collapses_to_one() {
-    let Some(url) = test_redis_url() else { return };
-    let mut conn = connect(&url).await.expect("connect");
-    let brief_id = brief_slug("idem_role_outcomes");
-    let sentinel_key = format!("agentry:verdict:emitted:{brief_id}");
-
-    // Three role outcomes for the same brief, with distinct kinds —
-    // mirrors the loop at daemon.rs handle_brief role-outcome path.
-    let role_a = Verdict::new(BriefId(brief_id.clone()), VerdictKind::Shipped);
-    let role_b = Verdict::new(
-        BriefId(brief_id.clone()),
-        VerdictKind::ReworkNeeded { findings: vec![] },
-    );
-    let role_c = Verdict::new(BriefId(brief_id.clone()), VerdictKind::Failed);
-
-    let before: i64 = conn.xlen(STREAM_VERDICTS).await.expect("xlen before");
-    let r_a = append_verdict_idempotent(&mut conn, &role_a)
-        .await
-        .expect("role a");
-    let r_b = append_verdict_idempotent(&mut conn, &role_b)
-        .await
-        .expect("role b");
-    let r_c = append_verdict_idempotent(&mut conn, &role_c)
-        .await
-        .expect("role c");
-    let after: i64 = conn.xlen(STREAM_VERDICTS).await.expect("xlen after");
-
-    assert!(r_a.is_some(), "first role outcome must claim the sentinel");
-    assert!(
-        r_b.is_none(),
-        "second role outcome on same brief must be suppressed"
-    );
-    assert!(
-        r_c.is_none(),
-        "third role outcome on same brief must be suppressed"
-    );
-    assert_eq!(
-        after,
-        before + 1,
-        "exactly one verdict must land on stream regardless of role count"
-    );
-
-    let _: () = conn.del(&sentinel_key).await.expect("cleanup sentinel");
-}
-
-/// Distinct brief_ids each get their own sentinel; both XADD.
-#[tokio::test]
-#[ignore = "requires live Redis (AGENTRY_TEST_REDIS_URL)"]
-async fn append_verdict_idempotent_distinct_briefs() {
-    let Some(url) = test_redis_url() else { return };
-    let mut conn = connect(&url).await.expect("connect");
-    let id_a = brief_slug("idem_dist_a");
-    let id_b = brief_slug("idem_dist_b");
-    let sentinel_a = format!("agentry:verdict:emitted:{id_a}");
-    let sentinel_b = format!("agentry:verdict:emitted:{id_b}");
-
-    let before: i64 = conn.xlen(STREAM_VERDICTS).await.expect("xlen before");
-    let r_a = append_verdict_idempotent(&mut conn, &shipped(&id_a))
-        .await
-        .expect("call a");
-    let r_b = append_verdict_idempotent(&mut conn, &shipped(&id_b))
-        .await
-        .expect("call b");
-    let after: i64 = conn.xlen(STREAM_VERDICTS).await.expect("xlen after");
-
-    assert!(r_a.is_some(), "brief A must XADD");
-    assert!(r_b.is_some(), "brief B must XADD");
-    assert_eq!(after, before + 2, "two verdicts must be on stream");
-
-    let _: () = conn.del(&sentinel_a).await.expect("cleanup a");
-    let _: () = conn.del(&sentinel_b).await.expect("cleanup b");
 }

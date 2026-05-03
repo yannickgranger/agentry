@@ -89,34 +89,6 @@ pub async fn append_verdict(conn: &mut ConnectionManager, v: &Verdict) -> Result
     Ok(id)
 }
 
-/// Append a brief verdict to `agentry:verdicts` IF this brief hasn't already
-/// emitted one. Uses a per-brief SETNX sentinel `agentry:verdict:emitted:{brief_id}`
-/// with a 24h TTL. Returns:
-///   - Ok(Some(stream_id)) — first XADD, sentinel claimed, verdict on stream.
-///   - Ok(None)            — duplicate suppressed, sentinel was already set.
-///   - Err(_)              — Redis error.
-pub async fn append_verdict_idempotent(
-    conn: &mut ConnectionManager,
-    v: &Verdict,
-) -> Result<Option<String>> {
-    let sentinel_key = format!("agentry:verdict:emitted:{}", v.brief.0);
-    // SET key 1 NX EX 86400 — atomic claim with 24h TTL.
-    let claimed: Option<String> = redis::cmd("SET")
-        .arg(&sentinel_key)
-        .arg("1")
-        .arg("NX")
-        .arg("EX")
-        .arg(86400)
-        .query_async(conn)
-        .await?;
-    if claimed.is_none() {
-        // Sentinel already set — duplicate suppressed.
-        return Ok(None);
-    }
-    let stream_id = append_verdict(conn, v).await?;
-    Ok(Some(stream_id))
-}
-
 /// Fetch an agent role by versioned ref.
 pub async fn fetch_role(
     conn: &mut ConnectionManager,

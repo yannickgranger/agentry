@@ -1,18 +1,13 @@
-//! L.3a parallel-run FSM driver task per brief.
+//! Lifecycle FSM driver task per brief.
 //!
-//! The daemon spawns one of these tasks per brief alongside the existing
-//! orchestrator role-chain (see `daemon::run`). The task drives the
+//! The daemon spawns one of these tasks per brief. The task drives the
 //! lifecycle FSM (`orchestrator_types::lifecycle::handle`) by pulling
 //! `BriefEvent`s from an [`EventSource`], applying each one, and writing
 //! the resulting [`BriefStateRecord`] via a [`StateProjector`]. On
-//! reaching a terminal state (`Shipped` or `Failed`), the task ALSO
-//! XADDs a [`Verdict`] to `agentry:verdicts` in parallel with the
-//! existing daemon emission — the per-brief SETNX sentinel suppresses
-//! duplicates, so the parallel run is safe.
-//!
-//! L.3b removes the existing path; this slice keeps both wired so the
-//! FSM emission can be validated against the legacy emission before
-//! cutover.
+//! reaching a terminal state (`Shipped` or `Failed`), the task XADDs a
+//! [`Verdict`] to `agentry:verdicts`. The terminal-state transition is
+//! single by construction, so this is the sole writer to the verdicts
+//! stream.
 
 use crate::lifecycle::{EventSource, StateProjector};
 use crate::redis_io;
@@ -40,8 +35,7 @@ use redis::aio::ConnectionManager;
 ///
 /// On reaching a terminal state, also emits a [`Verdict`] to
 /// `agentry:verdicts` via `verdict_conn` (when supplied). The
-/// production caller passes `Some(conn)` so the FSM emission lands
-/// alongside the legacy daemon emission; in-process tests pass `None`
+/// production caller passes `Some(conn)`; in-process tests pass `None`
 /// to exercise the projector pipeline without a Redis dependency.
 ///
 /// The cursor written by `projector.write` is a synthetic `step-N`
@@ -102,12 +96,9 @@ pub async fn projector_task(
     Ok(())
 }
 
-/// Emit the terminal [`Verdict`] for a brief from the FSM driver, in
-/// parallel with the legacy `daemon.rs` emission. Routes through
-/// [`redis_io::append_verdict_idempotent`] so the per-brief SETNX
-/// sentinel suppresses the duplicate when the legacy path has already
-/// fired — log the suppression at INFO so operators can see the
-/// parallel-run agreement.
+/// Emit the terminal [`Verdict`] for a brief from the FSM driver. The
+/// terminal-state transition is single by construction, so this is the
+/// sole writer to `agentry:verdicts`.
 async fn emit_terminal_verdict(
     conn: &mut ConnectionManager,
     brief_id: &BriefId,
@@ -122,18 +113,12 @@ async fn emit_terminal_verdict(
         _ => return Ok(()),
     };
     let verdict = Verdict::new(brief_id.clone(), kind).with_reason(reason);
-    match redis_io::append_verdict_idempotent(conn, &verdict).await? {
-        Some(stream_id) => tracing::info!(
-            brief = %verdict.brief.0,
-            kind = ?verdict.kind,
-            stream_id = %stream_id,
-            "fsm: terminal verdict emitted (parallel run)"
-        ),
-        None => tracing::info!(
-            brief = %verdict.brief.0,
-            kind = ?verdict.kind,
-            "fsm: terminal verdict suppressed by SETNX (legacy path won the race — parallel run agreed)"
-        ),
-    }
+    let stream_id = redis_io::append_verdict(conn, &verdict).await?;
+    tracing::info!(
+        brief = %verdict.brief.0,
+        kind = ?verdict.kind,
+        stream_id = %stream_id,
+        "fsm: terminal verdict emitted"
+    );
     Ok(())
 }

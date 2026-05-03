@@ -60,7 +60,6 @@ pub struct DashboardStore {
 const TRACE_FANOUT_CAPACITY: usize = 256;
 const VERDICTS_STREAM: &str = "agentry:verdicts";
 const BRIEFS_STREAM: &str = "agentry:briefs";
-const ACTIVE_BRIEFS_SET: &str = "agentry:active_briefs";
 const DEFAULT_BLOCK_MS: u64 = 5_000;
 const DEFAULT_EVICTION_GRACE: Duration = Duration::from_secs(30);
 
@@ -175,45 +174,6 @@ impl DashboardStore {
             method = "fetch_recent_briefs",
             elapsed_ms = _t.elapsed().as_millis(),
             n_commands = 1usize,
-            "dashboard_store_call"
-        );
-        Ok(out)
-    }
-
-    /// Briefs currently in flight: SMEMBERS of the `agentry:active_briefs`
-    /// set (maintained by the daemon on intake / verdict-emit), then a
-    /// single MGET across the `agentry:brief:<id>:body` keys to materialize.
-    pub async fn active_briefs(&self) -> anyhow::Result<Vec<Value>> {
-        let _t = std::time::Instant::now();
-        let mut n_commands: usize = 0;
-        let mut conn = self.inner.conn.clone();
-        let ids: Vec<String> = conn.smembers(ACTIVE_BRIEFS_SET).await?;
-        n_commands += 1;
-        if ids.is_empty() {
-            tracing::info!(
-                method = "active_briefs",
-                elapsed_ms = _t.elapsed().as_millis(),
-                n_commands,
-                "dashboard_store_call"
-            );
-            return Ok(Vec::new());
-        }
-        let keys: Vec<String> = ids
-            .iter()
-            .map(|id| format!("agentry:brief:{id}:body"))
-            .collect();
-        let bodies: Vec<Option<String>> = conn.mget(&keys).await?;
-        n_commands += 1;
-        let mut out = Vec::with_capacity(bodies.len());
-        for body in bodies.into_iter().flatten() {
-            if let Ok(v) = serde_json::from_str::<Value>(&body) {
-                out.push(v);
-            }
-        }
-        tracing::info!(
-            method = "active_briefs",
-            elapsed_ms = _t.elapsed().as_millis(),
-            n_commands,
             "dashboard_store_call"
         );
         Ok(out)

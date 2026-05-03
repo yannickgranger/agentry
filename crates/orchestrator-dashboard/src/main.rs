@@ -34,12 +34,15 @@ use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures::stream::{self, Stream, StreamExt};
+use orchestrator_runtime::redis_io;
 use orchestrator_runtime::Config;
+use orchestrator_types::lifecycle::{BriefState, BriefStateRecord};
 use orchestrator_types::{
     brief::EscalationMode, role::McpServer, AgentRole, Brief, MessageEdge, PackageManager,
     PermitScope, Project, ProjectSlug, RoleName, RoleRef, StandingOrders, SubstrateClass, TeamName,
     TeamTopology, ToolAllowlist,
 };
+use redis::AsyncCommands;
 use serde::Deserialize;
 use serde_json::Value;
 use std::convert::Infallible;
@@ -165,6 +168,58 @@ async fn webhook_submit(
     }
 }
 
+/// Derive the set of briefs in flight from the FSM state-key projection
+/// (`agentry:brief:*:state`) and materialise their bodies. Returns the
+/// same shape `active_briefs` previously produced (a Vec of brief-body
+/// JSON values) so the index template's field reads keep working.
+async fn derive_active_briefs(store: &DashboardStore) -> anyhow::Result<Vec<Value>> {
+    let mut conn = redis_io::connect(store.redis_url())
+        .await
+        .map_err(|e| anyhow::anyhow!("redis connect: {e}"))?;
+
+    let mut state_keys: Vec<String> = Vec::new();
+    {
+        let mut iter = conn
+            .scan_match::<_, String>("agentry:brief:*:state")
+            .await?;
+        while let Some(k) = iter.next_item().await {
+            state_keys.push(k);
+        }
+    }
+
+    let mut active_ids: Vec<String> = Vec::new();
+    for key in &state_keys {
+        let raw: Option<String> = conn.get(key).await?;
+        let Some(s) = raw else { continue };
+        let Ok(record) = serde_json::from_str::<BriefStateRecord>(&s) else {
+            continue;
+        };
+        if !matches!(
+            record.state,
+            BriefState::Shipped | BriefState::Failed { .. }
+        ) {
+            active_ids.push(record.brief_id.0);
+        }
+    }
+
+    if active_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let body_keys: Vec<String> = active_ids
+        .iter()
+        .map(|id| format!("agentry:brief:{id}:body"))
+        .collect();
+    let bodies: Vec<Option<String>> = conn.mget(&body_keys).await?;
+    let mut out = Vec::with_capacity(bodies.len());
+    for body in bodies.into_iter().flatten() {
+        if let Ok(v) = serde_json::from_str::<Value>(&body) {
+            out.push(v);
+        }
+    }
+    Ok(out)
+}
+
 // ---------- error wrapper so `?` works in handlers ----------
 
 struct AppError(anyhow::Error);
@@ -189,7 +244,7 @@ impl IntoResponse for AppError {
 // ---------- index ----------
 
 async fn index(State(state): State<AppState>) -> Result<Html<String>, AppError> {
-    let active = state.store.active_briefs().await?;
+    let active = derive_active_briefs(&state.store).await?;
     let verdicts = state.store.fetch_recent_verdicts(20).await?;
 
     // Best-effort per-brief metric badges. Aggregation is sync (blocks
