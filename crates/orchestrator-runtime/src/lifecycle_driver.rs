@@ -9,7 +9,9 @@
 //! single by construction, so this is the sole writer to the verdicts
 //! stream.
 
-use crate::lifecycle::{EventSource, StateProjector, NO_OP_VERDICT_REASON};
+use crate::lifecycle::{
+    EventSource, StateProjector, NO_OP_SHORT_CIRCUIT_CAUSE, NO_OP_VERDICT_REASON,
+};
 use crate::redis_io;
 use crate::workspace::{self, BriefWorkspace, TerminationDisposition};
 use crate::{Error, Result};
@@ -179,6 +181,21 @@ impl CleanupDisposition {
             Self::ShippedNoOp => "no-op short-circuit",
         }
     }
+
+    /// Machine-greppable cause sentinel emitted as a structured
+    /// `cause` field on the no-op cleanup trace event so operators
+    /// scanning `agentry:brief:<id>:trace` for the
+    /// `NO_OP_SHORT_CIRCUIT_CAUSE` constant value find both the
+    /// coder's terminal `Done` event and this cleanup event without
+    /// having to also know the human-readable disposition wording.
+    /// `None` for `Failed` — the existing `terminal Failed` label
+    /// already pins that disposition unambiguously.
+    fn cause_sentinel(self) -> Option<&'static str> {
+        match self {
+            Self::Failed => None,
+            Self::ShippedNoOp => Some(NO_OP_SHORT_CIRCUIT_CAUSE),
+        }
+    }
 }
 
 /// On terminal `BriefState::Failed`, tear down the brief's worktree dir
@@ -288,13 +305,15 @@ async fn cleanup_brief_at(
         );
     }
     if let Some(conn) = conn {
-        let event = Event::new(EventKind::Event {
-            payload: serde_json::json!({
-                "msg": format!("workspace cleaned ({label})"),
-                "brief_id": brief_id.0,
-                "disposition": label,
-            }),
+        let mut payload = serde_json::json!({
+            "msg": format!("workspace cleaned ({label})"),
+            "brief_id": brief_id.0,
+            "disposition": label,
         });
+        if let Some(cause) = disposition.cause_sentinel() {
+            payload["cause"] = serde_json::Value::String(cause.to_string());
+        }
+        let event = Event::new(EventKind::Event { payload });
         if let Err(e) = redis_io::append_trace(conn, brief_id, "lifecycle-driver", &event).await {
             tracing::warn!(
                 brief = %brief_id.0,

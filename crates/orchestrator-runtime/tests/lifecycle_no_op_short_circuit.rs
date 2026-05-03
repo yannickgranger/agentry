@@ -35,10 +35,12 @@ use orchestrator_runtime::lifecycle::{
     EventSource, EventSourceError, StateProjector, StateProjectorError, NO_OP_SHORT_CIRCUIT_CAUSE,
     NO_OP_VERDICT_REASON,
 };
-use orchestrator_runtime::lifecycle_driver::projector_task;
+use orchestrator_runtime::lifecycle_driver::{cleanup_shipped_no_op_brief_at, projector_task};
+use orchestrator_runtime::workspace::allocate_at;
 use orchestrator_types::lifecycle::{BriefEvent, BriefState, BriefStateRecord};
 use orchestrator_types::{BriefId, DoneReason, Event, EventKind, EventVerdict};
 use std::collections::VecDeque;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 struct MemEventSource {
@@ -294,4 +296,149 @@ async fn translator_decodes_no_op_cause_to_coder_done_no_op() {
         .del(&trace_key_plain)
         .await
         .expect("cleanup plain trace");
+}
+
+// ---------------------------------------------------------------------------
+// Workspace teardown on terminal no-op Shipped (the brief's checklist
+// item 6). The lifecycle driver's no-op branch reaches the shared
+// `cleanup_brief_at` body via the dedicated `cleanup_shipped_no_op_brief`
+// helper — exercising the helper directly (the same pattern
+// `lifecycle_failed_cleanup.rs` uses for the Failed disposition) pins
+// the contract: the worktree dir and the `auto/<brief_id>` branch are
+// removed, the bare clone survives. The audit-log wording difference
+// vs. the Failed cleanup is verified by code inspection — there is no
+// production assertion of log-line content.
+// ---------------------------------------------------------------------------
+
+async fn run_git(cwd: &Path, args: &[&str]) {
+    let out = tokio::process::Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .await
+        .expect("git spawn");
+    assert!(
+        out.status.success(),
+        "git {args:?} in {} failed: {}",
+        cwd.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+async fn setup_upstream(dir: &Path) -> String {
+    let upstream = dir.join("upstream.git");
+    tokio::fs::create_dir_all(&upstream)
+        .await
+        .expect("mk upstream dir");
+    let seed = dir.join("seed");
+    tokio::fs::create_dir_all(&seed).await.expect("mk seed dir");
+    run_git(&seed, &["init", "-q", "-b", "main"]).await;
+    run_git(&seed, &["config", "user.email", "test@example.com"]).await;
+    run_git(&seed, &["config", "user.name", "test"]).await;
+    tokio::fs::write(seed.join("README"), b"hello\n")
+        .await
+        .expect("write README");
+    run_git(&seed, &["add", "README"]).await;
+    run_git(&seed, &["commit", "-q", "-m", "initial"]).await;
+    let out = tokio::process::Command::new("git")
+        .args(["clone", "--bare", "-q"])
+        .arg(&seed)
+        .arg(&upstream)
+        .output()
+        .await
+        .expect("git clone --bare upstream");
+    assert!(
+        out.status.success(),
+        "git clone --bare upstream failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    format!("file://{}", upstream.display())
+}
+
+fn bare_clone_path_for(root: &Path) -> std::path::PathBuf {
+    let parent = root
+        .file_name()
+        .expect("tmp dir has a name")
+        .to_string_lossy()
+        .into_owned();
+    root.join(".clones").join(parent).join("upstream")
+}
+
+async fn branch_exists(bare: &Path, branch: &str) -> bool {
+    let out = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(bare)
+        .args(["show-ref", "--verify", "--quiet"])
+        .arg(format!("refs/heads/{branch}"))
+        .output()
+        .await
+        .expect("git show-ref spawn");
+    out.status.success()
+}
+
+/// The no-op cleanup helper removes both the worktree directory and the
+/// `auto/<brief_id>` branch from the bare clone — same teardown
+/// mechanics the Failed disposition uses, just routed through a sibling
+/// helper so the audit log cannot mislabel a successful no-op as a
+/// terminal Failed cleanup. The bare clone itself survives — it's
+/// shared across briefs.
+#[tokio::test]
+async fn cleanup_shipped_no_op_removes_worktree_and_auto_branch() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let url = setup_upstream(tmp.path()).await;
+    let bid = BriefId("brf_no_op_cleanup_real".into());
+
+    let ws = allocate_at(&bid, Some((url.as_str(), "main")), tmp.path())
+        .await
+        .expect("alloc");
+    assert!(ws.host_path.exists(), "worktree dir must exist pre-cleanup");
+
+    let bare = bare_clone_path_for(tmp.path());
+    let auto_branch = format!("auto/{}", bid.0);
+    assert!(
+        branch_exists(&bare, &auto_branch).await,
+        "auto/<brief_id> must exist in bare clone pre-cleanup"
+    );
+
+    cleanup_shipped_no_op_brief_at(&bid, tmp.path(), None).await;
+
+    assert!(
+        !ws.host_path.exists(),
+        "no-op cleanup must remove the worktree dir"
+    );
+    assert!(
+        !branch_exists(&bare, &auto_branch).await,
+        "no-op cleanup must delete the auto/<brief_id> branch from the bare clone"
+    );
+    assert!(
+        bare.join("HEAD").exists(),
+        "no-op cleanup must NOT nuke the shared bare clone"
+    );
+}
+
+/// Idempotency holds for the no-op disposition the same as for the
+/// Failed disposition: a second invocation of the no-op cleanup helper
+/// must be a no-op itself — no panic, no error escape (cleanup is
+/// best-effort by contract), and the post-cleanup invariants stay
+/// intact (worktree gone, branch gone). Pins the rename/refactor
+/// against accidentally regressing the swallow-errors semantics.
+#[tokio::test]
+async fn cleanup_shipped_no_op_is_idempotent() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let url = setup_upstream(tmp.path()).await;
+    let bid = BriefId("brf_no_op_cleanup_idem".into());
+
+    let ws = allocate_at(&bid, Some((url.as_str(), "main")), tmp.path())
+        .await
+        .expect("alloc");
+    let bare = bare_clone_path_for(tmp.path());
+    let auto_branch = format!("auto/{}", bid.0);
+
+    cleanup_shipped_no_op_brief_at(&bid, tmp.path(), None).await;
+    assert!(!ws.host_path.exists());
+    assert!(!branch_exists(&bare, &auto_branch).await);
+
+    cleanup_shipped_no_op_brief_at(&bid, tmp.path(), None).await;
+    assert!(!ws.host_path.exists());
+    assert!(!branch_exists(&bare, &auto_branch).await);
 }
