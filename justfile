@@ -168,6 +168,13 @@ verifier-dol-runner-binary:
     test -x ~/.local/bin/verifier-dol-runner
     echo "verifier-dol-runner installed at ~/.local/bin/verifier-dol-runner"
 
+# Build planner-runner into ~/.local/bin/planner-runner — the full lifecycle
+# runner for the planner-claude-agentry role (EPIC #161 Wave 3 port of
+# PLANNER_CLAUDE_AGENTRY_SCRIPT). Operator-invoked; idempotent. The role
+# bind-mounts this binary at /usr/local/bin/planner-runner.
+planner-runner-binary:
+    cargo install --path crates/agentry-role-runtime --bin planner-runner --root ~/.local --locked
+
 # Build git-op-commit into ~/.local/bin/git-op-commit for the git-op-commit
 # role's bind-mount. Operator-invoked; idempotent. Brief 190b of #182 — the
 # commit half of the git-operator split.
