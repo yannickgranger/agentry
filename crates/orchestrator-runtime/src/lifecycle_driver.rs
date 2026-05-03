@@ -97,10 +97,12 @@ pub async fn projector_task(
                         // handle_brief never reaches finalize_shipped_team
                         // (it only sees the coder's outcome and there
                         // was no fan-out), so the workspace teardown
-                        // must fire here. Reuses the FSM driver's
-                        // existing cleanup helper, the same path
-                        // terminal Failed uses.
-                        cleanup_failed_brief(&brief_id, verdict_conn.as_mut()).await;
+                        // must fire here. Uses the dedicated no-op
+                        // helper so the log line and Redis trace event
+                        // identify the cause as "no-op short-circuit"
+                        // rather than mislabeling the audit log with
+                        // "terminal Failed" wording.
+                        cleanup_shipped_no_op_brief(&brief_id, verdict_conn.as_mut()).await;
                     }
                     break;
                 }
@@ -150,6 +152,35 @@ async fn emit_terminal_verdict(
     Ok(())
 }
 
+/// Which terminal disposition triggered the workspace cleanup. Drives
+/// the wording of the tracing logs and the Redis trace event so the
+/// audit log truthfully labels successful no-op short-circuits separate
+/// from terminal Failed cleanups (the two paths are otherwise
+/// mechanically identical — same worktree tear-down, same branch
+/// removal, same idempotency / error-swallowing semantics).
+#[derive(Debug, Clone, Copy)]
+enum CleanupDisposition {
+    /// Cleanup fired because the FSM reached `BriefState::Failed`.
+    Failed,
+    /// Cleanup fired because the FSM short-circuited
+    /// `Authoring → Shipped` on a no-op brief (acceptance passed but
+    /// the coder's diff against base was empty).
+    ShippedNoOp,
+}
+
+impl CleanupDisposition {
+    /// Operator-facing wording for the disposition, used in both the
+    /// `tracing` info/warn lines and the `msg` field of the Redis
+    /// trace event appended at cleanup. Kept short — fits inline in
+    /// log scans and `agentry:brief:<id>:trace` tails.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Failed => "terminal Failed",
+            Self::ShippedNoOp => "no-op short-circuit",
+        }
+    }
+}
+
 /// On terminal `BriefState::Failed`, tear down the brief's worktree dir
 /// and the associated `auto/<brief_id>` branch in the bare clone, and
 /// (when `conn` is provided) append a trace event recording the cleanup.
@@ -170,7 +201,13 @@ async fn emit_terminal_verdict(
 /// [`cleanup_failed_brief_at`] directly with an explicit root so they
 /// don't race other tests on the process-wide env var.
 pub async fn cleanup_failed_brief(brief_id: &BriefId, conn: Option<&mut ConnectionManager>) {
-    cleanup_failed_brief_at(brief_id, &BriefWorkspace::root(), conn).await;
+    cleanup_brief_at(
+        brief_id,
+        &BriefWorkspace::root(),
+        CleanupDisposition::Failed,
+        conn,
+    )
+    .await;
 }
 
 /// Test-friendly variant of [`cleanup_failed_brief`] that takes an
@@ -181,30 +218,81 @@ pub async fn cleanup_failed_brief_at(
     root: &Path,
     conn: Option<&mut ConnectionManager>,
 ) {
+    cleanup_brief_at(brief_id, root, CleanupDisposition::Failed, conn).await;
+}
+
+/// On a no-op short-circuit `BriefState::Shipped`, tear down the
+/// brief's worktree dir and the associated `auto/<brief_id>` branch in
+/// the bare clone, and (when `conn` is provided) append a trace event
+/// truthfully labeled `"workspace cleaned (no-op short-circuit)"`.
+///
+/// The cleanup mechanics are identical to [`cleanup_failed_brief`]
+/// (same `workspace::destroy_with_disposition` call, same idempotency,
+/// same error-swallowing semantics) — only the audit-log wording
+/// differs. Lives as a sibling helper rather than a parameter on the
+/// existing function so callers cannot accidentally tag a Failed
+/// cleanup as a no-op or vice-versa: the disposition is fixed at the
+/// call site by the function name.
+pub async fn cleanup_shipped_no_op_brief(brief_id: &BriefId, conn: Option<&mut ConnectionManager>) {
+    cleanup_brief_at(
+        brief_id,
+        &BriefWorkspace::root(),
+        CleanupDisposition::ShippedNoOp,
+        conn,
+    )
+    .await;
+}
+
+/// Test-friendly variant of [`cleanup_shipped_no_op_brief`] that takes
+/// an explicit workspace root rather than reading
+/// `AGENTRY_WORKSPACE_ROOT`. Production code should call the wrapper.
+pub async fn cleanup_shipped_no_op_brief_at(
+    brief_id: &BriefId,
+    root: &Path,
+    conn: Option<&mut ConnectionManager>,
+) {
+    cleanup_brief_at(brief_id, root, CleanupDisposition::ShippedNoOp, conn).await;
+}
+
+/// Shared body of the per-disposition cleanup helpers. The disposition
+/// only influences the wording of the tracing log lines and the `msg`
+/// field of the Redis trace event — the worktree teardown,
+/// `auto/<brief_id>` branch removal, idempotency, and error-swallowing
+/// behavior are identical across dispositions.
+async fn cleanup_brief_at(
+    brief_id: &BriefId,
+    root: &Path,
+    disposition: CleanupDisposition,
+    conn: Option<&mut ConnectionManager>,
+) {
     let host_path = root.join("briefs").join(&brief_id.0);
     let ws = BriefWorkspace {
         brief_id: brief_id.clone(),
         host_path,
     };
+    let label = disposition.label();
     if let Err(e) = workspace::destroy_with_disposition(&ws, TerminationDisposition::TearDown).await
     {
         tracing::warn!(
             brief = %brief_id.0,
             error = %e,
-            "workspace cleanup on terminal Failed failed"
+            disposition = label,
+            "workspace cleanup failed"
         );
     } else {
         tracing::info!(
             brief = %brief_id.0,
             path = %ws.host_path.display(),
-            "workspace cleaned (terminal Failed)"
+            disposition = label,
+            "workspace cleaned"
         );
     }
     if let Some(conn) = conn {
         let event = Event::new(EventKind::Event {
             payload: serde_json::json!({
-                "msg": "workspace cleaned (terminal Failed)",
+                "msg": format!("workspace cleaned ({label})"),
                 "brief_id": brief_id.0,
+                "disposition": label,
             }),
         });
         if let Err(e) = redis_io::append_trace(conn, brief_id, "lifecycle-driver", &event).await {
