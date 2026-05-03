@@ -26,7 +26,10 @@
 //!      retry the merge, `done shipped`.
 //!    - `Conflict`: emit one Blocker finding per unmerged path,
 //!      `git rebase --abort`, emit a structured event with the file
-//!      list, `done failed` with cause `rebase_conflict_requires_human`.
+//!      list, `done rework_needed`. Mirrors the bash original's
+//!      `emit_done "rework_needed"` so the daemon's review-producer
+//!      routing rewinds the chain to upstream rework rather than
+//!      terminating the brief permanently.
 //!    - `Fatal`: emit the non-conflict diagnostic, `git rebase --abort`,
 //!      `done failed`.
 //!
@@ -256,23 +259,23 @@ fn handle_rebase_success(payload: &RebaserPayload, base_sha: &str) {
 }
 
 fn handle_rebase_conflict(payload: &RebaserPayload, status_out: &str) {
+    // Verdict is `ReworkNeeded` — verbatim port of the bash original's
+    // `emit_done "rework_needed"`. The per-file Blocker findings emitted
+    // above travel as separate `EventKind::Finding` events; the daemon
+    // accumulates them and routes the rewind via the team's
+    // ReworkNeeded edges. `Failed` would terminate the brief permanently
+    // and bypass that routing.
     let unmerged = parse_unmerged_files(status_out);
     for f in &unmerged {
         emit_finding(&conflict_finding(f));
     }
     let _ = run_git(&["rebase", "--abort"]);
     emit_event(json!({
-        "msg": "rebase conflicts — aborted, surfacing for human review",
+        "msg": "rebase conflicts — aborted, requesting rework",
         "branch": payload.branch,
         "files": unmerged,
     }));
-    emit_done(
-        EventVerdict::Failed,
-        Some(DoneReason {
-            cause: "rebase_conflict_requires_human".into(),
-            exit_code: None,
-        }),
-    );
+    emit_done(EventVerdict::ReworkNeeded, None);
 }
 
 fn conflict_finding(file: &str) -> ReviewFinding {
