@@ -102,6 +102,17 @@ path = "src/bin/pr_rebaser_runner.rs"
 name = "shipper-runner"
 path = "src/bin/shipper_runner.rs"
 
+# preflight-criterion-runner: full lifecycle for the
+# preflight-criterion-agentry role. Ports PREFLIGHT_CRITERION_AGENTRY_SCRIPT
+# (issue #84 baseline analyser — runs the brief's success_criteria, reports
+# baseline + smell-test findings) to Rust under EPIC #161 wave-bash.
+# Read-only on /workspace, no forge auth, no net. Operator-invoked via
+# `just preflight-criterion-runner-binary`; the role bind-mounts this binary
+# at /usr/local/bin/preflight-criterion-runner.
+[[bin]]
+name = "preflight-criterion-runner"
+path = "src/bin/preflight_criterion_runner.rs"
+
 [dependencies]
 orchestrator-types = { path = "../orchestrator-types" }
 serde.workspace = true

@@ -1550,3 +1550,134 @@ pub fn verdict_for_exit_code(code: i32) -> EventVerdict {
         EventVerdict::Failed
     }
 }
+
+// ---------- preflight-criterion helpers (extracted from preflight_criterion_runner, EPIC #161 wave-bash) ----------
+
+/// Tool name embedded in `FindingOrigin::Mechanical` for every
+/// preflight-criterion smell finding. Matches the bash heredoc's
+/// `emit_finding warn preflight-criterion criterion-quality "..."` call
+/// site verbatim so the daemon-side projector / dashboard attribution
+/// does not drift.
+pub const PREFLIGHT_TOOL: &str = "preflight-criterion";
+
+/// Category embedded in every preflight-criterion smell finding.
+/// Matches the bash heredoc.
+pub const PREFLIGHT_CATEGORY: &str = "criterion-quality";
+
+/// Split a `success_criteria` string on the FIRST occurrence of `" : "`
+/// (space-colon-space). Returns `(cmd, expected)` with the expected
+/// portion trimmed. Returns `None` when the separator is absent.
+///
+/// Mirrors bash:
+/// ```bash
+/// case "$criterion" in
+///     *' : '*) ;;
+///     *) ... ;;
+/// esac
+/// cmd="${criterion%% : *}"
+/// expected_raw="${criterion#* : }"
+/// expected=$(printf '%s' "$expected_raw" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+/// ```
+pub fn split_criterion(criterion: &str) -> Option<(String, String)> {
+    let sep = " : ";
+    let idx = criterion.find(sep)?;
+    let cmd = criterion[..idx].to_string();
+    let expected_raw = &criterion[idx + sep.len()..];
+    let expected = expected_raw
+        .trim_matches(|c: char| c.is_ascii_whitespace())
+        .to_string();
+    Some((cmd, expected))
+}
+
+/// Smell 1 — `expected == "0"`, baseline numeric > 100, cmd contains
+/// `wc -l`. The criterion looks like a count-zero filter but the
+/// baseline is huge: the filter is almost certainly too broad and will
+/// surface false positives.
+///
+/// Ports bash heredoc lines 912-920 from
+/// `crates/orchestrator-runtime/src/seed.rs`:
+/// ```bash
+/// if printf '%s' "$expected" | grep -qE '^[0-9]+$' \
+///     && printf '%s' "$baseline" | grep -qE '^[0-9]+$' \
+///     && [ "$expected" = "0" ] \
+///     && [ "$baseline" -gt 100 ] \
+///     && printf '%s' "$cmd" | grep -qF 'wc -l'; then
+///     emit_finding warn preflight-criterion criterion-quality \
+///         "criterion baseline ($baseline) is far from expected ($expected) — likely false positives if filter is naive"
+/// fi
+/// ```
+pub fn smell_huge_baseline_zero_expected(
+    cmd: &str,
+    baseline: &str,
+    expected: &str,
+) -> Option<ReviewFinding> {
+    if expected != "0" {
+        return None;
+    }
+    if !is_ascii_digits(expected) || !is_ascii_digits(baseline) {
+        return None;
+    }
+    let baseline_n: u64 = baseline.parse().ok()?;
+    if baseline_n <= 100 {
+        return None;
+    }
+    if !cmd.contains("wc -l") {
+        return None;
+    }
+    Some(preflight_warn_finding(format!(
+        "criterion baseline ({baseline}) is far from expected ({expected}) — likely false positives if filter is naive"
+    )))
+}
+
+/// Smell 2 — cmd contains the literal `grep -v 'mod tests'` filter.
+/// Canonical broken pattern from #51: the filter strips lines that
+/// literally contain `mod tests` but does not exclude `#[cfg(test)]`
+/// scopes, so test code still leaks past the count.
+///
+/// Ports bash heredoc lines 922-926.
+pub fn smell_grep_v_mod_tests(cmd: &str) -> Option<ReviewFinding> {
+    if !cmd.contains("grep -v 'mod tests'") {
+        return None;
+    }
+    Some(preflight_warn_finding(
+        "grep -v 'mod tests' filters lines containing literal text but not #[cfg(test)] scopes; use a Rust-aware tool like ra-query or cfdb instead".to_string(),
+    ))
+}
+
+/// Smell 3 — cmd contains `wc -l` AND does NOT contain `#[cfg(test)]`.
+/// Counting lines without an explicit test-scope exclusion likely
+/// includes test code in the baseline.
+///
+/// Ports bash heredoc lines 928-933.
+pub fn smell_wc_l_without_cfg_test(cmd: &str) -> Option<ReviewFinding> {
+    if !cmd.contains("wc -l") {
+        return None;
+    }
+    if cmd.contains("#[cfg(test)]") {
+        return None;
+    }
+    Some(preflight_warn_finding(
+        "counting via wc -l without test-scope exclusion may include test code".to_string(),
+    ))
+}
+
+fn preflight_warn_finding(message: String) -> ReviewFinding {
+    ReviewFinding {
+        file: None,
+        line: None,
+        severity: Severity::Warn,
+        origin: FindingOrigin::Mechanical {
+            tool: PREFLIGHT_TOOL.into(),
+            rule: None,
+        },
+        category: PREFLIGHT_CATEGORY.into(),
+        message,
+        suggested_fix: None,
+        prohibitions: Vec::new(),
+        requirements: Vec::new(),
+    }
+}
+
+fn is_ascii_digits(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+}
