@@ -259,6 +259,44 @@ fn exitpoint_phase(ctx: &BriefContext) -> Result<(), RunErr> {
     }
     emit_event(json!({"msg": "acceptance passed (self-check)"}));
 
+    // 3b. No-op short-circuit: acceptance passed, but the worktree
+    //     diff against the base branch is empty (the work was already
+    //     on base — typically a duplicate or stale brief). Emit
+    //     `done shipped` with the `no_op_short_circuit` cause so the
+    //     daemon's lifecycle driver folds this into a terminal Shipped
+    //     verdict and skips the downstream reviewer / shipper /
+    //     ci-watcher fan-out. The `cause:no_changes` failed-emission
+    //     path below is preserved for the non-acceptance-passed cases
+    //     (acceptance bypassed, or the diff probe itself failed I/O).
+    match git_diff_empty_against_base(&ctx.base_branch) {
+        Ok(true) => {
+            emit_event(json!({
+                "msg": "no-op brief — acceptance passed but diff against base is empty",
+                "base_branch": ctx.base_branch,
+                "reason": "coder analysis: work already on base branch (acceptance passed but produced no changes)",
+            }));
+            emit_done(
+                EventVerdict::Shipped,
+                Some(DoneReason {
+                    cause: "no_op_short_circuit".into(),
+                    exit_code: None,
+                }),
+            );
+            return Ok(());
+        }
+        Ok(false) => {}
+        Err(detail) => {
+            // Diff probe failed for I/O reasons — fall through to the
+            // existing `git add -A` path so the regular `cause:no_changes`
+            // failed-emission can still fire if there are no staged
+            // changes there either.
+            emit_event(json!({
+                "warn": "no-op probe failed; falling back to has-staged check",
+                "detail": detail,
+            }));
+        }
+    }
+
     // 4. git add -A + has-staged check
     git_add_all().map_err(|e| RunErr {
         event_msg: "git add -A failed",
@@ -438,6 +476,35 @@ fn git_add_all() -> Result<(), String> {
         return Err(String::from_utf8_lossy(&out.stderr).into_owned());
     }
     Ok(())
+}
+
+/// Probe whether the worktree diff against `origin/<base_branch>` is
+/// empty. `Ok(true)` ⇒ no changes produced (no-op short-circuit
+/// candidate); `Ok(false)` ⇒ real changes present; `Err(_)` on I/O
+/// failure (caller falls back to the regular has-staged check).
+fn git_diff_empty_against_base(base_branch: &str) -> Result<bool, String> {
+    let out = Command::new("git")
+        .arg("diff")
+        .arg("--quiet")
+        .arg(format!("origin/{base_branch}...HEAD"))
+        .current_dir(WORKSPACE_DIR)
+        .output()
+        .map_err(|e| format!("spawn git diff --quiet: {e}"))?;
+    match out.status.code() {
+        // `--quiet` is exit 0 when there is no diff, exit 1 when there
+        // is one. Anything else is a probe failure (bad ref, repo
+        // corruption, …) — surface it so the caller can degrade.
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        Some(code) => Err(format!(
+            "git diff exit {code}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )),
+        None => Err(format!(
+            "git diff terminated by signal: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )),
+    }
 }
 
 fn git_has_staged_changes() -> Result<bool, String> {

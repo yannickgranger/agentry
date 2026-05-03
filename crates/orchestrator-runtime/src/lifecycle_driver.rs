@@ -9,11 +9,11 @@
 //! single by construction, so this is the sole writer to the verdicts
 //! stream.
 
-use crate::lifecycle::{EventSource, StateProjector};
+use crate::lifecycle::{EventSource, StateProjector, NO_OP_VERDICT_REASON};
 use crate::redis_io;
 use crate::workspace::{self, BriefWorkspace, TerminationDisposition};
 use crate::{Error, Result};
-use orchestrator_types::lifecycle::{handle, BriefState, BriefStateRecord};
+use orchestrator_types::lifecycle::{handle, BriefEvent, BriefState, BriefStateRecord};
 use orchestrator_types::{now, BriefId, Event, EventKind, Verdict, VerdictKind};
 use redis::aio::ConnectionManager;
 use std::path::Path;
@@ -53,6 +53,7 @@ pub async fn projector_task(
 ) -> Result<()> {
     let mut state = BriefState::Submitted;
     let mut step: u64 = 0;
+    let mut no_op_reason: Option<String> = None;
     loop {
         let event = match source
             .next()
@@ -62,6 +63,12 @@ pub async fn projector_task(
             Some(ev) => ev,
             None => break,
         };
+        // Latch the no-op short-circuit reason BEFORE FSM dispatch so
+        // the terminal Shipped verdict carries the operator-visible
+        // text instead of the generic "fsm: shipped".
+        if let BriefEvent::CoderDoneNoOp { reason } = &event {
+            no_op_reason = Some(reason.clone());
+        }
         step = step.saturating_add(1);
         let cursor = format!("step-{step}");
         match handle(&state, &event) {
@@ -80,9 +87,19 @@ pub async fn projector_task(
                 state = new_state;
                 if matches!(state, BriefState::Shipped | BriefState::Failed { .. }) {
                     if let Some(ref mut conn) = verdict_conn {
-                        emit_terminal_verdict(conn, &brief_id, &state).await?;
+                        emit_terminal_verdict(conn, &brief_id, &state, no_op_reason.as_deref())
+                            .await?;
                     }
                     if matches!(state, BriefState::Failed { .. }) {
+                        cleanup_failed_brief(&brief_id, verdict_conn.as_mut()).await;
+                    } else if no_op_reason.is_some() {
+                        // No-op short-circuit: the daemon's
+                        // handle_brief never reaches finalize_shipped_team
+                        // (it only sees the coder's outcome and there
+                        // was no fan-out), so the workspace teardown
+                        // must fire here. Reuses the FSM driver's
+                        // existing cleanup helper, the same path
+                        // terminal Failed uses.
                         cleanup_failed_brief(&brief_id, verdict_conn.as_mut()).await;
                     }
                     break;
@@ -108,9 +125,14 @@ async fn emit_terminal_verdict(
     conn: &mut ConnectionManager,
     brief_id: &BriefId,
     state: &BriefState,
+    no_op_reason: Option<&str>,
 ) -> Result<()> {
     let (kind, reason) = match state {
-        BriefState::Shipped => (VerdictKind::Shipped, "fsm: shipped".to_string()),
+        BriefState::Shipped => match no_op_reason {
+            Some(text) if !text.is_empty() => (VerdictKind::Shipped, text.to_string()),
+            _ if no_op_reason.is_some() => (VerdictKind::Shipped, NO_OP_VERDICT_REASON.to_string()),
+            _ => (VerdictKind::Shipped, "fsm: shipped".to_string()),
+        },
         BriefState::Failed { reason } => (VerdictKind::Failed, format!("fsm: {reason:?}")),
         // projector_task only invokes this on terminal states, so this
         // arm is unreachable in practice. Returning Ok keeps the function

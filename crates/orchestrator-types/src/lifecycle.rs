@@ -124,6 +124,16 @@ pub enum BriefEvent {
     CoderDone {
         verdict: EventVerdict,
     },
+    /// Coder reported terminal Shipped but produced no diff against base
+    /// (acceptance passed against work that was already on the base
+    /// branch). Short-circuits the FSM Authoring → Shipped, bypassing
+    /// the Verifying / Reviewing / Shipping / Watching trail since
+    /// there is nothing for downstream roles to act on. The free-text
+    /// reason carries the coder's diagnosis for the operator-visible
+    /// terminal verdict.
+    CoderDoneNoOp {
+        reason: String,
+    },
     AcVerifierDone {
         verdict: EventVerdict,
     },
@@ -217,6 +227,14 @@ pub fn handle(state: &BriefState, event: &BriefEvent) -> Result<BriefState, Inva
         }
 
         // ---- Authoring ----
+        // No-op short-circuit: acceptance passed against work that was
+        // already on the base branch. Skip Verifying / Reviewing /
+        // Shipping / Watching — there is no diff for downstream roles
+        // to operate on. The lifecycle driver overrides the terminal
+        // verdict's reason with the carried free-text so the operator
+        // sees "no-op brief — ..." on `agentry:verdicts`.
+        (BriefState::Authoring { .. }, BriefEvent::CoderDoneNoOp { .. }) => Ok(BriefState::Shipped),
+
         (BriefState::Authoring { retry, .. }, BriefEvent::CoderDone { verdict }) => match verdict {
             EventVerdict::Shipped => Ok(BriefState::Verifying { retry: *retry }),
             EventVerdict::Failed => Ok(BriefState::Failed {
