@@ -10,8 +10,9 @@
 //! the workspace falls back to an empty scratch dir — preserving legacy
 //! semantics.
 //!
-//! The root defaults to `/var/mnt/workspaces/agentry-work/`. Override via the
-//! `AGENTRY_WORKSPACE_ROOT` env var when running on another machine.
+//! The root defaults to the value of the `XDG_DATA_HOME` env var joined with
+//! `/agentry/work`, falling back to `HOME` joined with `/.local/share/agentry/work`
+//! when `XDG_DATA_HOME` is unset. Override via the `AGENTRY_WORKSPACE_ROOT` env var.
 
 use crate::{Error, Result};
 use orchestrator_types::BriefId;
@@ -21,7 +22,18 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use tokio::sync::Mutex as TokioMutex;
 
 /// Default host root — overridable via `AGENTRY_WORKSPACE_ROOT`.
-const DEFAULT_ROOT: &str = "/var/mnt/workspaces/agentry-work";
+fn default_root() -> PathBuf {
+    if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
+        return PathBuf::from(xdg).join("agentry").join("work");
+    }
+    let home = std::env::var("HOME")
+        .expect("either XDG_DATA_HOME or HOME must be set to derive the default workspace root");
+    PathBuf::from(home)
+        .join(".local")
+        .join("share")
+        .join("agentry")
+        .join("work")
+}
 
 /// Per-bare-clone async lock registry.
 ///
@@ -61,12 +73,12 @@ pub struct BriefWorkspace {
 
 impl BriefWorkspace {
     /// Root under which all per-brief workspaces live for this process.
-    /// Reads `AGENTRY_WORKSPACE_ROOT` at call time; falls back to `DEFAULT_ROOT`.
+    /// Reads `AGENTRY_WORKSPACE_ROOT` at call time; falls back to `default_root()`.
     #[must_use]
     pub fn root() -> PathBuf {
         std::env::var("AGENTRY_WORKSPACE_ROOT")
             .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from(DEFAULT_ROOT))
+            .unwrap_or_else(|_| default_root())
     }
 }
 

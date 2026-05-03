@@ -54,7 +54,7 @@ pub struct Project {
     /// Optional forge URL for the project's primary repo. When set, briefs
     /// naming this project get their workspace allocated as a `git worktree`
     /// off a shared bare clone at `<workspace-root>/.clones/<org>/<repo>/`.
-    /// Example: `https://oauth2:${GITEA_TOKEN}@agency.lab:3000/yg/agentry.git`.
+    /// Example: `https://forge.example/owner/repo.git`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo_url: Option<String>,
     /// Optional base branch. When set together with `repo_url`, this is the
