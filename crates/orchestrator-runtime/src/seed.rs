@@ -887,8 +887,8 @@ fn build_archaeologist_claude_agentry_role(home: &str, claude_settings_path: &st
         extra_bootstrap: vec![
             "rustup component add rustfmt clippy".into(),
             "git config --global http.sslVerify false".into(),
-            "CARGO_NET_GIT_FETCH_WITH_CLI=true cargo install --git https://oauth2:${GITEA_TOKEN}@agency.lab:3000/yg/cfdb.git --rev 02c5a45 --root /usr/local --locked --quiet cfdb-cli || true".into(),
-            "CARGO_NET_GIT_FETCH_WITH_CLI=true cargo install --git https://oauth2:${GITEA_TOKEN}@agency.lab:3000/yg/graph-specs-rust.git --rev ecaedb9 --root /usr/local --locked --quiet application || true".into(),
+            "cargo install --git https://github.com/yannickgranger/cfdb.git --rev 02c5a45 --root /usr/local --locked --quiet cfdb-cli || true".into(),
+            "cargo install --git https://github.com/yannickgranger/graph-specs.git --rev ecaedb9 --root /usr/local --locked --quiet application || true".into(),
         ],
         mounts: vec![
             Mount {
@@ -1850,8 +1850,8 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         extra_bootstrap: vec![
             "rustup component add rustfmt clippy".into(),
             "git config --global http.sslVerify false".into(),
-            "CARGO_NET_GIT_FETCH_WITH_CLI=true cargo install --git https://oauth2:${GITEA_TOKEN}@agency.lab:3000/yg/cfdb.git --rev 02c5a45 --root /usr/local --locked --quiet cfdb-cli || true".into(),
-            "CARGO_NET_GIT_FETCH_WITH_CLI=true cargo install --git https://oauth2:${GITEA_TOKEN}@agency.lab:3000/yg/graph-specs-rust.git --rev ecaedb9 --root /usr/local --locked --quiet application || true".into(),
+            "cargo install --git https://github.com/yannickgranger/cfdb.git --rev 02c5a45 --root /usr/local --locked --quiet cfdb-cli || true".into(),
+            "cargo install --git https://github.com/yannickgranger/graph-specs.git --rev ecaedb9 --root /usr/local --locked --quiet application || true".into(),
         ],
         mounts: vec![],
         workspace_mount: Some(WorkspaceMount {
