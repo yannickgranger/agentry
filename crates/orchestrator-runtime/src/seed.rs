@@ -1309,195 +1309,21 @@ fi
 // `exec /usr/local/bin/ac-verifier-runner --provider X`. The runner has its
 // own unit-test coverage for AC parsing / degradation envelopes.
 
-const AUDITOR_CLAUDE_AGENTRY_SCRIPT: &str = r##"#!/usr/bin/env bash
-set -uo pipefail
-bundle=$(cat); brief_id=$(jq -r '.brief.id' <<<"$bundle")
-cd /workspace || { emit_event '{"error":"cd /workspace failed"}'; emit_done "failed"; exit 0; }
-emit_event '{"msg":"auditor starting"}'
-clippy_out=$(cargo clippy --workspace --all-targets -- -D warnings 2>&1 | tail -c 8192 || true)
-emit_event "$(jq -nc --arg out "$clippy_out" '{msg:"clippy_report",out:$out}')"
-build_out=$(RUSTFLAGS="-Dwarnings" cargo build --workspace 2>&1 | tail -c 8192 || true)
-emit_event "$(jq -nc --arg out "$build_out" '{msg:"build_report",out:$out}')"
-test_out=$(cargo test --workspace 2>&1 | tail -c 8192 || true)
-emit_event "$(jq -nc --arg out "$test_out" '{msg:"test_report",out:$out}')"
-udeps_json=$(cargo +nightly udeps --workspace --output json 2>/dev/null || echo '{}')
-emit_event "$(jq -nc --arg out "$(echo "$udeps_json" | tail -c 4096)" '{msg:"udeps_report",out:$out}')"
-findings='[]'
-if command -v ra-query >/dev/null 2>&1; then
-    total_critical=0
-    while IFS= read -r f; do
-        [ -f "$f" ] || continue
-        out=$(ra-query unwraps "$f" --severity critical --format json 2>/dev/null || echo '{"functions":[]}')
-        cnt=$(echo "$out" | jq '[.functions[]?.unwraps[]?] | length')
-        if [ "$cnt" -gt 0 ]; then
-            findings=$(echo "$findings" | jq --argjson r "$out" --arg p "$f" '. + [{file:$p, critical_count:($r.functions|map(.unwraps|length)|add // 0), result:$r}]')
-            total_critical=$((total_critical + cnt))
-        fi
-    done < <(find crates -name '*.rs' -not -path '*/tests/*' -not -name 'tests.rs' -not -path '*/target/*')
-    emit_event "$(jq -nc --argjson cnt "$total_critical" --arg out "$(echo "$findings" | jq -c . | tail -c 8192)" '{msg:"unwraps_report",critical_total:$cnt,findings_json_tail:$out}')"
-else
-    emit_event '{"msg":"ra_query_unavailable","detail":"skipping unwraps stage"}'
-fi
-if command -v ra-query >/dev/null 2>&1; then
-    cfindings='[]'; total_complex=0
-    while IFS= read -r f; do
-        [ -f "$f" ] || continue
-        cout=$(ra-query complexity "$f" --threshold 15 --format json 2>/dev/null || echo '{"functions":[]}')
-        ccnt=$(echo "$cout" | jq '[.functions[]?] | length')
-        if [ "$ccnt" -gt 0 ]; then
-            cfindings=$(echo "$cfindings" | jq --argjson r "$cout" --arg p "$f" '. + [{file:$p, complex_count:($r.functions|length), result:$r}]')
-            total_complex=$((total_complex + ccnt))
-        fi
-    done < <(find crates -name '*.rs' -not -path '*/tests/*' -not -name 'tests.rs' -not -path '*/target/*')
-    emit_event "$(jq -nc --argjson cnt "$total_complex" --arg out "$(echo "$cfindings" | jq -c . | tail -c 8192)" '{msg:"complexity_report",complex_total:$cnt,findings_json_tail:$out}')"
-else
-    emit_event '{"msg":"ra_query_unavailable_complexity","detail":"skipping complexity stage"}'
-fi
-if command -v ra-query >/dev/null 2>&1; then
-    pfindings='[]'; total_dead_pub=0
-    while IFS= read -r ctoml; do
-        [ -f "$ctoml" ] || continue
-        cdir=$(dirname "$ctoml")
-        pout=$(ra-query pub-surface "$cdir" --format json 2>/dev/null || echo '[]')
-        crate_dead='{}'
-        ilen=$(echo "$pout" | jq 'length')
-        i=0
-        while [ "$i" -lt "$ilen" ]; do
-            ifile=$(echo "$pout" | jq -r ".[$i].file // \"\"")
-            iline=$(echo "$pout" | jq -r ".[$i].line // 0")
-            iname=$(echo "$pout" | jq -r ".[$i].name // \"\"")
-            case "$ifile" in
-                */lib.rs) i=$((i+1)); continue ;;
-            esac
-            cout=$(ra-query callers "${ifile}:${iline}" --format json 2>/dev/null || echo '{"callers":[]}')
-            ccnt=$(echo "$cout" | jq '[.callers[]?] | length')
-            if [ "$ccnt" -eq 0 ]; then
-                crate_dead=$(echo "$crate_dead" | jq --arg f "$ifile" --arg n "$iname" --argjson l "$iline" '.[$f] = ((.[$f] // []) + [{name:$n,line:$l}])')
-            fi
-            i=$((i+1))
-        done
-        per_file=$(echo "$crate_dead" | jq -c '[to_entries[] | {file:.key, dead_count:(.value|length), items:.value}]')
-        plen=$(echo "$per_file" | jq 'length')
-        k=0
-        while [ "$k" -lt "$plen" ]; do
-            entry=$(echo "$per_file" | jq -c ".[$k]")
-            ecnt=$(echo "$entry" | jq '.dead_count')
-            pfindings=$(echo "$pfindings" | jq --argjson e "$entry" '. + [$e]')
-            total_dead_pub=$((total_dead_pub + ecnt))
-            k=$((k+1))
-        done
-    done < <(find crates -mindepth 2 -maxdepth 2 -name 'Cargo.toml' -not -path '*/target/*')
-    emit_event "$(jq -nc --argjson cnt "$total_dead_pub" --arg out "$(echo "$pfindings" | jq -c . | tail -c 8192)" '{msg:"pub_surface_report",dead_pub_total:$cnt,findings_json_tail:$out}')"
-else
-    emit_event '{"msg":"ra_query_unavailable_pub_surface","detail":"skipping pub-surface stage"}'
-fi
-mkdir -p /workspace/audit-children
-host_workspace="/var/mnt/workspaces/agentry-work/briefs/${brief_id}"
-refs='[]'
-top_unwrap_files=$(echo "$findings" | jq -c 'sort_by(-.critical_count) | .[:3]')
-unwrap_k=$(echo "$top_unwrap_files" | jq 'length')
-j=0
-while [ "$j" -lt "$unwrap_k" ]; do
-  ufile=$(echo "$top_unwrap_files" | jq -r ".[$j].file")
-  base=$(basename "$ufile")
-  child="/workspace/audit-children/child-unwrap-${j}.json"
-  jq -nc \
-    --arg id "brf_self_heal_${brief_id}_unwrap_${j}" \
-    --arg parent "$brief_id" \
-    --arg ufile "$ufile" \
-    --arg base "$base" \
-    --argjson finding "$(echo "$top_unwrap_files" | jq ".[$j]")" \
-    --argjson rank "$j" \
-    '($finding.result.functions // []
-        | map(. as $fn | ($fn.unwraps // [])
-            | map("  - " + ($fn.name // "?") + " at " + (.file // "?") + ":" + ((.line // 0) | tostring) + " — critical — " + (.reason // "no reason")))
-        | flatten | join("\n")) as $sites
-     | {id:$id, project:null,
-        topology:{name:"agentry-self-host-v0",version:1},
-        payload:{
-          issue_number:0,
-          issue_title:("fix(unwraps): replace critical unwraps in " + $base),
-          issue_body:("Replace critical unwraps in " + $ufile + ".\n\nSites:\n" + $sites + "\n\nFor each site choose the right replacement: ? if the function returns Result/Option, expect(\"<context>\") if the invariant truly holds and you can articulate why, unwrap_or / unwrap_or_else / ok_or if a fallback is appropriate. Do NOT silently swallow errors. Do NOT add bare expect(\"\") or expect(\"this should not fail\") — provide real context."),
-          acceptance:"cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace && scripts/arch-check.sh",
-          target_repo:"yg/agentry",
-          base_branch:"develop",
-          pr_title:("fix(unwraps): replace critical unwraps in " + $base),
-          pr_body:("Auto-dispatched by auditor (ra-query unwraps --severity critical, file ranked top-" + ($rank|tostring) + " by critical count).")
-        },
-        budget:{max_wall_seconds:1500},
-        escalation:"autonomous",
-        parent_brief:$parent,
-        submitted_by:"auditor-self-heal",
-        submitted_at:(now|todate)}' > "$child"
-  refs=$(echo "$refs" | jq -c --arg p "${host_workspace}/audit-children/child-unwrap-${j}.json" '. + [$p]')
-  j=$((j+1))
-done
-top_dead_pub_files=$(echo "$pfindings" | jq -c 'sort_by(-.dead_count) | .[:3]')
-dead_pub_k=$(echo "$top_dead_pub_files" | jq 'length')
-j=0
-while [ "$j" -lt "$dead_pub_k" ]; do
-  pfile=$(echo "$top_dead_pub_files" | jq -r ".[$j].file")
-  base=$(basename "$pfile")
-  child="/workspace/audit-children/child-dead-pub-${j}.json"
-  jq -nc \
-    --arg id "brf_self_heal_${brief_id}_dead_pub_${j}" \
-    --arg parent "$brief_id" \
-    --arg pfile "$pfile" \
-    --arg base "$base" \
-    --argjson finding "$(echo "$top_dead_pub_files" | jq ".[$j]")" \
-    --argjson rank "$j" \
-    '($finding.items // []
-        | map("  - " + ($finding.file) + ":" + ((.line // 0) | tostring) + " — " + (.name // "?"))
-        | join("\n")) as $sites
-     | {id:$id, project:null,
-        topology:{name:"agentry-self-host-v0",version:1},
-        payload:{
-          issue_number:0,
-          issue_title:("fix(dead-pub): remove or expose dead pub items in " + $base),
-          issue_body:("Dead pub items in " + $pfile + " (zero workspace callers per ra-query callers).\n\nSites:\n" + $sites + "\n\nFor each site: DELETE the pub keyword OR add a `pub use` re-export in lib.rs to expose it as documented API surface. Do NOT silently leave items pub-but-unused — pick one path and apply it."),
-          acceptance:"cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace && scripts/arch-check.sh",
-          target_repo:"yg/agentry",
-          base_branch:"develop",
-          pr_title:("fix(dead-pub): remove or expose dead pub items in " + $base),
-          pr_body:("Auto-dispatched by auditor (ra-query pub-surface + ra-query callers, file ranked top-" + ($rank|tostring) + " by dead-pub count).")
-        },
-        budget:{max_wall_seconds:1500},
-        escalation:"autonomous",
-        parent_brief:$parent,
-        submitted_by:"auditor-self-heal",
-        submitted_at:(now|todate)}' > "$child"
-  refs=$(echo "$refs" | jq -c --arg p "${host_workspace}/audit-children/child-dead-pub-${j}.json" '. + [$p]')
-  j=$((j+1))
-done
-pairs=$(echo "$udeps_json" | jq -c '[.unused_deps // {} | to_entries[] | .key as $k | ((.value.normal // []) + (.value.development // []) + (.value.build // []))[] as $d | {crate:($k|split(" ")[0]), dep:$d}]')
-count=$(echo "$pairs" | jq 'length')
-i=0
-while [ "$i" -lt "$count" ]; do
-  crate=$(echo "$pairs" | jq -r ".[$i].crate"); dep=$(echo "$pairs" | jq -r ".[$i].dep")
-  child="/workspace/audit-children/child-${i}.json"
-  jq -nc --arg id "brf_self_heal_${brief_id}_udep_${i}" --arg crate "$crate" --arg dep "$dep" --arg parent "$brief_id" \
-    '{id:$id, project:null, topology:{name:"agentry-bugfix-v0",version:1},
-      payload:{issue_number:0, issue_title:("fix(deps): remove unused "+$dep+" from "+$crate),
-        issue_body:("DELETE `"+$dep+".workspace = true` from crates/"+$crate+"/Cargo.toml. cargo-udeps reports unused."),
-        acceptance:"cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && RUSTFLAGS=\"-Dwarnings\" cargo build --workspace && cargo test --workspace",
-        target_repo:"yg/agentry", base_branch:"develop",
-        pr_title:("fix(deps): remove unused "+$dep+" from "+$crate),
-        pr_body:"Auto-dispatched by auditor."},
-      budget:{max_wall_seconds:900}, escalation:"autonomous", parent_brief:$parent,
-      submitted_by:"auditor-self-heal", submitted_at:(now|todate)}' > "$child"
-  refs=$(echo "$refs" | jq -c --arg p "${host_workspace}/audit-children/child-${i}.json" '. + [$p]')
-  i=$((i+1))
-done
-[ "$(echo "$refs" | jq 'length')" -gt 0 ] && emit_message "_chain_trigger" "$(jq -nc --argjson r "$refs" '{next_brief_refs:$r}')"
-emit_done "shipped"
-"##;
+// EPIC #161 Wave 2: AUDITOR_CLAUDE_AGENTRY_SCRIPT bash heredoc that used to
+// live here has been ported to a Rust runner —
+// `crates/agentry-role-runtime/src/bin/auditor_claude_runner.rs`. The role's
+// entrypoint_script now just `exec /usr/local/bin/auditor-claude-runner`.
+// The runner has its own unit-test coverage for the udeps-pair walker, the
+// unwraps-count aggregation, and the per-finding sites-block formatting.
 
 /// Build the auditor-claude-agentry role. Extracted from `seed_m0` so the
 /// permit-scope, passthru-env, and extra_bootstrap invariants can be asserted
 /// in unit tests. Bind-mounts host-built ra-query at /usr/local/bin/ra-query
-/// (operator runs `just ra-query-binary` to provide it); the audit script's
-/// `command -v ra-query` guard tolerates a missing binary by emitting
-/// `ra_query_unavailable` and skipping the relevant stage.
+/// (operator runs `just ra-query-binary` to provide it) and the host-built
+/// auditor-claude-runner at /usr/local/bin/auditor-claude-runner (operator
+/// runs `just auditor-claude-runner-binary`); the runner's `which_on_path`
+/// guard tolerates a missing ra-query by emitting `ra_query_unavailable`
+/// and skipping the relevant stage.
 fn build_auditor_claude_agentry_role(home: &str) -> AgentRole {
     AgentRole {
         name: RoleName("auditor-claude-agentry".into()),
@@ -1507,7 +1333,7 @@ fn build_auditor_claude_agentry_role(home: &str) -> AgentRole {
         image: "docker.io/library/rust:1.93".into(),
         substrate_class: SubstrateClass::Podman,
         package_manager: PackageManager::Apt,
-        entrypoint_script: format!("{BASH_PRELUDE}{AUDITOR_CLAUDE_AGENTRY_SCRIPT}"),
+        entrypoint_script: "#!/bin/sh\nexec /usr/local/bin/auditor-claude-runner\n".into(),
         exitpoint_script: None,
         binaries: vec![],
         mcp_servers: vec![],
@@ -1528,11 +1354,18 @@ fn build_auditor_claude_agentry_role(home: &str) -> AgentRole {
             "rustup toolchain install nightly --profile minimal || true".into(),
             "cargo +nightly install cargo-udeps --locked --quiet || true".into(),
         ],
-        mounts: vec![Mount {
-            source: format!("{home}/.local/bin/ra-query"),
-            target: "/usr/local/bin/ra-query".into(),
-            readonly: true,
-        }],
+        mounts: vec![
+            Mount {
+                source: format!("{home}/.local/bin/ra-query"),
+                target: "/usr/local/bin/ra-query".into(),
+                readonly: true,
+            },
+            Mount {
+                source: format!("{home}/.local/bin/auditor-claude-runner"),
+                target: "/usr/local/bin/auditor-claude-runner".into(),
+                readonly: true,
+            },
+        ],
         workspace_mount: Some(WorkspaceMount {
             container_path: "/workspace".into(),
             readonly: false,
