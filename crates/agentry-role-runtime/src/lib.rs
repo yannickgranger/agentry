@@ -23,6 +23,7 @@
 //! {"at":"...","type":"done","verdict":"failed","reason":{"cause":"unexpected_exit","exit_code":null}}
 //! ```
 
+pub mod archaeologist;
 pub mod claude;
 pub use claude::{stream_claude, StreamErr};
 

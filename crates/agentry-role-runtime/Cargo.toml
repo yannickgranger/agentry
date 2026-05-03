@@ -49,6 +49,15 @@ path = "src/bin/coder_claude_runner.rs"
 name = "auditor-claude-runner"
 path = "src/bin/auditor_claude_runner.rs"
 
+# archaeologist-runner: full lifecycle for the archaeologist-claude-agentry
+# role. Ports ARCHAEOLOGIST_CLAUDE_AGENTRY_SCRIPT (cfdb extract + graph-specs
+# check + seed queries + claude → discovery.json) to Rust under EPIC #161
+# Wave 3. Operator-invoked via `just archaeologist-runner-binary`; the role
+# bind-mounts this binary at /usr/local/bin/archaeologist-runner.
+[[bin]]
+name = "archaeologist-runner"
+path = "src/bin/archaeologist_runner.rs"
+
 [dependencies]
 orchestrator-types = { path = "../orchestrator-types" }
 serde.workspace = true
