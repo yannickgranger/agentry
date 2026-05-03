@@ -58,6 +58,14 @@ path = "src/bin/auditor_claude_runner.rs"
 name = "archaeologist-runner"
 path = "src/bin/archaeologist_runner.rs"
 
+# ci-watcher-runner: full lifecycle for the ci-watcher-agentry role. Ports
+# CI_WATCHER_AGENTRY_SCRIPT (~200 LoC bash heredoc) to Rust under EPIC #161
+# Wave 2. Polls the forge for PR mergeable + CI status, retries merge on
+# transient 405/409, chain-triggers pr-rebaser-agentry on `mergeable: false`.
+[[bin]]
+name = "ci-watcher-runner"
+path = "src/bin/ci_watcher_runner.rs"
+
 [dependencies]
 orchestrator-types = { path = "../orchestrator-types" }
 serde.workspace = true
