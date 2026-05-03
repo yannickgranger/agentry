@@ -447,6 +447,22 @@ pub fn parse_findings(response: &str, agent_id: &str) -> Vec<ReviewFinding> {
         .collect()
 }
 
+/// Drop reviewer-emitted Blocker findings whose `message`, `requirements`,
+/// AND `prohibitions` are ALL empty — the reviewer's prompt promises a
+/// structured Blocker, an empty one is a parse failure, not a real defect
+/// (#311). Returns the count of dropped findings so the caller can log
+/// and decide whether the surviving verdict still has a real Blocker.
+pub fn drop_empty_blocker_findings(findings: &mut Vec<ReviewFinding>) -> usize {
+    let before = findings.len();
+    findings.retain(|f| {
+        !matches!(f.severity, Severity::Blocker)
+            || !f.message.is_empty()
+            || !f.requirements.is_empty()
+            || !f.prohibitions.is_empty()
+    });
+    before - findings.len()
+}
+
 fn salvage_format_deviation(raw: &str, agent_id: &str) -> ReviewFinding {
     let head = head_bytes(raw, SALVAGE_BUDGET);
     emit_event(json!({

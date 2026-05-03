@@ -63,9 +63,9 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 use agentry_role_runtime::{
-    build_review_prompt, emit_done, emit_event, emit_finding, parse_allowed_tools, parse_findings,
-    pointer_str, read_bundle_value, run_fence, stream_claude, tail_lines, workspace_is_git_repo,
-    DoneGuard, StreamErr,
+    build_review_prompt, drop_empty_blocker_findings, emit_done, emit_event, emit_finding,
+    parse_allowed_tools, parse_findings, pointer_str, read_bundle_value, run_fence, stream_claude,
+    tail_lines, workspace_is_git_repo, DoneGuard, StreamErr,
 };
 use orchestrator_types::{DoneReason, EventVerdict, Severity};
 use serde_json::json;
@@ -186,13 +186,27 @@ fn main() {
         }
     };
 
-    let claude_findings = parse_findings(&response, &agent_id);
+    let mut claude_findings = parse_findings(&response, &agent_id);
+    // #311 fence: drop Blocker findings whose message+requirements+prohibitions
+    // are all empty. An empty Blocker is a parse failure, not a real defect;
+    // letting it through would route the slice to ReworkNeeded with no
+    // actionable signal for the coder respawn.
+    let dropped_empty = drop_empty_blocker_findings(&mut claude_findings);
+    if dropped_empty > 0 {
+        emit_event(json!({
+            "level": "warn",
+            "msg": "dropped malformed Blocker findings (empty message+requirements+prohibitions)",
+            "reviewer_agent_id": agent_id,
+            "dropped": dropped_empty,
+        }));
+    }
     let claude_has_blocker = claude_findings
         .iter()
         .any(|f| matches!(f.severity, Severity::Blocker));
     emit_event(json!({
         "msg": "claude review parsed",
         "findings_count": claude_findings.len(),
+        "dropped_empty_blockers": dropped_empty,
     }));
     for f in &claude_findings {
         emit_finding(f);
