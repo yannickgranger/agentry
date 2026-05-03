@@ -140,6 +140,14 @@ auditor-claude-runner-binary:
     test -x ~/.local/bin/auditor-claude-runner
     echo "auditor-claude-runner installed at ~/.local/bin/auditor-claude-runner"
 
+# Build archaeologist-runner into ~/.local/bin/archaeologist-runner — the
+# full lifecycle runner for the archaeologist-claude-agentry role (EPIC #161
+# Wave 3 port of ARCHAEOLOGIST_CLAUDE_AGENTRY_SCRIPT). Operator-invoked;
+# idempotent. The role bind-mounts this binary at
+# /usr/local/bin/archaeologist-runner.
+archaeologist-runner-binary:
+    cargo install --path crates/agentry-role-runtime --bin archaeologist-runner --root ~/.local --locked
+
 # Build git-op-commit into ~/.local/bin/git-op-commit for the git-op-commit
 # role's bind-mount. Operator-invoked; idempotent. Brief 190b of #182 — the
 # commit half of the git-operator split.

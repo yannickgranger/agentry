@@ -822,143 +822,12 @@ emit_event "$(jq -nc --arg b "$branch" --arg err "$detail" '{error:"git rebase f
 emit_done "failed"
 "##;
 
-/// Null role for `agentry-null-v0` team. Emits one event then `done shipped`
-/// and exits. Zero work — used as a shake-down for the role-introduction
-/// pipeline (reviewer-claude `Role-spec audit` clause; permit broker; spawner
-/// teardown). NOT a probe role's substrate-style probe; deliberately the
-/// simplest possible AgentRole.
-///
-/// This role is the FIRST port of the EPIC #161 bash → Rust migration. The
-/// behaviour now lives in `crates/agentry-role-runtime/src/bin/null_agent.rs`.
-/// The role's `entrypoint_script` is a one-line shell wrapper that execs
-/// `/usr/local/bin/null-agent` (bind-mounted from the host).
-/// Archaeologist role for the `agentry-discovery-v0` team. First stage of the
-/// upcoming `agentry-planner-v0` pipeline (#49). Runs `cfdb extract` and
-/// `graph-specs check --json`, optionally evaluates seed cypher queries, then
-/// asks `claude -p` to synthesize a structured `discovery.json` consumed by
-/// the planner. Mechanical-plus-narrative: cfdb + graph-specs are factual,
-/// claude produces summary + candidate list.
-const ARCHAEOLOGIST_CLAUDE_AGENTRY_SCRIPT: &str = r##"#!/usr/bin/env bash
-set -euo pipefail
-bundle="$(cat)"
-
-brief_id=$(jq -r '.brief.id' <<<"$bundle")
-intent=$(jq -r '.brief.payload.intent // ""' <<<"$bundle")
-success_criteria=$(jq -r '.brief.payload.success_criteria // ""' <<<"$bundle")
-discovery_seeds=$(jq -c '.brief.payload.discovery_seeds // []' <<<"$bundle")
-
-if [ ! -d /workspace/.git ] && [ ! -f /workspace/.git ]; then
-    emit_event '{"error":"workspace missing — no .git found at /workspace"}'
-    emit_done "failed"; exit 0
-fi
-
-cd /workspace
-export HOME=/root
-
-emit_event '{"msg":"running cfdb extract"}'
-if ! cfdb extract --workspace . --db .cfdb/db-discovery --keyspace agentry > /tmp/cfdb-extract.log 2>&1; then
-    err=$(tail -30 /tmp/cfdb-extract.log)
-    emit_event "$(jq -nc --arg err "$err" '{error:"cfdb extract failed",detail:$err}')"
-    emit_done "failed"; exit 0
-fi
-
-# Pull node/edge counts from the canonical "extract: N nodes, M edges" log line.
-counts_line=$(grep -E 'extract: [0-9]+ nodes' /tmp/cfdb-extract.log | tail -1 || true)
-nodes=$(printf '%s' "$counts_line" | sed -nE 's/.*extract: ([0-9]+) nodes.*/\1/p')
-edges=$(printf '%s' "$counts_line" | sed -nE 's/.*nodes, ([0-9]+) edges.*/\1/p')
-nodes=${nodes:-0}
-edges=${edges:-0}
-emit_event "$(jq -nc --argjson n "$nodes" --argjson e "$edges" '{msg:"cfdb extract done",nodes:$n,edges:$e}')"
-
-# graph-specs check is intentionally non-fatal: violations are signal for the
-# discovery, not a stop. Capture stdout+stderr.
-graph_specs_out=$(graph-specs check --specs specs/concepts/ --code crates/ --json 2>&1 || true)
-emit_event "$(jq -nc --arg head "$(printf '%s' "$graph_specs_out" | head -c 500)" '{msg:"graph-specs done",head:$head}')"
-
-# Optional seed cypher queries against the just-built db.
-seed_results='[]'
-seed_count=$(jq 'length' <<<"$discovery_seeds")
-if [ "$seed_count" -gt 0 ]; then
-    i=0
-    while [ "$i" -lt "$seed_count" ]; do
-        q=$(jq -r ".[$i]" <<<"$discovery_seeds")
-        rows=$(cfdb query --db .cfdb/db-discovery --keyspace agentry "$q" 2>/tmp/cfdb-q.err || echo '[]')
-        if ! printf '%s' "$rows" | jq empty 2>/dev/null; then
-            rows='[]'
-        fi
-        seed_results=$(jq -nc --argjson cur "$seed_results" --arg q "$q" --argjson r "$rows" \
-            '$cur + [{query:$q, rows:$r}]')
-        i=$((i+1))
-    done
-fi
-
-cat > /tmp/arch_prompt.txt <<PROMPT
-You are the archaeologist role for the agentry project. Synthesize a
-discovery.json for downstream planner consumption based on the inputs below.
-
-INTENT:
-$intent
-
-SUCCESS CRITERIA:
-$success_criteria
-
-CFDB EXTRACT SUMMARY:
-nodes=$nodes, edges=$edges
-
-GRAPH-SPECS OUTPUT (first 4000 chars):
-$(printf '%s' "$graph_specs_out" | head -c 4000)
-
-SEED-QUERY RESULTS (JSON):
-$seed_results
-
-Output EXACTLY one JSON object — no markdown fences, no prose. Schema:
-
-{
-  "intent": "<copied verbatim from INTENT above>",
-  "summary": "<1-3 sentence narrative about workspace state relative to intent>",
-  "raw_facts": {
-    "cfdb": {"nodes": $nodes, "edges": $edges},
-    "graph_specs_violations": [<pass-through of any violations parsed from GRAPH-SPECS OUTPUT, or []>],
-    "seed_queries": $seed_results
-  },
-  "candidates": [
-    {"target": "<qname or file:line>", "kind": "<reuse|extend|create|fix>", "rationale": "<short>"}
-  ],
-  "success_criteria": "<copied verbatim from SUCCESS CRITERIA above, or empty string>"
-}
-
-Your response, right now, starting with { and ending with }:
-PROMPT
-
-emit_event "$(jq -nc --arg len "$(wc -c < /tmp/arch_prompt.txt)" '{msg:"calling claude -p",prompt_bytes:$len}')"
-
-stream_claude response ".archaeologist" "$(cat /tmp/arch_prompt.txt)"
-
-# Same fence-stripping + brace-slice pattern as REVIEWER_CLAUDE_AGENTRY_SCRIPT,
-# but for an object ({...}) instead of an array ([...]).
-cleaned=$(printf '%s' "$response" | sed -e 's/^```json$//' -e 's/^```$//' -e '/^$/d' | tr -d '\r')
-start=$(printf '%s' "$cleaned" | grep -b -m1 '{' | head -1 | cut -d: -f1)
-end=$(printf '%s' "$cleaned" | grep -bo '}' | tail -1 | cut -d: -f1)
-if [ -z "$start" ] || [ -z "$end" ]; then
-    emit_event "$(jq -nc --arg r "$(printf '%s' "$cleaned" | head -c 300)" '{error:"claude response missing JSON object braces",head:$r}')"
-    emit_done "failed"; exit 0
-fi
-payload=$(printf '%s' "$cleaned" | tail -c +$((start+1)) | head -c $((end-start+1)))
-
-if ! printf '%s' "$payload" | jq -e 'type == "object"' >/dev/null 2>&1; then
-    emit_event "$(jq -nc --arg r "$(printf '%s' "$payload" | head -c 300)" '{error:"claude response not a JSON object",head:$r}')"
-    emit_done "failed"; exit 0
-fi
-if ! printf '%s' "$payload" | jq empty 2>/dev/null; then
-    emit_event "$(jq -nc --arg r "$(printf '%s' "$payload" | head -c 300)" '{error:"claude response invalid JSON",head:$r}')"
-    emit_done "failed"; exit 0
-fi
-
-printf '%s' "$payload" > /workspace/discovery.json
-bytes=$(wc -c < /workspace/discovery.json)
-emit_event "$(jq -nc --arg path "/workspace/discovery.json" --argjson bytes "$bytes" '{msg:"discovery.json written",path:$path,bytes:$bytes}')"
-emit_done "shipped"
-"##;
+// EPIC #161 Wave 3: ARCHAEOLOGIST_CLAUDE_AGENTRY_SCRIPT bash heredoc that
+// used to live here has been ported to a Rust runner —
+// `crates/agentry-role-runtime/src/bin/archaeologist_runner.rs`. The role's
+// entrypoint_script now just `exec /usr/local/bin/archaeologist-runner`.
+// The runner has its own unit-test coverage for cfdb-counts parsing,
+// discovery-seed extraction, prompt assembly, and JSON-object slicing.
 
 /// Planner role for the `agentry-planner-v0` team. Reads the
 /// `discovery.json` synthesized by the upstream archaeologist, asks
@@ -1211,7 +1080,7 @@ fn build_archaeologist_claude_agentry_role(home: &str, claude_settings_path: &st
         image: "docker.io/library/rust:1.93".into(),
         substrate_class: SubstrateClass::Podman,
         package_manager: PackageManager::Apt,
-        entrypoint_script: format!("{BASH_PRELUDE}{ARCHAEOLOGIST_CLAUDE_AGENTRY_SCRIPT}"),
+        entrypoint_script: "#!/bin/sh\nexec /usr/local/bin/archaeologist-runner\n".into(),
         exitpoint_script: None,
         // cfdb + graph-specs come via extra_bootstrap cargo install (same
         // pattern as quality-hygiene in coder-claude-agentry).
@@ -1257,6 +1126,11 @@ fn build_archaeologist_claude_agentry_role(home: &str, claude_settings_path: &st
                 source: "/var/lib/agentry/transcripts".into(),
                 target: "/transcripts".into(),
                 readonly: false,
+            },
+            Mount {
+                source: format!("{home}/.local/bin/archaeologist-runner"),
+                target: "/usr/local/bin/archaeologist-runner".into(),
+                readonly: true,
             },
         ],
         workspace_mount: Some(WorkspaceMount {
