@@ -1635,34 +1635,6 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         },
         max_retries: 0,
     };
-    // ---- agentry-null-v0 team (shake-down for role-introduction pipeline) ----
-    // null-agent emits one event then `done shipped`. Zero work — exercises
-    // the reviewer-claude Role-spec audit clause, permit broker, and spawner
-    // teardown on a deliberately minimal-permitted, well-formed role before
-    // real planner roles (archaeologist, planner, verifier) land.
-    // First role ported from bash to Rust under EPIC #161 B0. The legacy
-    // bash heredoc (4 lines: emit_event + emit_done) becomes a Rust binary
-    // built from `agentry-role-runtime`. The 1-line shell wrapper is
-    // acceptable bootstrap glue per the refined #161 rule.
-    let null_agent_agentry = RoleRef {
-        name: RoleName("null-agent-agentry".into()),
-        version: 1,
-    };
-    let agentry_null_v0 = TeamTopology {
-        name: TeamName("agentry-null-v0".into()),
-        version: 1,
-        roles: vec![RoleRef {
-            name: null_agent_agentry.name.clone(),
-            version: null_agent_agentry.version,
-        }],
-        message_graph: Vec::<MessageEdge>::new(),
-        terminal_role: RoleRef {
-            name: null_agent_agentry.name.clone(),
-            version: null_agent_agentry.version,
-        },
-        max_retries: 0,
-    };
-
     // ---- agentry-discovery-v0 team (first stage of the planner pipeline) ----
     // archaeologist-claude-agentry runs cfdb extract + graph-specs check, then
     // synthesizes a discovery.json via `claude -p`.
@@ -2145,7 +2117,6 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
     redis_io::save_team(&mut conn, &agentry_spec_edit_v0).await?;
     redis_io::save_role(&mut conn, &auditor_claude_agentry).await?;
     redis_io::save_team(&mut conn, &agentry_self_audit_v0).await?;
-    redis_io::save_team(&mut conn, &agentry_null_v0).await?;
     redis_io::save_role(&mut conn, &archaeologist_claude_agentry).await?;
     redis_io::save_team(&mut conn, &agentry_discovery_v0).await?;
     redis_io::save_role(&mut conn, &planner_claude_agentry).await?;
@@ -2169,8 +2140,23 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         );
     }
 
+    let topologies_dir = seed_topologies_dir();
+    if topologies_dir.exists() {
+        let loaded = load_topologies_from_dir(&mut conn, &topologies_dir).await?;
+        tracing::info!(
+            count = loaded.len(),
+            dir = %topologies_dir.display(),
+            "loaded JSON topology catalog from seed directory",
+        );
+    } else {
+        tracing::debug!(
+            dir = %topologies_dir.display(),
+            "seed topologies directory absent — skipping JSON topology load",
+        );
+    }
+
     tracing::info!(
-        "seeded: roles [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker, listener, grok-echo, claude-echo, synthesizer, narrowed-coder, coder-claude-agentry, ac-verifier-claude-agentry, ac-verifier-gemini-agentry, ac-verifier-grok-agentry, reviewer-mechanical-agentry, shipper-agentry, ci-watcher-agentry, pr-rebaser-agentry, reviewer-claude-agentry, auditor-claude-agentry, null-agent-agentry, archaeologist-claude-agentry, planner-claude-agentry, verifier-claude-agentry] (inline entrypoint scripts); teams [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker-listener, grok-echo, claude-echo, narrowed-team, agentry-self-host-v0, agentry-pr-rebaser-v0, agentry-self-audit-v0, agentry-null-v0, agentry-discovery-v0, agentry-planner-v0, agentry-verify-v0]"
+        "seeded: roles [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker, listener, grok-echo, claude-echo, synthesizer, narrowed-coder, coder-claude-agentry, ac-verifier-claude-agentry, ac-verifier-gemini-agentry, ac-verifier-grok-agentry, reviewer-mechanical-agentry, shipper-agentry, ci-watcher-agentry, pr-rebaser-agentry, reviewer-claude-agentry, auditor-claude-agentry, null-agent-agentry, archaeologist-claude-agentry, planner-claude-agentry, verifier-claude-agentry] (inline entrypoint scripts); teams [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker-listener, grok-echo, claude-echo, narrowed-team, agentry-self-host-v0, agentry-pr-rebaser-v0, agentry-self-audit-v0, agentry-discovery-v0, agentry-planner-v0, agentry-verify-v0] (Rust literals); teams [agentry-null-v0] (loaded from seed/topologies/*.json)"
     );
     Ok(())
 }
@@ -2194,4 +2180,90 @@ fn seed_roles_dir() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or(manifest);
     workspace_root.join("seed").join("roles")
+}
+
+/// Resolve the directory containing team-topology JSON files for seed-time
+/// loading. Mirrors [`seed_roles_dir`]: defaults to `<workspace_root>/seed/topologies`,
+/// overridable via `AGENTRY_SEED_TOPOLOGIES_DIR` for substrates that ship
+/// the catalog elsewhere.
+fn seed_topologies_dir() -> PathBuf {
+    if let Ok(override_path) = std::env::var("AGENTRY_SEED_TOPOLOGIES_DIR") {
+        return PathBuf::from(override_path);
+    }
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let workspace_root = manifest
+        .parent()
+        .and_then(|p| p.parent())
+        .map(PathBuf::from)
+        .unwrap_or(manifest);
+    workspace_root.join("seed").join("topologies")
+}
+
+/// Load every `*.json` topology file in `dir` into Redis via
+/// [`redis_io::register_team_strict`]. Returns the list of `(name, version)`
+/// pairs that were registered (or already present), in alphabetical order
+/// by file name. Mirrors the role-dir-loader pattern.
+///
+/// First-writer-wins: if a topology key already exists, it is left untouched
+/// and the loader logs the existing entry rather than overwriting. This
+/// matches the `orchestrator team register` CLI semantics — operator-edited
+/// topologies survive a re-seed.
+async fn load_topologies_from_dir(
+    conn: &mut redis::aio::ConnectionManager,
+    dir: &std::path::Path,
+) -> Result<Vec<(orchestrator_types::TeamName, u32)>> {
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut json_files: Vec<PathBuf> = Vec::new();
+    let mut rd = tokio::fs::read_dir(dir).await?;
+    while let Some(entry) = rd.next_entry().await? {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) == Some("json") {
+            json_files.push(path);
+        }
+    }
+    json_files.sort();
+
+    let mut out: Vec<(orchestrator_types::TeamName, u32)> = Vec::with_capacity(json_files.len());
+    for path in json_files {
+        let text =
+            tokio::fs::read_to_string(&path)
+                .await
+                .map_err(|e| Error::TopologyLoadFailed {
+                    path: path.clone(),
+                    source: Box::new(e),
+                })?;
+        let team: TeamTopology =
+            serde_json::from_str(&text).map_err(|e| Error::TopologyLoadFailed {
+                path: path.clone(),
+                source: Box::new(e),
+            })?;
+        match redis_io::register_team_strict(conn, &team)
+            .await
+            .map_err(|e| Error::TopologyLoadFailed {
+                path: path.clone(),
+                source: Box::new(e),
+            })? {
+            redis_io::RegisterOutcome::Registered => {
+                tracing::info!(
+                    team_name = %team.name.0,
+                    version = team.version,
+                    file_path = %path.display(),
+                    "registered topology from JSON file",
+                );
+            }
+            redis_io::RegisterOutcome::AlreadyExists => {
+                tracing::info!(
+                    team_name = %team.name.0,
+                    version = team.version,
+                    file_path = %path.display(),
+                    "topology already registered — skipping (first-writer-wins)",
+                );
+            }
+        }
+        out.push((team.name, team.version));
+    }
+    Ok(out)
 }

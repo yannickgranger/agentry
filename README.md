@@ -24,9 +24,10 @@ the agents, opens pull requests, watches CI, and either auto-merges on
 green or routes failures back to the coder agent for another iteration.
 
 Roles, workflows, and the architectural declarations the fleet enforces
-are all stored as data — JSON files in a catalog plus markdown
-specifications in `specs/`. New shapes don't require a new release.
-The fleet authors and registers them.
+are all stored as data — JSON files in a catalog (`seed/roles/` for
+agents, `seed/topologies/` for workflows) plus markdown specifications
+in `specs/`. New shapes don't require a new release. The fleet authors
+and registers them.
 
 ## Why it exists
 

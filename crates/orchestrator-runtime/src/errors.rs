@@ -19,6 +19,12 @@ pub enum Error {
         #[source]
         source: Box<dyn std::error::Error + Send + Sync + 'static>,
     },
+    #[error("failed to load topology from {path}: {source}")]
+    TopologyLoadFailed {
+        path: PathBuf,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync + 'static>,
+    },
     #[error("sqlite: {0}")]
     Sqlite(#[from] rusqlite::Error),
     #[error("not found: {kind} {key}")]
