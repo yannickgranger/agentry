@@ -30,6 +30,8 @@ pub struct Config {
     pub webhook: WebhookConfig,
     #[serde(default)]
     pub forge: ForgeConfig,
+    #[serde(default)]
+    pub sccache: SccacheConfig,
     #[serde(default = "default_max_concurrent_briefs")]
     pub max_concurrent_briefs: u32,
 }
@@ -64,10 +66,27 @@ pub struct WebhookConfig {
 /// `default_host` is the `host:port` (no scheme) used to construct the
 /// token-bearing clone URL. Unset means every brief must carry its own
 /// `forge_host` in the payload.
+///
+/// `allowed_owners` lists bare forge owner names (e.g. `"yg"`); seed.rs
+/// expands each to a `forge:write:<owner>/*` permit on roles that push
+/// branches or open PRs. Empty list rejects all writes — required for
+/// brief dispatch on the agentry-self-host topology.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ForgeConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_host: Option<String>,
+    #[serde(default)]
+    pub allowed_owners: Vec<String>,
+}
+
+/// Shared sccache backend used by roles that compile Rust. `endpoint`
+/// is the network alias or DNS name (with optional `:port`) of the
+/// sccache-redis container; seed.rs strips any port and expands it to
+/// a `net:allow:<host>` permit. Unset means roles run without sccache.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SccacheConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
 }
 
 impl Default for Config {
@@ -85,6 +104,7 @@ impl Default for Config {
             },
             webhook: WebhookConfig::default(),
             forge: ForgeConfig::default(),
+            sccache: SccacheConfig::default(),
             max_concurrent_briefs: 4,
         }
     }

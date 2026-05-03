@@ -6,12 +6,59 @@
 //!
 //! Idempotent: overwrites existing records with current definitions.
 
-use crate::{redis_io, role_dir_loader, Config, Result};
+use crate::{redis_io, role_dir_loader, Config, Error, Result};
 use orchestrator_types::{
     AgentRole, MessageEdge, Mount, PackageManager, PermitScope, RoleName, RoleRef, SubstrateClass,
     TeamName, TeamTopology, ToolAllowlist, WorkspaceMount,
 };
 use std::path::PathBuf;
+
+/// Derive the `net:allow:<host>` permit for the configured forge from
+/// `cfg.forge.default_host`. The port suffix (if any) is stripped so a
+/// `default_host = "agency.lab:3000"` still produces `"net:allow:agency.lab"`
+/// — byte-for-byte equivalent to the literal that lived in seed.rs before
+/// phase 4 of #330. Returns `Error::Config` when `default_host` is unset.
+pub fn derive_forge_net_allow(cfg: &Config) -> Result<String> {
+    let host_only = cfg
+        .forge
+        .default_host
+        .as_deref()
+        .map(|h| h.split(':').next().unwrap_or(h).to_string())
+        .ok_or_else(|| Error::Config("[forge] default_host required".into()))?;
+    Ok(format!("net:allow:{host_only}"))
+}
+
+/// Expand `cfg.forge.allowed_owners` to a `forge:write:<owner>/*` permit
+/// per entry. Empty list returns `Error::Config` — the prior literal
+/// `"forge:write:yg/*"` baked the only allowed owner into source; the
+/// empty list is treated as "no forge writes permitted" and rejected at
+/// seed time so misconfiguration surfaces immediately rather than as a
+/// silent broker denial mid-brief.
+pub fn derive_forge_write_permits(cfg: &Config) -> Result<Vec<String>> {
+    if cfg.forge.allowed_owners.is_empty() {
+        return Err(Error::Config(
+            "[forge] allowed_owners required (empty list rejects all writes)".into(),
+        ));
+    }
+    Ok(cfg
+        .forge
+        .allowed_owners
+        .iter()
+        .map(|owner| format!("forge:write:{owner}/*"))
+        .collect())
+}
+
+/// Derive the optional `net:allow:<host>` permit for the shared sccache
+/// backend. Same port-stripping idiom as `derive_forge_net_allow` — an
+/// `endpoint = "agentry-sccache-redis:6379"` produces
+/// `"net:allow:agentry-sccache-redis"`. `None` means roles seed without
+/// the sccache permit and with `sccache: false`.
+pub fn derive_sccache_net_allow(cfg: &Config) -> Option<String> {
+    cfg.sccache.endpoint.as_deref().map(|ep| {
+        let host_only = ep.split(':').next().unwrap_or(ep);
+        format!("net:allow:{host_only}")
+    })
+}
 
 // ---------------------------------------------------------------------------
 // Entrypoint scripts — inlined from what used to live in containers/*/entrypoint.sh.
@@ -603,7 +650,21 @@ fn build_planner_claude_agentry_role(home: &str, claude_settings_path: &str) -> 
 /// Build the archaeologist-claude-agentry role. Extracted from `seed_m0` so
 /// the permit-scope + tool-allowlist invariants can be asserted in a unit test
 /// without rebuilding the entire seed flow.
-fn build_archaeologist_claude_agentry_role(home: &str, claude_settings_path: &str) -> AgentRole {
+fn build_archaeologist_claude_agentry_role(
+    home: &str,
+    claude_settings_path: &str,
+    forge_net_allow: &str,
+    sccache_net_allow: Option<&str>,
+) -> AgentRole {
+    let mut permits = vec![
+        "fs:read:/workspace/**".into(),
+        "fs:write:/workspace/**".into(),
+        "net:allow:api.anthropic.com".into(),
+        forge_net_allow.to_string(),
+    ];
+    if let Some(sccache) = sccache_net_allow {
+        permits.push(sccache.to_string());
+    }
     AgentRole {
         name: RoleName("archaeologist-claude-agentry".into()),
         version: 1,
@@ -622,13 +683,7 @@ fn build_archaeologist_claude_agentry_role(home: &str, claude_settings_path: &st
         mcp_servers: vec![],
         tool_allowlist: ToolAllowlist(vec![]),
         allowed_tools: None,
-        permit_scope: PermitScope(vec![
-            "fs:read:/workspace/**".into(),
-            "fs:write:/workspace/**".into(),
-            "net:allow:api.anthropic.com".into(),
-            "net:allow:agency.lab".into(),
-            "net:allow:agentry-sccache-redis".into(),
-        ]),
+        permit_scope: PermitScope(permits),
         passthru_env: vec!["GITEA_TOKEN".into()],
         // cfdb rev `02c5a45` and graph-specs-rust rev `ecaedb9` mirror the
         // pinned revs in the workspace's `.cfdb/cfdb.rev` and
@@ -672,8 +727,9 @@ fn build_archaeologist_claude_agentry_role(home: &str, claude_settings_path: &st
             readonly: false,
         }),
         // Real cargo compilation in extra_bootstrap — share build cache with
-        // coder/reviewer roles via the shared sccache-redis container.
-        sccache: true,
+        // coder/reviewer roles via the shared sccache-redis container when
+        // the operator configured a [sccache] endpoint.
+        sccache: sccache_net_allow.is_some(),
     }
 }
 
@@ -707,7 +763,20 @@ fn build_archaeologist_claude_agentry_role(home: &str, claude_settings_path: &st
 /// runs `just auditor-claude-runner-binary`); the runner's `which_on_path`
 /// guard tolerates a missing ra-query by emitting `ra_query_unavailable`
 /// and skipping the relevant stage.
-fn build_auditor_claude_agentry_role(home: &str) -> AgentRole {
+fn build_auditor_claude_agentry_role(home: &str, sccache_net_allow: Option<&str>) -> AgentRole {
+    let mut permits = vec![
+        "fs:read:/workspace/**".into(),
+        "fs:write:/workspace/**".into(),
+    ];
+    if let Some(sccache) = sccache_net_allow {
+        permits.push(sccache.to_string());
+    }
+    permits.extend([
+        "net:allow:static.rust-lang.org".into(),
+        "net:allow:crates.io".into(),
+        "net:allow:index.crates.io".into(),
+        "net:allow:static.crates.io".into(),
+    ]);
     AgentRole {
         name: RoleName("auditor-claude-agentry".into()),
         version: 1,
@@ -722,15 +791,7 @@ fn build_auditor_claude_agentry_role(home: &str) -> AgentRole {
         mcp_servers: vec![],
         tool_allowlist: ToolAllowlist(vec![]),
         allowed_tools: None,
-        permit_scope: PermitScope(vec![
-            "fs:read:/workspace/**".into(),
-            "fs:write:/workspace/**".into(),
-            "net:allow:agentry-sccache-redis".into(),
-            "net:allow:static.rust-lang.org".into(),
-            "net:allow:crates.io".into(),
-            "net:allow:index.crates.io".into(),
-            "net:allow:static.crates.io".into(),
-        ]),
+        permit_scope: PermitScope(permits),
         passthru_env: vec![],
         extra_bootstrap: vec![
             "rustup component add rustfmt clippy || true".into(),
@@ -753,7 +814,7 @@ fn build_auditor_claude_agentry_role(home: &str) -> AgentRole {
             container_path: "/workspace".into(),
             readonly: false,
         }),
-        sccache: true,
+        sccache: sccache_net_allow.is_some(),
     }
 }
 
@@ -814,7 +875,17 @@ fn build_verifier_claude_agentry_role(home: &str) -> AgentRole {
 /// at `/usr/local/bin/pr-rebaser-runner`; image switched from alpine to
 /// debian:bookworm-slim (the runtime no longer needs cargo — just `git`
 /// + `curl` + `jq` from apt).
-fn build_pr_rebaser_agentry_role(home: &str) -> AgentRole {
+fn build_pr_rebaser_agentry_role(
+    home: &str,
+    forge_net_allow: &str,
+    forge_write_permits: &[String],
+) -> AgentRole {
+    let mut permits = vec![
+        "fs:read:/workspace/**".into(),
+        "fs:write:/workspace/**".into(),
+        forge_net_allow.to_string(),
+    ];
+    permits.extend(forge_write_permits.iter().cloned());
     AgentRole {
         name: RoleName("pr-rebaser-agentry".into()),
         version: 1,
@@ -834,12 +905,7 @@ fn build_pr_rebaser_agentry_role(home: &str) -> AgentRole {
         mcp_servers: vec![],
         tool_allowlist: ToolAllowlist(vec!["git".into(), "curl".into()]),
         allowed_tools: None,
-        permit_scope: PermitScope(vec![
-            "fs:read:/workspace/**".into(),
-            "fs:write:/workspace/**".into(),
-            "net:allow:agency.lab".into(),
-            "forge:write:yg/*".into(),
-        ]),
+        permit_scope: PermitScope(permits),
         passthru_env: vec!["GITEA_TOKEN".into()],
         extra_bootstrap: vec![],
         mounts: vec![Mount {
@@ -1003,6 +1069,16 @@ fn materialize_container_claude_settings() -> Result<String> {
 pub async fn seed_m0(cfg: &Config) -> Result<()> {
     let mut conn = redis_io::connect(&cfg.redis.url).await?;
     let claude_settings_path = materialize_container_claude_settings()?;
+
+    // Phase 4 of #330: permit strings derived once from `Config` so every
+    // role definition below references the operator-configured forge host
+    // / sccache endpoint instead of hard-coded `agency.lab` and
+    // `agentry-sccache-redis` literals. Port suffixes on either are
+    // stripped — `agency.lab:3000` still produces `net:allow:agency.lab`,
+    // byte-for-byte equivalent to the prior literal.
+    let forge_net_allow = derive_forge_net_allow(cfg)?;
+    let forge_write_permits = derive_forge_write_permits(cfg)?;
+    let sccache_net_allow = derive_sccache_net_allow(cfg);
 
     // ---- echo-agent (stateless hello → done shipped) ----
     let echo = AgentRole {
@@ -1378,6 +1454,10 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
     };
 
     // ---- sccache-probe (for sccache-wiring regression tests) ----
+    let sccache_probe_permits: Vec<String> = sccache_net_allow
+        .as_deref()
+        .map(|s| vec![s.to_string()])
+        .unwrap_or_default();
     let sccache_probe = AgentRole {
         name: RoleName("sccache-probe".into()),
         version: 1,
@@ -1394,12 +1474,12 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         mcp_servers: vec![],
         tool_allowlist: ToolAllowlist(vec![]),
         allowed_tools: None,
-        permit_scope: PermitScope(vec!["net:allow:agentry-sccache-redis".into()]),
+        permit_scope: PermitScope(sccache_probe_permits),
         passthru_env: vec![],
         extra_bootstrap: vec![],
         mounts: vec![],
         workspace_mount: None,
-        sccache: true,
+        sccache: sccache_net_allow.is_some(),
     };
     let sccache_probe_team = TeamTopology {
         name: TeamName("sccache-probe-team".into()),
@@ -1482,7 +1562,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         allowed_tools: None,
         permit_scope: PermitScope(vec![
             "fs:read:/workspace/**".into(),
-            "net:allow:agency.lab".into(),
+            forge_net_allow.clone(),
         ]),
         passthru_env: vec!["GITEA_TOKEN".into()],
         extra_bootstrap: vec![
@@ -1517,6 +1597,8 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         name: RoleName("ac-verifier-grok-agentry".into()),
         version: 1,
     };
+    let mut shipper_permits = vec![forge_net_allow.clone()];
+    shipper_permits.extend(forge_write_permits.iter().cloned());
     let shipper_agentry = AgentRole {
         name: RoleName("shipper-agentry".into()),
         version: 1,
@@ -1531,10 +1613,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         mcp_servers: vec![],
         tool_allowlist: ToolAllowlist(vec![]),
         allowed_tools: None,
-        permit_scope: PermitScope(vec![
-            "net:allow:agency.lab".into(),
-            "forge:write:yg/*".into(),
-        ]),
+        permit_scope: PermitScope(shipper_permits),
         passthru_env: vec!["GITEA_TOKEN".into()],
         extra_bootstrap: vec![],
         mounts: vec![],
@@ -1570,7 +1649,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         allowed_tools: None,
         permit_scope: PermitScope(vec![
             "fs:write:/workspace/**".into(),
-            "net:allow:agency.lab".into(),
+            forge_net_allow.clone(),
             "forge:write:yg/agentry".into(),
         ]),
         passthru_env: vec!["GITEA_TOKEN".into()],
@@ -1594,7 +1673,8 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
     // ci-watcher to chain-trigger a brief on this single-role topology when
     // a PR's `mergeable` flag flips false; the rebaser force-pushes the
     // rebased branch (or surfaces conflicts as findings).
-    let pr_rebaser_agentry = build_pr_rebaser_agentry_role(&home);
+    let pr_rebaser_agentry =
+        build_pr_rebaser_agentry_role(&home, &forge_net_allow, &forge_write_permits);
     let agentry_pr_rebaser_v0 = TeamTopology {
         name: TeamName("agentry-pr-rebaser-v0".into()),
         version: 1,
@@ -1640,8 +1720,12 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
     // ---- agentry-discovery-v0 team (first stage of the planner pipeline) ----
     // archaeologist-claude-agentry runs cfdb extract + graph-specs check, then
     // synthesizes a discovery.json via `claude -p`.
-    let archaeologist_claude_agentry =
-        build_archaeologist_claude_agentry_role(&home, &claude_settings_path);
+    let archaeologist_claude_agentry = build_archaeologist_claude_agentry_role(
+        &home,
+        &claude_settings_path,
+        &forge_net_allow,
+        sccache_net_allow.as_deref(),
+    );
     let agentry_discovery_v0 = TeamTopology {
         name: TeamName("agentry-discovery-v0".into()),
         version: 1,
@@ -2067,7 +2151,8 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         max_retries: 1,
     };
 
-    let auditor_claude_agentry = build_auditor_claude_agentry_role(&home);
+    let auditor_claude_agentry =
+        build_auditor_claude_agentry_role(&home, sccache_net_allow.as_deref());
     let agentry_self_audit_v0 = TeamTopology {
         name: TeamName("agentry-self-audit-v0".into()),
         version: 1,
