@@ -1503,3 +1503,47 @@ pub fn mech_finding_warn(tool: &str, category: &str, message: &str) -> ReviewFin
         requirements: Vec::new(),
     }
 }
+
+// ---------- verifier-dol helpers (extracted from verifier_dol_runner, EPIC #161 Wave 3) ----------
+
+/// Bash `tail -c 4096` — the last N bytes of the criterion's combined
+/// stdout+stderr output that get attached to the `criterion passed` /
+/// `criterion failed` event payload.
+pub const CRITERION_OUTPUT_TAIL: usize = 4096;
+
+/// Read the brief payload's `success_criteria` field. Returns `None`
+/// when the field is missing, null, non-string, or the empty string —
+/// matching the bash `jq -r '.brief.payload.success_criteria // ""'`
+/// + `[ -z "$criterion" ]` check.
+pub fn parse_success_criteria(bundle: &Value) -> Option<String> {
+    let s = bundle
+        .pointer("/brief/payload/success_criteria")
+        .and_then(Value::as_str)?;
+    if s.is_empty() {
+        None
+    } else {
+        Some(s.to_string())
+    }
+}
+
+/// Read the brief payload's `verifies_brief_id` field as a plain string.
+/// Returns the empty string when missing / null / non-string — matching
+/// the bash `jq -r '.brief.payload.verifies_brief_id // ""'` fallback.
+pub fn parse_verifies_brief_id(bundle: &Value) -> String {
+    bundle
+        .pointer("/brief/payload/verifies_brief_id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Map the criterion's exit code to a verdict: `0` ships, anything else
+/// fails. Mirrors the bash `if bash -c "$criterion"; then ... else ...`
+/// branching.
+pub fn verdict_for_exit_code(code: i32) -> EventVerdict {
+    if code == 0 {
+        EventVerdict::Shipped
+    } else {
+        EventVerdict::Failed
+    }
+}
