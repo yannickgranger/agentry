@@ -10,7 +10,7 @@
 
 use crate::{
     lifecycle::{EventSource, StateProjector},
-    lifecycle_driver, permit as permit_mod, projector, redis_io,
+    lifecycle_driver, permit as permit_mod, projector, reaper, redis_io,
     spawner::{PodmanSpawner, RoutedMessage, RunAgentCtx, Spawner, TeamContext},
     state,
     workspace::{self, BriefWorkspace},
@@ -68,6 +68,22 @@ pub async fn run(
     let state = std::sync::Arc::new(state::open_or_init(std::path::Path::new(&state_path))?);
     tracing::info!(path = %state_path, "agent state store ready");
     tokio::spawn(projector::run(state.clone(), conn.clone()));
+
+    // Wall-clock reaper (L.5 of EPIC #246): scans every 30s for briefs
+    // stuck in non-terminal state past their `budget.max_wall_seconds`,
+    // pushes `BriefEvent::BudgetExhausted` to the trace stream so the
+    // per-brief lifecycle FSM transitions to terminal Failed, and
+    // best-effort `podman kill`s the orphan containers. Closes the
+    // wall-clock-no-Failed orphan class (Cases 2/3/4 in
+    // `docs/forensics/orphan_pattern.md`).
+    let reaper_inventory = reaper::RedisInventory::new(conn.clone());
+    let reaper_sink = reaper::RedisReaperSink::new(conn.clone());
+    tokio::spawn(reaper::run(
+        reaper_inventory,
+        reaper_sink,
+        reaper::DEFAULT_WALL_CLOCK_SECONDS,
+        std::time::Duration::from_secs(reaper::REAPER_INTERVAL_SECONDS),
+    ));
     match std::env::var("XAI_API_KEY") {
         Ok(key) if !key.is_empty() => {
             let watchdog_cfg = crate::watchdog::Watchdog::new_default(key);

@@ -103,3 +103,66 @@ that triggered the rejection so the daemon can log the pair without
 re-borrowing the originals. Marked `Clone + PartialEq` so tests can
 compare the rejection shape and the daemon can attach the value to a
 trace event.
+
+## BriefInventory
+
+Read port for the wall-clock reaper. Yields every in-flight brief's
+latest `BriefStateRecord` plus that brief's declared
+`budget.max_wall_seconds`. Production scans `agentry:brief:*:state`;
+tests inject deterministic fixtures. Decoupled from the
+`StateProjector` write port so the reaper does not need a per-brief
+projector instance to enumerate orphans.
+
+## ReaperSink
+
+Write port for the wall-clock reaper. Two effects: `push_event`
+appends a `BriefEvent` to the brief's trace stream so the per-brief
+lifecycle FSM driver picks it up and transitions, and
+`kill_containers` shells out to `podman kill` against the
+`agentry.brief={id}` label so the orphan stops burning tokens. The
+trace push is correctness-critical (drives the FSM), the container
+kill is best-effort.
+
+## RedisInventory
+
+Production `BriefInventory` adapter. SCAN-pages
+`agentry:brief:*:state`, GETs each match, and parses the JSON
+`BriefStateRecord`. Body lookups GET `agentry:brief:{id}:body` and
+walk the JSON to `payload.budget.max_wall_seconds` — bypassing
+`serde_json::from_str::<Brief>` keeps the reaper insensitive to
+future Brief-shape changes outside the budget field.
+
+## RedisReaperSink
+
+Production `ReaperSink` adapter. Pushes lifecycle events to the trace
+stream as `EventKind::Event { payload: <BriefEvent JSON> }` — the
+`RedisEventSource` translator recognises this shape and yields the
+carried `BriefEvent` to the per-brief FSM driver. `podman kill`
+shells out via `tokio::process::Command`.
+
+#### Wall-clock reaper transition (not enforced by graph-specs)
+
+The daemon's wall-clock reaper closes the orphan-without-Failed class
+documented in `docs/forensics/orphan_pattern.md` (Cases 2/3/4 — PRs
+#374, #381, #382 from session 2026-05-04, where containers died
+silently before emitting their terminal `Done` event).
+
+Every 30 seconds the reaper sweep runs against every
+`agentry:brief:{id}:state` record. For each non-terminal record (any
+`BriefState` variant other than `Shipped` or `Failed`) whose `now() -
+record.at` exceeds the brief's `budget.max_wall_seconds` (with a
+30-minute daemon-level fallback when absent), the reaper pushes
+`BriefEvent::BudgetExhausted` into the brief's trace stream and
+best-effort `podman kill`s any container labeled
+`agentry.brief={id}`. The push lands as
+`EventKind::Event { payload }` carrying the serialised `BriefEvent`;
+`RedisEventSource::next` translates it back to the typed event so the
+FSM driver applies the existing universal-aborts arm of `handle()`,
+which transitions the brief to `BriefState::Failed { reason:
+BudgetExhausted }` from any non-terminal state.
+
+Boundary semantics for the reaper's `is_orphan` predicate are strict
+greater-than: a record exactly at the budget is NOT yet orphan (avoids
+double-fire on a freshly-stamped boundary), one second over is.
+Terminal states are never orphan regardless of elapsed time; clock
+skew that places `record.at` in the future is also not-orphan.

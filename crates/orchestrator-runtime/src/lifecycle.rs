@@ -144,6 +144,21 @@ fn translate_trace_entry(
                     }
                 }
             }
+            // Daemon-side lifecycle pushes (the wall-clock reaper, the
+            // handler-error AbortRequested in `daemon::run`) wrap a
+            // serialised `BriefEvent` as the `Event` payload. Detect
+            // the BriefEvent shape via its serde tag and yield it
+            // straight through so the FSM driver can apply it. The
+            // `kind` field is the discriminator; we only attempt the
+            // deserialise when it's present and string-typed to keep
+            // the cost off the hot agent-event path.
+            if payload.get("kind").and_then(JsonValue::as_str).is_some() {
+                if let Ok(brief_event) =
+                    serde_json::from_value::<BriefEvent>(payload.clone())
+                {
+                    return Ok(Some(brief_event));
+                }
+            }
             Ok(None)
         }
         EventKind::Done {
