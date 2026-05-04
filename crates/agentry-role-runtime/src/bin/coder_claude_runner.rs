@@ -39,10 +39,11 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 use agentry_role_runtime::{
-    body_has_verb_syntax, build_coder_prompt, build_self_review_prompt, emit_done, emit_event,
-    emit_finding, is_v1_plus_topology, mech_finding, mech_finding_warn, parse_brief_context,
-    parse_self_review_object, read_bundle_value, stream_claude, tail_bytes, tail_lines,
-    BriefContext, DoneGuard, StreamErr,
+    body_has_verb_syntax, build_coder_prompt, build_self_review_prompt, decide_gate, emit_done,
+    emit_event, emit_finding, is_v1_plus_topology, mech_finding, mech_finding_warn,
+    parse_allowlist_toml, parse_brief_context, parse_new_pub_items, parse_self_review_object,
+    ra_query_present, read_bundle_value, run_ra_query, stream_claude, tail_bytes, tail_lines,
+    BriefContext, DoneGuard, GateDecision, PublicApiAllowlist, StreamErr,
 };
 use orchestrator_types::{DoneReason, EventVerdict, FindingOrigin, ReviewFinding, Severity};
 use serde_json::{json, Value};
@@ -338,6 +339,13 @@ fn exitpoint_phase(ctx: &BriefContext) -> Result<(), RunErr> {
             "msg": "dead_pub_check_unavailable",
             "detail": "binary not on PATH; coder gate skipped",
         }));
+    }
+
+    // 6b. pre-commit callers gate — reject new pub items with zero callers
+    //     unless they're listed in docs/public_api_allowlist.toml.
+    if run_pre_commit_callers_gate(ctx).is_err() {
+        // Gate already emitted findings + done failed.
+        return Ok(());
     }
 
     // 7. git commit
@@ -742,4 +750,118 @@ fn run_dead_pub_check_phase() {
             }));
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Pre-commit callers gate
+// ---------------------------------------------------------------------------
+
+const PUBLIC_API_ALLOWLIST_PATH: &str = "/workspace/docs/public_api_allowlist.toml";
+
+fn run_pre_commit_callers_gate(ctx: &BriefContext) -> Result<(), ()> {
+    emit_event(json!({"msg": "running pre-commit callers gate"}));
+
+    let diff_text = match git_diff_against_base(&ctx.base_branch) {
+        Ok(d) => d,
+        Err(e) => {
+            emit_event(json!({
+                "msg": "pre-commit callers gate skipped",
+                "reason": format!("git diff vs base failed: {e}"),
+            }));
+            return Ok(());
+        }
+    };
+    let items = parse_new_pub_items(&diff_text);
+    if items.is_empty() {
+        emit_event(json!({"msg": "pre-commit callers gate: no new pub items"}));
+        return Ok(());
+    }
+
+    let allowlist = read_allowlist();
+
+    let decision = decide_gate(
+        ra_query_present(),
+        &items,
+        &allowlist,
+        ra_query_callers_count,
+    );
+    match decision {
+        GateDecision::SkippedNoRaQuery => {
+            emit_event(json!({
+                "msg": "pre-commit callers gate skipped",
+                "reason": "ra-query binary not on PATH",
+            }));
+            Ok(())
+        }
+        GateDecision::SkippedResolverFailed(detail) => {
+            emit_event(json!({
+                "msg": "pre-commit callers gate skipped",
+                "reason": format!("ra-query callers failed: {detail}"),
+            }));
+            Ok(())
+        }
+        GateDecision::Clean => {
+            emit_event(json!({"msg": "pre-commit callers gate: clean"}));
+            Ok(())
+        }
+        GateDecision::BlockersFired(findings) => {
+            let count = findings.len();
+            for f in &findings {
+                emit_finding(f);
+            }
+            emit_event(json!({
+                "error": "pre-commit callers gate: blockers fired",
+                "blocker_count": count,
+            }));
+            emit_done(
+                EventVerdict::Failed,
+                Some(DoneReason {
+                    cause: "pre_commit_callers_gate_failed".into(),
+                    exit_code: None,
+                }),
+            );
+            Err(())
+        }
+    }
+}
+
+fn read_allowlist() -> PublicApiAllowlist {
+    match fs::read_to_string(PUBLIC_API_ALLOWLIST_PATH) {
+        Ok(raw) => {
+            let (allowlist, warn) = parse_allowlist_toml(&raw);
+            if let Some(reason) = warn {
+                emit_event(json!({
+                    "warn": "public_api_allowlist parse warning",
+                    "detail": reason,
+                }));
+            }
+            allowlist
+        }
+        Err(_) => PublicApiAllowlist::default(),
+    }
+}
+
+fn git_diff_against_base(base_branch: &str) -> Result<String, String> {
+    let out = Command::new("git")
+        .arg("diff")
+        .arg(format!("origin/{base_branch}...HEAD"))
+        .current_dir(WORKSPACE_DIR)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("spawn git diff vs base: {e}"))?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+fn ra_query_callers_count(name: &str) -> Result<usize, String> {
+    let json = run_ra_query(&["callers", name, "--format", "json"])?;
+    if let Some(arr) = json.get("callers").and_then(Value::as_array) {
+        return Ok(arr.len());
+    }
+    if let Some(arr) = json.as_array() {
+        return Ok(arr.len());
+    }
+    Ok(0)
 }
