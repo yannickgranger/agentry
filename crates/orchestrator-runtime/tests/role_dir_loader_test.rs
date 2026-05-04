@@ -5,12 +5,21 @@
 //! we don't duplicate it here.
 
 use orchestrator_runtime::redis_io;
-use orchestrator_runtime::role_dir_loader::load_roles_from_dir;
+use orchestrator_runtime::role_dir_loader::{load_roles_from_dir, TemplateContext};
 use orchestrator_types::{
     AgentRole, PackageManager, PermitScope, RoleName, SubstrateClass, ToolAllowlist,
 };
 use redis::aio::ConnectionManager;
 use std::path::{Path, PathBuf};
+
+fn test_template_context() -> TemplateContext {
+    TemplateContext {
+        home: std::env::var("HOME").unwrap_or_else(|_| "/root".into()),
+        forge_net_allow: "net:allow:agency.lab".into(),
+        forge_write_permits: vec!["forge:write:yg/*".into()],
+        sccache_net_allow: None,
+    }
+}
 
 fn test_redis_url() -> Option<String> {
     std::env::var("AGENTRY_TEST_REDIS_URL").ok()
@@ -98,7 +107,8 @@ fn loads_seed_roles_dir_at_workspace_root() {
 async fn loads_empty_dir_returns_empty_vec() {
     let Some(url) = test_redis_url() else { return };
     let mut conn = redis_io::connect(&url).await.expect("connect");
-    let result = load_roles_from_dir(&mut conn, Path::new("/nonexistent/path"))
+    let ctx = test_template_context();
+    let result = load_roles_from_dir(&mut conn, Path::new("/nonexistent/path"), &ctx)
         .await
         .expect("non-existent dir is OK");
     assert!(result.is_empty(), "missing dir must yield empty Vec");
@@ -117,7 +127,8 @@ async fn loads_two_role_jsons_returns_both_names() {
     write_role(dir.path(), "a.json", &minimal_role(&n_a));
     write_role(dir.path(), "b.json", &minimal_role(&n_b));
 
-    let names = load_roles_from_dir(&mut conn, dir.path())
+    let ctx = test_template_context();
+    let names = load_roles_from_dir(&mut conn, dir.path(), &ctx)
         .await
         .expect("load");
     assert_eq!(names.len(), 2);
@@ -155,7 +166,8 @@ async fn loads_in_alphabetical_order() {
     write_role(dir.path(), "a.json", &minimal_role(&n_a));
     write_role(dir.path(), "b.json", &minimal_role(&n_b));
 
-    let names = load_roles_from_dir(&mut conn, dir.path())
+    let ctx = test_template_context();
+    let names = load_roles_from_dir(&mut conn, dir.path(), &ctx)
         .await
         .expect("load");
     let collected: Vec<String> = names.iter().map(|n| n.0.clone()).collect();

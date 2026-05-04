@@ -80,6 +80,23 @@ executes them sequentially (mechanical first, then claude); the DAG
 scheduler in issue #13 will enable parallel execution. A Blocker from
 either reviewer rewinds to the coder, bounded by `team.max_retries`.
 
+## TemplateContext
+
+Runtime-config-derived values made available to JSON role files at seed
+time. The seed context derives `home`, `forge_net_allow` (from
+`ForgeConfig.default_host`), `forge_write_permits` (one per
+`ForgeConfig.allowed_owners` entry), and an optional `sccache_net_allow`
+(from `SccacheConfig.endpoint`), then passes the bundle through to the
+role-directory loader. The loader expands `~/`, `${HOME}`,
+`${FORGE_NET_ALLOW}`, and `${SCCACHE_NET_ALLOW}` substrings in any string
+field eligible for templating, and treats `${FORGE_WRITE_PERMITS}` as a
+list-spread token in `permit_scope`: a `permit_scope` element exactly
+equal to that token is replaced inline by every entry of
+`forge_write_permits`. A sole `${SCCACHE_NET_ALLOW}` element with no
+configured sccache endpoint is dropped rather than emitted as the empty
+string. JSON role files therefore stay declarative without baking forge
+host, allowed owners, or sccache endpoint into source.
+
 ## TeamName
 
 Identifier for a team topology. Lowercase + hyphens, unique within the
