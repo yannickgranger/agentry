@@ -742,7 +742,16 @@ fn brief_env_args(brief: &Brief) -> Vec<String> {
 fn coder_tool_mount_role_can_warn_skip(role_name: &str) -> bool {
     matches!(
         role_name,
-        "reviewer-claude-agentry" | "coder-claude-agentry" | "git-operator"
+        "reviewer-claude-agentry"
+            | "coder-claude-agentry"
+            | "git-operator"
+            | "auditor-claude-agentry"
+            | "archaeologist-claude-agentry"
+            | "planner-claude-agentry"
+            | "verifier-claude-agentry"
+            | "ac-verifier-claude-agentry"
+            | "ac-verifier-gemini-agentry"
+            | "ac-verifier-grok-agentry"
     )
 }
 
@@ -756,6 +765,7 @@ fn is_coder_tool_mount_target(target: &str) -> bool {
             | "/usr/local/bin/dead-pub-check"
             | "/usr/local/bin/ship"
             | "/usr/local/bin/git-operator"
+            | "/usr/local/bin/rtk"
     )
 }
 
