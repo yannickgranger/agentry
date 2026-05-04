@@ -573,6 +573,11 @@ fn build_planner_claude_agentry_role(home: &str, claude_settings_path: &str) -> 
                 target: "/usr/local/bin/planner-runner".into(),
                 readonly: true,
             },
+            Mount {
+                source: format!("{home}/.local/bin/rtk"),
+                target: "/usr/local/bin/rtk".into(),
+                readonly: true,
+            },
         ],
         workspace_mount: Some(WorkspaceMount {
             container_path: "/workspace".into(),
@@ -654,6 +659,11 @@ fn build_archaeologist_claude_agentry_role(
             Mount {
                 source: format!("{home}/.local/bin/archaeologist-runner"),
                 target: "/usr/local/bin/archaeologist-runner".into(),
+                readonly: true,
+            },
+            Mount {
+                source: format!("{home}/.local/bin/rtk"),
+                target: "/usr/local/bin/rtk".into(),
                 readonly: true,
             },
         ],
@@ -744,6 +754,11 @@ fn build_auditor_claude_agentry_role(home: &str, sccache_net_allow: Option<&str>
                 target: "/usr/local/bin/auditor-claude-runner".into(),
                 readonly: true,
             },
+            Mount {
+                source: format!("{home}/.local/bin/rtk"),
+                target: "/usr/local/bin/rtk".into(),
+                readonly: true,
+            },
         ],
         workspace_mount: Some(WorkspaceMount {
             container_path: "/workspace".into(),
@@ -787,11 +802,18 @@ fn build_verifier_claude_agentry_role(home: &str) -> AgentRole {
         ]),
         passthru_env: vec![],
         extra_bootstrap: vec![],
-        mounts: vec![Mount {
-            source: format!("{home}/.local/bin/verifier-dol-runner"),
-            target: "/usr/local/bin/verifier-dol-runner".into(),
-            readonly: true,
-        }],
+        mounts: vec![
+            Mount {
+                source: format!("{home}/.local/bin/verifier-dol-runner"),
+                target: "/usr/local/bin/verifier-dol-runner".into(),
+                readonly: true,
+            },
+            Mount {
+                source: format!("{home}/.local/bin/rtk"),
+                target: "/usr/local/bin/rtk".into(),
+                readonly: true,
+            },
+        ],
         workspace_mount: Some(WorkspaceMount {
             container_path: "/workspace".into(),
             readonly: true,

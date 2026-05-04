@@ -46,6 +46,11 @@
       "source": "${HOME}/.local/bin/ac-verifier-runner",
       "target": "/usr/local/bin/ac-verifier-runner",
       "readonly": true
+    },
+    {
+      "source": "${HOME}/.local/bin/rtk",
+      "target": "/usr/local/bin/rtk",
+      "readonly": true
     }
   ],
   "workspace_mount": {
