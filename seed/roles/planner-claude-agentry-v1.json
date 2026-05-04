@@ -1,0 +1,59 @@
+{
+  "name": "planner-claude-agentry",
+  "version": 1,
+  "model": "claude-max",
+  "system_prompt": null,
+  "image": "docker.io/library/rust:1.93",
+  "substrate_class": "podman",
+  "package_manager": "apt",
+  "entrypoint_script": "#!/bin/sh\nexec /usr/local/bin/planner-runner\n",
+  "exitpoint_script": null,
+  "binaries": [],
+  "mcp_servers": [],
+  "tool_allowlist": [],
+  "allowed_tools": null,
+  "permit_scope": [
+    "fs:read:/workspace/**",
+    "fs:write:/workspace/**",
+    "net:allow:api.anthropic.com"
+  ],
+  "passthru_env": [],
+  "extra_bootstrap": [],
+  "mounts": [
+    {
+      "source": "${HOME}/.local/bin/claude",
+      "target": "/usr/local/bin/claude",
+      "readonly": true
+    },
+    {
+      "source": "${HOME}/.claude/.credentials.json",
+      "target": "/root/.claude/.credentials.json",
+      "readonly": true
+    },
+    {
+      "source": "${HOME}/.config/agentry/claude-container-settings.json",
+      "target": "/root/.claude/settings.json",
+      "readonly": true
+    },
+    {
+      "source": "/var/lib/agentry/transcripts",
+      "target": "/transcripts",
+      "readonly": false
+    },
+    {
+      "source": "${HOME}/.local/bin/planner-runner",
+      "target": "/usr/local/bin/planner-runner",
+      "readonly": true
+    },
+    {
+      "source": "${HOME}/.local/bin/rtk",
+      "target": "/usr/local/bin/rtk",
+      "readonly": true
+    }
+  ],
+  "workspace_mount": {
+    "container_path": "/workspace",
+    "readonly": false
+  },
+  "sccache": false
+}

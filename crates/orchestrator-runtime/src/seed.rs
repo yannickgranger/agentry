@@ -510,83 +510,6 @@ fi
 // The runner has its own unit-test coverage for cfdb-counts parsing,
 // discovery-seed extraction, prompt assembly, and JSON-object slicing.
 
-// EPIC #161 Wave 3: PLANNER_CLAUDE_AGENTRY_SCRIPT bash heredoc that used to
-// live here has been ported to a Rust runner —
-// `crates/agentry-role-runtime/src/bin/planner_runner.rs`. The role's
-// entrypoint_script now just `exec /usr/local/bin/planner-runner`. The
-// runner has its own unit-test coverage for payload parsing, prompt
-// assembly, response parsing, and child-brief construction.
-
-/// Build the planner-claude-agentry role. Extracted from `seed_m0` so the
-/// permit-scope invariants can be asserted in a unit test without rebuilding
-/// the entire seed flow.
-fn build_planner_claude_agentry_role(home: &str, claude_settings_path: &str) -> AgentRole {
-    AgentRole {
-        name: RoleName("planner-claude-agentry".into()),
-        version: 1,
-        model: Some("claude-max".into()),
-        system_prompt: None,
-        // Same toolchain as archaeologist for a uniform claude-mounted base,
-        // but planner installs nothing and runs no compilation.
-        image: "docker.io/library/rust:1.93".into(),
-        substrate_class: SubstrateClass::Podman,
-        package_manager: PackageManager::Apt,
-        entrypoint_script: "#!/bin/sh\nexec /usr/local/bin/planner-runner\n".into(),
-        exitpoint_script: None,
-        binaries: vec![],
-        mcp_servers: vec![],
-        tool_allowlist: ToolAllowlist(vec![]),
-        allowed_tools: None,
-        // Strictly tighter than archaeologist: no agency.lab (no cargo install),
-        // no agentry-sccache-redis (no compilation).
-        permit_scope: PermitScope(vec![
-            "fs:read:/workspace/**".into(),
-            "fs:write:/workspace/**".into(),
-            "net:allow:api.anthropic.com".into(),
-        ]),
-        // No GITEA_TOKEN — planner does not touch the forge.
-        passthru_env: vec![],
-        extra_bootstrap: vec![],
-        mounts: vec![
-            Mount {
-                source: format!("{home}/.local/bin/claude"),
-                target: "/usr/local/bin/claude".into(),
-                readonly: true,
-            },
-            Mount {
-                source: format!("{home}/.claude/.credentials.json"),
-                target: "/root/.claude/.credentials.json".into(),
-                readonly: true,
-            },
-            Mount {
-                source: claude_settings_path.into(),
-                target: "/root/.claude/settings.json".into(),
-                readonly: true,
-            },
-            Mount {
-                source: "/var/lib/agentry/transcripts".into(),
-                target: "/transcripts".into(),
-                readonly: false,
-            },
-            Mount {
-                source: format!("{home}/.local/bin/planner-runner"),
-                target: "/usr/local/bin/planner-runner".into(),
-                readonly: true,
-            },
-            Mount {
-                source: format!("{home}/.local/bin/rtk"),
-                target: "/usr/local/bin/rtk".into(),
-                readonly: true,
-            },
-        ],
-        workspace_mount: Some(WorkspaceMount {
-            container_path: "/workspace".into(),
-            readonly: false,
-        }),
-        sccache: false,
-    }
-}
-
 /// Build the archaeologist-claude-agentry role. Extracted from `seed_m0` so
 /// the permit-scope + tool-allowlist invariants can be asserted in a unit test
 /// without rebuilding the entire seed flow.
@@ -768,60 +691,6 @@ fn build_auditor_claude_agentry_role(home: &str, sccache_net_allow: Option<&str>
     }
 }
 
-/// Verifier role for the `agentry-verify-v0` team. Despite the `claude` in
-/// the name — kept for symmetry with the other agentry-* roles — the
-/// verifier never invokes claude; it just runs `success_criteria` as a
-/// shell command on a read-only snapshot of the workspace. Strictest
-/// permits in the registry: fs:read on /workspace, fs:write on /tmp only,
-/// no net, no git, no claude. Bind-mounts the host-built verifier-dol-runner
-/// at /usr/local/bin/verifier-dol-runner (operator runs
-/// `just verifier-dol-runner-binary`).
-fn build_verifier_claude_agentry_role(home: &str) -> AgentRole {
-    AgentRole {
-        name: RoleName("verifier-claude-agentry".into()),
-        version: 1,
-        // No claude needed — criterion is shell.
-        model: None,
-        system_prompt: None,
-        // Same rust-bookworm base as archaeologist so criteria can run cargo,
-        // ripgrep, jq, etc. without per-criterion bootstrap.
-        image: "docker.io/library/rust:1.93".into(),
-        substrate_class: SubstrateClass::Podman,
-        package_manager: PackageManager::Apt,
-        entrypoint_script: "#!/bin/sh\nexec /usr/local/bin/verifier-dol-runner\n".into(),
-        exitpoint_script: None,
-        binaries: vec![],
-        mcp_servers: vec![],
-        tool_allowlist: ToolAllowlist(vec![]),
-        allowed_tools: None,
-        // Strictly read-only on workspace (criterion shouldn't mutate). /tmp
-        // write for criterion temp files. No net, no git, no claude.
-        permit_scope: PermitScope(vec![
-            "fs:read:/workspace/**".into(),
-            "fs:write:/tmp/**".into(),
-        ]),
-        passthru_env: vec![],
-        extra_bootstrap: vec![],
-        mounts: vec![
-            Mount {
-                source: format!("{home}/.local/bin/verifier-dol-runner"),
-                target: "/usr/local/bin/verifier-dol-runner".into(),
-                readonly: true,
-            },
-            Mount {
-                source: format!("{home}/.local/bin/rtk"),
-                target: "/usr/local/bin/rtk".into(),
-                readonly: true,
-            },
-        ],
-        workspace_mount: Some(WorkspaceMount {
-            container_path: "/workspace".into(),
-            readonly: true,
-        }),
-        sccache: false,
-    }
-}
-
 /// PR rebaser role for the substrate auto-rebaser (#137). Triggered by a
 /// ci-watcher chain-trigger when a PR's `mergeable` flag flips false
 /// because `develop` advanced past the PR's base. Reads the PR
@@ -875,58 +744,6 @@ fn build_pr_rebaser_agentry_role(
         workspace_mount: Some(WorkspaceMount {
             container_path: "/workspace".into(),
             readonly: false,
-        }),
-        sccache: false,
-    }
-}
-
-/// Build the preflight-criterion-agentry role (issue #84). Runs the brief's
-/// `success_criteria` against the current workspace tip and reports the
-/// baseline + heuristic smells; does not gate. Brief 84b wires the planner to
-/// consume the baseline; until then the role is invoked manually for
-/// diagnosis.
-///
-/// EPIC #161 wave-bash port: bash heredoc PREFLIGHT_CRITERION_AGENTRY_SCRIPT
-/// ported to a Rust runner at
-/// crates/agentry-role-runtime/src/bin/preflight_criterion_runner.rs. The
-/// role bind-mounts the host-built binary at
-/// /usr/local/bin/preflight-criterion-runner (operator runs `just
-/// preflight-criterion-runner-binary`) and execs it directly. Image switched
-/// from alpine to debian:bookworm-slim for parity with the other ported
-/// runners; permit_scope and workspace_mount stay UNCHANGED — preflight is
-/// deliberately read-only on /workspace, has no net access, and no forge
-/// auth.
-fn build_preflight_criterion_agentry_role(home: &str) -> AgentRole {
-    AgentRole {
-        name: RoleName("preflight-criterion-agentry".into()),
-        version: 1,
-        model: None,
-        system_prompt: None,
-        image: "docker.io/library/debian:bookworm-slim".into(),
-        substrate_class: SubstrateClass::Podman,
-        package_manager: PackageManager::Apt,
-        entrypoint_script: "#!/bin/sh\nexec /usr/local/bin/preflight-criterion-runner\n".into(),
-        exitpoint_script: None,
-        binaries: vec![
-            "bash".into(),
-            "ripgrep".into(),
-            "jq".into(),
-            "coreutils".into(),
-        ],
-        mcp_servers: vec![],
-        tool_allowlist: ToolAllowlist(vec!["bash".into(), "rg".into(), "grep".into(), "wc".into()]),
-        allowed_tools: None,
-        permit_scope: PermitScope(vec!["fs:read:/workspace/**".into()]),
-        passthru_env: vec![],
-        extra_bootstrap: vec![],
-        mounts: vec![Mount {
-            source: format!("{home}/.local/bin/preflight-criterion-runner"),
-            target: "/usr/local/bin/preflight-criterion-runner".into(),
-            readonly: true,
-        }],
-        workspace_mount: Some(WorkspaceMount {
-            container_path: "/workspace".into(),
-            readonly: true,
         }),
         sccache: false,
     }
@@ -1571,24 +1388,6 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         sccache_net_allow.as_deref(),
     );
 
-    // ---- agentry-planner-v0 team (autonomous decomposition) ----
-    // archaeologist → planner: archaeologist writes /workspace/discovery.json,
-    // planner reads it and emits an outbox Message whose payload carries
-    // `next_brief_refs` — a list of absolute host paths to child brief JSONs.
-    // The daemon's chain-trigger auto-dispatches each child via submit_brief
-    // once the planner ships. The team topology lives in
-    // `seed/topologies/agentry-planner-v0.json` and is loaded by the
-    // seed-time topology walker.
-    let planner_claude_agentry = build_planner_claude_agentry_role(&home, &claude_settings_path);
-
-    // ---- agentry-verify-v0 team (DOL verifier — runs success_criteria) ----
-    // Daemon-Orchestrated Lifecycle: when all children of a meta-brief reach
-    // terminal verdict, the daemon auto-dispatches a verifier brief that runs
-    // the meta-brief's success_criteria. The verifier's verdict composes with
-    // the children's verdicts to produce the meta-brief's terminal verdict.
-    let verifier_claude_agentry = build_verifier_claude_agentry_role(&home);
-    let preflight_criterion_agentry = build_preflight_criterion_agentry_role(&home);
-
     let auditor_claude_agentry =
         build_auditor_claude_agentry_role(&home, sccache_net_allow.as_deref());
 
@@ -1619,9 +1418,6 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
     redis_io::save_role(&mut conn, &pr_rebaser_agentry).await?;
     redis_io::save_role(&mut conn, &auditor_claude_agentry).await?;
     redis_io::save_role(&mut conn, &archaeologist_claude_agentry).await?;
-    redis_io::save_role(&mut conn, &planner_claude_agentry).await?;
-    redis_io::save_role(&mut conn, &verifier_claude_agentry).await?;
-    redis_io::save_role(&mut conn, &preflight_criterion_agentry).await?;
 
     let roles_dir = seed_roles_dir();
     if roles_dir.exists() {
@@ -1654,7 +1450,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
     }
 
     tracing::info!(
-"seeded: roles [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker, listener, grok-echo, claude-echo, synthesizer, narrowed-coder, coder-claude-agentry, ac-verifier-claude-agentry, ac-verifier-gemini-agentry, ac-verifier-grok-agentry, reviewer-mechanical-agentry, shipper-agentry, ci-watcher-agentry, pr-rebaser-agentry, reviewer-claude-agentry, auditor-claude-agentry, null-agent-agentry, archaeologist-claude-agentry, planner-claude-agentry, verifier-claude-agentry] (inline entrypoint scripts); teams [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker-listener, grok-echo, claude-echo, narrowed-team] (Rust literals); teams [agentry-null-v0, agentry-pr-rebaser-v0, agentry-discovery-v0, agentry-verify-v0, agentry-planner-v0, agentry-self-host-v0, agentry-self-audit-v0] (loaded from seed/topologies/*.json)"
+"seeded: roles [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker, listener, grok-echo, claude-echo, synthesizer, narrowed-coder, coder-claude-agentry, ac-verifier-claude-agentry, ac-verifier-gemini-agentry, ac-verifier-grok-agentry, reviewer-mechanical-agentry, shipper-agentry, ci-watcher-agentry, pr-rebaser-agentry, reviewer-claude-agentry, auditor-claude-agentry, null-agent-agentry, archaeologist-claude-agentry] (inline entrypoint scripts); teams [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker-listener, grok-echo, claude-echo, narrowed-team] (Rust literals); teams [agentry-null-v0, agentry-pr-rebaser-v0, agentry-discovery-v0, agentry-verify-v0, agentry-planner-v0, agentry-self-host-v0, agentry-self-audit-v0] (loaded from seed/topologies/*.json)"
     );
     Ok(())
 }

@@ -1,0 +1,42 @@
+{
+  "name": "preflight-criterion-agentry",
+  "version": 1,
+  "model": null,
+  "system_prompt": null,
+  "image": "docker.io/library/debian:bookworm-slim",
+  "substrate_class": "podman",
+  "package_manager": "apt",
+  "entrypoint_script": "#!/bin/sh\nexec /usr/local/bin/preflight-criterion-runner\n",
+  "exitpoint_script": null,
+  "binaries": [
+    "bash",
+    "ripgrep",
+    "jq",
+    "coreutils"
+  ],
+  "mcp_servers": [],
+  "tool_allowlist": [
+    "bash",
+    "rg",
+    "grep",
+    "wc"
+  ],
+  "allowed_tools": null,
+  "permit_scope": [
+    "fs:read:/workspace/**"
+  ],
+  "passthru_env": [],
+  "extra_bootstrap": [],
+  "mounts": [
+    {
+      "source": "${HOME}/.local/bin/preflight-criterion-runner",
+      "target": "/usr/local/bin/preflight-criterion-runner",
+      "readonly": true
+    }
+  ],
+  "workspace_mount": {
+    "container_path": "/workspace",
+    "readonly": true
+  },
+  "sccache": false
+}
