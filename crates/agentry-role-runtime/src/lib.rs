@@ -1931,3 +1931,199 @@ fn preflight_warn_finding(message: String) -> ReviewFinding {
 fn is_ascii_digits(s: &str) -> bool {
     !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
 }
+
+// ---------- auditor ra-query helpers (brief #87 phase2) ----------
+//
+// These are the parser primitives behind the auditor-claude-runner's two
+// finding-emitting stages: `ra_query_unwraps_stage` (every unwrap site
+// becomes one Warn finding) and `ra_query_callers_pubsurface_stage` (each
+// new pub item with zero callers becomes one Warn `orphan_pub` finding).
+// Both stages are best-effort: a missing `ra-query` binary, a parse error,
+// or a non-zero exit shorts out the stage with a `*_skipped` event rather
+// than failing the auditor.
+
+/// Tool name embedded in `FindingOrigin::Mechanical` for findings emitted
+/// by the ra-query-driven stages.
+pub const RA_QUERY_TOOL: &str = "ra-query";
+
+/// Category for the per-unwrap Warn finding stream (auditor stage 1 of 2
+/// added in brief #87 phase2). The daemon never gates on Warns; this is
+/// purely informational.
+pub const UNWRAPS_CATEGORY: &str = "unwraps";
+
+/// Category for the per-orphan-pub Warn finding stream (auditor stage 2
+/// of 2 added in brief #87 phase2). A pub item is "orphan" iff it was
+/// added in this brief (vs base_branch) AND has zero workspace callers.
+pub const ORPHAN_PUB_CATEGORY: &str = "orphan_pub";
+
+/// Parse one `ra-query unwraps <file> --format json` response into a list
+/// of `Severity::Warn` findings, one per unwrap site. The `file` arg
+/// names the source file ra-query was invoked on; the JSON's top-level
+/// `file` field is preferred when present (and falls back to `file`).
+///
+/// Each finding's message is `<file>:<line>:<fqn>` per the brief, with
+/// the unwrap method and severity appended in parens for triage. The
+/// origin is `Mechanical { tool: "ra-query", rule: Some("unwraps") }`.
+///
+/// Returns an empty vec on any of: missing `functions` array, missing
+/// `unwraps` array per function, or unparseable line numbers — the
+/// caller treats absence of findings as "this file is clean".
+pub fn parse_unwraps_findings(file: &str, json: &Value) -> Vec<ReviewFinding> {
+    let mut out = Vec::new();
+    let functions = match json.get("functions").and_then(Value::as_array) {
+        Some(a) => a,
+        None => return out,
+    };
+    let json_file = json
+        .get("file")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| file.to_string());
+    for fn_v in functions {
+        let fn_name = fn_v
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("?")
+            .to_string();
+        let unwraps = match fn_v.get("unwraps").and_then(Value::as_array) {
+            Some(a) => a,
+            None => continue,
+        };
+        for u in unwraps {
+            let line_u64 = u.get("line").and_then(Value::as_u64).unwrap_or(0);
+            let line: u32 = line_u64.try_into().unwrap_or(u32::MAX);
+            let method = u.get("method").and_then(Value::as_str).unwrap_or("unwrap");
+            let severity_str = u.get("severity").and_then(Value::as_str).unwrap_or("low");
+            let message =
+                format!("{json_file}:{line}:{fn_name} ({method}, severity={severity_str})");
+            out.push(ReviewFinding {
+                file: Some(json_file.clone()),
+                line: Some(line),
+                severity: Severity::Warn,
+                origin: FindingOrigin::Mechanical {
+                    tool: RA_QUERY_TOOL.into(),
+                    rule: Some(UNWRAPS_CATEGORY.into()),
+                },
+                category: UNWRAPS_CATEGORY.into(),
+                message,
+                suggested_fix: None,
+                prohibitions: Vec::new(),
+                requirements: Vec::new(),
+            });
+        }
+    }
+    out
+}
+
+/// Parse `ra-query callers <pos> --format json` to a single caller count.
+/// Mirrors the existing pub-surface stage's `.callers | length` jq
+/// expression — a missing or non-array `callers` field reads as zero so
+/// "shape we did not recognise" cannot turn into a Blocker downstream.
+pub fn parse_callers_count(json: &Value) -> u64 {
+    json.get("callers")
+        .and_then(Value::as_array)
+        .map(|a| a.len() as u64)
+        .unwrap_or(0)
+}
+
+/// Build a single Warn finding for an orphan pub item (the
+/// `ra_query_callers_pubsurface_stage` output unit). `file:line:fqn` is
+/// the canonical message format shared with the unwraps stage.
+pub fn orphan_pub_finding(file: &str, line: u32, fqn: &str, kind: &str) -> ReviewFinding {
+    ReviewFinding {
+        file: Some(file.to_string()),
+        line: Some(line),
+        severity: Severity::Warn,
+        origin: FindingOrigin::Mechanical {
+            tool: RA_QUERY_TOOL.into(),
+            rule: Some(ORPHAN_PUB_CATEGORY.into()),
+        },
+        category: ORPHAN_PUB_CATEGORY.into(),
+        message: format!("{file}:{line}:{fqn} (new pub {kind} with zero callers)"),
+        suggested_fix: None,
+        prohibitions: Vec::new(),
+        requirements: Vec::new(),
+    }
+}
+
+/// Parse a `git diff --unified=0 <range>` text into a map from new-file
+/// path to the set of new-file line numbers added by the diff. Used by
+/// the orphan-pub stage to filter pub-surface output down to items
+/// actually introduced by this brief.
+///
+/// Hunk headers carry the new-file start line as `+c[,d]`; with `-U0`
+/// there are no context lines, so each `+`-prefixed line is at the
+/// running counter and `-`-prefixed lines do not advance it.
+pub fn parse_diff_added_lines(
+    diff: &str,
+) -> std::collections::BTreeMap<String, std::collections::BTreeSet<u32>> {
+    let mut map: std::collections::BTreeMap<String, std::collections::BTreeSet<u32>> =
+        std::collections::BTreeMap::new();
+    let mut cur_file: Option<String> = None;
+    let mut cur_line: u32 = 0;
+    for raw in diff.lines() {
+        if let Some(rest) = raw.strip_prefix("+++ b/") {
+            cur_file = Some(rest.to_string());
+            continue;
+        }
+        if raw.starts_with("+++ /dev/null") {
+            cur_file = None;
+            continue;
+        }
+        if raw.starts_with("@@") {
+            // "@@ -a[,b] +c[,d] @@ ..." — extract c.
+            let plus_idx = match raw.find('+') {
+                Some(i) => i,
+                None => continue,
+            };
+            let after = &raw[plus_idx + 1..];
+            let token: String = after
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || *c == ',')
+                .collect();
+            let start: u32 = token
+                .split(',')
+                .next()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            cur_line = start;
+            continue;
+        }
+        if cur_file.is_none() {
+            continue;
+        }
+        // Skip diff metadata lines that happen to start with '+' or '-'.
+        if raw.starts_with("+++") || raw.starts_with("---") {
+            continue;
+        }
+        if let Some(file) = &cur_file {
+            if let Some(byte) = raw.as_bytes().first() {
+                match *byte {
+                    b'+' => {
+                        map.entry(file.clone()).or_default().insert(cur_line);
+                        cur_line = cur_line.saturating_add(1);
+                    }
+                    b'-' => {
+                        // Removal — does not advance new-file counter.
+                    }
+                    _ => {
+                        // With --unified=0 there are no context lines, but be
+                        // permissive: treat anything else as a context line.
+                        cur_line = cur_line.saturating_add(1);
+                    }
+                }
+            }
+        }
+    }
+    map
+}
+
+/// Build the `*_skipped` event payload that both ra-query stages emit
+/// when they short-circuit (missing binary, git failure, parse error).
+/// Stage label is verbatim in `msg` so dashboards can filter on it.
+pub fn ra_query_skipped_event(stage: &str, reason: &str) -> Value {
+    json!({
+        "msg": format!("ra-query {stage} skipped"),
+        "reason": reason,
+    })
+}
