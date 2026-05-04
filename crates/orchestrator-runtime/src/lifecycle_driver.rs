@@ -158,8 +158,8 @@ async fn emit_terminal_verdict(
 /// the wording of the tracing logs and the Redis trace event so the
 /// audit log truthfully labels successful no-op short-circuits separate
 /// from terminal Failed cleanups (the two paths are otherwise
-/// mechanically identical — same worktree tear-down, same branch
-/// removal, same idempotency / error-swallowing semantics).
+/// mechanically identical — same workspace dir tear-down, same
+/// idempotency / error-swallowing semantics).
 #[derive(Debug, Clone, Copy)]
 enum CleanupDisposition {
     /// Cleanup fired because the FSM reached `BriefState::Failed`.
@@ -198,19 +198,18 @@ impl CleanupDisposition {
     }
 }
 
-/// On terminal `BriefState::Failed`, tear down the brief's worktree dir
-/// and the associated `auto/<brief_id>` branch in the bare clone, and
-/// (when `conn` is provided) append a trace event recording the cleanup.
+/// On terminal `BriefState::Failed`, tear down the brief's per-brief
+/// clone dir, and (when `conn` is provided) append a trace event
+/// recording the cleanup.
 ///
 /// Replaces the prior "retain on failure for audit" rule: failures are
 /// reconstructable from Redis (the trace stream and state log are the
-/// audit log), and retained worktrees produced ~6 dispatch-blocking
+/// audit log), and retained workspaces produced ~6 dispatch-blocking
 /// stale-worktree incidents in the EPIC #255/#256 drain.
 ///
-/// Idempotent — `workspace::destroy` treats a missing worktree dir as a
-/// no-op and `git branch -D` on a non-existent branch is logged at debug
-/// only. Errors are logged and swallowed: cleanup failure must not crash
-/// the projector_task at the terminal step.
+/// Idempotent — `workspace::destroy` treats a missing dir as a no-op.
+/// Errors are logged and swallowed: cleanup failure must not crash the
+/// projector_task at the terminal step.
 ///
 /// The thin wrapper resolves the workspace root from the
 /// `AGENTRY_WORKSPACE_ROOT` env var (or its compiled-in default) and
@@ -239,9 +238,9 @@ pub async fn cleanup_failed_brief_at(
 }
 
 /// On a no-op short-circuit `BriefState::Shipped`, tear down the
-/// brief's worktree dir and the associated `auto/<brief_id>` branch in
-/// the bare clone, and (when `conn` is provided) append a trace event
-/// truthfully labeled `"workspace cleaned (no-op short-circuit)"`.
+/// brief's per-brief clone dir, and (when `conn` is provided) append
+/// a trace event truthfully labeled `"workspace cleaned (no-op
+/// short-circuit)"`.
 ///
 /// The cleanup mechanics are identical to [`cleanup_failed_brief`]
 /// (same `workspace::destroy_with_disposition` call, same idempotency,
@@ -273,9 +272,9 @@ pub async fn cleanup_shipped_no_op_brief_at(
 
 /// Shared body of the per-disposition cleanup helpers. The disposition
 /// only influences the wording of the tracing log lines and the `msg`
-/// field of the Redis trace event — the worktree teardown,
-/// `auto/<brief_id>` branch removal, idempotency, and error-swallowing
-/// behavior are identical across dispositions.
+/// field of the Redis trace event — the workspace dir teardown,
+/// idempotency, and error-swallowing behavior are identical across
+/// dispositions.
 async fn cleanup_brief_at(
     brief_id: &BriefId,
     root: &Path,

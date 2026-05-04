@@ -270,34 +270,64 @@ pub async fn allocate_at(
                 Error::Config(format!("workspace parent {}: {e}", parent.display()))
             })?;
         }
-        let branch = format!("auto/{}", brief_id.0);
-        let out = tokio::process::Command::new("git")
+        // Clone from the local bare into the brief's host_path. --local + --no-hardlinks
+        // gives the brief its own independent .git database (no shared object files,
+        // no worktree linkage). Branch-lock impossible because nothing in the bare
+        // ever knows about auto/<brief_id>.
+        let clone = tokio::process::Command::new("git")
             .arg("-c")
             .arg("http.sslVerify=false")
-            .arg("-C")
+            .arg("clone")
+            .arg("--local")
+            .arg("--no-hardlinks")
             .arg(&bare)
-            .arg("worktree")
-            .arg("add")
-            .arg("-b")
-            .arg(&branch)
             .arg(&host_path)
-            .arg(base_branch)
             .output()
             .await
-            .map_err(|e| Error::Config(format!("git worktree add: {e}")))?;
-        if !out.status.success() {
+            .map_err(|e| Error::Config(format!("git clone --local: {e}")))?;
+        if !clone.status.success() {
             return Err(Error::Config(format!(
-                "git worktree add failed: {}",
-                String::from_utf8_lossy(&out.stderr)
+                "git clone --local failed: {}",
+                String::from_utf8_lossy(&clone.stderr)
             )));
         }
 
-        // Defense-in-depth: verify the new worktree's HEAD points at a real
-        // commit. If git silently created an unborn-HEAD worktree (because
-        // base_branch resolved to nothing — e.g. fetch race left the ref
-        // transient, or base_branch is misspelled), reject the allocation
-        // here rather than letting the coder commit an orphan that fails to
-        // merge later.
+        // Repoint origin from the local bare to the actual forge URL so push goes
+        // to the forge, not back to the host bare.
+        let set_url = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(&host_path)
+            .args(["remote", "set-url", "origin", repo_url])
+            .output()
+            .await
+            .map_err(|e| Error::Config(format!("git remote set-url: {e}")))?;
+        if !set_url.status.success() {
+            return Err(Error::Config(format!(
+                "git remote set-url failed: {}",
+                String::from_utf8_lossy(&set_url.stderr)
+            )));
+        }
+
+        // Create the brief's branch from the cloned base_branch tip.
+        let branch = format!("auto/{}", brief_id.0);
+        let checkout = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(&host_path)
+            .args(["checkout", "-b", &branch, &format!("origin/{base_branch}")])
+            .output()
+            .await
+            .map_err(|e| Error::Config(format!("git checkout -b: {e}")))?;
+        if !checkout.status.success() {
+            return Err(Error::Config(format!(
+                "git checkout -b {branch} from origin/{base_branch} failed: {}",
+                String::from_utf8_lossy(&checkout.stderr)
+            )));
+        }
+
+        // Defense-in-depth: verify HEAD points at a real commit. If the
+        // checkout silently produced an unborn HEAD (base_branch misspelled or
+        // unreachable in the cloned base), reject the allocation here rather
+        // than letting the coder commit an orphan that fails to merge later.
         let head_check = tokio::process::Command::new("git")
             .arg("-C")
             .arg(&host_path)
@@ -312,18 +342,10 @@ pub async fn allocate_at(
                 .trim()
                 .is_empty()
         {
-            // Tear down the broken worktree so the bare clone forgets it.
-            let _ = tokio::process::Command::new("git")
-                .arg("-C")
-                .arg(&bare)
-                .arg("worktree")
-                .arg("remove")
-                .arg("--force")
-                .arg(&host_path)
-                .output()
-                .await;
+            // No worktree linkage to clean up — just remove the cloned dir.
+            let _ = tokio::fs::remove_dir_all(&host_path).await;
             return Err(Error::Config(format!(
-                "worktree HEAD is unborn after add (base_branch={base_branch} \
+                "HEAD is unborn after checkout (base_branch={base_branch} \
                  likely unreachable in bare clone {}); refusing to allocate",
                 bare.display()
             )));
@@ -510,147 +532,11 @@ pub fn gc_run(root: &Path, threshold: std::time::Duration, dry_run: bool) -> Vec
 /// preserves the dir for audit.
 pub async fn destroy(ws: &BriefWorkspace) -> Result<()> {
     if !ws.host_path.exists() {
-        return Ok(());
+        return Ok(()); // idempotent — already gone
     }
-    // Detect if this is a worktree (has a `.git` file, not dir). If so,
-    // run `git worktree remove --force` so the bare-clone's admin dir
-    // forgets this worktree. Falls back to plain rm -rf for legacy briefs.
-    let dotgit = ws.host_path.join(".git");
-    let is_worktree = tokio::fs::metadata(&dotgit)
+    tokio::fs::remove_dir_all(&ws.host_path)
         .await
-        .map(|m| m.is_file())
-        .unwrap_or(false);
-    if is_worktree {
-        // Resolve the bare-clone path BEFORE removing the worktree — once
-        // the worktree dir is gone, `git -C <ws.host_path>` can't query it.
-        let bare_path = bare_clone_path_for_worktree(&ws.host_path).await;
-
-        let _ = tokio::process::Command::new("git")
-            .arg("-C")
-            .arg(&ws.host_path)
-            .arg("worktree")
-            .arg("remove")
-            .arg("--force")
-            .arg(".")
-            .output()
-            .await;
-        // Even on `worktree remove` success, the dir itself is gone now.
-        // On failure, fall through to rm -rf.
-
-        // Delete the per-brief branch ref from the bare clone. Without this,
-        // every shipped brief leaves an `auto/<brief_id>` ref accumulated in
-        // the bare clone; the next brief that collides on id fails dispatch
-        // with "branch already exists" — same dispatch-blocking class as the
-        // original worktree leak. Idempotent: tolerate "branch not found"
-        // (the brief may have errored mid-allocate before the branch was
-        // created), warn only on unexpected git errors.
-        if let Some(bare) = bare_path {
-            let branch = format!("auto/{}", ws.brief_id.0);
-            match tokio::process::Command::new("git")
-                .arg("-C")
-                .arg(&bare)
-                .arg("branch")
-                .arg("-D")
-                .arg(&branch)
-                .output()
-                .await
-            {
-                Ok(out) if out.status.success() => {
-                    tracing::debug!(
-                        bare = %bare.display(),
-                        branch = %branch,
-                        "deleted worktree branch ref from bare clone"
-                    );
-                }
-                Ok(out) => {
-                    let stderr = String::from_utf8_lossy(&out.stderr);
-                    if stderr.contains("not found") || stderr.contains("not a valid object") {
-                        tracing::debug!(
-                            bare = %bare.display(),
-                            branch = %branch,
-                            "branch ref already absent (idempotent)"
-                        );
-                    } else {
-                        tracing::warn!(
-                            bare = %bare.display(),
-                            branch = %branch,
-                            stderr = %stderr,
-                            "git branch -D failed unexpectedly"
-                        );
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        bare = %bare.display(),
-                        branch = %branch,
-                        error = %e,
-                        "git branch -D spawn failed"
-                    );
-                }
-            }
-        }
-    }
-    if ws.host_path.exists() {
-        tokio::fs::remove_dir_all(&ws.host_path)
-            .await
-            .map_err(|e| {
-                Error::Config(format!("workspace destroy {}: {e}", ws.host_path.display()))
-            })?;
-    }
-    Ok(())
-}
-
-/// Resolve the bare-clone path that owns `worktree` by querying
-/// `git rev-parse --git-common-dir`. Returns `None` if the dir is not a
-/// recognizable worktree.
-///
-/// `--git-common-dir` returns the shared gitdir of the worktree set. For a
-/// worktree of a bare clone, that's the bare clone itself; for a worktree of
-/// a non-bare repo, it's the repo's `.git` dir. Output may be:
-/// * `<bare>` — bare-clone case, no normalization needed
-/// * `<repo>/.git` — non-bare case, strip the `.git` component
-/// * `<bare>/worktrees/<name>` — defensive: some git versions or callers
-///   reach for `--git-dir` instead; strip the worktrees suffix
-///
-/// May be relative (when run inside the worktree without `-C`) or absolute
-/// (when run with an absolute `-C`). Both are normalized against `worktree`.
-async fn bare_clone_path_for_worktree(worktree: &Path) -> Option<PathBuf> {
-    let out = tokio::process::Command::new("git")
-        .arg("-C")
-        .arg(worktree)
-        .arg("rev-parse")
-        .arg("--git-common-dir")
-        .output()
-        .await
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if raw.is_empty() {
-        return None;
-    }
-    let raw_path = Path::new(&raw);
-    let mut p = if raw_path.is_absolute() {
-        raw_path.to_path_buf()
-    } else {
-        worktree.join(raw_path)
-    };
-    // Defensive: strip a trailing `/worktrees/<name>` segment if present.
-    if let Some(parent) = p.parent() {
-        if parent.file_name().and_then(|n| n.to_str()) == Some("worktrees") {
-            if let Some(grandparent) = parent.parent() {
-                p = grandparent.to_path_buf();
-            }
-        }
-    }
-    // Strip a trailing `.git` segment (non-bare case).
-    if p.file_name().and_then(|n| n.to_str()) == Some(".git") {
-        if let Some(parent) = p.parent() {
-            p = parent.to_path_buf();
-        }
-    }
-    Some(p)
+        .map_err(|e| Error::Config(format!("workspace destroy {}: {e}", ws.host_path.display())))
 }
 
 /// Sweep orphan `auto/*` branches from every bare clone under `<root>/.clones/`.
