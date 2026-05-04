@@ -48,3 +48,28 @@ fences:
   the named rung.
 - `EqualTo(u32)` — numeric count equal to N, used by `CallersZero`
   to gate dead-on-arrival pub items.
+
+## RaQueryPrePass
+
+The outcome of the informational ra-query pre-pass run by the
+reviewer-claude container before the LLM review (Phase 2.2 #87).
+Distinct from the fail-closed `run_fence` Blocker pipeline: the
+pre-pass calls `ra-query unwraps`, `ra-query complexity`, and
+`ra-query callers` against the diff, folds the responses into
+Warn-severity Mechanical findings, and lets the LLM see the
+resulting `severity:category:file:line:message` summary as part of
+its prompt so architectural review does not re-flag mechanical
+issues by hand.
+
+Fields:
+
+- `findings` — Warn-severity `ReviewFinding`s emitted as informational
+  context (categories `unwraps`, `complexity`, `callers`).
+- `skipped_reason` — `Some(<short>)` when the binary is missing or
+  any ra-query call fails. The reviewer emits a structured
+  `ra-query pre-pass skipped` event and continues with LLM-only
+  review. `None` on a successful pass.
+
+The pre-pass is non-blocking by design: blockers belong to
+`run_fence` (deterministic gating). The pre-pass shapes LLM
+attention, not the verdict.

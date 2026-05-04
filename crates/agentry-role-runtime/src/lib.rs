@@ -1195,6 +1195,245 @@ pub fn build_review_prompt(
     s
 }
 
+// ---------- ra-query pre-pass (Phase 2.2 #87) ----------
+
+/// Outcome of [`ra_query_pre_pass`]. Carries Warn-severity informational
+/// findings (`unwraps`/`complexity`/`callers`) on success, or a
+/// `skipped_reason` when the pre-pass could not run (binary missing,
+/// ra-query call failed). Skip is non-blocking — the runner emits a
+/// `ra-query pre-pass skipped` event and continues to LLM-only review.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct RaQueryPrePass {
+    pub findings: Vec<ReviewFinding>,
+    pub skipped_reason: Option<String>,
+}
+
+/// Pre-pass parser for `ra-query unwraps --severity high --format json`.
+/// Mirrors [`unwraps_to_findings`] but emits Warn-severity findings tagged
+/// `category = "unwraps"` so the LLM-prompt summary distinguishes them.
+pub fn prepass_unwraps_to_findings(file: &str, json: &Value) -> Vec<ReviewFinding> {
+    let mut out = unwraps_to_findings(file, json);
+    for f in &mut out {
+        f.severity = Severity::Warn;
+        f.category = "unwraps".into();
+    }
+    out
+}
+
+/// Pre-pass parser for `ra-query complexity --threshold 15 --format json`.
+/// Emits Warn-severity findings tagged `category = "complexity"`.
+pub fn prepass_complexity_to_findings(file: &str, json: &Value) -> Vec<ReviewFinding> {
+    let mut out = complexity_to_findings(file, json);
+    for f in &mut out {
+        f.severity = Severity::Warn;
+        f.category = "complexity".into();
+    }
+    out
+}
+
+/// Pre-pass parser for one `ra-query callers <pos> -f json` response. Emits
+/// a single zero-callers Warn finding when the response lists no callers,
+/// or an empty vec otherwise. Accepts either `{"callers": [...]}` or a bare
+/// JSON array — same shapes the [`run_fence`] callers helper handles.
+pub fn prepass_callers_to_findings(
+    file: &str,
+    item_name: &str,
+    line: u32,
+    json: &Value,
+) -> Vec<ReviewFinding> {
+    let count = json
+        .get("callers")
+        .and_then(Value::as_array)
+        .map(|a| a.len())
+        .or_else(|| json.as_array().map(|a| a.len()))
+        .unwrap_or(0);
+    if count != 0 {
+        return Vec::new();
+    }
+    vec![ReviewFinding {
+        file: Some(file.to_string()),
+        line: Some(line),
+        severity: Severity::Warn,
+        origin: FindingOrigin::Mechanical {
+            tool: "ra-query".into(),
+            rule: Some("callers_zero".into()),
+        },
+        category: "callers".into(),
+        message: format!("pub item `{item_name}` has zero callers in workspace"),
+        suggested_fix: None,
+        prohibitions: Vec::new(),
+        requirements: Vec::new(),
+    }]
+}
+
+/// Format pre-pass findings as a multi-line summary for the reviewer
+/// prompt — one line per finding shaped `severity:category:file:line:message`.
+/// Returns the literal string `(none)` for an empty slice so the prompt
+/// section has a stable shape regardless of pre-pass outcome.
+pub fn format_mechanical_findings_summary(findings: &[ReviewFinding]) -> String {
+    if findings.is_empty() {
+        return "(none)".into();
+    }
+    findings
+        .iter()
+        .map(|f| {
+            let sev = match f.severity {
+                Severity::Blocker => "blocker",
+                Severity::Warn => "warn",
+            };
+            let line = f.line.map(|l| l.to_string()).unwrap_or_default();
+            let file = f.file.as_deref().unwrap_or("");
+            format!("{sev}:{}:{file}:{line}:{}", f.category, f.message)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Build the strict reviewer prompt with an extra "mechanical findings"
+/// section appended. The `mechanical_findings_summary` is the output of
+/// [`format_mechanical_findings_summary`] (or `(none)` when the pre-pass
+/// found nothing or was skipped). The base prompt body is produced by
+/// [`build_review_prompt`] verbatim — the section is purely additive so
+/// LLM-only review (skipped pre-pass) reads identically aside from a
+/// `(none)` summary.
+pub fn build_review_prompt_with_mechanical_findings(
+    base_branch: &str,
+    issue_title: &str,
+    issue_body: &str,
+    diff_text: &str,
+    mechanical_findings_summary: &str,
+) -> String {
+    let mut s = build_review_prompt(base_branch, issue_title, issue_body, diff_text);
+    s.push_str(&format!(
+        "\nMechanical findings already detected (do not re-flag, but consider them in your architectural review):\n{mechanical_findings_summary}\n",
+    ));
+    s
+}
+
+/// Run the ra-query pre-pass against `workspace`'s diff vs `base_branch`.
+/// For each changed `*.rs` file outside `tests/`, calls `ra-query unwraps`,
+/// `ra-query complexity`, and (per pub item from `ra-query pub-surface`)
+/// `ra-query callers`, folding the results into Warn-severity findings.
+///
+/// Skip-friendly (Phase 2.2): missing binary or any ra-query failure
+/// returns a [`RaQueryPrePass`] with `skipped_reason` populated and an
+/// empty `findings` vec — the caller emits `{"msg":"ra-query pre-pass
+/// skipped","reason":"<short>"}` and continues with LLM-only review. This
+/// is intentionally distinct from the fail-closed [`run_fence`] which
+/// blocks on substrate failure: the pre-pass is informational, the fence
+/// is gatekeeping.
+pub fn ra_query_pre_pass(workspace: &Path, base_branch: &str) -> RaQueryPrePass {
+    if !ra_query_present() {
+        return RaQueryPrePass {
+            findings: Vec::new(),
+            skipped_reason: Some("ra-query binary missing".into()),
+        };
+    }
+    let changed = match prepass_changed_rs_files(workspace, base_branch) {
+        Ok(v) => v,
+        Err(e) => {
+            return RaQueryPrePass {
+                findings: Vec::new(),
+                skipped_reason: Some(format!("git diff failed: {e}")),
+            };
+        }
+    };
+    let workspace_s = workspace.to_string_lossy().into_owned();
+    let mut findings = Vec::new();
+    for f in &changed {
+        let abs = workspace.join(f);
+        if !abs.is_file() {
+            continue;
+        }
+        let abs_s = abs.to_string_lossy().into_owned();
+
+        match run_ra_query(&["unwraps", &abs_s, "--severity", "high", "--format", "json"]) {
+            Ok(j) => findings.extend(prepass_unwraps_to_findings(f, &j)),
+            Err(e) => {
+                return RaQueryPrePass {
+                    findings: Vec::new(),
+                    skipped_reason: Some(format!("ra-query unwraps failed: {e}")),
+                };
+            }
+        }
+
+        match run_ra_query(&[
+            "complexity",
+            &abs_s,
+            "--threshold",
+            "15",
+            "--format",
+            "json",
+        ]) {
+            Ok(j) => findings.extend(prepass_complexity_to_findings(f, &j)),
+            Err(e) => {
+                return RaQueryPrePass {
+                    findings: Vec::new(),
+                    skipped_reason: Some(format!("ra-query complexity failed: {e}")),
+                };
+            }
+        }
+
+        let items = match pub_surface_at(workspace, f) {
+            Ok(items) => items,
+            Err(e) => {
+                return RaQueryPrePass {
+                    findings: Vec::new(),
+                    skipped_reason: Some(format!("ra-query pub-surface failed: {e}")),
+                };
+            }
+        };
+        for item in items {
+            if item.col == 0 {
+                continue;
+            }
+            let pos = format!("{}:{}:{}", abs_s, item.line, item.col);
+            match run_ra_query(&["callers", &pos, "-p", &workspace_s, "-f", "json"]) {
+                Ok(j) => findings.extend(prepass_callers_to_findings(
+                    f,
+                    &item.name,
+                    item.line as u32,
+                    &j,
+                )),
+                Err(e) => {
+                    return RaQueryPrePass {
+                        findings: Vec::new(),
+                        skipped_reason: Some(format!("ra-query callers failed: {e}")),
+                    };
+                }
+            }
+        }
+    }
+    RaQueryPrePass {
+        findings,
+        skipped_reason: None,
+    }
+}
+
+fn prepass_changed_rs_files(workspace: &Path, base_branch: &str) -> Result<Vec<String>, String> {
+    let range = format!("{base_branch}...HEAD");
+    let out = Command::new("git")
+        .arg("diff")
+        .arg("--name-only")
+        .arg(&range)
+        .current_dir(workspace)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| format!("spawn git diff: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("git diff exit {:?}", out.status.code()));
+    }
+    let s = String::from_utf8_lossy(&out.stdout);
+    Ok(s.lines()
+        .filter(|line| {
+            line.ends_with(".rs") && !line.starts_with("tests/") && !line.contains("/tests/")
+        })
+        .map(|l| l.to_string())
+        .collect())
+}
+
 // ---------- coder-binary helpers (extracted from coder_claude_runner, brief X.7c) ----------
 
 /// Issue-body byte budget used by [`build_self_review_prompt`].
