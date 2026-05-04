@@ -1,0 +1,50 @@
+{
+  "name": "auditor-claude-agentry",
+  "version": 1,
+  "model": null,
+  "system_prompt": null,
+  "image": "docker.io/library/rust:1.93",
+  "substrate_class": "podman",
+  "package_manager": "apt",
+  "entrypoint_script": "#!/bin/sh\nexec /usr/local/bin/auditor-claude-runner\n",
+  "binaries": [],
+  "mcp_servers": [],
+  "tool_allowlist": [],
+  "permit_scope": [
+    "fs:read:/workspace/**",
+    "fs:write:/workspace/**",
+    "${SCCACHE_NET_ALLOW}",
+    "net:allow:static.rust-lang.org",
+    "net:allow:crates.io",
+    "net:allow:index.crates.io",
+    "net:allow:static.crates.io"
+  ],
+  "passthru_env": [],
+  "mounts": [
+    {
+      "source": "${HOME}/.local/bin/ra-query",
+      "target": "/usr/local/bin/ra-query",
+      "readonly": true
+    },
+    {
+      "source": "${HOME}/.local/bin/auditor-claude-runner",
+      "target": "/usr/local/bin/auditor-claude-runner",
+      "readonly": true
+    },
+    {
+      "source": "${HOME}/.local/bin/rtk",
+      "target": "/usr/local/bin/rtk",
+      "readonly": true
+    }
+  ],
+  "workspace_mount": {
+    "container_path": "/workspace",
+    "readonly": false
+  },
+  "sccache": true,
+  "extra_bootstrap": [
+    "rustup component add rustfmt clippy || true",
+    "rustup toolchain install nightly --profile minimal || true",
+    "cargo +nightly install cargo-udeps --locked --quiet || true"
+  ]
+}
