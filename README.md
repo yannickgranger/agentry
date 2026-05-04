@@ -69,8 +69,8 @@ authoring, deliberation, implementation, and enforcement.
 ```mermaid
 flowchart LR
     you([You])
-    grill[/grill-me dialog/]
-    council[(Specialist council<br/>+ specs + ban rules)]
+    grill[/grill-me external<br/>Claude Code skill/]
+    council[(Specialist council<br/>external Claude Code TeamCreate)]
     cat[(Catalog<br/>roles + workflows)]
     sub[agentry]
     agents[Agents in containers]
@@ -91,6 +91,8 @@ flowchart LR
     fences -.->|fail, send to coder| sub
     sub -.->|must-decide-human| you
 ```
+
+> Note: `/grill-me` and the specialist council run on the user's Claude Code host — they are not provided by this repository.
 
 The pieces:
 
