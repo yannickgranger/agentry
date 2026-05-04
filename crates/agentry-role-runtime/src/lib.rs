@@ -28,8 +28,13 @@ pub mod ci_watcher_runner;
 pub mod claude;
 pub mod planner;
 pub mod pr_rebaser;
+pub mod precommit_gate;
 pub mod shipper_runner;
 pub use claude::{stream_claude, StreamErr};
+pub use precommit_gate::{
+    decide_gate, derive_fqn, is_orphan_pub_item, orphan_pub_item_finding, parse_allowlist_toml,
+    parse_new_pub_items, GateDecision, NewPubItem, PublicApiAllowlist, GATE_CATEGORY, GATE_SOURCE,
+};
 
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
