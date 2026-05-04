@@ -206,6 +206,16 @@ pr-rebaser-runner-binary:
 preflight-criterion-runner-binary:
     cargo install --path crates/agentry-role-runtime --bin preflight-criterion-runner --root ~/.local --locked
 
+# Build reviewer-mechanical-runner into ~/.local/bin/reviewer-mechanical-runner — the
+# full lifecycle runner for the reviewer-mechanical-agentry role (EPIC #161
+# Wave 2 final slice). The role bind-mounts this binary at
+# /usr/local/bin/reviewer-mechanical-runner.
+reviewer-mechanical-runner-binary:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo install --path crates/agentry-role-runtime --bin reviewer-mechanical-runner --root ~/.local --locked --quiet
+    test -x ~/.local/bin/reviewer-mechanical-runner
+
 # Build git-op-commit into ~/.local/bin/git-op-commit for the git-op-commit
 # role's bind-mount. Operator-invoked; idempotent. Brief 190b of #182 — the
 # commit half of the git-operator split.

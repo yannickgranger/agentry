@@ -233,6 +233,17 @@ pub fn head_bytes(s: &str, n: usize) -> String {
     s[..cut].to_string()
 }
 
+/// Build the reviewer-mechanical combined-output snippet. Mirrors the bash
+/// `printf '%s\n---stdout---\n%s' "$err" "$out" | head -c <n>` exactly: BYTE
+/// (not char) truncation with a fixed `\n---stdout---\n` separator, decoded
+/// `String::from_utf8_lossy` so a byte-cut inside a multi-byte UTF-8 sequence
+/// produces a replacement char rather than panic.
+pub fn build_reviewer_combined(err_tail: &str, out_tail: &str, n: usize) -> String {
+    let combined = format!("{err_tail}\n---stdout---\n{out_tail}");
+    let head = combined.as_bytes().chunks(n).next().unwrap_or_default();
+    String::from_utf8_lossy(head).into_owned()
+}
+
 /// Read `v.pointer(ptr).as_str()` or `""` when missing/non-string.
 pub fn pointer_str<'a>(v: &'a Value, ptr: &str) -> &'a str {
     v.pointer(ptr).and_then(Value::as_str).unwrap_or("")

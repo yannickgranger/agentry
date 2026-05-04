@@ -434,50 +434,13 @@ printf '{"at":"%s","type":"done","verdict":"shipped"}\n' "$(date -Iseconds)"
 // handle); state lives in typed Rust structs throughout. DoneGuard now
 // wraps the whole role.
 
-/// Mechanical reviewer role. Reads the coder's workspace read-only,
-/// re-runs the acceptance command in an isolated build dir (`CARGO_TARGET_DIR=/tmp/review-target`),
-/// emits `shipped` on success and `failed` on any non-zero exit with the
-/// tail of stderr/stdout in the reason payload.
-const REVIEWER_MECHANICAL_AGENTRY_SCRIPT: &str = r##"#!/usr/bin/env bash
-set -euo pipefail
-bundle="$(cat)"
-
-base_branch=$(jq -r '.brief.payload.base_branch // "develop"' <<<"$bundle")
-acceptance=$(jq -r '.brief.payload.acceptance // "cargo test --workspace"' <<<"$bundle")
-
-if [ ! -d /workspace/.git ] && [ ! -f /workspace/.git ]; then
-    emit_event '{"error":"workspace missing — coder did not produce it"}'
-    emit_done "failed"; exit 0
-fi
-
-cd /workspace
-
-emit_event '{"msg":"reviewer starting"}'
-
-# Diff summary. base_branch is on `origin/<base_branch>`.
-diff_stat=$(git diff --stat "${base_branch}"...HEAD 2>&1 | tail -1 || true)
-emit_event "$(jq -nc --arg d "$diff_stat" '{msg:"diff",summary:$d}')"
-
-# Workspace is read-only for this role — redirect Cargo's target/ to /tmp.
-export CARGO_TARGET_DIR=/tmp/review-target
-mkdir -p "$CARGO_TARGET_DIR"
-
-emit_event "$(jq -nc --arg a "$acceptance" '{msg:"running acceptance (isolated)",cmd:$a}')"
-if eval "$acceptance" >/tmp/rev.out 2>/tmp/rev.err; then
-    emit_event '{"msg":"acceptance passed"}'
-    emit_done "shipped"
-else
-    err=$(tail -50 /tmp/rev.err)
-    out=$(tail -20 /tmp/rev.out)
-    emit_event "$(jq -nc --arg err "$err" --arg out "$out" '{error:"acceptance failed",stderr:$err,stdout:$out}')"
-    # Minimal single-finding emit — one blocker bundling the full stderr+stdout
-    # tail. Per-lint structured parsing (cargo clippy --message-format=json,
-    # test --format json) is a follow-up; the primitive is the point here.
-    combined=$(printf '%s\n---stdout---\n%s' "$err" "$out" | head -c 2000)
-    emit_finding "blocker" "cargo" "acceptance" "$combined"
-    emit_done "rework_needed"
-fi
-"##;
+// EPIC #161 Wave 2 final slice: REVIEWER_MECHANICAL_AGENTRY_SCRIPT bash
+// heredoc that used to live here has been ported to a Rust runner —
+// `crates/agentry-role-runtime/src/bin/reviewer_mechanical_runner.rs`. The
+// role definition migrated from the inline `seed_m0` block to
+// `seed/roles/reviewer-mechanical-agentry-v1.json` (loaded by the
+// role-dir loader). The role's entrypoint_script now just
+// `exec /usr/local/bin/reviewer-mechanical-runner`.
 
 // EPIC #161 Wave 1.4: REVIEWER_CLAUDE_AGENTRY_SCRIPT bash heredoc that used
 // to live here has been ported to a Rust runner —
@@ -1013,47 +976,6 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         max_retries: 0,
     };
 
-    // ---- agentry-self-host-v0 team (cutoff trigger) ----
-    // Coder clones, calls claude, runs acceptance, commits locally.
-    // Reviewer re-runs acceptance in isolation on the coder's workspace.
-    // Shipper pushes the branch and opens a PR on the forge.
-    // Ci-watcher polls forge CI on the PR's head sha and merges on green.
-    let reviewer_mechanical_agentry = AgentRole {
-        name: RoleName("reviewer-mechanical-agentry".into()),
-        version: 1,
-        model: None,
-        system_prompt: None,
-        // Same toolchain as coder — deterministic re-run.
-        image: "docker.io/library/rust:1.93".into(),
-        substrate_class: SubstrateClass::Podman,
-        package_manager: PackageManager::Apt,
-        entrypoint_script: format!("{BASH_PRELUDE}{REVIEWER_MECHANICAL_AGENTRY_SCRIPT}"),
-        exitpoint_script: None,
-        binaries: vec!["git".into(), "ca-certificates".into()],
-        mcp_servers: vec![],
-        tool_allowlist: ToolAllowlist(vec![]),
-        allowed_tools: None,
-        permit_scope: PermitScope(vec![
-            "fs:read:/workspace/**".into(),
-            forge_net_allow.clone(),
-        ]),
-        passthru_env: vec!["GITEA_TOKEN".into()],
-        extra_bootstrap: vec![
-            "rustup component add rustfmt clippy".into(),
-            "git config --global http.sslVerify false".into(),
-            "cargo install --git https://github.com/yannickgranger/cfdb.git --rev 02c5a45 --root /usr/local --locked --quiet cfdb-cli || true".into(),
-            "cargo install --git https://github.com/yannickgranger/graph-specs.git --rev ecaedb9 --root /usr/local --locked --quiet application || true".into(),
-        ],
-        mounts: vec![],
-        workspace_mount: Some(WorkspaceMount {
-            container_path: "/workspace".into(),
-            // Reviewer is mechanical and independent — it does not mutate
-            // the workspace. CARGO_TARGET_DIR is redirected to /tmp inside
-            // the container so a read-only mount is sufficient.
-            readonly: true,
-        }),
-        sccache: false,
-    };
     // ---- persist everything ----
     redis_io::save_role(&mut conn, &echo).await?;
     redis_io::save_team(&mut conn, &echo_team).await?;
@@ -1075,7 +997,6 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
     redis_io::save_role(&mut conn, &synthesizer).await?;
     redis_io::save_role(&mut conn, &narrowed_coder).await?;
     redis_io::save_team(&mut conn, &narrowed_team).await?;
-    redis_io::save_role(&mut conn, &reviewer_mechanical_agentry).await?;
 
     let roles_dir = seed_roles_dir();
     if roles_dir.exists() {
@@ -1115,7 +1036,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
     }
 
     tracing::info!(
-"seeded: roles [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker, listener, grok-echo, claude-echo, synthesizer, narrowed-coder, coder-claude-agentry, ac-verifier-claude-agentry, ac-verifier-gemini-agentry, ac-verifier-grok-agentry, reviewer-mechanical-agentry, reviewer-claude-agentry, null-agent-agentry] (inline entrypoint scripts); teams [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker-listener, grok-echo, claude-echo, narrowed-team] (Rust literals); teams [agentry-null-v0, agentry-pr-rebaser-v0, agentry-discovery-v0, agentry-verify-v0, agentry-planner-v0, agentry-self-host-v0, agentry-self-audit-v0] (loaded from seed/topologies/*.json)"
+"seeded: roles [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker, listener, grok-echo, claude-echo, synthesizer, narrowed-coder, coder-claude-agentry, ac-verifier-claude-agentry, ac-verifier-gemini-agentry, ac-verifier-grok-agentry, reviewer-claude-agentry, null-agent-agentry] (inline entrypoint scripts); teams [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker-listener, grok-echo, claude-echo, narrowed-team] (Rust literals); teams [agentry-null-v0, agentry-pr-rebaser-v0, agentry-discovery-v0, agentry-verify-v0, agentry-planner-v0, agentry-self-host-v0, agentry-self-audit-v0] (loaded from seed/topologies/*.json)"
     );
     Ok(())
 }
