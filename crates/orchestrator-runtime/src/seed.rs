@@ -1421,7 +1421,14 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
 
     let roles_dir = seed_roles_dir();
     if roles_dir.exists() {
-        let loaded = role_dir_loader::load_roles_from_dir(&mut conn, &roles_dir).await?;
+        let template_ctx = role_dir_loader::TemplateContext {
+            home: std::env::var("HOME").expect("HOME env var must be set to derive role-dir paths"),
+            forge_net_allow: forge_net_allow.clone(),
+            forge_write_permits: forge_write_permits.clone(),
+            sccache_net_allow: sccache_net_allow.clone(),
+        };
+        let loaded =
+            role_dir_loader::load_roles_from_dir(&mut conn, &roles_dir, &template_ctx).await?;
         tracing::info!(
             count = loaded.len(),
             dir = %roles_dir.display(),
