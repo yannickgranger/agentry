@@ -153,9 +153,7 @@ fn translate_trace_entry(
             // deserialise when it's present and string-typed to keep
             // the cost off the hot agent-event path.
             if payload.get("kind").and_then(JsonValue::as_str).is_some() {
-                if let Ok(brief_event) =
-                    serde_json::from_value::<BriefEvent>(payload.clone())
-                {
+                if let Ok(brief_event) = serde_json::from_value::<BriefEvent>(payload.clone()) {
                     return Ok(Some(brief_event));
                 }
             }

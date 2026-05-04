@@ -264,9 +264,14 @@ async fn tick_uses_default_budget_when_brief_body_absent() {
 async fn tick_with_no_records_is_a_no_op() {
     let mut inv = MockInventory::default();
     let mut sink = MockSink::default();
-    let reaped = reaper::tick(&mut inv, &mut sink, DEFAULT_WALL_CLOCK_SECONDS, ts(1_000_000))
-        .await
-        .expect("tick");
+    let reaped = reaper::tick(
+        &mut inv,
+        &mut sink,
+        DEFAULT_WALL_CLOCK_SECONDS,
+        ts(1_000_000),
+    )
+    .await
+    .expect("tick");
     assert_eq!(reaped, 0);
     assert!(sink.pushed.lock().await.is_empty());
     assert!(sink.killed.lock().await.is_empty());

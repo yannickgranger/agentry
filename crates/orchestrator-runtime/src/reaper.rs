@@ -50,7 +50,10 @@ pub const REAPER_AGENT_ID: &str = "wall-clock-reaper";
 /// `Failed`) are never orphan regardless of elapsed time.
 #[must_use]
 pub fn is_orphan(record: &BriefStateRecord, now: Ts, budget_seconds: u64) -> bool {
-    if matches!(record.state, BriefState::Shipped | BriefState::Failed { .. }) {
+    if matches!(
+        record.state,
+        BriefState::Shipped | BriefState::Failed { .. }
+    ) {
         return false;
     }
     let elapsed = now.signed_duration_since(record.at).num_seconds();
