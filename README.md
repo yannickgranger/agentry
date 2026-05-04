@@ -92,7 +92,7 @@ flowchart LR
     sub -.->|must-decide-human| you
 ```
 
-> Note: `/grill-me` and the specialist council run on the user's Claude Code host — they are not provided by this repository.
+> Note: `/grill-me` and the specialist council run on the user's Claude Code host — they are not provided by this repository. The `/grill-me` skill is the public one from [mattpocock/skills](https://github.com/mattpocock/skills); the council pattern is described in `docs/architectural-control-loop.md`.
 
 The pieces:
 
