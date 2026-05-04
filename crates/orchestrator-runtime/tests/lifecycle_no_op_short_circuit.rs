@@ -376,14 +376,16 @@ async fn branch_exists(bare: &Path, branch: &str) -> bool {
     out.status.success()
 }
 
-/// The no-op cleanup helper removes both the worktree directory and the
-/// `auto/<brief_id>` branch from the bare clone — same teardown
-/// mechanics the Failed disposition uses, just routed through a sibling
-/// helper so the audit log cannot mislabel a successful no-op as a
-/// terminal Failed cleanup. The bare clone itself survives — it's
-/// shared across briefs.
+/// The no-op cleanup helper removes the per-brief clone directory —
+/// same teardown mechanics the Failed disposition uses, just routed
+/// through a sibling helper so the audit log cannot mislabel a
+/// successful no-op as a terminal Failed cleanup. The bare clone
+/// itself survives — it's the read-only cache shared across briefs.
+/// Under the per-brief-clone model the `auto/<brief_id>` branch never
+/// exists on the bare in the first place; no bare-side branch
+/// deletion is needed.
 #[tokio::test]
-async fn cleanup_shipped_no_op_removes_worktree_and_auto_branch() {
+async fn cleanup_shipped_no_op_removes_per_brief_clone_dir() {
     let tmp = tempfile::tempdir().expect("tmp");
     let url = setup_upstream(tmp.path()).await;
     let bid = BriefId("brf_no_op_cleanup_real".into());
@@ -391,24 +393,24 @@ async fn cleanup_shipped_no_op_removes_worktree_and_auto_branch() {
     let ws = allocate_at(&bid, Some((url.as_str(), "main")), tmp.path())
         .await
         .expect("alloc");
-    assert!(ws.host_path.exists(), "worktree dir must exist pre-cleanup");
+    assert!(ws.host_path.exists(), "clone dir must exist pre-cleanup");
 
     let bare = bare_clone_path_for(tmp.path());
     let auto_branch = format!("auto/{}", bid.0);
     assert!(
-        branch_exists(&bare, &auto_branch).await,
-        "auto/<brief_id> must exist in bare clone pre-cleanup"
+        !branch_exists(&bare, &auto_branch).await,
+        "auto/<brief_id> must NEVER exist in the bare clone (per-brief-clone model)"
     );
 
     cleanup_shipped_no_op_brief_at(&bid, tmp.path(), None).await;
 
     assert!(
         !ws.host_path.exists(),
-        "no-op cleanup must remove the worktree dir"
+        "no-op cleanup must remove the per-brief clone dir"
     );
     assert!(
         !branch_exists(&bare, &auto_branch).await,
-        "no-op cleanup must delete the auto/<brief_id> branch from the bare clone"
+        "auto/<brief_id> must remain absent from the bare clone after cleanup"
     );
     assert!(
         bare.join("HEAD").exists(),
@@ -419,8 +421,8 @@ async fn cleanup_shipped_no_op_removes_worktree_and_auto_branch() {
 /// Idempotency holds for the no-op disposition the same as for the
 /// Failed disposition: a second invocation of the no-op cleanup helper
 /// must be a no-op itself — no panic, no error escape (cleanup is
-/// best-effort by contract), and the post-cleanup invariants stay
-/// intact (worktree gone, branch gone). Pins the rename/refactor
+/// best-effort by contract), and the post-cleanup invariant stays
+/// intact (per-brief clone dir gone). Pins the rename/refactor
 /// against accidentally regressing the swallow-errors semantics.
 #[tokio::test]
 async fn cleanup_shipped_no_op_is_idempotent() {

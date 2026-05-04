@@ -138,16 +138,33 @@ async fn ensure_bare_clone_creates_on_first_call_fetches_on_second() {
 }
 
 #[tokio::test]
-async fn allocate_with_repo_creates_worktree_on_branch() {
+async fn allocate_with_repo_creates_per_brief_clone_on_branch() {
     let tmp = tempfile::tempdir().expect("tmp");
     let url = setup_upstream(tmp.path()).await;
     let bid = brief("brf_wt_test");
     let ws = allocate_at(&bid, Some((url.as_str(), "main")), tmp.path())
         .await
-        .expect("alloc worktree");
+        .expect("alloc clone");
     let dotgit = ws.host_path.join(".git");
     let meta = tokio::fs::metadata(&dotgit).await.expect("dotgit meta");
-    assert!(meta.is_file(), ".git in a worktree is a file, not dir");
+    assert!(
+        meta.is_dir(),
+        ".git in a per-brief clone is a directory, not a worktree pointer file"
+    );
+
+    // HEAD points at a real commit.
+    let head = tokio::process::Command::new("git")
+        .args(["rev-parse", "--verify", "HEAD"])
+        .current_dir(&ws.host_path)
+        .output()
+        .await
+        .expect("rev-parse HEAD");
+    assert!(head.status.success(), "rev-parse --verify HEAD failed");
+    assert!(
+        !String::from_utf8_lossy(&head.stdout).trim().is_empty(),
+        "HEAD must resolve to a non-empty SHA"
+    );
+
     // Confirm the checkout is on `auto/<brief_id>`.
     let out = tokio::process::Command::new("git")
         .args(["rev-parse", "--abbrev-ref", "HEAD"])
@@ -158,10 +175,46 @@ async fn allocate_with_repo_creates_worktree_on_branch() {
     assert!(out.status.success(), "rev-parse failed");
     let branch = String::from_utf8_lossy(&out.stdout).trim().to_string();
     assert_eq!(branch, format!("auto/{}", bid.0));
+
+    // origin URL was repointed from the local bare to the forge URL.
+    let origin = tokio::process::Command::new("git")
+        .args(["remote", "get-url", "origin"])
+        .current_dir(&ws.host_path)
+        .output()
+        .await
+        .expect("remote get-url origin");
+    assert!(origin.status.success(), "remote get-url origin failed");
+    let origin_url = String::from_utf8_lossy(&origin.stdout).trim().to_string();
+    assert_eq!(
+        origin_url, url,
+        "origin must point at the forge URL, not the local bare path"
+    );
+
+    // The bare clone has no per-brief worktree linkage — `git worktree list`
+    // from the bare returns ONLY the bare itself.
+    let bare = bare_clone_path_for(tmp.path());
+    let wt_list = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(&bare)
+        .args(["worktree", "list", "--porcelain"])
+        .output()
+        .await
+        .expect("git worktree list");
+    assert!(wt_list.status.success(), "git worktree list failed");
+    let listing = String::from_utf8_lossy(&wt_list.stdout);
+    let worktree_lines: Vec<&str> = listing
+        .lines()
+        .filter(|l| l.starts_with("worktree "))
+        .collect();
+    assert_eq!(
+        worktree_lines.len(),
+        1,
+        "bare must show exactly itself in worktree list, got: {listing}"
+    );
 }
 
 #[tokio::test]
-async fn destroy_worktree_leaves_bare_clone_intact() {
+async fn destroy_per_brief_clone_leaves_bare_clone_intact() {
     let tmp = tempfile::tempdir().expect("tmp");
     let url = setup_upstream(tmp.path()).await;
     let bid = brief("brf_destroy_wt");
@@ -178,7 +231,10 @@ async fn destroy_worktree_leaves_bare_clone_intact() {
         bare_dir.display()
     );
     destroy(&ws).await.expect("destroy");
-    assert!(!ws.host_path.exists(), "worktree dir survived destroy");
+    assert!(
+        !ws.host_path.exists(),
+        "per-brief clone dir survived destroy"
+    );
     assert!(
         bare_dir.join("HEAD").exists(),
         "destroy nuked the bare clone (must survive)"
@@ -335,12 +391,13 @@ async fn branch_exists(bare: &Path, branch: &str) -> bool {
     out.status.success()
 }
 
-/// Pin: `destroy(&ws)` must delete the per-brief `auto/<brief_id>` branch
-/// from the bare clone. Without this the bare accumulates stale refs that
-/// eventually collide with future dispatches (production hit ~101 stale
-/// branches; dispatch fails with "branch already exists").
+/// Pin: under the per-brief-clone model, the `auto/<brief_id>` branch
+/// never exists on the host bare clone — it only exists in the brief's
+/// independent `.git` database. The bare can therefore never accumulate
+/// stale per-brief refs, eliminating the "branch already exists"
+/// dispatch-failure class structurally.
 #[tokio::test]
-async fn destroy_deletes_branch_ref() {
+async fn allocate_does_not_create_branch_in_bare() {
     let tmp = tempfile::tempdir().expect("tmp");
     let url = setup_upstream(tmp.path()).await;
     let bid = brief("test-brief-1");
@@ -349,45 +406,66 @@ async fn destroy_deletes_branch_ref() {
         .expect("alloc");
 
     let bare = bare_clone_path_for(tmp.path());
-
     assert!(
-        branch_exists(&bare, "auto/test-brief-1").await,
-        "branch ref must exist before destroy"
+        !branch_exists(&bare, "auto/test-brief-1").await,
+        "auto/<brief_id> must NEVER appear in the bare clone"
     );
 
     destroy(&ws).await.expect("destroy");
 
     assert!(
         !branch_exists(&bare, "auto/test-brief-1").await,
-        "branch ref must be gone after destroy"
+        "auto/<brief_id> must remain absent from the bare clone after destroy"
     );
 }
 
-/// `sweep_orphan_branches` MUST delete only branches whose corresponding
-/// `briefs/<brief_id>` dir is missing, leaving in-flight worktrees alone.
+/// `sweep_orphan_branches` MUST delete only bare-clone branches whose
+/// corresponding `briefs/<brief_id>` dir is missing, leaving branches
+/// for in-flight briefs alone.
+///
+/// Under the per-brief-clone model `allocate_at` never creates auto/*
+/// refs on the bare — this test seeds them manually to exercise the
+/// legacy-cleanup contract that `sweep_orphan_branches` still upholds
+/// for refs left behind by pre-migration deployments.
 #[tokio::test]
 async fn sweep_orphan_branches_removes_only_orphans() {
     let tmp = tempfile::tempdir().expect("tmp");
     let url = setup_upstream(tmp.path()).await;
 
+    // Seed the bare clone via a no-op allocate so the bare exists.
     let keeper = brief("keeper");
-    let orphan = brief("orphan");
     let _keeper_ws = allocate_at(&keeper, Some((url.as_str(), "main")), tmp.path())
         .await
         .expect("alloc keeper");
-    let orphan_ws = allocate_at(&orphan, Some((url.as_str(), "main")), tmp.path())
-        .await
-        .expect("alloc orphan");
-
-    // Simulate the legacy stale-branch-no-worktree state: the briefs dir
-    // is gone but the bare-clone branch ref + worktree admin entry
-    // remain. The sweep must reconcile via `git worktree prune` then
-    // delete the now-truly-orphan ref.
-    tokio::fs::remove_dir_all(&orphan_ws.host_path)
-        .await
-        .expect("remove orphan briefs dir");
 
     let bare = bare_clone_path_for(tmp.path());
+
+    // Manually plant legacy auto/* refs in the bare to simulate the
+    // pre-migration state the sweep was designed to clean up. We point
+    // both refs at HEAD so they're valid objects.
+    let head_sha = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(&bare)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .await
+        .expect("rev-parse HEAD in bare");
+    assert!(head_sha.status.success());
+    let sha = String::from_utf8_lossy(&head_sha.stdout).trim().to_string();
+    for branch in ["auto/keeper", "auto/orphan"] {
+        let out = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(&bare)
+            .args(["update-ref", &format!("refs/heads/{branch}"), &sha])
+            .output()
+            .await
+            .expect("update-ref");
+        assert!(out.status.success(), "update-ref {branch} failed");
+    }
+
+    // Keep the keeper's briefs dir on disk; remove no orphan dir
+    // (the "orphan" brief never had a workspace). Sweep must delete
+    // auto/orphan and leave auto/keeper alone.
     assert!(branch_exists(&bare, "auto/keeper").await);
     assert!(branch_exists(&bare, "auto/orphan").await);
 
@@ -396,7 +474,7 @@ async fn sweep_orphan_branches_removes_only_orphans() {
 
     assert!(
         branch_exists(&bare, "auto/keeper").await,
-        "keeper branch must survive (its worktree dir is still on disk)"
+        "keeper branch must survive (its briefs dir is still on disk)"
     );
     assert!(
         !branch_exists(&bare, "auto/orphan").await,
@@ -415,94 +493,52 @@ async fn sweep_orphan_branches_handles_missing_clones_dir() {
     assert_eq!(count, 0);
 }
 
-/// On `Preserve`, the worktree's `auto/<brief_id>` branch must be detached
-/// so subsequent `git fetch` calls into the bare clone don't refuse with
-/// "refusing to fetch into branch ... checked out at <path>".
+/// Under the per-brief-clone model the brief's `auto/<brief_id>`
+/// branch only exists in the brief's own `.git` database — never on
+/// the host bare. The bare can therefore continue to `git fetch`
+/// regardless of any preserved per-brief workspace, eliminating the
+/// "refusing to fetch into branch ... checked out at <path>" failure
+/// mode structurally.
 #[tokio::test]
-async fn preserve_detaches_worktree_branch() {
+async fn preserve_keeps_clone_and_bare_can_still_fetch() {
     let tmp = tempfile::tempdir().expect("tmp");
     let url = setup_upstream(tmp.path()).await;
-    let bid = brief("brf_preserve_detach");
+    let bid = brief("brf_preserve_no_collision");
     let ws = allocate_at(&bid, Some((url.as_str(), "main")), tmp.path())
         .await
         .expect("alloc");
 
     let bare = bare_clone_path_for(tmp.path());
-    let branch = format!("auto/{}", bid.0);
 
-    // Reproduce the pre-fix failure mode: give the upstream a divergent
-    // `auto/<brief_id>` ref so the bare's next `git fetch` will try to
-    // fast-forward the local ref — which the worktree blocks.
-    let seed = tmp.path().join("seed");
-    run_git(&seed, &["checkout", "-q", "-b", branch.as_str()]).await;
-    tokio::fs::write(seed.join("CHANGE"), b"diverge\n")
-        .await
-        .expect("write change");
-    run_git(&seed, &["add", "CHANGE"]).await;
-    run_git(&seed, &["commit", "-q", "-m", "diverge"]).await;
-    let upstream = tmp.path().join("upstream.git");
-    let push = tokio::process::Command::new("git")
-        .arg("-C")
-        .arg(&seed)
-        .args(["push", "-q"])
-        .arg(&upstream)
-        .arg(&branch)
-        .output()
-        .await
-        .expect("push spawn");
-    assert!(
-        push.status.success(),
-        "seed push failed: {}",
-        String::from_utf8_lossy(&push.stderr)
-    );
-
-    // Pre-condition: fetch in the bare must fail with the expected collision.
-    let pre = tokio::process::Command::new("git")
-        .arg("-C")
-        .arg(&bare)
-        .arg("fetch")
-        .output()
-        .await
-        .expect("pre-fetch spawn");
-    assert!(
-        !pre.status.success(),
-        "pre-detach fetch was expected to fail: worktree has the branch checked out"
-    );
-    let pre_stderr = String::from_utf8_lossy(&pre.stderr);
-    assert!(
-        pre_stderr.contains("checked out"),
-        "expected checkout collision in stderr, got: {pre_stderr}"
-    );
-
-    // Preserve must detach the worktree and leave the dir on disk.
+    // Preserve must keep the dir on disk.
     destroy_with_disposition(&ws, TerminationDisposition::Preserve)
         .await
         .expect("destroy_with_disposition Preserve");
     assert!(
         ws.host_path.exists(),
-        "worktree dir must survive Preserve disposition"
+        "per-brief clone dir must survive Preserve disposition"
     );
 
-    // The same fetch must now succeed.
-    let post = tokio::process::Command::new("git")
+    // The bare's fetch is unaffected by the preserved per-brief clone:
+    // there's no shared branch state, no worktree linkage.
+    let fetch = tokio::process::Command::new("git")
         .arg("-C")
         .arg(&bare)
         .arg("fetch")
         .output()
         .await
-        .expect("post-fetch spawn");
+        .expect("fetch spawn");
     assert!(
-        post.status.success(),
-        "post-detach fetch must succeed: {}",
-        String::from_utf8_lossy(&post.stderr)
+        fetch.status.success(),
+        "bare fetch must succeed regardless of preserved per-brief clones: {}",
+        String::from_utf8_lossy(&fetch.stderr)
     );
 }
 
-/// `detach_worktree_branch` failing (e.g. workspace dir is missing) must
-/// not propagate — the Preserve arm logs a warning and returns Ok so the
-/// daemon continues to record the retain.
+/// Preserve disposition on a missing dir must not propagate an error —
+/// the daemon must continue to record the retain.
 #[tokio::test]
-async fn preserve_logs_warning_on_detach_failure() {
+async fn preserve_no_error_on_missing_dir() {
     let tmp = tempfile::tempdir().expect("tmp");
     let ws = BriefWorkspace {
         brief_id: brief("brf_preserve_no_dir"),

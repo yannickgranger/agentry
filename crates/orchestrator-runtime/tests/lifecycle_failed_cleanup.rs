@@ -107,12 +107,14 @@ async fn branch_exists(bare: &Path, branch: &str) -> bool {
     out.status.success()
 }
 
-/// Scenario 1: cleanup against a real worktree allocation removes both
-/// the worktree directory and the `auto/<brief_id>` branch from the
-/// bare clone. The bare clone itself survives — it's shared across
-/// briefs.
+/// Scenario 1: cleanup against a real per-brief-clone allocation
+/// removes the per-brief clone directory. The bare clone itself
+/// survives — it's the read-only cache shared across briefs. Under the
+/// per-brief-clone model the `auto/<brief_id>` branch never exists on
+/// the bare in the first place; no bare-side branch deletion is
+/// needed.
 #[tokio::test]
-async fn cleanup_removes_worktree_dir_and_auto_branch() {
+async fn cleanup_removes_per_brief_clone_dir() {
     let tmp = tempfile::tempdir().expect("tmp");
     let url = setup_upstream(tmp.path()).await;
     let bid = brief("brf_failed_cleanup_real");
@@ -120,24 +122,24 @@ async fn cleanup_removes_worktree_dir_and_auto_branch() {
     let ws = allocate_at(&bid, Some((url.as_str(), "main")), tmp.path())
         .await
         .expect("alloc");
-    assert!(ws.host_path.exists(), "worktree dir must exist pre-cleanup");
+    assert!(ws.host_path.exists(), "clone dir must exist pre-cleanup");
 
     let bare = bare_clone_path_for(tmp.path());
     let auto_branch = format!("auto/{}", bid.0);
     assert!(
-        branch_exists(&bare, &auto_branch).await,
-        "auto/<brief_id> must exist in bare clone pre-cleanup"
+        !branch_exists(&bare, &auto_branch).await,
+        "auto/<brief_id> must NEVER exist in the bare clone (per-brief-clone model)"
     );
 
     cleanup_failed_brief_at(&bid, tmp.path(), None).await;
 
     assert!(
         !ws.host_path.exists(),
-        "cleanup must remove the worktree dir"
+        "cleanup must remove the per-brief clone dir"
     );
     assert!(
         !branch_exists(&bare, &auto_branch).await,
-        "cleanup must delete the auto/<brief_id> branch from the bare clone"
+        "auto/<brief_id> must remain absent from the bare clone after cleanup"
     );
     assert!(
         bare.join("HEAD").exists(),
@@ -148,7 +150,7 @@ async fn cleanup_removes_worktree_dir_and_auto_branch() {
 /// Scenario 2: idempotency. Driving cleanup twice against the same
 /// brief must not panic, must not return an error (cleanup is
 /// best-effort by contract), and must leave the post-cleanup invariants
-/// intact (worktree gone, branch gone). This is the regression for
+/// intact (per-brief clone dir gone). This is the regression for
 /// "FSM transitions to Failed twice" — re-entry, replay, or a future
 /// retry path that lands back on Failed must all be safe.
 #[tokio::test]
@@ -164,7 +166,7 @@ async fn cleanup_is_idempotent() {
     let auto_branch = format!("auto/{}", bid.0);
 
     cleanup_failed_brief_at(&bid, tmp.path(), None).await;
-    // First cleanup tore down the worktree + branch.
+    // First cleanup tore down the per-brief clone dir.
     assert!(!ws.host_path.exists());
     assert!(!branch_exists(&bare, &auto_branch).await);
 
