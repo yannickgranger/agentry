@@ -1,0 +1,37 @@
+{
+  "name": "reviewer-mechanical-agentry",
+  "version": 1,
+  "model": null,
+  "system_prompt": null,
+  "image": "docker.io/library/rust:1.93",
+  "substrate_class": "podman",
+  "package_manager": "apt",
+  "entrypoint_script": "#!/bin/sh\nexec /usr/local/bin/reviewer-mechanical-runner\n",
+  "binaries": ["git", "ca-certificates"],
+  "mcp_servers": [],
+  "tool_allowlist": [],
+  "allowed_tools": null,
+  "permit_scope": [
+    "fs:read:/workspace/**",
+    "${FORGE_NET_ALLOW}"
+  ],
+  "passthru_env": ["GITEA_TOKEN"],
+  "extra_bootstrap": [
+    "rustup component add rustfmt clippy",
+    "git config --global http.sslVerify false",
+    "cargo install --git https://github.com/yannickgranger/cfdb.git --rev 02c5a45 --root /usr/local --locked --quiet cfdb-cli || true",
+    "cargo install --git https://github.com/yannickgranger/graph-specs.git --rev ecaedb9 --root /usr/local --locked --quiet application || true"
+  ],
+  "mounts": [
+    {
+      "source": "${HOME}/.local/bin/reviewer-mechanical-runner",
+      "target": "/usr/local/bin/reviewer-mechanical-runner",
+      "readonly": true
+    }
+  ],
+  "workspace_mount": {
+    "container_path": "/workspace",
+    "readonly": true
+  },
+  "sccache": false
+}

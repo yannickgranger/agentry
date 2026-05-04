@@ -113,6 +113,16 @@ path = "src/bin/shipper_runner.rs"
 name = "preflight-criterion-runner"
 path = "src/bin/preflight_criterion_runner.rs"
 
+# reviewer-mechanical-runner: full lifecycle for the reviewer-mechanical-agentry
+# role. Ports REVIEWER_MECHANICAL_AGENTRY_SCRIPT (mechanical reviewer bash
+# heredoc — re-runs the brief's `acceptance` in an isolated CARGO_TARGET_DIR
+# on a read-only workspace) to Rust under EPIC #161 Wave 2 final slice.
+# Operator-invoked via `just reviewer-mechanical-runner-binary`; the role
+# bind-mounts this binary at /usr/local/bin/reviewer-mechanical-runner.
+[[bin]]
+name = "reviewer-mechanical-runner"
+path = "src/bin/reviewer_mechanical_runner.rs"
+
 [dependencies]
 orchestrator-types = { path = "../orchestrator-types" }
 serde.workspace = true
