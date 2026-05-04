@@ -13,8 +13,8 @@
   "permit_scope": [
     "fs:read:/workspace/**",
     "fs:write:/workspace/**",
-    "net:allow:agency.lab",
-    "forge:write:yg/*"
+    "${FORGE_NET_ALLOW}",
+    "${FORGE_WRITE_PERMITS}"
   ],
   "passthru_env": ["GITEA_TOKEN"],
   "mounts": [

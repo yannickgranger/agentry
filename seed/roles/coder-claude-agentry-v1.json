@@ -31,7 +31,7 @@
     "fs:read:/workspace/**",
     "fs:write:/workspace/**",
     "net:allow:api.anthropic.com",
-    "net:allow:agency.lab"
+    "${FORGE_NET_ALLOW}"
   ],
   "passthru_env": ["GITEA_TOKEN"],
   "mounts": [
