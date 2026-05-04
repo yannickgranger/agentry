@@ -1,0 +1,119 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+      - 'feat/*'
+      - 'fix/*'
+      - 'docs/*'
+      - 'ci/*'
+    paths:
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.gitea/workflows/**'
+  pull_request:
+    branches:
+      - main
+      - develop
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -Dwarnings -Clink-arg=-fuse-ld=mold
+  GIT_SSL_NO_VERIFY: true
+  CARGO_HOME: /cache/cargo
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+  # Shared sccache Redis backend (same LXC qbot-core uses, different key prefix).
+  SCCACHE_REDIS_ENDPOINT: "redis://192.168.1.107:6380"
+  SCCACHE_REDIS_KEY_PREFIX: "agentry-1.93"
+  SCCACHE_REDIS_EXPIRATION: "604800"
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: fmt + clippy + test
+    runs-on: rust
+    container:
+      image: docker.io/library/rust:1.93
+    steps:
+      - name: Setup (cache-aware)
+        run: |
+          set -e
+          apt-get clean && apt-get update && apt-get install -y --no-install-recommends \
+            git build-essential libssl-dev pkg-config curl ca-certificates
+          mkdir -p /cache/cargo/registry /cache/cargo/git /cache/cargo/bin /cache/rustup ~/.cargo
+          ln -sf /cache/cargo/registry ~/.cargo/registry
+          ln -sf /cache/cargo/git ~/.cargo/git
+
+          # Reuse cached rustup toolchain (avoids re-downloading components).
+          if [ -d "/cache/rustup/toolchains" ]; then
+            echo "Rustup cache HIT"
+          else
+            echo "Rustup cache MISS — seeding from image"
+            cp -a /usr/local/rustup/* /cache/rustup/
+          fi
+          export RUSTUP_HOME=/cache/rustup
+          echo "RUSTUP_HOME=/cache/rustup" >> "$GITHUB_ENV"
+          rustc --version
+          rustup component add rustfmt clippy
+
+          # mold linker — faster link step.
+          if [ ! -f "/cache/cargo/bin/mold" ]; then
+            MOLD_VERSION="2.40.4"
+            curl -fsSL "https://github.com/rui314/mold/releases/download/v${MOLD_VERSION}/mold-${MOLD_VERSION}-x86_64-linux.tar.gz" \
+              | tar xzf - --strip-components=2 -C /cache/cargo/bin/ "mold-${MOLD_VERSION}-x86_64-linux/bin/mold"
+            chmod +x /cache/cargo/bin/mold
+            ln -sf /cache/cargo/bin/mold /cache/cargo/bin/ld.mold
+          fi
+          echo "PATH=/cache/cargo/bin:${PATH}" >> "$GITHUB_ENV"
+
+          # sccache via Redis (shared backend).
+          if [ ! -f "/cache/cargo/bin/sccache" ]; then
+            SCCACHE_VERSION="v0.8.2"
+            curl -fsSL "https://github.com/mozilla/sccache/releases/download/${SCCACHE_VERSION}/sccache-${SCCACHE_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
+              | tar xzf - --strip-components=1 -C /cache/cargo/bin/ "sccache-${SCCACHE_VERSION}-x86_64-unknown-linux-musl/sccache"
+            chmod +x /cache/cargo/bin/sccache
+          fi
+          if /cache/cargo/bin/sccache --start-server 2>&1; then
+            echo "RUSTC_WRAPPER=/cache/cargo/bin/sccache" >> "$GITHUB_ENV"
+            echo "sccache ready (redis: ${SCCACHE_REDIS_ENDPOINT})"
+          else
+            echo "WARNING: sccache failed to start — compiling without cache"
+          fi
+
+      - name: Clone
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BRANCH=${GITHUB_HEAD_REF:-${GITHUB_REF#refs/heads/}}
+          git config --global url."https://oauth2:${GITHUB_TOKEN}@agency.lab:3000/".insteadOf "https://agency.lab:3000/"
+          git clone --depth=1 --branch="$BRANCH" "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git" repo
+
+      - name: Format
+        run: |
+          cd repo
+          cargo fmt --check
+
+      - name: Clippy
+        run: |
+          cd repo
+          export PATH="/cache/cargo/bin:$PATH"
+          cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Tests
+        run: |
+          cd repo
+          export PATH="/cache/cargo/bin:$PATH"
+          cargo test --workspace
+
+      - name: sccache stats
+        if: always()
+        run: /cache/cargo/bin/sccache --show-stats 2>/dev/null || true

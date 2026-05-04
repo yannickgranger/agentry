@@ -22,6 +22,238 @@ export RUST_LOG := env_var_or_default("RUST_LOG", "orchestrator=info,info")
 default:
     @just --list
 
+# Build ra-query into ~/.local/bin/ra-query for the reviewer-claude bind-mount.
+# Operator-invoked; idempotent. Reviewer-claude container expects the binary
+# at this path (matches the existing ~/.local/bin/claude pattern).
+ra-query-binary:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    : ${GITEA_TOKEN:?GITEA_TOKEN must be set}
+    CARGO_NET_GIT_FETCH_WITH_CLI=true cargo install \
+        --git https://oauth2:${GITEA_TOKEN}@agency.lab:3000/yg/ra-query.git \
+        --rev 2200414 --root ~/.local --locked ra-query
+    test -x ~/.local/bin/ra-query
+    echo "ra-query installed at ~/.local/bin/ra-query"
+
+# Build/install rtk into ~/.local/bin/rtk — CLI-output compression layer
+# that reduces LLM token consumption on bash tool-call outputs (60-90%
+# on common dev commands per upstream). Operator-invoked; idempotent.
+# Subsequent phases of #138 add the bind-mount on the agent containers.
+rtk-binary:
+    cargo install --git https://github.com/rtk-ai/rtk --locked --root ~/.local
+
+# Build dead-pub-check into ~/.local/bin/dead-pub-check for the coder-claude
+# bind-mount. Operator-invoked; idempotent. Coder-claude container expects the
+# binary at this path (matches the existing ~/.local/bin/ra-query pattern).
+dead-pub-check-binary:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo install --path crates/coder-precommit --bin dead-pub-check --root ~/.local --locked --quiet
+    test -x ~/.local/bin/dead-pub-check
+    echo "dead-pub-check installed at ~/.local/bin/dead-pub-check"
+
+# Build ac-verifier into ~/.local/bin/ac-verifier for the
+# ac-verifier-claude-agentry bind-mount. Operator-invoked; idempotent.
+ac-verifier-binary:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo install --path crates/coder-precommit --bin ac-verifier --root ~/.local --locked --quiet
+    test -x ~/.local/bin/ac-verifier
+    echo "ac-verifier installed at ~/.local/bin/ac-verifier"
+
+# Build ac-verifier-gemini into ~/.local/bin/ac-verifier-gemini for the
+# ac-verifier-gemini-agentry bind-mount. Operator-invoked; idempotent.
+ac-verifier-gemini-binary:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo install --path crates/coder-precommit --bin ac-verifier-gemini --root ~/.local --locked --quiet
+    test -x ~/.local/bin/ac-verifier-gemini
+    echo "ac-verifier-gemini installed at ~/.local/bin/ac-verifier-gemini"
+
+# Build ac-verifier-grok into ~/.local/bin/ac-verifier-grok for the
+# ac-verifier-grok-agentry bind-mount. Operator-invoked; idempotent.
+ac-verifier-grok-binary:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo install --path crates/coder-precommit --bin ac-verifier-grok --root ~/.local --locked --quiet
+    test -x ~/.local/bin/ac-verifier-grok
+    echo "ac-verifier-grok installed at ~/.local/bin/ac-verifier-grok"
+
+# Build ship into ~/.local/bin/ship for the coder-claude-agentry bind-mount.
+# Operator-invoked; idempotent. EPIC #152 brief 1 — stub binary.
+ship-binary:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo install --path crates/coder-precommit --bin ship --root ~/.local --locked --quiet
+    test -x ~/.local/bin/ship
+    echo "ship installed at ~/.local/bin/ship"
+
+# Build null-agent into ~/.local/bin/null-agent — first role binary under
+# EPIC #161 (bash → Rust port). Used by the null-agent-agentry role in
+# agentry-null-v0 topology. Operator-invoked; idempotent.
+null-agent-binary:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo install --path crates/agentry-role-runtime --bin null-agent --root ~/.local --locked --quiet
+    test -x ~/.local/bin/null-agent
+    echo "null-agent installed at ~/.local/bin/null-agent"
+
+# Build ac-verifier-runner into ~/.local/bin/ac-verifier-runner — the shared
+# workspace-prep + provider-invocation runner for ac-verifier-{claude,gemini,
+# grok}-agentry roles. EPIC #161 Wave 1.3. Operator-invoked; idempotent. The
+# three roles bind-mount this binary at /usr/local/bin/ac-verifier-runner and
+# pass --provider {claude,gemini,grok} on the entrypoint exec line.
+ac-verifier-runner-binary:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo install --path crates/agentry-role-runtime --bin ac-verifier-runner --root ~/.local --locked --quiet
+    test -x ~/.local/bin/ac-verifier-runner
+    echo "ac-verifier-runner installed at ~/.local/bin/ac-verifier-runner"
+
+# Build reviewer-claude-runner into ~/.local/bin/reviewer-claude-runner — the
+# workspace-prep + claude-streaming + finding-emission runner for the
+# reviewer-claude-agentry role. EPIC #161 Wave 1.4. Operator-invoked;
+# idempotent. The role bind-mounts this binary at
+# /usr/local/bin/reviewer-claude-runner and execs it directly.
+reviewer-claude-runner-binary:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo install --path crates/agentry-role-runtime --bin reviewer-claude-runner --root ~/.local --locked --quiet
+    test -x ~/.local/bin/reviewer-claude-runner
+    echo "reviewer-claude-runner installed at ~/.local/bin/reviewer-claude-runner"
+
+# Build coder-claude-runner into ~/.local/bin/coder-claude-runner — the
+# entrypoint half of the coder-claude-agentry role (Wave 1.2a). Reads the
+# bundle, builds the verb-structured prompt with optional rework banner,
+# writes /tmp/brief_vars.sh for the (still-bash) exitpoint, and streams
+# claude. Operator-invoked; idempotent. The role bind-mounts this binary
+# at /usr/local/bin/coder-claude-runner. Wave 1.2b will port the exitpoint.
+coder-claude-runner-binary:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo install --path crates/agentry-role-runtime --bin coder-claude-runner --root ~/.local --locked --quiet
+    test -x ~/.local/bin/coder-claude-runner
+    echo "coder-claude-runner installed at ~/.local/bin/coder-claude-runner"
+
+# Build auditor-claude-runner into ~/.local/bin/auditor-claude-runner — the
+# full lifecycle runner for the auditor-claude-agentry role (EPIC #161
+# Wave 2 port of AUDITOR_CLAUDE_AGENTRY_SCRIPT). Operator-invoked;
+# idempotent. The role bind-mounts this binary at
+# /usr/local/bin/auditor-claude-runner.
+auditor-claude-runner-binary:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo install --path crates/agentry-role-runtime --bin auditor-claude-runner --root ~/.local --locked --quiet
+    test -x ~/.local/bin/auditor-claude-runner
+    echo "auditor-claude-runner installed at ~/.local/bin/auditor-claude-runner"
+
+# Build archaeologist-runner into ~/.local/bin/archaeologist-runner — the
+# full lifecycle runner for the archaeologist-claude-agentry role (EPIC #161
+# Wave 3 port of ARCHAEOLOGIST_CLAUDE_AGENTRY_SCRIPT). Operator-invoked;
+# idempotent. The role bind-mounts this binary at
+# /usr/local/bin/archaeologist-runner.
+archaeologist-runner-binary:
+    cargo install --path crates/agentry-role-runtime --bin archaeologist-runner --root ~/.local --locked
+
+# Build ci-watcher-runner into ~/.local/bin/ci-watcher-runner — the full
+# lifecycle runner for the ci-watcher-agentry role (EPIC #161 Wave 2 port
+# of CI_WATCHER_AGENTRY_SCRIPT). Operator-invoked; idempotent. The role
+# bind-mounts this binary at /usr/local/bin/ci-watcher-runner.
+ci-watcher-runner-binary:
+    cargo install --path crates/agentry-role-runtime --bin ci-watcher-runner --root ~/.local --locked
+
+# Build shipper-runner into ~/.local/bin/shipper-runner — the full lifecycle
+# runner for the shipper-agentry role (EPIC #161 wave-bash port of
+# SHIPPER_AGENTRY_SCRIPT). v2 keeps the GITEA_TOKEN out of every URL —
+# auth flows only via `-c http.extraheader` (git) and the `Authorization:`
+# header (curl). Operator-invoked; idempotent. The role bind-mounts this
+# binary at /usr/local/bin/shipper-runner.
+shipper-runner-binary:
+    cargo install --path crates/agentry-role-runtime --bin shipper-runner --root ~/.local --locked
+
+# Build verifier-dol-runner into ~/.local/bin/verifier-dol-runner — the
+# full lifecycle runner for the verifier-claude-agentry role (EPIC #161
+# Wave 3 port of VERIFIER_CLAUDE_AGENTRY_SCRIPT — the DOL verifier that
+# runs the brief's success_criteria and maps exit code to verdict).
+# Operator-invoked; idempotent. The role bind-mounts this binary at
+# /usr/local/bin/verifier-dol-runner.
+verifier-dol-runner-binary:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo install --path crates/agentry-role-runtime --bin verifier-dol-runner --root ~/.local --locked --quiet
+    test -x ~/.local/bin/verifier-dol-runner
+    echo "verifier-dol-runner installed at ~/.local/bin/verifier-dol-runner"
+
+# Build planner-runner into ~/.local/bin/planner-runner — the full lifecycle
+# runner for the planner-claude-agentry role (EPIC #161 Wave 3 port of
+# PLANNER_CLAUDE_AGENTRY_SCRIPT). Operator-invoked; idempotent. The role
+# bind-mounts this binary at /usr/local/bin/planner-runner.
+planner-runner-binary:
+    cargo install --path crates/agentry-role-runtime --bin planner-runner --root ~/.local --locked
+
+# Build pr-rebaser-runner into ~/.local/bin/pr-rebaser-runner — the full
+# lifecycle runner for the pr-rebaser-agentry role (EPIC #161 port of
+# PR_REBASER_AGENTRY_SCRIPT). Operator-invoked; idempotent.
+pr-rebaser-runner-binary:
+    cargo install --path crates/agentry-role-runtime --bin pr-rebaser-runner --root ~/.local --locked
+
+# Build preflight-criterion-runner into ~/.local/bin/preflight-criterion-runner
+# — the full lifecycle runner for the preflight-criterion-agentry role
+# (EPIC #161 wave-bash port of PREFLIGHT_CRITERION_AGENTRY_SCRIPT — issue #84
+# baseline analyser that runs the brief's success_criteria and emits Warn
+# findings for canonical broken patterns). Operator-invoked; idempotent. The
+# role bind-mounts this binary at /usr/local/bin/preflight-criterion-runner.
+preflight-criterion-runner-binary:
+    cargo install --path crates/agentry-role-runtime --bin preflight-criterion-runner --root ~/.local --locked
+
+# Build reviewer-mechanical-runner into ~/.local/bin/reviewer-mechanical-runner — the
+# full lifecycle runner for the reviewer-mechanical-agentry role (EPIC #161
+# Wave 2 final slice). The role bind-mounts this binary at
+# /usr/local/bin/reviewer-mechanical-runner.
+reviewer-mechanical-runner-binary:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo install --path crates/agentry-role-runtime --bin reviewer-mechanical-runner --root ~/.local --locked --quiet
+    test -x ~/.local/bin/reviewer-mechanical-runner
+
+# Build git-op-commit into ~/.local/bin/git-op-commit for the git-op-commit
+# role's bind-mount. Operator-invoked; idempotent. Brief 190b of #182 — the
+# commit half of the git-operator split.
+git-op-commit-binary:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo install --path crates/coder-precommit --bin git-op-commit --root ~/.local --locked --quiet
+    test -x ~/.local/bin/git-op-commit
+    echo "git-op-commit installed at ~/.local/bin/git-op-commit"
+
+# Build git-op-push into ~/.local/bin/git-op-push for the git-op-push role's
+# bind-mount. Operator-invoked; idempotent. Brief 190b of #182 — the push
+# half of the git-operator split.
+git-op-push-binary:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo install --path crates/coder-precommit --bin git-op-push --root ~/.local --locked --quiet
+    test -x ~/.local/bin/git-op-push
+    echo "git-op-push installed at ~/.local/bin/git-op-push"
+
+# Build git-op-rebase into ~/.local/bin/git-op-rebase for the git-op-rebase
+# role's bind-mount. Operator-invoked; idempotent. Brief 192a of #192 — the
+# rebase phase that #192b will wire into the self-host workflow as a
+# loop-back target on rebase conflict.
+git-op-rebase-binary:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo install --path crates/coder-precommit --bin git-op-rebase --root ~/.local --locked --quiet
+    test -x ~/.local/bin/git-op-rebase
+    echo "git-op-rebase installed at ~/.local/bin/git-op-rebase"
+
+# Build quality-fast into ~/.local/bin/quality-fast for the coder-claude
+# bind-mount. Operator-invoked; idempotent. Composes external CLI invocations
+# against pre-paid indices for fast no-compile feedback to the coder.
+quality-fast:
+    cargo build --release -p quality-fast
+    cp target/release/quality-fast ~/.local/bin/quality-fast
+
 # Build everything
 build:
     cargo build --workspace --release
@@ -39,36 +271,6 @@ check:
 fix:
     cargo fmt
     cargo clippy --workspace --fix --allow-dirty --allow-staged
-
-# Build echo-agent container image (M0)
-build-echo:
-    cd containers/echo-agent && podman build -t agentry/echo-agent:v1 -f Containerfile .
-
-# Build naughty-agent container image (M3)
-build-naughty:
-    cd containers/naughty-agent && podman build -t agentry/naughty-agent:v1 -f Containerfile .
-
-# Build M4 speaker + listener images
-build-m4:
-    cd containers/speaker-agent && podman build -t agentry/speaker-agent:v1 -f Containerfile .
-    cd containers/listener-agent && podman build -t agentry/listener-agent:v1 -f Containerfile .
-
-# Build M5a grok image
-build-m5a:
-    cd containers/grok-agent && podman build -t agentry/grok-agent:v1 -f Containerfile .
-
-# Build M5b claude-agent image (no Anthropic API — Claude Max subscription only).
-build-m5b:
-    cd containers/claude-agent && podman build -t agentry/claude-agent:v1 -f Containerfile .
-
-# Build M6 synthesizer + narrowed-coder images.
-build-m6:
-    cd containers/synthesizer-agent  && podman build -t agentry/synthesizer-agent:v1  -f Containerfile .
-    cd containers/narrowed-coder-agent && podman build -t agentry/narrowed-coder-agent:v1 -f Containerfile .
-
-# Build M7 shipper image.
-build-m7:
-    cd containers/shipper-agent && podman build -t agentry/shipper-agent:v1 -f Containerfile .
 
 # Start local dev Redis container on :6380. Idempotent.
 dev-redis-up:
@@ -101,8 +303,48 @@ dev-redis-down:
     -podman stop agentry-dev-redis
     -podman rm agentry-dev-redis
 
+# Create the podman network every agentry-spawned container joins, and bring
+# up a dedicated `agentry-sccache-redis` container attached to it so roles
+# with `sccache=true` can reach the compile cache by DNS name. Orchestratord
+# itself runs on the host and reaches agentry-dev-redis via the existing
+# 127.0.0.1:6380 port mapping — it doesn't need agentry-net. Idempotent.
+agentry-net-up:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if ! podman network exists agentry-net; then
+        podman network create agentry-net > /dev/null
+        echo "created podman network agentry-net"
+    else
+        echo "agentry-net already exists"
+    fi
+    # agentry-scoped sccache backend. Kept separate from any other `sccache-redis`
+    # container so we don't touch cross-team state. No host port mapping — only
+    # reachable from containers on agentry-net.
+    if podman container exists agentry-sccache-redis; then
+        podman start agentry-sccache-redis > /dev/null 2>&1 || true
+        echo "agentry-sccache-redis already exists; (re)started"
+    else
+        podman volume inspect agentry-sccache-data >/dev/null 2>&1 || podman volume create agentry-sccache-data > /dev/null
+        podman run -d \
+            --name agentry-sccache-redis \
+            --network agentry-net \
+            -v agentry-sccache-data:/data \
+            docker.io/library/redis:7-alpine \
+            redis-server --maxmemory 2gb --maxmemory-policy allkeys-lru --appendonly no > /dev/null
+        echo "created agentry-sccache-redis on agentry-net"
+    fi
+    sleep 1
+    # Smoke test: reach the cache by DNS name from an ephemeral container on agentry-net.
+    podman run --rm --network agentry-net docker.io/library/redis:7-alpine \
+        redis-cli -h agentry-sccache-redis -p 6379 ping
+
+agentry-net-down:
+    -podman stop agentry-sccache-redis
+    -podman rm agentry-sccache-redis
+    -podman network rm -f agentry-net
+
 # Start dev infra (orchestratord + dashboard as user processes, podman for agents)
-dev-up: dev-redis-up build build-echo
+dev-up: dev-redis-up build
     #!/usr/bin/env bash
     set -euo pipefail
     # Ensure Redis is reachable

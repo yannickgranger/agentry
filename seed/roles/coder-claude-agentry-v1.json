@@ -1,0 +1,101 @@
+{
+  "name": "coder-claude-agentry",
+  "version": 1,
+  "model": "claude-max",
+  "system_prompt": null,
+  "image": "docker.io/library/rust:1.93",
+  "substrate_class": "podman",
+  "package_manager": "apt",
+  "entrypoint_script": "#!/bin/sh\nexport CARGO_NET_GIT_FETCH_WITH_CLI=true\nexec /usr/local/bin/coder-claude-runner\n",
+  "binaries": ["git", "curl", "ca-certificates", "quality-fast"],
+  "mcp_servers": [],
+  "tool_allowlist": [],
+  "allowed_tools": [
+    "Read",
+    "Edit",
+    "Write",
+    "Bash(*)",
+    "Bash(git status:*)",
+    "Bash(git diff:*)",
+    "Bash(rg:*)",
+    "Bash(jq:*)",
+    "Bash(cat:*)",
+    "Bash(sed:*)",
+    "Bash(grep:*)",
+    "Bash(find:*)",
+    "Bash(ls:*)",
+    "Bash(test:*)",
+    "Bash(quality-fast:*)"
+  ],
+  "permit_scope": [
+    "fs:read:/workspace/**",
+    "fs:write:/workspace/**",
+    "net:allow:api.anthropic.com",
+    "${FORGE_NET_ALLOW}"
+  ],
+  "passthru_env": ["GITEA_TOKEN"],
+  "mounts": [
+    {
+      "source": "${HOME}/.local/bin/claude",
+      "target": "/usr/local/bin/claude",
+      "readonly": true
+    },
+    {
+      "source": "${HOME}/.claude/.credentials.json",
+      "target": "/root/.claude/.credentials.json",
+      "readonly": true
+    },
+    {
+      "source": "${HOME}/.config/agentry/claude-container-settings.json",
+      "target": "/root/.claude/settings.json",
+      "readonly": true
+    },
+    {
+      "source": "/var/lib/agentry/transcripts",
+      "target": "/transcripts",
+      "readonly": false
+    },
+    {
+      "source": "${HOME}/.local/bin/ra-query",
+      "target": "/usr/local/bin/ra-query",
+      "readonly": true
+    },
+    {
+      "source": "${HOME}/.local/bin/dead-pub-check",
+      "target": "/usr/local/bin/dead-pub-check",
+      "readonly": true
+    },
+    {
+      "source": "${HOME}/.local/bin/ship",
+      "target": "/usr/local/bin/ship",
+      "readonly": true
+    },
+    {
+      "source": "${HOME}/.local/bin/coder-claude-runner",
+      "target": "/usr/local/bin/coder-claude-runner",
+      "readonly": true
+    },
+    {
+      "source": "${HOME}/.local/bin/quality-fast",
+      "target": "/usr/local/bin/quality-fast",
+      "readonly": true
+    },
+    {
+      "source": "${HOME}/.local/bin/rtk",
+      "target": "/usr/local/bin/rtk",
+      "readonly": true
+    }
+  ],
+  "workspace_mount": {
+    "container_path": "/workspace",
+    "readonly": false
+  },
+  "sccache": false,
+  "extra_bootstrap": [
+    "rustup component add rustfmt clippy",
+    "git config --global http.sslVerify false",
+    "CARGO_NET_GIT_FETCH_WITH_CLI=true cargo install --git https://oauth2:${GITEA_TOKEN}@agency.lab:3000/yg/quality-architecture.git --bin quality-hygiene --root /usr/local --locked --quiet || true",
+    "CARGO_NET_GIT_FETCH_WITH_CLI=true cargo install --git https://oauth2:${GITEA_TOKEN}@agency.lab:3000/yg/cfdb.git --rev 02c5a45 --root /usr/local --locked --quiet cfdb-cli || true",
+    "CARGO_NET_GIT_FETCH_WITH_CLI=true cargo install --git https://oauth2:${GITEA_TOKEN}@agency.lab:3000/yg/graph-specs-rust.git --rev ecaedb9 --root /usr/local --locked --quiet application || true"
+  ]
+}

@@ -1,0 +1,41 @@
+{
+  "name": "agentry-bugfix-v0",
+  "version": 1,
+  "roles": [
+    {
+      "name": "coder-claude-agentry",
+      "version": 1
+    },
+    {
+      "name": "reviewer-mechanical-agentry",
+      "version": 1
+    },
+    {
+      "name": "shipper-agentry",
+      "version": 1
+    },
+    {
+      "name": "ci-watcher-agentry",
+      "version": 1
+    }
+  ],
+  "message_graph": [
+    {
+      "from": { "name": "coder-claude-agentry", "version": 1 },
+      "to": { "name": "reviewer-mechanical-agentry", "version": 1 }
+    },
+    {
+      "from": { "name": "reviewer-mechanical-agentry", "version": 1 },
+      "to": { "name": "shipper-agentry", "version": 1 }
+    },
+    {
+      "from": { "name": "shipper-agentry", "version": 1 },
+      "to": { "name": "ci-watcher-agentry", "version": 1 }
+    }
+  ],
+  "terminal_role": {
+    "name": "ci-watcher-agentry",
+    "version": 1
+  },
+  "max_retries": 2
+}

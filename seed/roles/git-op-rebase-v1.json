@@ -1,0 +1,31 @@
+{
+  "name": "git-op-rebase",
+  "version": 1,
+  "model": null,
+  "system_prompt": null,
+  "image": "docker.io/library/debian:trixie-slim",
+  "substrate_class": "podman",
+  "package_manager": "apt",
+  "entrypoint_script": "#!/bin/sh\nexec /usr/local/bin/git-op-rebase\n",
+  "binaries": ["git", "ca-certificates"],
+  "mcp_servers": [],
+  "tool_allowlist": ["git"],
+  "permit_scope": [
+    "fs:read:/workspace/**",
+    "fs:write:/workspace/**",
+    "${FORGE_NET_ALLOW}"
+  ],
+  "passthru_env": ["GITEA_TOKEN"],
+  "mounts": [
+    {
+      "source": "~/.local/bin/git-op-rebase",
+      "target": "/usr/local/bin/git-op-rebase",
+      "readonly": true
+    }
+  ],
+  "workspace_mount": {
+    "container_path": "/workspace",
+    "readonly": false
+  },
+  "sccache": false
+}

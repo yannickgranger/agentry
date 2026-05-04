@@ -1,0 +1,41 @@
+{
+  "name": "ac-verifier-grok-agentry",
+  "version": 1,
+  "model": "grok-4-fast",
+  "system_prompt": null,
+  "image": "docker.io/library/debian:trixie-slim",
+  "substrate_class": "podman",
+  "package_manager": "apt",
+  "entrypoint_script": "#!/bin/sh\nexec /usr/local/bin/ac-verifier-runner --provider grok\n",
+  "binaries": ["git", "curl", "ca-certificates"],
+  "mcp_servers": [],
+  "tool_allowlist": [],
+  "permit_scope": [
+    "fs:read:/workspace/**",
+    "net:allow:api.x.ai",
+    "${FORGE_NET_ALLOW}"
+  ],
+  "passthru_env": ["XAI_API_KEY"],
+  "mounts": [
+    {
+      "source": "${HOME}/.local/bin/ac-verifier-grok",
+      "target": "/usr/local/bin/ac-verifier-grok",
+      "readonly": true
+    },
+    {
+      "source": "${HOME}/.local/bin/ac-verifier-runner",
+      "target": "/usr/local/bin/ac-verifier-runner",
+      "readonly": true
+    },
+    {
+      "source": "${HOME}/.local/bin/rtk",
+      "target": "/usr/local/bin/rtk",
+      "readonly": true
+    }
+  ],
+  "workspace_mount": {
+    "container_path": "/workspace",
+    "readonly": true
+  },
+  "sccache": false
+}

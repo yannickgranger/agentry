@@ -1,0 +1,134 @@
+[package]
+name = "agentry-role-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[lib]
+name = "agentry_role_runtime"
+path = "src/lib.rs"
+
+# null-agent: meta-brief no-op shake-down agent. First role ported from bash
+# (NULL_AGENT_AGENTRY_SCRIPT) to Rust under EPIC #161 B0.
+[[bin]]
+name = "null-agent"
+path = "src/bin/null_agent.rs"
+
+# ac-verifier-runner: shared workspace-prep + provider-invocation wrapper for
+# the ac-verifier-{claude,gemini,grok}-agentry role trio. Ports the three
+# AC_VERIFIER_*_AGENTRY_SCRIPT bash entrypoints to one Rust binary
+# parameterized by --provider.
+[[bin]]
+name = "ac-verifier-runner"
+path = "src/bin/ac_verifier_runner.rs"
+
+# reviewer-claude-runner: workspace-prep + claude streaming + finding emission
+# for the reviewer-claude-agentry role. Ports REVIEWER_CLAUDE_AGENTRY_SCRIPT
+# (~220 LoC bash) to Rust under EPIC #161 Wave 1.4.
+[[bin]]
+name = "reviewer-claude-runner"
+path = "src/bin/reviewer_claude_runner.rs"
+
+# coder-claude-runner: entrypoint half of the coder-claude-agentry role
+# (Wave 1.2a). Reads the bundle, builds the verb-structured prompt
+# (with prior-rework banner if applicable), writes /tmp/brief_vars.sh
+# for the (still-bash) exitpoint, and streams claude. Exitpoint port
+# is Wave 1.2b.
+[[bin]]
+name = "coder-claude-runner"
+path = "src/bin/coder_claude_runner.rs"
+
+# auditor-claude-runner: full lifecycle for the auditor-claude-agentry role.
+# Ports AUDITOR_CLAUDE_AGENTRY_SCRIPT (~180 LoC bash heredoc) to Rust under
+# EPIC #161 Wave 2. Runs the cargo report stages (clippy/build/test/udeps),
+# the three ra-query stages (unwraps/complexity/pub-surface+callers), and
+# emits self-heal child briefs via the daemon's _chain_trigger pathway.
+[[bin]]
+name = "auditor-claude-runner"
+path = "src/bin/auditor_claude_runner.rs"
+
+# archaeologist-runner: full lifecycle for the archaeologist-claude-agentry
+# role. Ports ARCHAEOLOGIST_CLAUDE_AGENTRY_SCRIPT (cfdb extract + graph-specs
+# check + seed queries + claude → discovery.json) to Rust under EPIC #161
+# Wave 3. Operator-invoked via `just archaeologist-runner-binary`; the role
+# bind-mounts this binary at /usr/local/bin/archaeologist-runner.
+[[bin]]
+name = "archaeologist-runner"
+path = "src/bin/archaeologist_runner.rs"
+
+# ci-watcher-runner: full lifecycle for the ci-watcher-agentry role. Ports
+# CI_WATCHER_AGENTRY_SCRIPT (~200 LoC bash heredoc) to Rust under EPIC #161
+# Wave 2. Polls the forge for PR mergeable + CI status, retries merge on
+# transient 405/409, chain-triggers pr-rebaser-agentry on `mergeable: false`.
+[[bin]]
+name = "ci-watcher-runner"
+path = "src/bin/ci_watcher_runner.rs"
+
+# verifier-dol-runner: full lifecycle for the verifier-claude-agentry role
+# (the DOL verifier — runs the brief's success_criteria as a shell command,
+# maps exit code to verdict). EPIC #161 Wave 3 final slice; ports
+# VERIFIER_CLAUDE_AGENTRY_SCRIPT to Rust.
+[[bin]]
+name = "verifier-dol-runner"
+path = "src/bin/verifier_dol_runner.rs"
+
+# planner-runner: full lifecycle for the planner-claude-agentry role. Ports
+# PLANNER_CLAUDE_AGENTRY_SCRIPT (discovery.json + claude → child briefs +
+# _chain_trigger) to Rust under EPIC #161 Wave 3. Operator-invoked via
+# `just planner-runner-binary`; the role bind-mounts this binary at
+# /usr/local/bin/planner-runner.
+[[bin]]
+name = "planner-runner"
+path = "src/bin/planner_runner.rs"
+
+# pr-rebaser-runner: full lifecycle for the pr-rebaser-agentry role. Ports
+# PR_REBASER_AGENTRY_SCRIPT to Rust under EPIC #161. Operator-invoked via
+# `just pr-rebaser-runner-binary`; the role bind-mounts this binary at
+# /usr/local/bin/pr-rebaser-runner.
+[[bin]]
+name = "pr-rebaser-runner"
+path = "src/bin/pr_rebaser_runner.rs"
+
+# shipper-runner: full lifecycle for the shipper-agentry role. Ports
+# SHIPPER_AGENTRY_SCRIPT (git push via http.extraheader + forge PR creation)
+# to Rust under EPIC #161 wave-bash. v2 fixes the v1 reviewer Blocker on
+# credential leakage by keeping the token out of every URL — auth flows
+# only via `-c http.extraheader` (git) and `Authorization:` header (curl).
+# Operator-invoked via `just shipper-runner-binary`; the role bind-mounts
+# this binary at /usr/local/bin/shipper-runner.
+[[bin]]
+name = "shipper-runner"
+path = "src/bin/shipper_runner.rs"
+
+# preflight-criterion-runner: full lifecycle for the
+# preflight-criterion-agentry role. Ports PREFLIGHT_CRITERION_AGENTRY_SCRIPT
+# (issue #84 baseline analyser — runs the brief's success_criteria, reports
+# baseline + smell-test findings) to Rust under EPIC #161 wave-bash.
+# Read-only on /workspace, no forge auth, no net. Operator-invoked via
+# `just preflight-criterion-runner-binary`; the role bind-mounts this binary
+# at /usr/local/bin/preflight-criterion-runner.
+[[bin]]
+name = "preflight-criterion-runner"
+path = "src/bin/preflight_criterion_runner.rs"
+
+# reviewer-mechanical-runner: full lifecycle for the reviewer-mechanical-agentry
+# role. Ports REVIEWER_MECHANICAL_AGENTRY_SCRIPT (mechanical reviewer bash
+# heredoc — re-runs the brief's `acceptance` in an isolated CARGO_TARGET_DIR
+# on a read-only workspace) to Rust under EPIC #161 Wave 2 final slice.
+# Operator-invoked via `just reviewer-mechanical-runner-binary`; the role
+# bind-mounts this binary at /usr/local/bin/reviewer-mechanical-runner.
+[[bin]]
+name = "reviewer-mechanical-runner"
+path = "src/bin/reviewer_mechanical_runner.rs"
+
+[dependencies]
+orchestrator-types = { path = "../orchestrator-types" }
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+anyhow = "1.0"
+
+[lints]
+workspace = true

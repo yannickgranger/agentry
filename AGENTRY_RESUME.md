@@ -1,162 +1,114 @@
-# AGENTRY — Session-Portable Resume Plan
+# agentry — session resume
 
-**Canonical recovery document.** Any future Claude session can read this file + `git log` + Redis state + the `TODO.md` next-to-it and continue exactly where the last session stopped.
+Canonical per-session state for any future Claude session picking this up.
 
----
+## What this project is
 
-## What this is
+A minimal orchestrator for ephemeral agent containers. Every containerised agent speaks the same NDJSON stdin/stdout protocol; the daemon reads `Brief`s off `agentry:briefs`, resolves a `TeamTopology` + `AgentRole`s, mints signed `WorkPermit`s, spawns one container per role on a stock public image, enforces the permit on every `tool_call`, routes inter-role `Message` events, records a verdict.
 
-`agentry` is a minimal orchestrator for ephemeral agent containers. It is the v2 replacement for `agency-orchestrator` (declared dead; graveyard). The design was crystallized 2026-04-23 via a four-miner archaeology pass over the KB, Redis memory, 28 local workspaces, and the v1 graveyard. Full proposal: `docs/PROPOSAL.md`.
+Full architectural read: `README.md` → `specs/concepts/*.md` (the DDD concept list enforced by `graph-specs-rust`).
 
-**One-line summary:**
-A bus driver for ephemeral, capability-minimized agent containers talking via typed events, with methodology externalized to Redis-backed typed records and observability forced by design.
+## The cutoff rule
 
-## North star
+`agentry` is built by `agentry`. Once issue #8 on `yg/agentry` merges, Claude cannot author code on `yg/agentry` directly. Every further change is a brief dispatched into the `agentry-self-host-v0` team defined in that PR (`coder-claude-agentry → reviewer-mechanical-agentry → shipper-agentry`).
 
-**M9 green:** a real qbot-core issue is closed end-to-end by agentry. PR merged, zero human keystrokes between brief submission and merge.
+**No break-glass exception.** If agentry breaks, root-cause it from the trace stream + orchestratord log + stderr, then either (a) convince the user case-by-case that a one-off direct fix is warranted, or (b) file another brief with more precise instructions.
 
-## The four data records (Redis, typed, dashboard-edited)
+Verify where we are:
 
-| Record | Key pattern | Purpose |
-|--------|-------------|---------|
-| `Brief` | `agentry:brief:{id}` | Unit of work; carries project ref + topology + payload + budget + escalation |
-| `AgentRole` | `agentry:role:{name}:{version}` | Container spec: model, system prompt, tool allowlist, substrate class, binaries, MCPs |
-| `TeamTopology` | `agentry:team:{name}:{version}` | Roles + message graph + permit-override rules |
-| `Project` | `agentry:project:{slug}` | Name, forges, budget cap, escalation default, default topology |
+```bash
+# PR #8 merge status on the forge.
+curl -sk https://agency.lab:3000/api/v1/repos/yg/agentry/pulls/8 \
+    -H "Authorization: token $(keepassxc-cli show -sa Password --no-password \
+        -k ~/agent-zero/key/claude.key ~/agent-zero/claude.kdbx 'gitea/agency.lab')" \
+    | jq '{state, merged, merged_at}'
+```
 
-## The three crates
+If `merged: true` — cutoff is live, no direct commits. If still open — the pre-cutoff rules (feature branch + PR + CI green) still apply.
 
-| Crate | Purpose | Target LOC |
-|-------|---------|-----------|
-| `orchestrator-types` | Pure types + serde (Brief, AgentRole, TeamTopology, Project, Verdict, WorkPermit, Event) | ~250 |
-| `orchestrator-runtime` | Daemon: Redis consumer, Spawner trait + podman adapter, permit broker, CLI | ~900 |
-| `orchestrator-dashboard` | Axum + htmx + SSE + webhook endpoint | ~400 |
+## Redis + infra
 
-**Total new LOC at M9: ~1,550.**
+| Resource | Endpoint | Owner |
+|---|---|---|
+| Dev Redis (briefs, verdicts, trace, audit, registry) | `127.0.0.1:6380` inside `agentry-dev-redis` podman container | `just dev-redis-up` |
+| sccache backend | `agentry-sccache-redis:6379` on `agentry-net` network (no host port) | `just agentry-net-up` |
+| Ed25519 signing key | `~/.config/agentry/signing.key` (0600) | `orchestrator key-gen` |
+| Redis password | `~/.config/agentry/redis.password` (0600) | `just dev-redis-up` generates it once |
+| Gitea | `https://agency.lab:3000/` (token at keepassxc `gitea/agency.lab`) | external |
+| Workspace root | `/var/mnt/workspaces/agentry-work/briefs/<brief_id>/` | daemon allocates lazily |
 
-## Agent I/O contract (the one required interface)
+**Never** point agentry's dev runs at a production Redis. Pin tests in `crates/orchestrator-runtime/src/config.rs` already reject `192.168.1.152` and `192.168.1.189` as hardcoded targets; the default is `127.0.0.1:6380`.
 
-An agent is any process that:
-1. Reads Brief + Permit + RoleConfig as one JSON document on stdin.
-2. Emits events as NDJSON on stdout: `{"type":"event","at":"<iso>","payload":{...}}`.
-3. Reads inbox messages (from teammates) as NDJSON on fd 3 (bound to a Redis stream).
-4. Writes outbox messages as NDJSON on fd 4 (bound to a Redis stream).
-5. Emits `{"type":"done","verdict":"shipped|failed|escalated","at":"<iso>"}` as last event, then exits.
+## Resumption protocol
 
-Claude CLI, Grok CLI, Gemini CLI, Python script, shell script — anything that satisfies this contract is an agent.
+Fresh Claude session picking this up MUST, in order:
 
-## Redis namespace & endpoints
+1. `mcp__memory__load_state namespace='a0-session:<latest-agentry-date>'` — the canonical per-session handoff record. If absent, read `mcp__memory__get key='project:agentry:resume'` for the pointer.
+2. `git fetch origin develop` in `/var/mnt/workspaces/agentry`; compare local `origin/develop` to the forge's `develop` branch. If they diverge (e.g. a stacked PR merged into a feature branch instead of develop), that's an orphan-gotcha — recover via cherry-pick onto develop in a fresh PR before any new feature work.
+3. Check open issues + PRs on `yg/agentry`. If PR #8 is open: pre-cutoff, continue. If merged: cutoff is live, any new work goes through `agentry-self-host-v0` via `orchestrator submit`.
+4. `scripts/arch-check.sh` — verify the spec + cfdb gates still pass locally before touching anything.
+5. Pick up from the single "next one PR" in `TODO.md` or from a brief plan in the saved session state.
 
-- **Redis: LOCAL podman container** — `127.0.0.1:6380` (inside `agentry-dev-redis` container, port 6380 to avoid any collision). Password at `~/.config/agentry/redis.password` (0600, gitignored). `just dev-redis-up` brings it online idempotently.
-- **NEVER use prod Redis LXCs** for agentry dev. Both LXC 401 (`.152` — A0 session/memory) and LXC 522 (`.189` — PROD-AGENCY streams) are off-limits for this project's dev traffic.
-- All agentry keys live under `agentry:` prefix (clean-separated from v1 `agency:` graveyard)
-- Key streams:
-  - `agentry:briefs` — brief submission inbox (XADD/XREAD)
-  - `agentry:verdicts` — verdict log (append-only)
-  - `agentry:brief:{id}:trace` — per-brief event trace
-  - `agentry:agent:{id}:inbox` / `outbox` — per-agent messaging
-- Gitea: `https://agency.lab:3000/` (token in KeePassXC under `gitea/agency.lab`)
-- Podman: local on dev box, user-mode, default substrate
-- Dashboard: `http://localhost:7800` when `just dev-up` is running
+Do not invent new primitives, add new crates, or re-open deferred features. If tempted, stop and re-read the frozen rules below.
 
-## Recycle inventory (gems salvaged from existing workspaces)
+## Frozen rules
 
-| Source | Role in agentry | How to reuse |
-|--------|-----------------|-------------|
-| `~/workspaces/agency-orchestrator/crates/agency-aegis` | WorkPermit type + signer + audit | Copy into `orchestrator-runtime` under `permit/` module (≈2k LOC, drop-in) |
-| `~/workspaces/agency-orchestrator/crates/agent-events` | Canonical event vocabulary | Copy types into `orchestrator-types` |
-| `~/workspaces/agency-orchestrator/crates/forge-subprocess` | Shipper role tool | Install binary in shipper container only |
-| `~/workspaces/stdin-daemon` | Agent-in-container wrapper template | Pattern for agent roles; don't depend on the crate |
-| `~/workspaces/agent-lifecycle` | Spawner trait reference | Base the agentry Spawner trait shape on it; Podman adapter is new |
-| `~/workspaces/mcp-forge`, `mcp-rules`, `mcp-signal`, `mcp-devkit` | Drop-in MCP servers | Install in relevant roles' containers |
-| `~/workspaces/cfdb`, `~/workspaces/graph-specs-rust` | External services roles call (not embedded) | Spec-guardian + archaeologist roles invoke via MCP |
+**Terminal:**
+- Claude is Claude Max subscription only — never the per-token Anthropic API. Every Claude-driven role subprocesses the host's `claude` CLI. Grok and Gemini APIs are fine.
+- Dev Redis is local podman only — never prod LXCs.
+- Every change flows through a PR against `develop` with CI green. Never bypass hooks or push to main/develop directly.
+- After PR #8 merges, no Claude-authored code on `yg/agentry`. No break-glass.
 
-## Roadmap (M0 → M9)
+**Process:**
+- When user questions a choice: answer WHY first, wait for them to redirect, don't reverse-pitch.
+- When unsure: "I don't know, stopping." No pitched alternatives.
+- Factual commits. No milestone numbering. No celebratory language.
+- Stacked PRs: rebase the stacked PR onto develop the instant the base PR is approved for merge. Never merge a stacked PR after its base has already merged — it orphans the feature branch and the commits never reach develop.
 
-Deploy pattern for every milestone: `just dev-up` (systemd user units on dev box).
-Verify: every issue ships with a brief in `examples/verify-M<N>.json` that produces a verdict on `agentry:verdicts`.
+**Methodology:**
+- Every change that adds, renames, or removes a top-level `pub struct/enum/trait/type` must update `specs/concepts/*.md` in the same PR. Arch gate enforces.
+- Ban rules (`.cfdb/queries/*.cypher`) arrive one per PR, each with its own justification, zero existing violations at introduction. No baseline file, no ratchet, no allowlist.
+- Bug fixes that reach pub surface follow the same rule.
 
-| # | Ship | Verify | Recycles | LOC |
-|---|------|--------|----------|-----|
-| M0 | Runtime + podman spawner + echo role + CLI | `orchestrator submit examples/verify-M0.json` → verdict=shipped + event "hello" | podman | ~400 |
-| M1 | Dashboard (Axum + htmx + SSE) | Replay M0; localhost:7800 shows spawn → event → teardown in real time | — | ~250 |
-| M2 | Typed registry editor (forms for Role / Team / Project) | Create role via form → submit brief → spawns correctly | — | ~200 |
-| M3 | Permit broker (AEGIS signing + tool-call enforcement) | Role with `allowlist:[read]` attempts `write` → killed; violation on dashboard | agency-aegis | ~200 |
-| M4 | Two-role message routing via agency-bus | `speaker → listener` team → trace has both events in order | agency-bus | ~100 |
-| M5 | Real Claude CLI role inside container (stdin-daemon pattern) | `reader` role reads /workspace/README.md via MCP; dashboard shows content bytes | stdin-daemon | ~200 |
-| M6 | Upstream `permit_overrides` narrow downstream scope | Synthesizer declares `files_to_touch:[src/a.rs]`; coder attempts `src/b.rs` → blocked | — | ~80 |
-| M7 | E2E on toy repo with shipper role | Team ships a trivial PR to a dev forge repo; `gh pr view` confirms; dashboard shows full trace | forge-subprocess, mcp-forge | ~200 |
-| M8 | Project + cron + webhook triggers | Linux cron fires `orchestrator submit steward.json`; steward brief opens a PR editing ROADMAP.md on qbot-core | — | ~120 |
-| M9 | First real qbot-core issue closed | A trivially-specced open issue is picked, worked, PR merged on qbot-core | cfdb, graph-specs (external) | ~0 |
+**Brief discipline (pre- and post-cutoff):**
+- Before dispatching any brief: read the forge issue, read the affected source, query cfdb for affected symbols, read the relevant `specs/contexts/` or `specs/concepts/` file. If the spec is missing or stale for what the brief would touch, spec update goes first (either a precursor brief or folded into the scope).
+- Brief payloads use verbs `CREATE / DELETE / REPLACE / UPDATE / MOVE` + `crate:file:line` targets. Free-form "fix this issue" briefs are forbidden.
+- See `docs/dogfood-protocol.md` for the example payload shape and the dispatch recipe.
 
-## Drift-prevention rules (re-read at every milestone start)
+## Seeding roles
 
-1. **No verdict, no close.** Every milestone's commit body links the `agentry:verdicts` entry + the dashboard trace.
-2. **LOC ceiling per milestone: ~250.** Over = scope-creep. Revisit.
-3. **No new primitives between M0–M9.** Four records + one event contract. Anything beyond = M10+.
-4. **Dashboard-first.** No feature without a visible surface (M1+).
-5. **Dogfood ratchet from M7 on.** Every M<N+1> PR must be opened by the v2 orchestrator itself.
-6. **Every milestone has a kill switch.** `orchestrator abort --all` works.
-7. **Replay principle.** Brief + verdict + trace always on Redis; any run replayable from dashboard.
-8. **No edits outside `/var/mnt/workspaces/agentry/`.**
-9. **No push to any repo other than `agency:yg/agentry`.**
-10. **No InMemory in production paths.** Test doubles feature-gated only.
+`orchestrator seed` loads roles from two sources and writes them to the registry:
 
-## Explicitly deferred to M10+ (do NOT build these before M9)
+1. The Rust-defined defaults compiled into `crates/orchestrator-runtime/src/seed.rs`.
+2. Any `*.json` files in `seed/roles/` at the workspace root (override the directory with `AGENTRY_SEED_ROLES_DIR=<path> orchestrator seed`).
 
-- Additional substrates beyond podman (LXC, Docker, SSH, VM).
-- PHOSPHENE-style absence telemetry.
-- Budget/escalation UI beyond a numeric cap.
-- Multi-project concurrency controls.
-- Episodic memory / cross-brief knowledge transfer.
-- Auto-retry strategies.
-- Visual team-graph editor (forms are enough).
-- Any "plugin architecture".
+JSON role files use the same `AgentRole` struct schema as the Rust definitions; `serde(deny_unknown_fields)` rejects typos. `~/` and `${HOME}` in any `Mount.source` are expanded against the substrate's `$HOME` at seed time (see issue #199 for context).
 
-## Resumption protocol (for a fresh session)
+Inspect or pre-validate role definitions with `orchestrator role list / show / validate`; the equivalent for workflows is `orchestrator team list / show / register / validate`.
 
-Any future Claude session picking this up MUST:
+Operator note: re-running `orchestrator seed` after editing a JSON file is idempotent (last-writer-wins via `save_role`) and required for the daemon to pick up the change.
 
-1. `cd /var/mnt/workspaces/agentry && git status && git log --oneline -20`
-2. Read `AGENTRY_RESUME.md` (this file) + `TODO.md` (next action) + `docs/PROPOSAL.md` (the full shape).
-3. `mcp__memory__get key="project:agentry:resume"` — supplementary Redis state (last milestone completed, current focus, open TODOs).
-4. `just verdicts` (or `redis-cli -h 127.0.0.1 -p 6380 -a "$(cat ~/.config/agentry/redis.password)" --no-auth-warning XREVRANGE agentry:verdicts + - COUNT 10`) — verify last verdicts.
-5. `just dev-up` if starting fresh work session; verify dev infra is up.
-6. Continue from "Next concrete action" in `TODO.md`.
+## Known limitations (current develop)
 
-**DO NOT** invent new primitives, add a new crate, or re-open deferred features. If tempted, stop and re-read drift rules above.
+- **Single-daemon.** `orchestratord` uses `XREAD BLOCK $` — no consumer groups. Running two daemon processes against the same Redis double-processes every brief. Issue #13 introduces concurrent brief execution; multi-daemon consumer groups are a later step.
+- **Sequential role iteration.** Within a single brief, the daemon loops over `team.roles` in declaration order — the DAG walk of `message_graph` lands in #13.
+- **No rework loop.** Reviewer's verdict is boolean (`Shipped` or `Failed`); structured findings + coder↔reviewer iteration come in #11.
+- **Mechanical reviewer only.** LLM review (`reviewer-claude-agentry`) arrives in #12 after `ReviewFinding` lands.
+- **No ci-watcher.** Shipper opens a PR; a human merges it after CI goes green. Auto-merge lands in #9.
+- **Minimal workspace.** Coder `git clone`s inside its container per brief. Bare-clone + `git worktree add` is #10.
+- **No MCP server mounting at runtime.** `AgentRole.mcp_servers` is declared but the spawner ignores it today.
+- **`fetch_role_any_version` iterates v1..v5 and picks the first hit.** Later versions lose to earlier. Will bite when a role's version gets bumped. Not yet filed as an issue; fix is trivial.
+- **Shipper's `permit_scope` is symbolic.** `forge:write:yg/agentry` in the scope is not runtime-checked against `brief.payload.repo`. A brief with a different repo in the payload would still push there if the shipper's GITEA_TOKEN authorises it. Internal trust only until it becomes a real concern.
 
-## Known limitations (M0 / M1 / M2 / M3 / M4 / M5a / M5b / M6 / M7)
+## Previous state (for diffing)
 
-- **M7 verify is not idempotent by design.** Fixed branch name in `verify-M7.json`. First run opens the PR; subsequent runs find the existing PR event in the trace stream. Proof is on the forge, not the repeatability of the grep. Fix if it bites: randomize branch per run.
+`docs/PROPOSAL.md` contains the 2026-04-23 archaeology proposal that seeded this project. It describes a roadmap in M0-M9 milestones. That framing is retired: the project now plans in GitHub-issue-sized transformations with explicit verbs + file:line targets, not in milestones. The proposal is kept for the motivation + context it encodes, not for its roadmap.
 
+## Recent milestones
 
-- **SELinux + bind mounts:** rootless podman on Fedora/Silverblue requires `--security-opt label=disable` to read host-owned files. Spawner auto-adds it whenever `role.mounts` is non-empty. Don't use `:z`/`:Z` — they relabel the host path.
-- **Claude Max via bind-mounted binary + `~/.claude/.credentials.json`.** `settings.json` is also mounted read-only. Container's `HOME` is `/root`; `~/.claude` maps from the host.
+- 2026-04-29: EPIC #182 sub-issue #190 closed. Substrate now runs Commandant-authored workflows via `orchestrator team register`. agentry-self-host-v2 (coder → git-op-commit → reviewer → git-op-push → ci-watcher) replaces the empty_diff-broken v1.
 
-## OLD Known limitations (M0 / M1 / M2 / M3 / M4 / M5a)
+## Last updated
 
-- **Single-daemon only.** `orchestratord` uses `XREAD BLOCK $` — no consumer groups. Two daemons will both consume a brief → double-processing. Production uses a single systemd user unit; this is fine until M4+. Dodge: `pkill -f orchestratord` before `orchestratord`.
-- **Permit signing is active from M3.** Run `orchestrator key-gen` once; key lives at `~/.config/agentry/signing.key` (0600). Without the key, `orchestratord` refuses to start.
-- **Message routing is sequential only.** M4 ships role-A → role-B hand-off via accumulated `team_context.messages` in the next role's startup bundle. Roles run one-at-a-time; parallel team execution is M10+.
-- **Registry editor is create-only.** M2 ships list + new + POST for Role/Team/Project. Edit (PUT/PATCH) + delete land when the need surfaces; until then version-bump on every save is the history trail.
-- **No CSRF / auth on the dashboard.** Single-user LAN dev tool. Shipping to any shared network is a separate M10+ concern.
-- **303 redirect + curl quirk:** curl by default does NOT downgrade POST → GET on a 303 (contrary to RFC 7231). Every form POST from curl must NOT use `-L`; browser clients follow the PRG pattern correctly.
-
-## Frozen rules (do not re-open)
-
-### Terminal rules
-- **Claude is Claude Max subscription only — NEVER the per-token Anthropic API.** Any Claude agent subprocesses the host's `claude` CLI. No `ANTHROPIC_API_KEY`, no `anthropic` SDK, no HTTP to api.anthropic.com. Grok and Gemini APIs are fine (cheap/fast models). See `~/.claude/projects/-var-mnt-workspaces-agency-orchestrator/memory/feedback_claude_max_only.md`.
-
-### Design points
-- Front-door = any client (app/CLI/IDE) writing to `agentry:briefs`. Not an agentry agent.
-- Dashboard = Axum + htmx + Alpine + Tailwind CDN. No SPA. Leptos islands reserved for a future drag-drop graph editor.
-- Registry storage = Redis + typed dashboard forms. No YAML files.
-- cfdb + graph-specs = role-embodied enforcers, not runtime-embedded.
-- Phases = graph convention (synthesizer emits `permit_overrides` consumed downstream). Not a separate type.
-- Triggers = Linux cron + one webhook route + `next_brief` on verdicts. No scheduler crate.
-- Project = 40-line record; standing orders live there.
-
----
-
-*Last updated: see `git log -1 AGENTRY_RESUME.md`. If this document drifts from the code, the code is right.*
+See `git log -1 AGENTRY_RESUME.md`. If this document drifts from the code, the code is right and this document is a bug to fix via a brief.
+_poc_v6: 2026-04-25_

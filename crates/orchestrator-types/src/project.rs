@@ -51,30 +51,16 @@ pub struct Project {
     pub steward_topology: Option<TeamName>,
     #[serde(default)]
     pub standing_orders: StandingOrders,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn project_roundtrip_json() {
-        let p = Project {
-            slug: ProjectSlug("qbot-core".into()),
-            name: "qbot-core".into(),
-            forges: vec!["agency:yg/qbot-core".into()],
-            default_topology: Some(TeamName("qbot-issue-team".into())),
-            steward_topology: Some(TeamName("qbot-steward".into())),
-            standing_orders: StandingOrders {
-                tokens_daily: Some(2_000_000),
-                usd_daily: Some(20.0),
-                default_escalation: EscalationMode::Autonomous,
-                priorities: vec!["close RFC-023".into()],
-                forbidden: vec!["git:force-push:main".into()],
-            },
-        };
-        let s = serde_json::to_string(&p).expect("ser");
-        let back: Project = serde_json::from_str(&s).expect("de");
-        assert_eq!(p, back);
-    }
+    /// Optional forge URL for the project's primary repo. When set, briefs
+    /// naming this project get their workspace allocated as a `git worktree`
+    /// off a shared bare clone at `<workspace-root>/.clones/<org>/<repo>/`.
+    /// Example: `https://forge.example/owner/repo.git`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_url: Option<String>,
+    /// Optional base branch. When set together with `repo_url`, this is the
+    /// ref the bare clone tracks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrent_briefs: Option<u32>,
 }

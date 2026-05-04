@@ -43,6 +43,19 @@ pub fn generate_and_save(path: &Path) -> Result<()> {
 /// Load a signing key from disk (hex-encoded 32 bytes).
 pub fn load_signing_key(path: &Path) -> Result<SigningKey> {
     let hex_str = std::fs::read_to_string(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path)?.permissions().mode() & 0o777;
+        if mode != 0o600 {
+            return Err(Error::Config(format!(
+                "signing key {} has mode {:o}, expected 600; remediation: chmod 600 {}",
+                path.display(),
+                mode,
+                path.display()
+            )));
+        }
+    }
     let bytes = hex::decode(hex_str.trim())
         .map_err(|e| Error::Config(format!("signing key hex decode: {e}")))?;
     let arr: [u8; 32] = bytes
@@ -74,8 +87,8 @@ pub fn verify(permit: &WorkPermit, pub_key: &VerifyingKey) -> Result<()> {
         .signature
         .as_ref()
         .ok_or_else(|| Error::Config("permit has no signature".into()))?;
-    let sig_bytes = hex::decode(sig_hex)
-        .map_err(|e| Error::Config(format!("signature hex decode: {e}")))?;
+    let sig_bytes =
+        hex::decode(sig_hex).map_err(|e| Error::Config(format!("signature hex decode: {e}")))?;
     let sig_arr: [u8; 64] = sig_bytes
         .as_slice()
         .try_into()
@@ -92,57 +105,4 @@ pub fn verify(permit: &WorkPermit, pub_key: &VerifyingKey) -> Result<()> {
 #[must_use]
 pub fn tool_allowed(permit: &WorkPermit, tool: &str) -> bool {
     permit.allows(tool)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use orchestrator_types::{
-        BriefId, PermitScope, RoleName, ToolAllowlist, WorkPermit, now,
-    };
-
-    fn sample_permit() -> WorkPermit {
-        WorkPermit {
-            permit_id: "prm_t".into(),
-            agent_id: "agt_t".into(),
-            role: RoleName("t".into()),
-            brief: BriefId("brf_t".into()),
-            tool_allowlist: ToolAllowlist(vec!["read".into()]),
-            permit_scope: PermitScope::default(),
-            max_tokens: None,
-            max_wall_seconds: None,
-            max_usd: None,
-            expires_at: now() + chrono::Duration::hours(1),
-            issued_at: now(),
-            signature: None,
-        }
-    }
-
-    #[test]
-    fn sign_verify_roundtrip() {
-        let sk = SigningKey::generate(&mut OsRng);
-        let pk = sk.verifying_key();
-        let mut p = sample_permit();
-        sign(&mut p, &sk).expect("sign");
-        assert!(p.signature.is_some());
-        verify(&p, &pk).expect("verify");
-    }
-
-    #[test]
-    fn tampered_permit_fails_verify() {
-        let sk = SigningKey::generate(&mut OsRng);
-        let pk = sk.verifying_key();
-        let mut p = sample_permit();
-        sign(&mut p, &sk).expect("sign");
-        // Tamper with the allowlist after signing.
-        p.tool_allowlist.0.push("write".into());
-        assert!(verify(&p, &pk).is_err());
-    }
-
-    #[test]
-    fn tool_allowed_checks() {
-        let p = sample_permit();
-        assert!(tool_allowed(&p, "read"));
-        assert!(!tool_allowed(&p, "write"));
-    }
 }

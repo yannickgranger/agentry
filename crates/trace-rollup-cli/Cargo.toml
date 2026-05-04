@@ -1,0 +1,17 @@
+# Aspirational stub. Exists to ground the Stable Dependencies Principle
+# for `trace-query` — see crates/watchdog-alerts/Cargo.toml for the same
+# rationale. Will become a binary crate when monthly rollup becomes a
+# regular operator workflow.
+[package]
+name = "trace-rollup-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+trace-query = { path = "../trace-query" }
+
+[lints]
+workspace = true

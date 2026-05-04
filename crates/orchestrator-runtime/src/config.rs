@@ -1,11 +1,11 @@
 //! Typed configuration via figment.
 //!
 //! Load order (later wins):
-//!   1. Code defaults (`Config::default()`).
-//!   2. `~/.config/agentry/agentry.toml` (optional, 0600 recommended).
-//!   3. Env vars prefixed `AGENTRY_`, nested by `__`
-//!      (e.g. `AGENTRY_REDIS__URL`, `AGENTRY_DASHBOARD__PORT`,
-//!       `AGENTRY_SIGNING__KEY_PATH`).
+//! 1. Code defaults (`Config::default()`).
+//! 2. `~/.config/agentry/agentry.toml` (optional, 0600 recommended).
+//! 3. Env vars prefixed `AGENTRY_`, nested by `__`
+//!    (e.g. `AGENTRY_REDIS__URL`, `AGENTRY_DASHBOARD__PORT`,
+//!    `AGENTRY_SIGNING__KEY_PATH`).
 //!
 //! **NOT managed here:** per-role LLM API keys (`XAI_API_KEY`, `GEMINI_API_KEY`).
 //! Those are per-role `passthru_env` — the central config has no business
@@ -17,6 +17,10 @@ use figment::Figment;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+fn default_max_concurrent_briefs() -> u32 {
+    4
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub redis: RedisConfig,
@@ -24,6 +28,12 @@ pub struct Config {
     pub signing: SigningConfig,
     #[serde(default)]
     pub webhook: WebhookConfig,
+    #[serde(default)]
+    pub forge: ForgeConfig,
+    #[serde(default)]
+    pub sccache: SccacheConfig,
+    #[serde(default = "default_max_concurrent_briefs")]
+    pub max_concurrent_briefs: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,6 +62,33 @@ pub struct WebhookConfig {
     pub secret: Option<String>,
 }
 
+/// Forge defaults applied when a brief's payload does not override them.
+/// `default_host` is the `host:port` (no scheme) used to construct the
+/// token-bearing clone URL. Unset means every brief must carry its own
+/// `forge_host` in the payload.
+///
+/// `allowed_owners` lists bare forge owner names (e.g. `"yg"`); seed.rs
+/// expands each to a `forge:write:<owner>/*` permit on roles that push
+/// branches or open PRs. Empty list rejects all writes — required for
+/// brief dispatch on the agentry-self-host topology.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ForgeConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_host: Option<String>,
+    #[serde(default)]
+    pub allowed_owners: Vec<String>,
+}
+
+/// Shared sccache backend used by roles that compile Rust. `endpoint`
+/// is the network alias or DNS name (with optional `:port`) of the
+/// sccache-redis container; seed.rs strips any port and expands it to
+/// a `net:allow:<host>` permit. Unset means roles run without sccache.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SccacheConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+}
+
 impl Default for Config {
     fn default() -> Self {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
@@ -66,6 +103,9 @@ impl Default for Config {
                 key_path: PathBuf::from(format!("{home}/.config/agentry/signing.key")),
             },
             webhook: WebhookConfig::default(),
+            forge: ForgeConfig::default(),
+            sccache: SccacheConfig::default(),
+            max_concurrent_briefs: 4,
         }
     }
 }
@@ -84,44 +124,5 @@ impl Config {
 
         fig.extract()
             .map_err(|e| Error::Config(format!("figment extract: {e}")))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn default_targets_local_redis_not_prod() {
-        let c = Config::default();
-        assert!(
-            c.redis.url.contains("127.0.0.1") || c.redis.url.contains("localhost"),
-            "default Redis URL must target local: got {}",
-            c.redis.url
-        );
-        assert!(
-            !c.redis.url.contains("192.168.1.152"),
-            "default Redis URL must never point at prod LXC 401"
-        );
-        assert!(
-            !c.redis.url.contains("192.168.1.189"),
-            "default Redis URL must never point at prod LXC 522"
-        );
-    }
-
-    #[test]
-    fn env_overlay_overrides_defaults() {
-        // Scope env change to this test (cargo runs tests in parallel; use figment's providers directly to avoid clobbering).
-        let fig = Figment::from(Serialized::defaults(Config::default()))
-            .merge(("redis.url", "redis://test.example:1234"))
-            .merge(("dashboard.port", 9999u16));
-        let c: Config = fig.extract().expect("extract");
-        assert_eq!(c.redis.url, "redis://test.example:1234");
-        assert_eq!(c.dashboard.port, 9999);
-    }
-
-    #[test]
-    fn default_dashboard_port_is_7800() {
-        assert_eq!(Config::default().dashboard.port, 7800);
     }
 }

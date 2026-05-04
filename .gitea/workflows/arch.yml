@@ -1,0 +1,103 @@
+name: Arch
+
+# Spec-drift gate + code-fact extraction.
+#
+# Runs on every push to a feature branch and on every PR into main/develop.
+# Installs pinned revisions of cfdb (x-ray) and graph-specs-rust (vaccine),
+# then:
+#   1. graph-specs check — blocks on concept-level spec/code drift.
+#   2. cfdb extract — produces a fact graph artifact (proves extractor health).
+#   3. cfdb violations — runs every *.cypher in .cfdb/queries/ (empty today;
+#      rules are added one at a time in their own PRs).
+#
+# The single source of truth for what runs locally vs in CI is
+# scripts/arch-check.sh. This workflow installs the tools and shells out.
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+      - 'feat/*'
+      - 'fix/*'
+      - 'docs/*'
+      - 'ci/*'
+    paths:
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'specs/**'
+      - '.cfdb/**'
+      - '.gitea/workflows/arch.yml'
+      - 'scripts/arch-check.sh'
+  pull_request:
+    branches:
+      - main
+      - develop
+
+env:
+  CARGO_TERM_COLOR: always
+  GIT_SSL_NO_VERIFY: true
+  CARGO_HOME: /cache/cargo
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+  SCCACHE_REDIS_ENDPOINT: "redis://192.168.1.107:6380"
+  SCCACHE_REDIS_KEY_PREFIX: "agentry-arch-1.93"
+  SCCACHE_REDIS_EXPIRATION: "604800"
+
+concurrency:
+  group: arch-${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  arch:
+    name: graph-specs + cfdb
+    runs-on: rust
+    container:
+      image: docker.io/library/rust:1.93
+    steps:
+      - name: Setup
+        run: |
+          set -e
+          apt-get clean && apt-get update && apt-get install -y --no-install-recommends \
+            git build-essential libssl-dev pkg-config curl ca-certificates
+          mkdir -p /cache/cargo/registry /cache/cargo/git /cache/cargo/bin ~/.cargo
+          ln -sf /cache/cargo/registry ~/.cargo/registry
+          ln -sf /cache/cargo/git ~/.cargo/git
+          rustc --version
+
+      - name: Clone
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BRANCH=${GITHUB_HEAD_REF:-${GITHUB_REF#refs/heads/}}
+          git config --global url."https://oauth2:${GITHUB_TOKEN}@agency.lab:3000/".insteadOf "https://agency.lab:3000/"
+          git clone --depth=1 --branch="$BRANCH" "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git" repo
+
+      - name: Install cfdb + graph-specs at pinned revs
+        run: |
+          set -e
+          cd repo
+          CFDB_REV=$(cat .cfdb/cfdb.rev | tr -d '[:space:]')
+          GRAPHSPECS_REV=$(cat .cfdb/graph-specs.rev | tr -d '[:space:]')
+          echo "Installing cfdb @ ${CFDB_REV}"
+          cargo install --git https://agency.lab:3000/yg/cfdb.git --rev "$CFDB_REV" --locked --root /cache/cargo cfdb-cli
+          echo "Installing graph-specs @ ${GRAPHSPECS_REV}"
+          cargo install --git https://agency.lab:3000/yg/graph-specs-rust.git --rev "$GRAPHSPECS_REV" --locked --root /cache/cargo application
+          echo "PATH=/cache/cargo/bin:${PATH}" >> "$GITHUB_ENV"
+          /cache/cargo/bin/cfdb --version || true
+          /cache/cargo/bin/graph-specs --version || true
+
+      - name: Run arch check
+        run: |
+          cd repo
+          bash scripts/arch-check.sh
+
+      - name: cfdb fact counts (diagnostic)
+        if: always()
+        run: |
+          cd repo
+          if [ -d ".cfdb/db-local" ]; then
+            /cache/cargo/bin/cfdb dump --db .cfdb/db-local --keyspace agentry 2>/dev/null | wc -l | awk '{print "cfdb fact lines: " $1}'
+          else
+            echo "cfdb db-local not present — extract step did not complete"
+          fi

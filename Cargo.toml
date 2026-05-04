@@ -1,9 +1,24 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/orchestrator-types",
-    "crates/orchestrator-runtime",
+    "crates/agentry-role-runtime",
+    "crates/coder-precommit",
     "crates/orchestrator-dashboard",
+    "crates/orchestrator-runtime",
+    "crates/orchestrator-types",
+    "crates/quality-fast",
+    "crates/trace-query",
+    "crates/trace-rollup-cli",
+    "crates/validators",
+    "crates/watchdog-alerts",
+]
+default-members = [
+    "crates/agentry-role-runtime",
+    "crates/coder-precommit",
+    "crates/orchestrator-dashboard",
+    "crates/orchestrator-runtime",
+    "crates/orchestrator-types",
+    "crates/validators",
 ]
 
 [workspace.package]
@@ -16,6 +31,7 @@ repository = "https://agency.lab:3000/yg/agentry"
 
 [workspace.dependencies]
 # Core
+schemars = { version = "0.8", features = ["chrono", "derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
@@ -26,6 +42,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Async + Redis
 redis = { version = "0.27", features = ["tokio-comp", "streams", "aio", "connection-manager"] }
 async-trait = "0.1"
+futures = "0.3"
 
 # Time + IDs
 chrono = { version = "0.4", features = ["serde"] }
@@ -47,12 +64,16 @@ clap = { version = "4", features = ["derive"] }
 
 # Config (typed, layered: defaults + TOML + env overlay)
 figment = { version = "0.10", features = ["toml", "env"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
 
+# Targeted lints only. Pedantic is noise for a small utilitarian workspace;
+# re-enable individual pedantic lints if a concrete bug class surfaces.
+# `expect_used` intentionally omitted — `.expect("context")` is idiomatic in tests
+# and in code where a panic-with-context is the right response.
 [workspace.lints.clippy]
-pedantic = { level = "warn", priority = -1 }
 unwrap_used = "warn"
-module_name_repetitions = "allow"
-missing_errors_doc = "allow"
+todo = "warn"
+dbg_macro = "warn"

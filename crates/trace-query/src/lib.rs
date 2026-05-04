@@ -1,0 +1,267 @@
+//! Concrete trace-metric producer.
+//!
+//! Reads three existing data sources for a brief and folds them into a
+//! single `TraceMetric` value:
+//!   * `agentry:brief:{brief_id}:trace` — Redis stream of agent events.
+//!   * `/transcripts/{brief_id}.jsonl`  — claude transcript on disk.
+//!   * `agentry:audit:tool-calls:{brief_id}` — tool-call audit log.
+//!
+//! v1 is best-effort: if a source is unreachable, the corresponding
+//! fields are emitted as zero rather than failing the whole aggregate.
+
+use std::fs;
+
+use serde::{Deserialize, Serialize};
+
+const TRANSCRIPTS_DIR: &str = "/transcripts";
+
+/// One brief's worth of folded trace evidence. Field set is fixed by
+/// `specs/concepts/trace_metric.md#TraceMetric`; do not extend without a
+/// corresponding spec change.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct TraceMetric {
+    #[serde(default)]
+    pub brief_id: String,
+    #[serde(default)]
+    pub compile_cycles: u32,
+    #[serde(default)]
+    pub reads_before_first_edit: u32,
+    #[serde(default)]
+    pub refusal_count: u32,
+    #[serde(default)]
+    pub wall_seconds: u64,
+    #[serde(default)]
+    pub lines_changed: u32,
+    #[serde(default)]
+    pub verb_citation_density: f32,
+}
+
+/// Fold the three data sources for `brief_id` into a `TraceMetric`.
+///
+/// Best-effort: an unreachable source contributes zero to its fields.
+/// Returns `Err` only when the call cannot produce even a partial
+/// result (which today is never — every source is guarded individually).
+pub fn aggregate(brief_id: &str, redis: &mut redis::Connection) -> anyhow::Result<TraceMetric> {
+    use compute::{count_compile_cycles, count_reads_before_first_edit, count_refusals};
+
+    let mut metric = TraceMetric {
+        brief_id: brief_id.to_string(),
+        ..TraceMetric::default()
+    };
+
+    if let Ok(events) = read_trace_stream(brief_id, redis) {
+        metric.compile_cycles = count_compile_cycles(&events);
+        metric.reads_before_first_edit = count_reads_before_first_edit(&events);
+        metric.refusal_count = count_refusals(&events);
+    }
+
+    let transcript = format!("{TRANSCRIPTS_DIR}/{brief_id}.jsonl");
+    if let Ok(body) = fs::read_to_string(&transcript) {
+        metric.wall_seconds = wall_seconds_from_transcript(&body);
+        // lines_changed left at 0 for v1 — transcript line-count
+        // deltas require parsing tool-result payloads in a way that
+        // is not yet stable across claude versions.
+    }
+
+    // verb_citation_density left at 0.0 for v1 — the brief payload's
+    // verb list is not yet wired into the audit log shape used by all
+    // roles. Reading the audit log is still attempted so a future
+    // implementation can evolve the field without changing the
+    // aggregate signature.
+    let _ = read_audit_log(brief_id, redis);
+
+    Ok(metric)
+}
+
+/// XRANGE the brief's trace stream and pull out each entry's `event`
+/// field as a parsed JSON value. Empty streams return an empty Vec.
+fn read_trace_stream(
+    brief_id: &str,
+    conn: &mut redis::Connection,
+) -> anyhow::Result<Vec<serde_json::Value>> {
+    let stream_key = format!("agentry:brief:{brief_id}:trace");
+    let reply: redis::streams::StreamRangeReply = redis::cmd("XRANGE")
+        .arg(&stream_key)
+        .arg("-")
+        .arg("+")
+        .query(conn)?;
+    let mut out = Vec::with_capacity(reply.ids.len());
+    for entry in reply.ids {
+        if let Some(body) = entry.map.get("event").and_then(redis_value_as_str) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
+                out.push(v);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// LRANGE the brief's tool-call audit log. Stored as a Redis list of
+/// JSON-encoded strings, one per tool call, in append order.
+fn read_audit_log(
+    brief_id: &str,
+    conn: &mut redis::Connection,
+) -> anyhow::Result<Vec<serde_json::Value>> {
+    let key = format!("agentry:audit:tool-calls:{brief_id}");
+    let entries: Vec<String> = redis::cmd("LRANGE").arg(&key).arg(0).arg(-1).query(conn)?;
+    let mut out = Vec::with_capacity(entries.len());
+    for s in entries {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
+            out.push(v);
+        }
+    }
+    Ok(out)
+}
+
+fn redis_value_as_str(v: &redis::Value) -> Option<String> {
+    match v {
+        redis::Value::BulkString(b) => std::str::from_utf8(b).ok().map(String::from),
+        redis::Value::SimpleString(s) => Some(s.clone()),
+        _ => None,
+    }
+}
+
+/// Pure metric-compute helpers. Reused by `aggregate`'s reduction pass
+/// over a brief's trace events. These are pure functions over
+/// `serde_json::Value` slices — no I/O, no Redis.
+pub mod compute {
+    use serde_json::Value;
+
+    /// True iff the event is a Bash tool_call whose `command` arg invokes
+    /// the rust toolchain in a way that triggers a compile cycle (check,
+    /// build, test, clippy).
+    pub fn is_compile_cycle(event: &Value) -> bool {
+        if event.get("type").and_then(|v| v.as_str()) != Some("tool_call") {
+            return false;
+        }
+        let call = event.get("call");
+        let tool = call.and_then(|c| c.get("tool")).and_then(|v| v.as_str());
+        if tool != Some("Bash") {
+            return false;
+        }
+        let cmd = call
+            .and_then(|c| c.get("args"))
+            .and_then(|a| a.get("command"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        cmd.contains("cargo check")
+            || cmd.contains("cargo build")
+            || cmd.contains("cargo test")
+            || cmd.contains("cargo clippy")
+    }
+
+    /// Tool name from a tool_call event (e.g. "Bash", "Read"); `None`
+    /// for non-tool_call events.
+    pub fn tool_name(event: &Value) -> Option<&str> {
+        if event.get("type").and_then(|v| v.as_str()) != Some("tool_call") {
+            return None;
+        }
+        event
+            .get("call")
+            .and_then(|c| c.get("tool"))
+            .and_then(|v| v.as_str())
+    }
+
+    /// True iff the event is a tool_refused event (or carries an
+    /// explicit `payload.refused` flag from older roles).
+    pub fn is_refusal(event: &Value) -> bool {
+        if event.get("type").and_then(|v| v.as_str()) == Some("tool_refused") {
+            return true;
+        }
+        event
+            .get("payload")
+            .and_then(|p| p.get("refused"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    }
+
+    /// Count compile-cycle events in a slice of trace events.
+    pub fn count_compile_cycles(events: &[Value]) -> u32 {
+        u32::try_from(events.iter().filter(|e| is_compile_cycle(e)).count()).unwrap_or(u32::MAX)
+    }
+
+    /// Count Read tool calls that occurred before the first
+    /// Edit/Write/NotebookEdit call.
+    pub fn count_reads_before_first_edit(events: &[Value]) -> u32 {
+        let mut reads: u32 = 0;
+        for event in events {
+            match tool_name(event) {
+                Some("Edit" | "Write" | "NotebookEdit") => return reads,
+                Some("Read") => reads = reads.saturating_add(1),
+                _ => {}
+            }
+        }
+        reads
+    }
+
+    /// Count tool_refused events.
+    pub fn count_refusals(events: &[Value]) -> u32 {
+        u32::try_from(events.iter().filter(|e| is_refusal(e)).count()).unwrap_or(u32::MAX)
+    }
+}
+
+/// First→last `at` timestamp delta across the transcript's JSONL lines,
+/// in whole seconds. Returns 0 for an empty transcript or one whose
+/// timestamps don't parse as RFC3339.
+fn wall_seconds_from_transcript(body: &str) -> u64 {
+    let mut first: Option<i64> = None;
+    let mut last: Option<i64> = None;
+    for line in body.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(ts) = parse_ts(&v) else { continue };
+        first.get_or_insert(ts);
+        last = Some(ts);
+    }
+    match (first, last) {
+        (Some(a), Some(b)) if b >= a => u64::try_from(b - a).unwrap_or(0),
+        _ => 0,
+    }
+}
+
+fn parse_ts(v: &serde_json::Value) -> Option<i64> {
+    let s = v
+        .get("at")
+        .or_else(|| v.get("timestamp"))
+        .and_then(|t| t.as_str())?;
+    parse_rfc3339_secs(s)
+}
+
+/// Tiny RFC3339-to-epoch-seconds parser. Whole seconds only — chrono
+/// would be overkill for a one-shot transcript scan, and trace-query's
+/// dep set is constrained by spec.
+fn parse_rfc3339_secs(s: &str) -> Option<i64> {
+    // Accept e.g. 2026-04-30T12:34:56Z or 2026-04-30T12:34:56.123+00:00.
+    if s.len() < 19 {
+        return None;
+    }
+    let year: i64 = s.get(0..4)?.parse().ok()?;
+    let month: u32 = s.get(5..7)?.parse().ok()?;
+    let day: u32 = s.get(8..10)?.parse().ok()?;
+    let hour: u32 = s.get(11..13)?.parse().ok()?;
+    let minute: u32 = s.get(14..16)?.parse().ok()?;
+    let second: u32 = s.get(17..19)?.parse().ok()?;
+    Some(
+        days_from_civil(year, month, day) * 86400
+            + i64::from(hour) * 3600
+            + i64::from(minute) * 60
+            + i64::from(second),
+    )
+}
+
+/// Howard Hinnant's days-from-civil. Returns days since 1970-01-01.
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = u64::try_from(y - era * 400).unwrap_or(0);
+    let m = u64::from(m);
+    let d = u64::from(d);
+    let doy = (153 * if m > 2 { m - 3 } else { m + 9 } + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + i64::try_from(doe).unwrap_or(0) - 719468
+}

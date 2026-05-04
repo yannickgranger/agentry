@@ -1,13 +1,15 @@
 //! orchestrator — the CLI.
 //! `orchestrator submit <brief-file>` — submit a brief.
-//! `orchestrator seed` — seed the registry (M0: echo role + team).
+//! `orchestrator seed` — seed the registry (roles + teams).
 //! `orchestrator verdicts` — list last N verdicts.
 //! `orchestrator abort --all` — abort all running briefs.
 
 use clap::{Parser, Subcommand};
-use orchestrator_runtime::{Config, Result, permit, redis_io, seed};
+use orchestrator_runtime::{
+    cli_agents, cli_roles, cli_teams, permit, redis_io, seed, state, Config, Result,
+};
 use orchestrator_types::Brief;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Parser, Debug)]
 #[command(name = "orchestrator", version)]
@@ -23,7 +25,7 @@ enum Cmd {
         /// Path to a JSON Brief file.
         file: PathBuf,
     },
-    /// Seed the registry with M0 defaults (echo-agent role + echo-team).
+    /// Seed the registry with the default roles and team topologies.
     Seed,
     /// List the last N verdicts.
     Verdicts {
@@ -40,6 +42,70 @@ enum Cmd {
         /// Overwrite if the key already exists.
         #[arg(long)]
         force: bool,
+    },
+    /// Inspect the running fleet (NDJSON output).
+    Agents {
+        #[command(subcommand)]
+        sub: AgentsCmd,
+    },
+    /// Inspect the role catalog (engine-seeded; no register subcommand).
+    Role {
+        #[command(subcommand)]
+        sub: RoleCmd,
+    },
+    /// Inspect or mutate the team-topology catalog.
+    Team {
+        #[command(subcommand)]
+        sub: TeamCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum RoleCmd {
+    /// List every registered `(name, version)` pair.
+    List,
+    /// Print one role as pretty JSON.
+    Show { name: String, version: u32 },
+    /// Validate a role JSON file (parse-only; does NOT contact Redis).
+    Validate { file: PathBuf },
+    /// Print the JSON schema of `AgentRole` (offline; no Redis).
+    Schema,
+}
+
+#[derive(Subcommand, Debug)]
+enum TeamCmd {
+    /// List every registered `(name, version)` pair.
+    List,
+    /// Print one team topology as pretty JSON.
+    Show { name: String, version: u32 },
+    /// Validate + atomically register a `TeamTopology` JSON file.
+    Register { file: PathBuf },
+    /// Validate a `TeamTopology` JSON file without persisting.
+    Validate { file: PathBuf },
+    /// Print the JSON schema of `TeamTopology` (offline; no Redis).
+    Schema,
+}
+
+#[derive(Subcommand, Debug)]
+enum AgentsCmd {
+    /// List agents (default: status='running').
+    List {
+        #[arg(long)]
+        all: bool,
+    },
+    /// Run a read-only SELECT against the agent index.
+    Query { sql: String },
+    /// Show recent trace events for an agent.
+    Trace {
+        agent_id: String,
+        #[arg(long, default_value_t = 50)]
+        last: usize,
+    },
+    /// Show recent Status verdicts for an agent.
+    RecentStatus {
+        agent_id: String,
+        #[arg(long, default_value_t = 10)]
+        count: usize,
     },
 }
 
@@ -60,7 +126,10 @@ async fn main() -> Result<()> {
             let brief: Brief = serde_json::from_str(&text)?;
             let mut conn = redis_io::connect(&cfg.redis.url).await?;
             let id = redis_io::submit_brief(&mut conn, &brief).await?;
-            println!("{{\"submitted\":true,\"brief_id\":\"{}\",\"stream_id\":\"{}\"}}", brief.id, id);
+            println!(
+                "{{\"submitted\":true,\"brief_id\":\"{}\",\"stream_id\":\"{}\"}}",
+                brief.id, id
+            );
         }
         Cmd::Seed => {
             seed::seed_m0(&cfg).await?;
@@ -93,10 +162,7 @@ async fn main() -> Result<()> {
                 std::process::exit(2);
             }
             permit::generate_and_save(path)?;
-            println!(
-                "{{\"generated\":true,\"path\":\"{}\"}}",
-                path.display()
-            );
+            println!("{{\"generated\":true,\"path\":\"{}\"}}", path.display());
         }
         Cmd::Abort { all } => {
             if all {
@@ -118,6 +184,84 @@ async fn main() -> Result<()> {
                 std::process::exit(2);
             }
         }
+        Cmd::Agents { sub } => {
+            let state_path = std::env::var("AGENTRY_STATE_PATH").unwrap_or_else(|_| {
+                format!(
+                    "{}/.config/agentry/state.db",
+                    std::env::var("HOME").unwrap_or_else(|_| "/tmp".into())
+                )
+            });
+            match sub {
+                AgentsCmd::List { all } => {
+                    let state = state::open_or_init(Path::new(&state_path))?;
+                    let rows = cli_agents::list(&state, all).await?;
+                    for v in rows {
+                        println!("{}", serde_json::to_string(&v)?);
+                    }
+                }
+                AgentsCmd::Query { sql } => {
+                    let state = state::open_or_init(Path::new(&state_path))?;
+                    let rows = cli_agents::query(&state, &sql).await?;
+                    for v in rows {
+                        println!("{}", serde_json::to_string(&v)?);
+                    }
+                }
+                AgentsCmd::Trace { agent_id, last } => {
+                    let mut conn = redis_io::connect(&cfg.redis.url).await?;
+                    let rows = cli_agents::trace(&mut conn, &agent_id, last).await?;
+                    for v in rows {
+                        println!("{}", serde_json::to_string(&v)?);
+                    }
+                }
+                AgentsCmd::RecentStatus { agent_id, count } => {
+                    let mut conn = redis_io::connect(&cfg.redis.url).await?;
+                    let rows = cli_agents::recent_status(&mut conn, &agent_id, count).await?;
+                    for v in rows {
+                        println!("{}", serde_json::to_string(&v)?);
+                    }
+                }
+            }
+        }
+        Cmd::Role { sub } => match sub {
+            RoleCmd::Schema => cli_roles::schema()?,
+            RoleCmd::List => {
+                let mut conn = redis_io::connect(&cfg.redis.url).await?;
+                cli_roles::list(&mut conn).await?;
+            }
+            RoleCmd::Show { name, version } => {
+                let mut conn = redis_io::connect(&cfg.redis.url).await?;
+                cli_roles::show(&mut conn, &name, version).await?;
+            }
+            RoleCmd::Validate { file } => {
+                let mut conn = redis_io::connect(&cfg.redis.url).await?;
+                match cli_roles::validate(&mut conn, &file).await {
+                    Ok(()) => {}
+                    Err(_) => std::process::exit(2),
+                }
+            }
+        },
+        Cmd::Team { sub } => match sub {
+            TeamCmd::Schema => cli_teams::schema()?,
+            TeamCmd::List => {
+                let mut conn = redis_io::connect(&cfg.redis.url).await?;
+                cli_teams::list(&mut conn).await?;
+            }
+            TeamCmd::Show { name, version } => {
+                let mut conn = redis_io::connect(&cfg.redis.url).await?;
+                cli_teams::show(&mut conn, &name, version).await?;
+            }
+            TeamCmd::Register { file } => {
+                let mut conn = redis_io::connect(&cfg.redis.url).await?;
+                match cli_teams::register(&mut conn, &file).await {
+                    Ok(()) => {}
+                    Err(_) => std::process::exit(2),
+                }
+            }
+            TeamCmd::Validate { file } => {
+                let mut conn = redis_io::connect(&cfg.redis.url).await?;
+                cli_teams::validate(&mut conn, &file).await?;
+            }
+        },
     }
     Ok(())
 }

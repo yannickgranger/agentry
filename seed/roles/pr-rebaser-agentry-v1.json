@@ -1,0 +1,32 @@
+{
+  "name": "pr-rebaser-agentry",
+  "version": 1,
+  "model": null,
+  "system_prompt": null,
+  "image": "docker.io/library/debian:bookworm-slim",
+  "substrate_class": "podman",
+  "package_manager": "apt",
+  "entrypoint_script": "#!/bin/sh\nexec /usr/local/bin/pr-rebaser-runner\n",
+  "binaries": ["git", "curl", "jq", "ca-certificates"],
+  "mcp_servers": [],
+  "tool_allowlist": ["git", "curl"],
+  "permit_scope": [
+    "fs:read:/workspace/**",
+    "fs:write:/workspace/**",
+    "${FORGE_NET_ALLOW}",
+    "${FORGE_WRITE_PERMITS}"
+  ],
+  "passthru_env": ["GITEA_TOKEN"],
+  "mounts": [
+    {
+      "source": "${HOME}/.local/bin/pr-rebaser-runner",
+      "target": "/usr/local/bin/pr-rebaser-runner",
+      "readonly": true
+    }
+  ],
+  "workspace_mount": {
+    "container_path": "/workspace",
+    "readonly": false
+  },
+  "sccache": false
+}

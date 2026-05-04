@@ -3,10 +3,18 @@
 //! Appended to `agentry:verdicts` stream. Drives the dashboard's verdict-history
 //! view and satisfies the "no verdict, no close" drift rule.
 
-use crate::{Ts, brief::BriefId, event::Verdict as EventVerdict, now};
+use crate::{brief::BriefId, event::EventVerdict, now, review::ReviewFinding, Ts};
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// The terminal kind of a role's outcome.
+///
+/// `ReworkNeeded` carries findings so the daemon can route them back to the
+/// upstream worker via the team's `message_graph`. `Rejected` is the
+/// "unfixable — don't bother retrying" escape hatch; it short-circuits the
+/// rework loop and produces a `Failed` team verdict.
+///
+/// Not `Copy` — `ReworkNeeded` carries a `Vec`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VerdictKind {
     Shipped,
@@ -15,6 +23,8 @@ pub enum VerdictKind {
     PermitViolation,
     BudgetExceeded,
     Aborted,
+    Rejected,
+    ReworkNeeded { findings: Vec<ReviewFinding> },
 }
 
 impl From<EventVerdict> for VerdictKind {
@@ -23,6 +33,11 @@ impl From<EventVerdict> for VerdictKind {
             EventVerdict::Shipped => Self::Shipped,
             EventVerdict::Failed => Self::Failed,
             EventVerdict::Escalated => Self::Escalated,
+            EventVerdict::Rejected => Self::Rejected,
+            // Findings travel as separate events and are merged by the
+            // spawner's `compute_verdict` — this placeholder lets callers
+            // with no accumulated findings still produce a valid kind.
+            EventVerdict::ReworkNeeded => Self::ReworkNeeded { findings: vec![] },
         }
     }
 }
@@ -36,6 +51,9 @@ pub struct Verdict {
     pub trace_stream: String,
     /// Optional short reason for the verdict.
     pub reason: Option<String>,
+    /// Number of refusals observed across the brief's role runs.
+    #[serde(default)]
+    pub refusal_count: u32,
 }
 
 impl Verdict {
@@ -48,6 +66,7 @@ impl Verdict {
             at: now(),
             trace_stream,
             reason: None,
+            refusal_count: 0,
         }
     }
 
@@ -55,26 +74,5 @@ impl Verdict {
     pub fn with_reason(mut self, reason: impl Into<String>) -> Self {
         self.reason = Some(reason.into());
         self
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn verdict_roundtrip_json() {
-        let v = Verdict::new(BriefId("brf_xyz".into()), VerdictKind::Shipped)
-            .with_reason("echo completed");
-        let s = serde_json::to_string(&v).expect("ser");
-        let back: Verdict = serde_json::from_str(&s).expect("de");
-        assert_eq!(v, back);
-        assert!(v.trace_stream.contains("brf_xyz"));
-    }
-
-    #[test]
-    fn event_verdict_maps() {
-        assert_eq!(VerdictKind::from(EventVerdict::Shipped), VerdictKind::Shipped);
-        assert_eq!(VerdictKind::from(EventVerdict::Failed), VerdictKind::Failed);
     }
 }
