@@ -50,7 +50,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use agentry_role_runtime::{
-    emit_done, emit_event, emit_message, pointer_str, read_bundle_value, tail_bytes, DoneGuard,
+    emit_done, emit_event, emit_finding, emit_message, orphan_pub_finding, parse_callers_count,
+    parse_diff_added_lines, parse_unwraps_findings, pointer_str, pointer_str_or,
+    ra_query_skipped_event, read_bundle_value, tail_bytes, DoneGuard,
 };
 use chrono::Utc;
 use orchestrator_types::{DoneReason, EventVerdict};
@@ -297,6 +299,144 @@ fn main() {
         }));
     }
 
+    // ----- ra-query unwraps stage (per-site Warn findings, brief #87 phase2) -----
+    //
+    // Distinct from the aggregate `unwraps_report` above: that emits one
+    // event with file-level critical counts so the self-heal dispatch can
+    // rank top-3 files; this stage emits one Warn ReviewFinding per
+    // unwrap site so downstream dashboards / coder rework prompts can
+    // address sites individually. Severity is always Warn — the brief
+    // calls out NEVER emitting Blocker.
+    'ra_unwraps_findings: {
+        if !which_on_path("ra-query") {
+            emit_event(ra_query_skipped_event(
+                "unwraps_findings",
+                "ra-query binary missing",
+            ));
+            break 'ra_unwraps_findings;
+        }
+        let mut findings_emitted: u64 = 0;
+        for file in walk_crate_rs_files() {
+            let file_str = file.to_string_lossy().to_string();
+            let res = match ra_query_capture(&["unwraps", &file_str, "--format", "json"]) {
+                Some(v) => v,
+                None => continue,
+            };
+            for f in parse_unwraps_findings(&file_str, &res) {
+                emit_finding(&f);
+                findings_emitted += 1;
+            }
+        }
+        emit_event(json!({
+            "msg": "ra_query_unwraps_findings_complete",
+            "findings_emitted": findings_emitted,
+        }));
+    }
+
+    // ----- ra-query callers + pub-surface stage: orphan-pub Warn findings -----
+    //
+    // For each pub item INTRODUCED in this brief (line number falls
+    // inside the unified-zero diff vs base_branch) and reachable by zero
+    // workspace callers, emit a Warn `orphan_pub` finding. Best-effort:
+    // a missing ra-query, git failure, or unparseable pub-surface output
+    // shorts out with a `_skipped` event and the auditor proceeds.
+    'ra_orphan_pub: {
+        if !which_on_path("ra-query") {
+            emit_event(ra_query_skipped_event(
+                "orphan_pub",
+                "ra-query binary missing",
+            ));
+            break 'ra_orphan_pub;
+        }
+        let base_branch = pointer_str_or(&bundle, "/brief/payload/base_branch", "develop");
+        let diff_text = match git_diff_unified_zero(&base_branch) {
+            Ok(d) => d,
+            Err(e) => {
+                emit_event(ra_query_skipped_event(
+                    "orphan_pub",
+                    &format!("git diff failed: {e}"),
+                ));
+                break 'ra_orphan_pub;
+            }
+        };
+        let added: std::collections::BTreeMap<String, std::collections::BTreeSet<u32>> =
+            parse_diff_added_lines(&diff_text);
+        if added.is_empty() {
+            emit_event(json!({
+                "msg": "ra_query_orphan_pub_complete",
+                "findings_emitted": 0,
+                "detail": "no added lines in diff",
+            }));
+            break 'ra_orphan_pub;
+        }
+        let mut findings_emitted: u64 = 0;
+        for ctoml in walk_crate_cargo_tomls() {
+            let cdir = match ctoml.parent() {
+                Some(p) => p.to_path_buf(),
+                None => continue,
+            };
+            let pout = match ra_query_capture(&[
+                "pub-surface",
+                cdir.to_string_lossy().as_ref(),
+                "--format",
+                "json",
+            ]) {
+                Some(v) => v,
+                None => continue,
+            };
+            let items = match pout.as_array() {
+                Some(a) => a.clone(),
+                None => continue,
+            };
+            for item in items {
+                let ifile = match item.get("file").and_then(Value::as_str) {
+                    Some(s) if !s.is_empty() => s.to_string(),
+                    _ => continue,
+                };
+                // pub-surface emits absolute paths; the diff map is
+                // workspace-relative. Normalise both ends.
+                let ifile_rel = ifile
+                    .strip_prefix(&format!("{WORKSPACE_DIR}/"))
+                    .map(str::to_string)
+                    .unwrap_or_else(|| ifile.clone());
+                let iline = match item.get("line").and_then(Value::as_u64) {
+                    Some(l) => l as u32,
+                    None => continue,
+                };
+                let added_lines = match added.get(&ifile_rel) {
+                    Some(s) => s,
+                    None => continue,
+                };
+                if !added_lines.contains(&iline) {
+                    continue;
+                }
+                let iname = item
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("?")
+                    .to_string();
+                let ikind = item
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .unwrap_or("item")
+                    .to_string();
+                let pos = format!("{ifile_rel}:{iline}:1");
+                let cout = match ra_query_capture(&["callers", &pos, "--format", "json"]) {
+                    Some(v) => v,
+                    None => continue,
+                };
+                if parse_callers_count(&cout) == 0 {
+                    emit_finding(&orphan_pub_finding(&ifile_rel, iline, &iname, &ikind));
+                    findings_emitted += 1;
+                }
+            }
+        }
+        emit_event(json!({
+            "msg": "ra_query_orphan_pub_complete",
+            "findings_emitted": findings_emitted,
+        }));
+    }
+
     // ----- Self-heal child-brief dispatch -----
     let _ = std::fs::create_dir_all(format!("{WORKSPACE_DIR}/audit-children"));
     let host_workspace = format!("{HOST_WORKSPACE_PREFIX}/{brief_id}");
@@ -411,6 +551,31 @@ fn run_udeps_json() -> String {
     } else {
         s
     }
+}
+
+/// `git diff --unified=0 <base_branch>...HEAD` capturing stdout. Used by
+/// the orphan-pub stage to identify pub items added in this brief. The
+/// 3-dot range is symmetric (HEAD vs merge-base with base) — the same
+/// shape `reviewer_claude_runner` uses for its review prompt.
+fn git_diff_unified_zero(base_branch: &str) -> Result<String, String> {
+    let range = format!("{base_branch}...HEAD");
+    let out = Command::new("git")
+        .args(["diff", "--unified=0", &range])
+        .current_dir(WORKSPACE_DIR)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| format!("spawn git diff: {e}"))?;
+    if !out.status.success() {
+        let mut combined = Vec::with_capacity(out.stdout.len() + out.stderr.len());
+        combined.extend_from_slice(&out.stdout);
+        combined.extend_from_slice(&out.stderr);
+        let tail = String::from_utf8_lossy(&combined).into_owned();
+        let trimmed: String = tail.lines().rev().take(5).collect::<Vec<_>>().join(" | ");
+        return Err(trimmed);
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// Invoke `ra-query` and parse stdout as JSON. Returns `None` on spawn /
