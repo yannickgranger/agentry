@@ -18,6 +18,7 @@ pub mod lifecycle;
 pub mod lifecycle_driver;
 pub mod permit;
 pub mod projector;
+pub mod reaper;
 pub mod redis_io;
 pub mod role_dir_loader;
 pub mod seed;
