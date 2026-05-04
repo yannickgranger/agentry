@@ -13,7 +13,7 @@
   "permit_scope": [
     "fs:read:/workspace/**",
     "net:allow:api.anthropic.com",
-    "net:allow:agency.lab"
+    "${FORGE_NET_ALLOW}"
   ],
   "passthru_env": [],
   "mounts": [

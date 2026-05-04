@@ -13,7 +13,7 @@
   "permit_scope": [
     "fs:read:/workspace/**",
     "net:allow:api.x.ai",
-    "net:allow:agency.lab"
+    "${FORGE_NET_ALLOW}"
   ],
   "passthru_env": ["XAI_API_KEY"],
   "mounts": [

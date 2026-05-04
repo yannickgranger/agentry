@@ -13,7 +13,7 @@
   "permit_scope": [
     "fs:read:/workspace/**",
     "net:allow:generativelanguage.googleapis.com",
-    "net:allow:agency.lab"
+    "${FORGE_NET_ALLOW}"
   ],
   "passthru_env": ["GEMINI_API_KEY"],
   "mounts": [
