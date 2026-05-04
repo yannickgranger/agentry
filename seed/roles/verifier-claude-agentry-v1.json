@@ -1,0 +1,38 @@
+{
+  "name": "verifier-claude-agentry",
+  "version": 1,
+  "model": null,
+  "system_prompt": null,
+  "image": "docker.io/library/rust:1.93",
+  "substrate_class": "podman",
+  "package_manager": "apt",
+  "entrypoint_script": "#!/bin/sh\nexec /usr/local/bin/verifier-dol-runner\n",
+  "exitpoint_script": null,
+  "binaries": [],
+  "mcp_servers": [],
+  "tool_allowlist": [],
+  "allowed_tools": null,
+  "permit_scope": [
+    "fs:read:/workspace/**",
+    "fs:write:/tmp/**"
+  ],
+  "passthru_env": [],
+  "extra_bootstrap": [],
+  "mounts": [
+    {
+      "source": "${HOME}/.local/bin/verifier-dol-runner",
+      "target": "/usr/local/bin/verifier-dol-runner",
+      "readonly": true
+    },
+    {
+      "source": "${HOME}/.local/bin/rtk",
+      "target": "/usr/local/bin/rtk",
+      "readonly": true
+    }
+  ],
+  "workspace_mount": {
+    "container_path": "/workspace",
+    "readonly": true
+  },
+  "sccache": false
+}
