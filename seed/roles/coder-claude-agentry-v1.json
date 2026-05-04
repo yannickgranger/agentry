@@ -79,6 +79,11 @@
       "source": "${HOME}/.local/bin/quality-fast",
       "target": "/usr/local/bin/quality-fast",
       "readonly": true
+    },
+    {
+      "source": "${HOME}/.local/bin/rtk",
+      "target": "/usr/local/bin/rtk",
+      "readonly": true
     }
   ],
   "workspace_mount": {
