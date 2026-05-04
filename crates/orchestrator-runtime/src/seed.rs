@@ -503,104 +503,6 @@ fi
 // composition, porcelain-v2 unmerged-file extraction, push argv shape,
 // and rebase-outcome classification.
 
-// EPIC #161 Wave 3: ARCHAEOLOGIST_CLAUDE_AGENTRY_SCRIPT bash heredoc that
-// used to live here has been ported to a Rust runner —
-// `crates/agentry-role-runtime/src/bin/archaeologist_runner.rs`. The role's
-// entrypoint_script now just `exec /usr/local/bin/archaeologist-runner`.
-// The runner has its own unit-test coverage for cfdb-counts parsing,
-// discovery-seed extraction, prompt assembly, and JSON-object slicing.
-
-/// Build the archaeologist-claude-agentry role. Extracted from `seed_m0` so
-/// the permit-scope + tool-allowlist invariants can be asserted in a unit test
-/// without rebuilding the entire seed flow.
-fn build_archaeologist_claude_agentry_role(
-    home: &str,
-    claude_settings_path: &str,
-    forge_net_allow: &str,
-    sccache_net_allow: Option<&str>,
-) -> AgentRole {
-    let mut permits = vec![
-        "fs:read:/workspace/**".into(),
-        "fs:write:/workspace/**".into(),
-        "net:allow:api.anthropic.com".into(),
-        forge_net_allow.to_string(),
-    ];
-    if let Some(sccache) = sccache_net_allow {
-        permits.push(sccache.to_string());
-    }
-    AgentRole {
-        name: RoleName("archaeologist-claude-agentry".into()),
-        version: 1,
-        model: Some("claude-max".into()),
-        system_prompt: None,
-        // Same toolchain as coder-claude-agentry — needed for the cfdb +
-        // graph-specs `cargo install` in extra_bootstrap.
-        image: "docker.io/library/rust:1.93".into(),
-        substrate_class: SubstrateClass::Podman,
-        package_manager: PackageManager::Apt,
-        entrypoint_script: "#!/bin/sh\nexec /usr/local/bin/archaeologist-runner\n".into(),
-        exitpoint_script: None,
-        // cfdb + graph-specs come via extra_bootstrap cargo install (same
-        // pattern as quality-hygiene in coder-claude-agentry).
-        binaries: vec![],
-        mcp_servers: vec![],
-        tool_allowlist: ToolAllowlist(vec![]),
-        allowed_tools: None,
-        permit_scope: PermitScope(permits),
-        passthru_env: vec!["GITEA_TOKEN".into()],
-        // cfdb rev `02c5a45` and graph-specs-rust rev `ecaedb9` mirror the
-        // pinned revs in the workspace's `.cfdb/cfdb.rev` and
-        // `.cfdb/graph-specs.rev` files used by `scripts/arch-check.sh`.
-        // A future brief can wire them through dynamically.
-        extra_bootstrap: vec![
-            "rustup component add rustfmt clippy".into(),
-            "git config --global http.sslVerify false".into(),
-            "cargo install --git https://github.com/yannickgranger/cfdb.git --rev 02c5a45 --root /usr/local --locked --quiet cfdb-cli || true".into(),
-            "cargo install --git https://github.com/yannickgranger/graph-specs.git --rev ecaedb9 --root /usr/local --locked --quiet application || true".into(),
-        ],
-        mounts: vec![
-            Mount {
-                source: format!("{home}/.local/bin/claude"),
-                target: "/usr/local/bin/claude".into(),
-                readonly: true,
-            },
-            Mount {
-                source: format!("{home}/.claude/.credentials.json"),
-                target: "/root/.claude/.credentials.json".into(),
-                readonly: true,
-            },
-            Mount {
-                source: claude_settings_path.into(),
-                target: "/root/.claude/settings.json".into(),
-                readonly: true,
-            },
-            Mount {
-                source: "/var/lib/agentry/transcripts".into(),
-                target: "/transcripts".into(),
-                readonly: false,
-            },
-            Mount {
-                source: format!("{home}/.local/bin/archaeologist-runner"),
-                target: "/usr/local/bin/archaeologist-runner".into(),
-                readonly: true,
-            },
-            Mount {
-                source: format!("{home}/.local/bin/rtk"),
-                target: "/usr/local/bin/rtk".into(),
-                readonly: true,
-            },
-        ],
-        workspace_mount: Some(WorkspaceMount {
-            container_path: "/workspace".into(),
-            readonly: false,
-        }),
-        // Real cargo compilation in extra_bootstrap — share build cache with
-        // coder/reviewer roles via the shared sccache-redis container when
-        // the operator configured a [sccache] endpoint.
-        sccache: sccache_net_allow.is_some(),
-    }
-}
-
 // EPIC #161 Wave 3: VERIFIER_CLAUDE_AGENTRY_SCRIPT bash heredoc that used to
 // live here (the DOL verifier — runs the meta-brief's success_criteria as a
 // shell command and maps exit code to verdict) has been ported to a Rust
@@ -615,139 +517,6 @@ fn build_archaeologist_claude_agentry_role(
 // by `--provider claude|gemini|grok`. The roles' entrypoint_scripts now just
 // `exec /usr/local/bin/ac-verifier-runner --provider X`. The runner has its
 // own unit-test coverage for AC parsing / degradation envelopes.
-
-// EPIC #161 Wave 2: AUDITOR_CLAUDE_AGENTRY_SCRIPT bash heredoc that used to
-// live here has been ported to a Rust runner —
-// `crates/agentry-role-runtime/src/bin/auditor_claude_runner.rs`. The role's
-// entrypoint_script now just `exec /usr/local/bin/auditor-claude-runner`.
-// The runner has its own unit-test coverage for the udeps-pair walker, the
-// unwraps-count aggregation, and the per-finding sites-block formatting.
-
-/// Build the auditor-claude-agentry role. Extracted from `seed_m0` so the
-/// permit-scope, passthru-env, and extra_bootstrap invariants can be asserted
-/// in unit tests. Bind-mounts host-built ra-query at /usr/local/bin/ra-query
-/// (operator runs `just ra-query-binary` to provide it) and the host-built
-/// auditor-claude-runner at /usr/local/bin/auditor-claude-runner (operator
-/// runs `just auditor-claude-runner-binary`); the runner's `which_on_path`
-/// guard tolerates a missing ra-query by emitting `ra_query_unavailable`
-/// and skipping the relevant stage.
-fn build_auditor_claude_agentry_role(home: &str, sccache_net_allow: Option<&str>) -> AgentRole {
-    let mut permits = vec![
-        "fs:read:/workspace/**".into(),
-        "fs:write:/workspace/**".into(),
-    ];
-    if let Some(sccache) = sccache_net_allow {
-        permits.push(sccache.to_string());
-    }
-    permits.extend([
-        "net:allow:static.rust-lang.org".into(),
-        "net:allow:crates.io".into(),
-        "net:allow:index.crates.io".into(),
-        "net:allow:static.crates.io".into(),
-    ]);
-    AgentRole {
-        name: RoleName("auditor-claude-agentry".into()),
-        version: 1,
-        model: None,
-        system_prompt: None,
-        image: "docker.io/library/rust:1.93".into(),
-        substrate_class: SubstrateClass::Podman,
-        package_manager: PackageManager::Apt,
-        entrypoint_script: "#!/bin/sh\nexec /usr/local/bin/auditor-claude-runner\n".into(),
-        exitpoint_script: None,
-        binaries: vec![],
-        mcp_servers: vec![],
-        tool_allowlist: ToolAllowlist(vec![]),
-        allowed_tools: None,
-        permit_scope: PermitScope(permits),
-        passthru_env: vec![],
-        extra_bootstrap: vec![
-            "rustup component add rustfmt clippy || true".into(),
-            "rustup toolchain install nightly --profile minimal || true".into(),
-            "cargo +nightly install cargo-udeps --locked --quiet || true".into(),
-        ],
-        mounts: vec![
-            Mount {
-                source: format!("{home}/.local/bin/ra-query"),
-                target: "/usr/local/bin/ra-query".into(),
-                readonly: true,
-            },
-            Mount {
-                source: format!("{home}/.local/bin/auditor-claude-runner"),
-                target: "/usr/local/bin/auditor-claude-runner".into(),
-                readonly: true,
-            },
-            Mount {
-                source: format!("{home}/.local/bin/rtk"),
-                target: "/usr/local/bin/rtk".into(),
-                readonly: true,
-            },
-        ],
-        workspace_mount: Some(WorkspaceMount {
-            container_path: "/workspace".into(),
-            readonly: false,
-        }),
-        sccache: sccache_net_allow.is_some(),
-    }
-}
-
-/// PR rebaser role for the substrate auto-rebaser (#137). Triggered by a
-/// ci-watcher chain-trigger when a PR's `mergeable` flag flips false
-/// because `develop` advanced past the PR's base. Reads the PR
-/// coordinates from the brief payload, rebases the branch onto
-/// `origin/<base>`, and either force-pushes the rebased head or surfaces
-/// each conflict as a `Finding` so the coder can re-roll. EPIC #161
-/// wave-bash port: the bash heredoc is now a Rust runner bind-mounted
-/// at `/usr/local/bin/pr-rebaser-runner`; image switched from alpine to
-/// debian:bookworm-slim (the runtime no longer needs cargo — just `git`
-/// + `curl` + `jq` from apt).
-fn build_pr_rebaser_agentry_role(
-    home: &str,
-    forge_net_allow: &str,
-    forge_write_permits: &[String],
-) -> AgentRole {
-    let mut permits = vec![
-        "fs:read:/workspace/**".into(),
-        "fs:write:/workspace/**".into(),
-        forge_net_allow.to_string(),
-    ];
-    permits.extend(forge_write_permits.iter().cloned());
-    AgentRole {
-        name: RoleName("pr-rebaser-agentry".into()),
-        version: 1,
-        model: None,
-        system_prompt: None,
-        image: "docker.io/library/debian:bookworm-slim".into(),
-        substrate_class: SubstrateClass::Podman,
-        package_manager: PackageManager::Apt,
-        entrypoint_script: "#!/bin/sh\nexec /usr/local/bin/pr-rebaser-runner\n".into(),
-        exitpoint_script: None,
-        binaries: vec![
-            "git".into(),
-            "curl".into(),
-            "jq".into(),
-            "ca-certificates".into(),
-        ],
-        mcp_servers: vec![],
-        tool_allowlist: ToolAllowlist(vec!["git".into(), "curl".into()]),
-        allowed_tools: None,
-        permit_scope: PermitScope(permits),
-        passthru_env: vec!["GITEA_TOKEN".into()],
-        extra_bootstrap: vec![],
-        mounts: vec![Mount {
-            source: format!("{home}/.local/bin/pr-rebaser-runner"),
-            target: "/usr/local/bin/pr-rebaser-runner".into(),
-            readonly: true,
-        }],
-        // Rebaser mutates /workspace/.git during fetch/checkout/rebase/push,
-        // so the workspace mount must be writable (parallel to shipper-agentry).
-        workspace_mount: Some(WorkspaceMount {
-            container_path: "/workspace".into(),
-            readonly: false,
-        }),
-        sccache: false,
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Stock base images. Two families: alpine (small, fast apk) and debian
@@ -1249,9 +1018,6 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
     // Reviewer re-runs acceptance in isolation on the coder's workspace.
     // Shipper pushes the branch and opens a PR on the forge.
     // Ci-watcher polls forge CI on the PR's head sha and merges on green.
-    let home = std::env::var("HOME").expect(
-        "HOME env var must be set to bind claude credentials into the reviewer-mechanical role",
-    );
     let reviewer_mechanical_agentry = AgentRole {
         name: RoleName("reviewer-mechanical-agentry".into()),
         version: 1,
@@ -1288,109 +1054,6 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         }),
         sccache: false,
     };
-    // EPIC #161 wave-bash: bash heredoc SHIPPER_AGENTRY_SCRIPT ported to a
-    // Rust runner at crates/agentry-role-runtime/src/bin/shipper_runner.rs.
-    // The role bind-mounts the host-built binary at
-    // /usr/local/bin/shipper-runner (operator runs `just
-    // shipper-runner-binary`) and execs it directly. Image switched from
-    // alpine to debian:bookworm-slim for parity with the other ported
-    // runtime roles (ci-watcher-agentry).
-    let mut shipper_permits = vec![forge_net_allow.clone()];
-    shipper_permits.extend(forge_write_permits.iter().cloned());
-    let shipper_agentry = AgentRole {
-        name: RoleName("shipper-agentry".into()),
-        version: 1,
-        model: None,
-        system_prompt: None,
-        image: "docker.io/library/debian:bookworm-slim".into(),
-        substrate_class: SubstrateClass::Podman,
-        package_manager: PackageManager::Apt,
-        entrypoint_script: "#!/bin/sh\nexec /usr/local/bin/shipper-runner\n".into(),
-        exitpoint_script: None,
-        binaries: vec!["git".into(), "curl".into(), "ca-certificates".into()],
-        mcp_servers: vec![],
-        tool_allowlist: ToolAllowlist(vec![]),
-        allowed_tools: None,
-        permit_scope: PermitScope(shipper_permits),
-        passthru_env: vec!["GITEA_TOKEN".into()],
-        extra_bootstrap: vec![],
-        mounts: vec![Mount {
-            source: format!("{home}/.local/bin/shipper-runner"),
-            target: "/usr/local/bin/shipper-runner".into(),
-            readonly: true,
-        }],
-        // Shipper writes to /workspace/.git during `git push` (reflog,
-        // FETCH_HEAD), so the workspace mount must be writable.
-        workspace_mount: Some(WorkspaceMount {
-            container_path: "/workspace".into(),
-            readonly: false,
-        }),
-        sccache: false,
-    };
-    // EPIC #161 Wave 2: bash heredoc CI_WATCHER_AGENTRY_SCRIPT ported to a
-    // Rust runner at crates/agentry-role-runtime/src/bin/ci_watcher_runner.rs.
-    // The role bind-mounts the host-built binary at
-    // /usr/local/bin/ci-watcher-runner (operator runs `just
-    // ci-watcher-runner-binary`) and execs it directly. Image switched from
-    // alpine to debian:bookworm-slim per #320 v1 reviewer Warn — the runtime
-    // role no longer cargo-installs anything (it just polls a forge API), so
-    // the rust:1.93 / alpine cargo toolchain is overkill.
-    let ci_watcher_agentry = AgentRole {
-        name: RoleName("ci-watcher-agentry".into()),
-        version: 1,
-        model: None,
-        system_prompt: None,
-        image: "docker.io/library/debian:bookworm-slim".into(),
-        substrate_class: SubstrateClass::Podman,
-        package_manager: PackageManager::Apt,
-        entrypoint_script: "#!/bin/sh\nexec /usr/local/bin/ci-watcher-runner\n".into(),
-        exitpoint_script: None,
-        binaries: vec!["curl".into(), "ca-certificates".into()],
-        mcp_servers: vec![],
-        tool_allowlist: ToolAllowlist(vec![]),
-        allowed_tools: None,
-        permit_scope: PermitScope(vec![
-            "fs:write:/workspace/**".into(),
-            forge_net_allow.clone(),
-            "forge:write:yg/agentry".into(),
-        ]),
-        passthru_env: vec!["GITEA_TOKEN".into()],
-        extra_bootstrap: vec![],
-        mounts: vec![Mount {
-            source: format!("{home}/.local/bin/ci-watcher-runner"),
-            target: "/usr/local/bin/ci-watcher-runner".into(),
-            readonly: true,
-        }],
-        // Brief 137b: ci-watcher writes /workspace/pr_rebaser_brief.json
-        // when chain-triggering pr-rebaser-agentry on a `mergeable: false`
-        // PR; the daemon's chain-trigger reads that file off-host once
-        // ci-watcher ships, so the workspace mount must be writable.
-        workspace_mount: Some(WorkspaceMount {
-            container_path: "/workspace".into(),
-            readonly: false,
-        }),
-        sccache: false,
-    };
-    // pr-rebaser-agentry — substrate auto-rebaser (#137). Brief 137b wires
-    // ci-watcher to chain-trigger a brief on this single-role topology when
-    // a PR's `mergeable` flag flips false; the rebaser force-pushes the
-    // rebased branch (or surfaces conflicts as findings).
-    let pr_rebaser_agentry =
-        build_pr_rebaser_agentry_role(&home, &forge_net_allow, &forge_write_permits);
-    // ---- agentry-discovery-v0 team (first stage of the planner pipeline) ----
-    // archaeologist-claude-agentry runs cfdb extract + graph-specs check, then
-    // synthesizes a discovery.json via `claude -p`. Topology is loaded from
-    // `seed/topologies/agentry-discovery-v0.json` by the seed-time walker.
-    let archaeologist_claude_agentry = build_archaeologist_claude_agentry_role(
-        &home,
-        &claude_settings_path,
-        &forge_net_allow,
-        sccache_net_allow.as_deref(),
-    );
-
-    let auditor_claude_agentry =
-        build_auditor_claude_agentry_role(&home, sccache_net_allow.as_deref());
-
     // ---- persist everything ----
     redis_io::save_role(&mut conn, &echo).await?;
     redis_io::save_team(&mut conn, &echo_team).await?;
@@ -1413,11 +1076,6 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
     redis_io::save_role(&mut conn, &narrowed_coder).await?;
     redis_io::save_team(&mut conn, &narrowed_team).await?;
     redis_io::save_role(&mut conn, &reviewer_mechanical_agentry).await?;
-    redis_io::save_role(&mut conn, &shipper_agentry).await?;
-    redis_io::save_role(&mut conn, &ci_watcher_agentry).await?;
-    redis_io::save_role(&mut conn, &pr_rebaser_agentry).await?;
-    redis_io::save_role(&mut conn, &auditor_claude_agentry).await?;
-    redis_io::save_role(&mut conn, &archaeologist_claude_agentry).await?;
 
     let roles_dir = seed_roles_dir();
     if roles_dir.exists() {
@@ -1457,7 +1115,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
     }
 
     tracing::info!(
-"seeded: roles [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker, listener, grok-echo, claude-echo, synthesizer, narrowed-coder, coder-claude-agentry, ac-verifier-claude-agentry, ac-verifier-gemini-agentry, ac-verifier-grok-agentry, reviewer-mechanical-agentry, shipper-agentry, ci-watcher-agentry, pr-rebaser-agentry, reviewer-claude-agentry, auditor-claude-agentry, null-agent-agentry, archaeologist-claude-agentry] (inline entrypoint scripts); teams [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker-listener, grok-echo, claude-echo, narrowed-team] (Rust literals); teams [agentry-null-v0, agentry-pr-rebaser-v0, agentry-discovery-v0, agentry-verify-v0, agentry-planner-v0, agentry-self-host-v0, agentry-self-audit-v0] (loaded from seed/topologies/*.json)"
+"seeded: roles [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker, listener, grok-echo, claude-echo, synthesizer, narrowed-coder, coder-claude-agentry, ac-verifier-claude-agentry, ac-verifier-gemini-agentry, ac-verifier-grok-agentry, reviewer-mechanical-agentry, reviewer-claude-agentry, null-agent-agentry] (inline entrypoint scripts); teams [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker-listener, grok-echo, claude-echo, narrowed-team] (Rust literals); teams [agentry-null-v0, agentry-pr-rebaser-v0, agentry-discovery-v0, agentry-verify-v0, agentry-planner-v0, agentry-self-host-v0, agentry-self-audit-v0] (loaded from seed/topologies/*.json)"
     );
     Ok(())
 }
