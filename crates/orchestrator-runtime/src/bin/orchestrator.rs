@@ -6,7 +6,8 @@
 
 use clap::{Parser, Subcommand};
 use orchestrator_runtime::{
-    cli_agents, cli_roles, cli_teams, permit, redis_io, seed, state, Config, Result,
+    cli_agents, cli_roles, cli_teams, permit, redis_io, seed, state, submit_shape_check, Config,
+    Result,
 };
 use orchestrator_types::Brief;
 use std::path::{Path, PathBuf};
@@ -124,6 +125,10 @@ async fn main() -> Result<()> {
         Cmd::Submit { file } => {
             let text = tokio::fs::read_to_string(&file).await?;
             let brief: Brief = serde_json::from_str(&text)?;
+            if let Err(e) = submit_shape_check::check_brief(&brief) {
+                eprintln!("{}", e.message());
+                std::process::exit(2);
+            }
             let mut conn = redis_io::connect(&cfg.redis.url).await?;
             let id = redis_io::submit_brief(&mut conn, &brief).await?;
             println!(

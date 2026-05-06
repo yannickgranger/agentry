@@ -3,11 +3,28 @@
   "version": 1,
   "roles": [
     {
+      "name": "preflight-criterion-agentry",
+      "version": 1
+    },
+    {
       "name": "verifier-claude-agentry",
       "version": 1
     }
   ],
-  "message_graph": [],
+  "message_graph": [
+    {
+      "from": {
+        "name": "preflight-criterion-agentry",
+        "version": 1
+      },
+      "to": {
+        "name": "verifier-claude-agentry",
+        "version": 1
+      },
+      "permit_overrides_from": null,
+      "rework_target": null
+    }
+  ],
   "terminal_role": {
     "name": "verifier-claude-agentry",
     "version": 1
