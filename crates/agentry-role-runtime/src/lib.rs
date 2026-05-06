@@ -1916,6 +1916,34 @@ pub fn smell_wc_l_without_cfg_test(cmd: &str) -> Option<ReviewFinding> {
     ))
 }
 
+/// `DoneReason.cause` discriminant emitted by preflight-criterion-runner
+/// when one of the blocking smell heuristics (smell-1 or smell-2) fires.
+/// The daemon-side trace translator (wired in 84b-2) folds this into
+/// `BriefEvent::PreflightSmellDetected`, which the FSM transitions into
+/// `BriefState::Failed { reason: Reason::PreflightSmell }`. Smell-3 stays
+/// Warn-only and does NOT emit this cause.
+pub const PREFLIGHT_SMELL_CAUSE: &str = "preflight_smell";
+
+/// Returns the first blocking preflight-criterion smell finding for the
+/// given criterion, or `None` if neither smell-1 nor smell-2 fires. The
+/// runner emits the returned finding (Warn severity, operator-visible
+/// trace) and then `done failed` with cause [`PREFLIGHT_SMELL_CAUSE`].
+///
+/// Order is deliberate and contractual: smell-1 (huge baseline + zero
+/// expected) is checked before smell-2 (canonical `grep -v 'mod tests'`)
+/// so a criterion that trips both surfaces the more specific
+/// false-positive signal first. Smell-3 (`wc -l` without `#[cfg(test)]`)
+/// is excluded — it stays advisory and the runner handles it separately
+/// after the blocking-smell short-circuit.
+pub fn first_blocking_preflight_smell(
+    cmd: &str,
+    baseline: &str,
+    expected: &str,
+) -> Option<ReviewFinding> {
+    smell_huge_baseline_zero_expected(cmd, baseline, expected)
+        .or_else(|| smell_grep_v_mod_tests(cmd))
+}
+
 fn preflight_warn_finding(message: String) -> ReviewFinding {
     ReviewFinding {
         file: None,
