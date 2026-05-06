@@ -98,6 +98,50 @@ Rust-aware tool like `ra-query` or `cfdb`) and resubmit. Smell details
 transition; the variant itself carries no payload so dashboards
 surface a typed badge per smell-class without re-parsing prose.
 
+## GatePolicy
+
+The rule applied at a phase fan-in to fold a multiset of role verdicts
+into a single decision. Three variants: `AllMustPass` — every role-kind
+in `expected_roles` must report `Shipped`; any other verdict triggers
+`Rework` (soft fails) or `Reject` (hard fails). `FailFast` — the same
+short-circuit verdicts but evaluated as evidence arrives, without
+waiting for siblings; the first non-`Shipped` verdict transitions the
+brief immediately. `Majority { threshold_pct }` — the `Shipped` count
+must reach the threshold percentage of expected roles to `Pass`; soft
+fails after the threshold is unreachable trigger `Rework`; hard fails
+always `Reject`.
+
+## GateConfig
+
+Pairs a `GatePolicy` with the list of role-kinds the gate waits on.
+`expected_roles` enumerates the role-kinds (the output of
+`lifecycle::role_kind`) that must appear in the received verdict
+multiset for the gate to reach a terminal `Pass` outcome. The shape is
+generic — the verifier phase under `agentry-self-host-v0` carries the
+three `ac-verifier-*` kinds, but `GateConfig` accepts any list.
+
+- depends on: GatePolicy
+
+## PhaseGates
+
+Per-brief container for the verifying-phase and reviewing-phase
+`GateConfig` values. The daemon will populate this from team topology
+at brief dispatch time (landed in 396b) so each brief carries the gate
+shape its topology fans out — three verifiers and two reviewers under
+`agentry-self-host-v0`, different counts and policies under other
+topologies.
+
+- depends on: GateConfig
+
+## Decide
+
+The return value of the pure `decide` function that folds a phase's
+collected verdicts against its `GateConfig`. Four variants: `Wait`
+(collect more evidence), `Pass` (gate satisfied — advance), `Rework`
+(soft failure — re-author the brief), `Reject` (hard failure —
+terminate the brief). `Decide` is a transient return value; it is not
+persisted, not serialized, and does not appear in `BriefStateRecord`.
+
 ## CiState
 
 The CI status carried by a `BriefEvent::CiResult`. Three variants —
@@ -235,3 +279,32 @@ is still waiting on green). `Watching → Reworking` triggers on
 `CiResult Failed`, bumping the retry budget. `Authoring → Shipped`
 short-circuits via `CoderDoneNoOp` when the coder's acceptance check
 passes against an empty diff (no work to verify, review, or ship).
+
+#### Gate policy and evidence accumulation (planned — #396)
+
+The current FSM transitions on the first matching event for each phase:
+the first `AcVerifierDone` advances `Verifying → Reviewing`, the first
+`ReviewerDone` advances `Reviewing → Shipping`. Under the
+`agentry-self-host-v0` topology — which fans out three `ac-verifier-*`
+roles in the verifier phase and two `reviewer-*` roles in the reviewer
+phase — this silently drops the 2nd and 3rd verifiers' reports and the
+2nd reviewer's report. It looks like an observability bug (the
+verdicts never reach the dashboard) but it is a correctness bug: a
+brief that the first verifier waved through can have a hard `Rejected`
+sitting in a sibling verifier's stdout that the FSM never sees.
+
+#396a (this brief) lands the additive precursor: the `GatePolicy`,
+`GateConfig`, `PhaseGates`, and `Decide` types plus the pure
+`decide(received, gate) -> Decide` function. No behavior change yet —
+`handle()` and `BriefState` are untouched, the new types are not
+threaded anywhere, the existing tests in `crates/orchestrator-types/
+tests/lifecycle.rs` continue to pass without edits.
+
+#396b will migrate `BriefState::Verifying` and `BriefState::Reviewing`
+to carry the received-verdict multiset (`BTreeMap<String, EventVerdict>`)
+and the per-phase `GateConfig`. `handle()` will fold each new
+`AcVerifierDone` / `ReviewerDone` into the multiset and call `decide`;
+the FSM only transitions out of the phase when `decide` returns
+`Pass`, `Rework`, or `Reject`. The lifecycle driver will fail the
+brief on `InvalidTransition` rather than silently swallowing
+out-of-state events — closing the silent-drop bug at both layers.
