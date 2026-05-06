@@ -10,7 +10,7 @@
 //! error enums ([`EventSourceError`], [`StateProjectorError`]).
 
 use async_trait::async_trait;
-use orchestrator_types::lifecycle::{BriefEvent, BriefStateRecord};
+use orchestrator_types::lifecycle::{BriefEvent, BriefStateRecord, CiState};
 use orchestrator_types::{BriefId, Event, EventKind, EventVerdict};
 use redis::aio::ConnectionManager;
 use redis::streams::{StreamReadOptions, StreamReadReply};
@@ -125,11 +125,47 @@ impl RedisEventSource {
     }
 }
 
+/// Map an agent's full role name (as emitted by the spawner — e.g.
+/// `"coder-claude-agentry"`, `"shipper-agentry"`,
+/// `"preflight-criterion-agentry"`) to the short role kind the
+/// translator's `Done`-branch matches against.
+///
+/// Returns `None` for role names outside the recognised families; the
+/// translator skips memoization in that case so the `Done` lookup
+/// falls through to the catch-all (no `BriefEvent` emitted) rather
+/// than mis-classifying an unknown role.
+///
+/// Public so the peer `tests/lifecycle.rs` integration suite can pin
+/// the per-family mapping without re-deriving the prefix table.
+#[must_use]
+pub fn role_kind(role_name: &str) -> Option<&'static str> {
+    if role_name.starts_with("coder-") {
+        Some("coder")
+    } else if role_name.starts_with("ac-verifier-") {
+        Some("ac-verifier")
+    } else if role_name.starts_with("verifier-") {
+        Some("verifier")
+    } else if role_name.starts_with("reviewer-") {
+        Some("reviewer")
+    } else if role_name == "shipper-agentry" {
+        Some("shipper")
+    } else if role_name == "ci-watcher-agentry" {
+        Some("ci-watcher")
+    } else if role_name.starts_with("preflight-criterion") {
+        Some("preflight")
+    } else {
+        None
+    }
+}
+
 /// Translate one trace-stream `(agent_id, Event)` pair into the matching
-/// `BriefEvent`, threading the per-source agent-id → role-name memo.
+/// `BriefEvent`, threading the per-source agent-id → role-kind memo.
 /// Free function so unit tests can drive it without standing up a
-/// `ConnectionManager`.
-fn translate_trace_entry(
+/// `ConnectionManager`. Public so the peer `tests/lifecycle.rs`
+/// integration suite can drive it directly with synthesised
+/// `Event`s — the workspace's `arch-ban-inline-cfg-test-in-src.cypher`
+/// rule forbids inline `#[cfg(test)]` blocks here.
+pub fn translate_trace_entry(
     role_by_agent: &mut HashMap<String, String>,
     agent_id: String,
     event: Event,
@@ -138,9 +174,11 @@ fn translate_trace_entry(
         EventKind::Event { payload } => {
             if payload.get("agent_event").and_then(JsonValue::as_str) == Some("spawned") {
                 if let Some(role) = payload.get("role_name").and_then(JsonValue::as_str) {
-                    role_by_agent.insert(agent_id.clone(), role.to_string());
-                    if role == "coder" {
-                        return Ok(Some(BriefEvent::CoderStarted { agent_id }));
+                    if let Some(kind) = role_kind(role) {
+                        role_by_agent.insert(agent_id.clone(), kind.to_string());
+                        if kind == "coder" {
+                            return Ok(Some(BriefEvent::CoderStarted { agent_id }));
+                        }
                     }
                 }
             }
@@ -182,6 +220,38 @@ fn translate_trace_entry(
                     verdict,
                     findings: vec![],
                 })),
+                // Shipper Done. Acceptance pr_number / head_sha ride
+                // separately on the trace stream as the shipper's own
+                // emit_message to ci-watcher; the FSM's
+                // Shipping → Watching arm carries the values that
+                // were already sealed into Shipping. Defaults are
+                // safe here — the existing FSM arm only reads the
+                // event's pr_number / head_sha, and the lifecycle
+                // driver overrides them at write time.
+                Some("shipper") => Ok(Some(BriefEvent::ShipperDone {
+                    pr_number: 0,
+                    head_sha: String::new(),
+                })),
+                // CI watcher Done. Map the agent verdict onto the
+                // poller-shaped CiState the FSM expects:
+                //   Shipped → Success, Failed → Failed, else Pending.
+                // The else arm covers Escalated / ReworkNeeded /
+                // Rejected, which the watcher does not normally emit
+                // but which the FSM treats as no-op Pending in the
+                // Watching state.
+                Some("ci-watcher") => {
+                    let state = match verdict {
+                        EventVerdict::Shipped => CiState::Success,
+                        EventVerdict::Failed => CiState::Failed,
+                        EventVerdict::Escalated
+                        | EventVerdict::ReworkNeeded
+                        | EventVerdict::Rejected => CiState::Pending,
+                    };
+                    Ok(Some(BriefEvent::CiResult {
+                        state,
+                        head_sha: String::new(),
+                    }))
+                }
                 _ => Ok(None),
             }
         }

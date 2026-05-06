@@ -13,14 +13,14 @@
 use async_trait::async_trait;
 use chrono::Utc;
 use orchestrator_runtime::lifecycle::{
-    EventSource, EventSourceError, RedisEventSource, RedisStateProjector, StateProjector,
-    StateProjectorError,
+    role_kind, translate_trace_entry, EventSource, EventSourceError, RedisEventSource,
+    RedisStateProjector, StateProjector, StateProjectorError,
 };
 use orchestrator_types::lifecycle::{
-    handle, BriefEvent, BriefState, BriefStateRecord, RetryBudget, DEFAULT_ATTEMPT_CAP,
+    handle, BriefEvent, BriefState, BriefStateRecord, CiState, RetryBudget, DEFAULT_ATTEMPT_CAP,
 };
-use orchestrator_types::{BriefId, EventVerdict};
-use std::collections::VecDeque;
+use orchestrator_types::{BriefId, Event, EventKind, EventVerdict};
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 struct MemEventSource {
@@ -329,4 +329,136 @@ async fn redis_event_source_translates_retry_requested() {
     }
 
     let _: () = conn.del(&trace_key).await.expect("cleanup trace");
+}
+
+// --- role-kind normalization + translate_trace_entry unit tests ---
+//
+// These pin the brief-#392 fix: `role_by_agent` memoizes the SHORT
+// role kind (so the `Done` branch's `match role.as_deref()` arms
+// trigger), and the `Done` branch grew arms for `shipper-agentry`
+// and `ci-watcher-agentry` so the FSM actually advances through
+// Shipping → Watching → Shipped.
+
+fn spawned_event(role_name: &str) -> Event {
+    Event::new(EventKind::Event {
+        payload: serde_json::json!({
+            "agent_event": "spawned",
+            "role_name": role_name,
+        }),
+    })
+}
+
+fn done_event(verdict: EventVerdict) -> Event {
+    Event::new(EventKind::Done {
+        verdict,
+        reason: None,
+        refusal_count: 0,
+    })
+}
+
+#[test]
+fn role_kind_maps_each_family_to_its_short_kind() {
+    assert_eq!(role_kind("coder-claude-agentry"), Some("coder"));
+    assert_eq!(role_kind("coder-grok-agentry"), Some("coder"));
+    assert_eq!(role_kind("ac-verifier-agentry"), Some("ac-verifier"));
+    assert_eq!(role_kind("verifier-agentry"), Some("verifier"));
+    assert_eq!(role_kind("reviewer-agentry"), Some("reviewer"));
+    assert_eq!(role_kind("shipper-agentry"), Some("shipper"));
+    assert_eq!(role_kind("ci-watcher-agentry"), Some("ci-watcher"));
+    assert_eq!(role_kind("preflight-criterion-agentry"), Some("preflight"));
+    assert_eq!(role_kind("unknown-role"), None);
+    // `coder` without the family-suffix is NOT a recognised coder
+    // role — the spawner always emits the suffixed form. Pre-fix the
+    // translator memoized this bare string and the `match Some("coder")`
+    // arm matched it; after the fix the prefix-only match guarantees
+    // the spawner-shape is what triggers the arm.
+    assert_eq!(role_kind("coder"), None);
+}
+
+#[test]
+fn translate_spawned_coder_claude_agentry_emits_coder_started() {
+    let mut memo: HashMap<String, String> = HashMap::new();
+    let out = translate_trace_entry(
+        &mut memo,
+        "agent-99".to_string(),
+        spawned_event("coder-claude-agentry"),
+    )
+    .expect("translate spawned coder-claude-agentry");
+    match out {
+        Some(BriefEvent::CoderStarted { agent_id }) => {
+            assert_eq!(agent_id, "agent-99");
+        }
+        other => panic!("expected CoderStarted, got {other:?}"),
+    }
+    assert_eq!(memo.get("agent-99").map(String::as_str), Some("coder"));
+}
+
+#[test]
+fn translate_done_from_coder_emits_coder_done() {
+    let mut memo: HashMap<String, String> = HashMap::new();
+    let _ = translate_trace_entry(
+        &mut memo,
+        "agent-c".to_string(),
+        spawned_event("coder-claude-agentry"),
+    )
+    .expect("memoize coder spawn");
+    let out = translate_trace_entry(
+        &mut memo,
+        "agent-c".to_string(),
+        done_event(EventVerdict::Shipped),
+    )
+    .expect("translate coder done");
+    assert!(matches!(
+        out,
+        Some(BriefEvent::CoderDone {
+            verdict: EventVerdict::Shipped
+        })
+    ));
+}
+
+#[test]
+fn translate_done_from_shipper_emits_shipper_done() {
+    let mut memo: HashMap<String, String> = HashMap::new();
+    let _ = translate_trace_entry(
+        &mut memo,
+        "agent-s".to_string(),
+        spawned_event("shipper-agentry"),
+    )
+    .expect("memoize shipper spawn");
+    assert_eq!(memo.get("agent-s").map(String::as_str), Some("shipper"));
+    let out = translate_trace_entry(
+        &mut memo,
+        "agent-s".to_string(),
+        done_event(EventVerdict::Shipped),
+    )
+    .expect("translate shipper done");
+    assert!(matches!(out, Some(BriefEvent::ShipperDone { .. })));
+}
+
+#[test]
+fn translate_done_from_ci_watcher_maps_verdict_to_ci_state() {
+    let cases = [
+        (EventVerdict::Shipped, CiState::Success),
+        (EventVerdict::Failed, CiState::Failed),
+        (EventVerdict::Escalated, CiState::Pending),
+        (EventVerdict::ReworkNeeded, CiState::Pending),
+        (EventVerdict::Rejected, CiState::Pending),
+    ];
+    for (verdict, expected) in cases {
+        let mut memo: HashMap<String, String> = HashMap::new();
+        let _ = translate_trace_entry(
+            &mut memo,
+            "agent-w".to_string(),
+            spawned_event("ci-watcher-agentry"),
+        )
+        .expect("memoize ci-watcher spawn");
+        let out = translate_trace_entry(&mut memo, "agent-w".to_string(), done_event(verdict))
+            .expect("translate ci-watcher done");
+        match out {
+            Some(BriefEvent::CiResult { state, .. }) => {
+                assert_eq!(state, expected, "verdict {verdict:?} → {expected:?}");
+            }
+            other => panic!("expected CiResult for {verdict:?}, got {other:?}"),
+        }
+    }
 }
