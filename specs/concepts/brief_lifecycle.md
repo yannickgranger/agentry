@@ -65,17 +65,38 @@ verdicts, PR numbers, head SHAs, actor identities.
 
 ## Reason
 
-Why a brief landed in `BriefState::Failed`. Tagged enum with four
+Why a brief landed in `BriefState::Failed`. Tagged enum with five
 variants: `BudgetExhausted` (retry counter exceeded `RetryBudget.max`,
 or the daemon raised `BudgetExhausted` from a token/wall-clock cap),
 `AbortRequested` (a human or supervising agent issued an abort —
 carries `actor` and `message` so the dashboard surfaces who and why),
 `AcceptanceFailed` (a quality gate — coder, ac-verifier, or reviewer —
 returned a non-rework failure verdict that does not warrant retry),
-and `DaemonError` (an internal substrate failure with a free-text
-`detail` field; reserved for the daemon's own bookkeeping mistakes,
-not for agent-side problems). The discriminator is `kind` so dashboards
-can render a typed badge per failure mode without parsing prose.
+`PreflightSmell` (preflight-criterion-agentry's smell heuristics fired
+on the brief's `success_criteria` — see below), and `DaemonError` (an
+internal substrate failure with a free-text `detail` field; reserved
+for the daemon's own bookkeeping mistakes, not for agent-side
+problems). The discriminator is `kind` so dashboards can render a
+typed badge per failure mode without parsing prose.
+
+`PreflightSmell` fires when preflight-criterion-agentry detects that
+the operator-authored `success_criteria` matches one of the blocking
+smell heuristics (a count-zero `wc -l` filter against a baseline >100;
+a literal `grep -v 'mod tests'` filter that does not exclude
+`#[cfg(test)]` scopes — see the runner for the current rule set). It
+is distinct from `AcceptanceFailed` along an authoring-vs-execution
+axis: `AcceptanceFailed` means the work itself missed the bar
+(coder/ac-verifier/reviewer rejected the diff); `PreflightSmell`
+means the bar itself is malformed before any work runs. Per the
+brief-84b grill-me transcript (Q4), there is no operator-override
+mechanism — the smell heuristics ARE the contract, and refining them
+is a code-level PR against the runner. The operator's response is to
+rewrite the criterion to be more specific (e.g. swap `wc -l` for a
+Rust-aware tool like `ra-query` or `cfdb`) and resubmit. Smell details
+(which smell-id fired, criterion text, baseline value) ride in the
+`BriefEvent::PreflightSmellDetected` payload that triggers the
+transition; the variant itself carries no payload so dashboards
+surface a typed badge per smell-class without re-parsing prose.
 
 ## CiState
 
