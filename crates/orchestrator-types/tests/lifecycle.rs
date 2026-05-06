@@ -56,6 +56,7 @@ fn happy_path_submitted_to_shipped() {
         &s2,
         &BriefEvent::AcVerifierDone {
             verdict: EventVerdict::Shipped,
+            role_name: "ac-verifier-test".to_owned(),
         },
     )
     .expect("verifying + ac_verifier_done(shipped)");
@@ -66,6 +67,7 @@ fn happy_path_submitted_to_shipped() {
         &BriefEvent::ReviewerDone {
             verdict: EventVerdict::Shipped,
             findings: vec![],
+            role_name: "reviewer-test".to_owned(),
         },
     )
     .expect("reviewing + reviewer_done(shipped)");
@@ -154,6 +156,7 @@ fn verifier_failed_pushes_to_reworking_and_increments_retry() {
         &s,
         &BriefEvent::AcVerifierDone {
             verdict: EventVerdict::Failed,
+            role_name: "ac-verifier-test".to_owned(),
         },
     )
     .expect("ok");
@@ -178,6 +181,7 @@ fn reviewer_rework_increments_retry() {
         &BriefEvent::ReviewerDone {
             verdict: EventVerdict::ReworkNeeded,
             findings: vec![],
+            role_name: "reviewer-test".to_owned(),
         },
     )
     .expect("ok");
@@ -200,6 +204,7 @@ fn reviewer_rejected_goes_to_failed() {
         &BriefEvent::ReviewerDone {
             verdict: EventVerdict::Rejected,
             findings: vec![],
+            role_name: "reviewer-test".to_owned(),
         },
     )
     .expect("ok");
@@ -317,6 +322,7 @@ fn rework_at_cap_short_circuits_to_budget_exhausted() {
         &BriefEvent::ReviewerDone {
             verdict: EventVerdict::ReworkNeeded,
             findings: vec![],
+            role_name: "reviewer-test".to_owned(),
         },
     )
     .expect("ok");
@@ -437,10 +443,12 @@ fn shipped_rejects_every_event() {
         },
         BriefEvent::AcVerifierDone {
             verdict: EventVerdict::Shipped,
+            role_name: "ac-verifier-test".to_owned(),
         },
         BriefEvent::ReviewerDone {
             verdict: EventVerdict::Shipped,
             findings: vec![],
+            role_name: "reviewer-test".to_owned(),
         },
         BriefEvent::ShipperDone {
             pr_number: 1,
@@ -520,10 +528,12 @@ fn submitted_rejects_non_starter_events() {
         },
         BriefEvent::AcVerifierDone {
             verdict: EventVerdict::Shipped,
+            role_name: "ac-verifier-test".to_owned(),
         },
         BriefEvent::ReviewerDone {
             verdict: EventVerdict::Shipped,
             findings: vec![],
+            role_name: "reviewer-test".to_owned(),
         },
         BriefEvent::ShipperDone {
             pr_number: 1,
@@ -558,10 +568,12 @@ fn authoring_rejects_unrelated_events() {
         coder_started(),
         BriefEvent::AcVerifierDone {
             verdict: EventVerdict::Shipped,
+            role_name: "ac-verifier-test".to_owned(),
         },
         BriefEvent::ReviewerDone {
             verdict: EventVerdict::Shipped,
             findings: vec![],
+            role_name: "reviewer-test".to_owned(),
         },
         BriefEvent::ShipperDone {
             pr_number: 1,
@@ -599,10 +611,12 @@ fn watching_rejects_unrelated_events() {
         },
         BriefEvent::AcVerifierDone {
             verdict: EventVerdict::Shipped,
+            role_name: "ac-verifier-test".to_owned(),
         },
         BriefEvent::ReviewerDone {
             verdict: EventVerdict::Shipped,
             findings: vec![],
+            role_name: "reviewer-test".to_owned(),
         },
         BriefEvent::ShipperDone {
             pr_number: 2,
@@ -632,10 +646,12 @@ fn shipping_rejects_unrelated_events() {
         },
         BriefEvent::AcVerifierDone {
             verdict: EventVerdict::Shipped,
+            role_name: "ac-verifier-test".to_owned(),
         },
         BriefEvent::ReviewerDone {
             verdict: EventVerdict::Shipped,
             findings: vec![],
+            role_name: "reviewer-test".to_owned(),
         },
         BriefEvent::CiResult {
             state: CiState::Success,
@@ -767,6 +783,7 @@ fn brief_event_roundtrip_every_variant() {
         },
         BriefEvent::AcVerifierDone {
             verdict: EventVerdict::ReworkNeeded,
+            role_name: "ac-verifier-test".to_owned(),
         },
         BriefEvent::ReviewerDone {
             verdict: EventVerdict::ReworkNeeded,
@@ -784,6 +801,7 @@ fn brief_event_roundtrip_every_variant() {
                 prohibitions: vec![],
                 requirements: vec![],
             }],
+            role_name: "reviewer-test".to_owned(),
         },
         BriefEvent::ShipperDone {
             pr_number: 1,

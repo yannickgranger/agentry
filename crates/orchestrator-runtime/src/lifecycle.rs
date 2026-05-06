@@ -175,7 +175,7 @@ pub fn translate_trace_entry(
             if payload.get("agent_event").and_then(JsonValue::as_str) == Some("spawned") {
                 if let Some(role) = payload.get("role_name").and_then(JsonValue::as_str) {
                     if let Some(kind) = role_kind(role) {
-                        role_by_agent.insert(agent_id.clone(), kind.to_string());
+                        role_by_agent.insert(agent_id.clone(), role.to_string());
                         if kind == "coder" {
                             return Ok(Some(BriefEvent::CoderStarted { agent_id }));
                         }
@@ -200,8 +200,10 @@ pub fn translate_trace_entry(
         EventKind::Done {
             verdict, reason, ..
         } => {
-            let role = role_by_agent.get(&agent_id).cloned();
-            match role.as_deref() {
+            let Some(role_name) = role_by_agent.get(&agent_id).cloned() else {
+                return Ok(None);
+            };
+            match role_kind(&role_name) {
                 Some("coder") => {
                     if verdict == EventVerdict::Shipped
                         && reason.as_ref().map(|r| r.cause.as_str())
@@ -214,11 +216,12 @@ pub fn translate_trace_entry(
                     Ok(Some(BriefEvent::CoderDone { verdict }))
                 }
                 Some("ac-verifier") | Some("verifier") => {
-                    Ok(Some(BriefEvent::AcVerifierDone { verdict }))
+                    Ok(Some(BriefEvent::AcVerifierDone { verdict, role_name }))
                 }
                 Some("reviewer") => Ok(Some(BriefEvent::ReviewerDone {
                     verdict,
                     findings: vec![],
+                    role_name,
                 })),
                 // Shipper Done. Acceptance pr_number / head_sha ride
                 // separately on the trace stream as the shipper's own

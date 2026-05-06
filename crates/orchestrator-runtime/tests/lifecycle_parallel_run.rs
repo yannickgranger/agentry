@@ -81,10 +81,12 @@ async fn projector_task_walks_happy_path_to_shipped() {
         },
         BriefEvent::AcVerifierDone {
             verdict: EventVerdict::Shipped,
+            role_name: "ac-verifier-test".to_owned(),
         },
         BriefEvent::ReviewerDone {
             verdict: EventVerdict::Shipped,
             findings: vec![],
+            role_name: "reviewer-test".to_owned(),
         },
         BriefEvent::ShipperDone {
             pr_number: 42,
@@ -151,6 +153,7 @@ async fn projector_task_skips_invalid_transitions_and_continues() {
         // Submitted state — `AcVerifierDone` is illegal here, must be skipped.
         BriefEvent::AcVerifierDone {
             verdict: EventVerdict::Shipped,
+            role_name: "ac-verifier-test".to_owned(),
         },
         // Now the legal start.
         BriefEvent::CoderStarted {
@@ -160,6 +163,7 @@ async fn projector_task_skips_invalid_transitions_and_continues() {
         BriefEvent::ReviewerDone {
             verdict: EventVerdict::Shipped,
             findings: vec![],
+            role_name: "reviewer-test".to_owned(),
         },
         // Legal continuation that drives toward terminal.
         BriefEvent::CoderDone {

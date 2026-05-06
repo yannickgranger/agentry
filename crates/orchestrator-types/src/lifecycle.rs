@@ -153,10 +153,12 @@ pub enum BriefEvent {
     },
     AcVerifierDone {
         verdict: EventVerdict,
+        role_name: String,
     },
     ReviewerDone {
         verdict: EventVerdict,
         findings: Vec<ReviewFinding>,
+        role_name: String,
     },
     ShipperDone {
         pr_number: u32,
@@ -309,7 +311,7 @@ pub fn handle(
         },
 
         // ---- Verifying ----
-        (BriefState::Verifying { retry }, BriefEvent::AcVerifierDone { verdict }) => {
+        (BriefState::Verifying { retry }, BriefEvent::AcVerifierDone { verdict, .. }) => {
             match verdict {
                 EventVerdict::Shipped => Ok(BriefState::Reviewing { retry: *retry }),
                 EventVerdict::ReworkNeeded | EventVerdict::Failed => {
@@ -337,6 +339,7 @@ pub fn handle(
             BriefEvent::ReviewerDone {
                 verdict,
                 findings: _,
+                ..
             },
         ) => match verdict {
             EventVerdict::Shipped => Ok(BriefState::Shipping {
