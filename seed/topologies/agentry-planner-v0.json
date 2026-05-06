@@ -3,6 +3,10 @@
   "version": 1,
   "roles": [
     {
+      "name": "preflight-criterion-agentry",
+      "version": 1
+    },
+    {
       "name": "archaeologist-claude-agentry",
       "version": 1
     },
@@ -12,6 +16,18 @@
     }
   ],
   "message_graph": [
+    {
+      "from": {
+        "name": "preflight-criterion-agentry",
+        "version": 1
+      },
+      "to": {
+        "name": "archaeologist-claude-agentry",
+        "version": 1
+      },
+      "permit_overrides_from": null,
+      "rework_target": null
+    },
     {
       "from": {
         "name": "archaeologist-claude-agentry",

@@ -24,6 +24,7 @@ pub mod role_dir_loader;
 pub mod seed;
 pub mod spawner;
 pub mod state;
+pub mod submit_shape_check;
 pub mod team_validator;
 pub mod transcript;
 pub mod watchdog;
