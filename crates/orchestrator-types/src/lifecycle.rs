@@ -8,6 +8,7 @@
 
 use crate::{BriefId, EventVerdict, ReviewFinding, Ts};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// Compile-time default for `RetryBudget.max` when a topology does not
 /// specify `max_retries`.
@@ -443,4 +444,199 @@ fn increment_or_fail(
     } else {
         build(next)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Additive gate-policy precursor (#396a) — types + pure `decide()`.
+//
+// These items are introduced ahead of the #396 FSM evidence migration. Today
+// `handle()` transitions on the first matching event for each phase, which
+// silently drops the 2nd and 3rd reports when a topology fans out multiple
+// ac-verifiers or reviewers — a correctness bug, not just observability. The
+// migration in 396b will replace the serial first-event arms in `Verifying`
+// and `Reviewing` with evidence-based gating: BriefState carries the
+// `received` verdict multiset and the per-phase `GateConfig`, and `handle()`
+// only advances when `decide()` returns `Pass`. This brief lands the new
+// types and the pure decision function additively; nothing in `handle()` or
+// `BriefState` changes here.
+// ---------------------------------------------------------------------------
+
+/// The rule applied at a phase fan-in to fold a multiset of role verdicts
+/// into a single `Decide` outcome.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum GatePolicy {
+    AllMustPass,
+    FailFast,
+    Majority { threshold_pct: u32 },
+}
+
+/// Pairs a `GatePolicy` with the list of role-kinds the gate waits on.
+/// `expected_roles` holds the role-kind strings as returned by
+/// `lifecycle::role_kind` (e.g. `"ac-verifier-claude"`); the shape is
+/// generic and accepts any list.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GateConfig {
+    pub expected_roles: Vec<String>,
+    pub policy: GatePolicy,
+}
+
+/// Per-brief container for the verifying-phase and reviewing-phase
+/// `GateConfig` values. 396b will populate this from team topology at
+/// brief dispatch time and thread it through `handle()`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PhaseGates {
+    pub verifying: GateConfig,
+    pub reviewing: GateConfig,
+}
+
+/// Return value of the pure `decide` function. Transient — not persisted,
+/// not serialized, does not appear in `BriefStateRecord`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Decide {
+    Wait,
+    Pass,
+    Rework { detail: String },
+    Reject { detail: String },
+}
+
+/// Pure gate-fan-in decision. Folds the multiset of role-kind → verdict
+/// reports collected so far against the gate's policy and expected role
+/// list. No I/O, no async, no allocation beyond the returned `Decide`
+/// value (the `detail` strings).
+///
+/// `received` keys are role-kind strings from `lifecycle::role_kind`;
+/// values are the verdict that role reported. `gate.expected_roles`
+/// enumerates which role-kinds must appear in `received` for the gate
+/// to be satisfied.
+#[must_use]
+pub fn decide(received: &BTreeMap<String, EventVerdict>, gate: &GateConfig) -> Decide {
+    match &gate.policy {
+        GatePolicy::AllMustPass => decide_all_must_pass(received, &gate.expected_roles),
+        GatePolicy::FailFast => decide_fail_fast(received, &gate.expected_roles),
+        GatePolicy::Majority { threshold_pct } => {
+            decide_majority(received, &gate.expected_roles, *threshold_pct)
+        }
+    }
+}
+
+fn decide_all_must_pass(received: &BTreeMap<String, EventVerdict>, expected: &[String]) -> Decide {
+    for (role, verdict) in received {
+        if matches!(verdict, EventVerdict::Rejected) {
+            return Decide::Reject {
+                detail: format!("verifier {role} rejected"),
+            };
+        }
+        if matches!(verdict, EventVerdict::Escalated) {
+            return Decide::Reject {
+                detail: format!("verifier {role} escalated"),
+            };
+        }
+    }
+    for (role, verdict) in received {
+        if matches!(verdict, EventVerdict::Failed) {
+            return Decide::Rework {
+                detail: format!("verifier {role} failed"),
+            };
+        }
+        if matches!(verdict, EventVerdict::ReworkNeeded) {
+            return Decide::Rework {
+                detail: format!("verifier {role} requested rework"),
+            };
+        }
+    }
+    if expected.iter().all(|r| {
+        received
+            .get(r)
+            .is_some_and(|v| matches!(v, EventVerdict::Shipped))
+    }) {
+        Decide::Pass
+    } else {
+        Decide::Wait
+    }
+}
+
+fn decide_fail_fast(received: &BTreeMap<String, EventVerdict>, expected: &[String]) -> Decide {
+    for (role, verdict) in received {
+        match verdict {
+            EventVerdict::Rejected => {
+                return Decide::Reject {
+                    detail: format!("verifier {role} rejected"),
+                };
+            }
+            EventVerdict::Escalated => {
+                return Decide::Reject {
+                    detail: format!("verifier {role} escalated"),
+                };
+            }
+            EventVerdict::Failed => {
+                return Decide::Rework {
+                    detail: format!("verifier {role} failed"),
+                };
+            }
+            EventVerdict::ReworkNeeded => {
+                return Decide::Rework {
+                    detail: format!("verifier {role} requested rework"),
+                };
+            }
+            EventVerdict::Shipped => {}
+        }
+    }
+    if expected.iter().all(|r| {
+        received
+            .get(r)
+            .is_some_and(|v| matches!(v, EventVerdict::Shipped))
+    }) {
+        Decide::Pass
+    } else {
+        Decide::Wait
+    }
+}
+
+fn decide_majority(
+    received: &BTreeMap<String, EventVerdict>,
+    expected: &[String],
+    threshold_pct: u32,
+) -> Decide {
+    let n: u32 = u32::try_from(expected.len()).unwrap_or(u32::MAX);
+    let mut s: u32 = 0;
+    let mut soft_fail: u32 = 0;
+    let mut hard_fail: u32 = 0;
+    for verdict in received.values() {
+        match verdict {
+            EventVerdict::Shipped => s += 1,
+            EventVerdict::Failed | EventVerdict::ReworkNeeded => soft_fail += 1,
+            EventVerdict::Rejected | EventVerdict::Escalated => hard_fail += 1,
+        }
+    }
+
+    if hard_fail > 0 {
+        return Decide::Reject {
+            detail: format!("majority gate hard fail count {hard_fail}"),
+        };
+    }
+
+    let threshold_total = u64::from(threshold_pct) * u64::from(n);
+    if u64::from(s) * 100 >= threshold_total {
+        return Decide::Pass;
+    }
+
+    let received_count: u32 = u32::try_from(received.len()).unwrap_or(u32::MAX);
+    let unreported = n.saturating_sub(received_count);
+    let max_possible = unreported.saturating_add(s);
+    let all_reported = s.saturating_add(soft_fail) == n;
+
+    if all_reported && soft_fail > 0 {
+        return Decide::Rework {
+            detail: format!("majority threshold {threshold_pct} not reached, soft fails present"),
+        };
+    }
+
+    if u64::from(max_possible) * 100 < threshold_total {
+        return Decide::Reject {
+            detail: format!("majority threshold {threshold_pct} unreachable"),
+        };
+    }
+
+    Decide::Wait
 }
