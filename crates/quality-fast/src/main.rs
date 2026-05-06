@@ -1,58 +1,29 @@
 //! quality-fast — small standalone binary that runs external CLI checks
-//! against pre-paid indices for fast no-compile feedback. Default scope
-//! is changed files (`git diff --name-only HEAD`); pass `--workspace` to
-//! widen to the whole workspace. Substrate validators handle the
-//! doughnut in the slow tier.
+//! against pre-paid indices for fast feedback. Scope is changed files
+//! only (`git diff --name-only HEAD`); changed crates drive cargo fmt,
+//! cargo check, and cargo clippy. Substrate validators handle
+//! workspace-wide compile and test in the slow tier.
 
 use anyhow::Result;
-use serde::Serialize;
-use std::collections::BTreeSet;
+use quality_fast::{cargo_check_targets_with, derive_changed_crates, Check};
 use std::path::PathBuf;
 use std::process::Command;
 
-#[derive(Serialize)]
-struct Check {
-    name: String,
-    ok: bool,
-    stdout: String,
-    stderr: String,
-}
-
-impl Check {
-    fn skipped(name: &str, reason: &str) -> Self {
-        Self {
-            name: name.to_string(),
-            ok: true,
-            stdout: String::new(),
-            stderr: reason.to_string(),
-        }
-    }
-}
-
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let workspace_scope = args.iter().any(|a| a == "--workspace");
-
-    let changed = if workspace_scope {
-        Vec::new()
-    } else {
-        changed_files().unwrap_or_default()
-    };
+    let changed = changed_files().unwrap_or_default();
     let changed_crates = derive_changed_crates(&changed);
 
     let mut checks: Vec<Check> = Vec::new();
 
-    if workspace_scope {
-        checks.push(run("cargo-fmt", "cargo", &["fmt", "--check"]));
-    } else if !changed_crates.is_empty() {
-        for c in &changed_crates {
-            checks.push(run(
-                &format!("cargo-fmt[{c}]"),
-                "cargo",
-                &["fmt", "--check", "-p", c],
-            ));
-        }
+    for c in &changed_crates {
+        checks.push(run(
+            &format!("cargo-fmt[{c}]"),
+            "cargo",
+            &["fmt", "--check", "-p", c],
+        ));
     }
+
+    checks.extend(cargo_check_targets_with(&changed_crates, run));
 
     checks.extend(cfdb_checks(&changed));
     checks.extend(ra_query_checks(&changed_crates));
@@ -82,17 +53,6 @@ fn changed_files() -> Result<Vec<String>> {
         .map(|l| l.trim().to_string())
         .filter(|l| !l.is_empty())
         .collect())
-}
-
-fn derive_changed_crates(changed: &[String]) -> Vec<String> {
-    let mut set: BTreeSet<String> = BTreeSet::new();
-    for path in changed {
-        let parts: Vec<&str> = path.splitn(3, '/').collect();
-        if parts.len() >= 2 && parts[0] == "crates" {
-            set.insert(parts[1].to_string());
-        }
-    }
-    set.into_iter().collect()
 }
 
 fn run(name: &str, prog: &str, args: &[&str]) -> Check {
