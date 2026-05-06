@@ -46,9 +46,25 @@ pub struct RetryBudget {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Reason {
     BudgetExhausted,
-    AbortRequested { actor: String, message: String },
-    AcceptanceFailed { detail: String },
-    DaemonError { detail: String },
+    AbortRequested {
+        actor: String,
+        message: String,
+    },
+    AcceptanceFailed {
+        detail: String,
+    },
+    /// preflight-criterion-agentry detected a smell heuristic firing on the
+    /// brief's `success_criteria`. The criterion is operator-authored and
+    /// the smell rules ARE the contract — refining is a code-level change
+    /// to the heuristics, not an operator-overridable knob. Smell details
+    /// (which smell-id fired, criterion text, baseline value) ride in the
+    /// `BriefEvent::PreflightSmellDetected` payload that triggers the
+    /// transition; the variant itself carries no payload so dashboards
+    /// surface a typed badge without parsing prose.
+    PreflightSmell,
+    DaemonError {
+        detail: String,
+    },
 }
 
 /// CI status carried by a `BriefEvent::CiResult`.
@@ -162,6 +178,19 @@ pub enum BriefEvent {
         message: String,
     },
     BudgetExhausted,
+    /// preflight-criterion-agentry's smell heuristics fired on the brief's
+    /// `success_criteria`. The runner emits `done failed` with
+    /// `cause: "preflight_smell"`; the daemon's trace translator (wired in
+    /// 84b-2) folds that into this variant so the FSM can transition the
+    /// brief to `Failed { reason: PreflightSmell }`. Carries the smell
+    /// identifier plus the criterion text and observed baseline so the
+    /// terminal verdict surfaces enough context for the operator to
+    /// rewrite the criterion without re-reading the trace stream.
+    PreflightSmellDetected {
+        smell_id: String,
+        criterion: String,
+        baseline: String,
+    },
 }
 
 /// Returned when an event is not legal in the current state. Carries an
@@ -185,12 +214,20 @@ pub struct InvalidTransition {
 /// are populated with `Ts::default()`; the daemon caller overlays the real
 /// wall-clock when wrapping into a `BriefStateRecord`. Keeping `handle`
 /// time-free is what makes the transition table testable as a pure table.
-pub fn handle(state: &BriefState, event: &BriefEvent) -> Result<BriefState, InvalidTransition> {
+///
+/// Error type is boxed because [`InvalidTransition`] embeds `BriefState +
+/// BriefEvent`, both of which grow whenever a new variant lands; clippy's
+/// `result_large_err` lint (denied as error in CI) flags the unboxed
+/// shape once the inner pair crosses the 128-byte threshold.
+pub fn handle(
+    state: &BriefState,
+    event: &BriefEvent,
+) -> Result<BriefState, Box<InvalidTransition>> {
     let invalid = || {
-        Err(InvalidTransition {
+        Err(Box::new(InvalidTransition {
             from: state.clone(),
             event: event.clone(),
-        })
+        }))
     };
 
     // Universal aborts on every non-terminal state.
@@ -227,6 +264,21 @@ pub fn handle(state: &BriefState, event: &BriefEvent) -> Result<BriefState, Inva
         }
 
         // ---- Authoring ----
+        // Preflight smell: preflight-criterion-agentry detected an
+        // operator-authored criterion that triggers one of the smell
+        // heuristics. Per Q1/Q3 of the brief 84b grill-me transcript,
+        // smell is a terminal block (no warn-and-continue, no
+        // operator-override): the criterion itself is the contract and
+        // refining the heuristics is a code-level PR. Routes through
+        // Authoring because preflight currently has no state of its
+        // own; 84b-2 will revisit the FSM if a dedicated `Preflight`
+        // state turns out to be worth the variant.
+        (BriefState::Authoring { .. }, BriefEvent::PreflightSmellDetected { .. }) => {
+            Ok(BriefState::Failed {
+                reason: Reason::PreflightSmell,
+            })
+        }
+
         // No-op short-circuit: acceptance passed against work that was
         // already on the base branch. Skip Verifying / Reviewing /
         // Shipping / Watching — there is no diff for downstream roles

@@ -872,7 +872,8 @@ fn retry_budget_roundtrip() {
 fn invalid_transition_carries_owned_pair() {
     let s = BriefState::Shipped;
     let e = coder_started();
-    let err: InvalidTransition = handle(&s, &e).expect_err("Shipped + CoderStarted is invalid");
+    let err: Box<InvalidTransition> =
+        handle(&s, &e).expect_err("Shipped + CoderStarted is invalid");
     assert_eq!(err.from, s);
     assert_eq!(err.event, e);
     // Cloneable so the daemon can attach the pair to a log line.
