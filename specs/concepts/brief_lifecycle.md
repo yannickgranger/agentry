@@ -187,3 +187,51 @@ greater-than: a record exactly at the budget is NOT yet orphan (avoids
 double-fire on a freshly-stamped boundary), one second over is.
 Terminal states are never orphan regardless of elapsed time; clock
 skew that places `record.at` in the future is also not-orphan.
+
+#### Role-name → kind mapping (not enforced by graph-specs)
+
+The spawner emits the full role name on each agent's spawn event
+(`role_name: "coder-claude-agentry"`, `"shipper-agentry"`, …). The
+translator's `role_by_agent` memo must store the SHORT kind that the
+`Done`-branch match arms compare against — otherwise the lookup
+returns the full name, no arm fires, and the FSM never advances out
+of `Authoring`. The mapping table:
+
+| Spawned role-name shape           | Short kind     | Done-branch BriefEvent                              |
+|-----------------------------------|----------------|-----------------------------------------------------|
+| `coder-*`                         | `coder`        | `CoderStarted` (on spawn), `CoderDone` (on done)    |
+| `ac-verifier-*`                   | `ac-verifier`  | `AcVerifierDone`                                    |
+| `verifier-*`                      | `verifier`     | `AcVerifierDone`                                    |
+| `reviewer-*`                      | `reviewer`     | `ReviewerDone { findings: [] }`                     |
+| `shipper-agentry` (exact)         | `shipper`      | `ShipperDone`                                       |
+| `ci-watcher-agentry` (exact)      | `ci-watcher`   | `CiResult { state: <verdict→CiState> }`             |
+| `preflight-criterion-*`           | `preflight`    | (none — preflight emits its own typed BriefEvent)   |
+
+CI-watcher verdict mapping: `EventVerdict::Shipped → CiState::Success`,
+`EventVerdict::Failed → CiState::Failed`, all other verdicts (`Escalated`,
+`ReworkNeeded`, `Rejected`) → `CiState::Pending`. The watcher does not
+normally emit the latter three on its happy path; the Pending fallback
+keeps the brief in `Watching` so the next poll tick can advance it.
+
+Unrecognised role names are NOT memoized — the `Done` lookup falls
+through to the catch-all (no `BriefEvent` emitted), preserving the
+"unknown role is invisible" invariant rather than silently
+mis-classifying a future role family.
+
+#### FSM transition flow (not enforced by graph-specs)
+
+```
+Submitted
+  → Authoring   (CoderStarted)
+  → Verifying   (CoderDone Shipped)
+  → Reviewing   (AcVerifierDone Shipped)
+  → Shipping    (ReviewerDone Shipped)
+  → Watching    (ShipperDone)
+  → Shipped     (CiResult Success)
+```
+
+`Watching` is a self-loop on `CiResult Pending` (the gitea poller
+is still waiting on green). `Watching → Reworking` triggers on
+`CiResult Failed`, bumping the retry budget. `Authoring → Shipped`
+short-circuits via `CoderDoneNoOp` when the coder's acceptance check
+passes against an empty diff (no work to verify, review, or ship).
