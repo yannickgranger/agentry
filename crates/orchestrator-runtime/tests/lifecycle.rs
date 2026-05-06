@@ -80,10 +80,12 @@ async fn mem_adapters_drive_handle() {
             },
             BriefEvent::AcVerifierDone {
                 verdict: EventVerdict::Shipped,
+                role_name: "ac-verifier-test".to_owned(),
             },
             BriefEvent::ReviewerDone {
                 verdict: EventVerdict::Shipped,
                 findings: vec![],
+                role_name: "reviewer-test".to_owned(),
             },
         ]),
     };
@@ -135,6 +137,7 @@ async fn mem_adapters_carry_retry_budget_through_rework() {
             },
             BriefEvent::AcVerifierDone {
                 verdict: EventVerdict::ReworkNeeded,
+                role_name: "ac-verifier-test".to_owned(),
             },
             BriefEvent::CoderStarted {
                 agent_id: "agent-2".into(),
@@ -390,7 +393,10 @@ fn translate_spawned_coder_claude_agentry_emits_coder_started() {
         }
         other => panic!("expected CoderStarted, got {other:?}"),
     }
-    assert_eq!(memo.get("agent-99").map(String::as_str), Some("coder"));
+    assert_eq!(
+        memo.get("agent-99").map(String::as_str),
+        Some("coder-claude-agentry")
+    );
 }
 
 #[test]
@@ -425,7 +431,10 @@ fn translate_done_from_shipper_emits_shipper_done() {
         spawned_event("shipper-agentry"),
     )
     .expect("memoize shipper spawn");
-    assert_eq!(memo.get("agent-s").map(String::as_str), Some("shipper"));
+    assert_eq!(
+        memo.get("agent-s").map(String::as_str),
+        Some("shipper-agentry")
+    );
     let out = translate_trace_entry(
         &mut memo,
         "agent-s".to_string(),

@@ -159,10 +159,12 @@ async fn projector_stops_at_no_op_terminal_and_does_not_consume_tail_events() {
         // terminal Shipped.
         BriefEvent::AcVerifierDone {
             verdict: EventVerdict::Shipped,
+            role_name: "ac-verifier-test".to_owned(),
         },
         BriefEvent::ReviewerDone {
             verdict: EventVerdict::Shipped,
             findings: vec![],
+            role_name: "reviewer-test".to_owned(),
         },
         BriefEvent::ShipperDone {
             pr_number: 1,

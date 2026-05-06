@@ -107,10 +107,12 @@ async fn projector_emits_one_shipped_terminal_on_happy_path() {
         },
         BriefEvent::AcVerifierDone {
             verdict: EventVerdict::Shipped,
+            role_name: "ac-verifier-test".to_owned(),
         },
         BriefEvent::ReviewerDone {
             verdict: EventVerdict::Shipped,
             findings: vec![],
+            role_name: "reviewer-test".to_owned(),
         },
         BriefEvent::ShipperDone {
             pr_number: 1,
@@ -180,10 +182,12 @@ async fn premature_shipped_event_does_not_yield_shipped_terminal() {
         },
         BriefEvent::AcVerifierDone {
             verdict: EventVerdict::Shipped,
+            role_name: "ac-verifier-test".to_owned(),
         },
         BriefEvent::ReviewerDone {
             verdict: EventVerdict::ReworkNeeded,
             findings: vec![blocker],
+            role_name: "reviewer-test".to_owned(),
         },
         // Universal handler short-circuits any non-terminal state to
         // Failed{BudgetExhausted}.

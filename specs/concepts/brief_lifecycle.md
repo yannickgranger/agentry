@@ -63,6 +63,16 @@ another input so the budget enforcement layer stays decoupled. Each
 variant carries the minimal data needed to compute the next state —
 verdicts, PR numbers, head SHAs, actor identities.
 
+`AcVerifierDone` and `ReviewerDone` additionally carry the originating
+`role_name` (the full role name like `"ac-verifier-claude-agentry"` or
+`"reviewer-mechanical-agentry"`) so the planned evidence multiset
+(396b-2) can key by sibling and distinguish reports from a fan-out (e.g.
+the three `ac-verifier-*` roles or the two `reviewer-*` roles under
+`agentry-self-host-v0`). Other variants are unchanged. The `role_name`
+field is populated by `translate_trace_entry` in the runtime adapter at
+the projector boundary — the same site that already maps each agent's
+spawned role onto an `EventKind`-shaped `BriefEvent`.
+
 ## Reason
 
 Why a brief landed in `BriefState::Failed`. Tagged enum with five
@@ -308,3 +318,10 @@ the FSM only transitions out of the phase when `decide` returns
 `Pass`, `Rework`, or `Reject`. The lifecycle driver will fail the
 brief on `InvalidTransition` rather than silently swallowing
 out-of-state events — closing the silent-drop bug at both layers.
+
+396b-1 has landed the `BriefEvent::AcVerifierDone` /
+`BriefEvent::ReviewerDone` `role_name` field as the multiset-key
+prerequisite — `handle()` still uses the existing serial-first-event
+semantics and pattern-matches the new field with `..` so behavior is
+unchanged. 396b-2 will land the `BriefState` evidence shape and the
+3-arg `handle()` that consumes `role_name` to key the multiset.
