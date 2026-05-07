@@ -111,12 +111,36 @@ pub async fn projector_task(
                 }
             }
             Err(invalid) => {
-                tracing::warn!(
+                tracing::error!(
                     brief = %brief_id.0,
                     from = ?invalid.from,
                     event = ?invalid.event,
-                    "FSM rejected event for current state; skipping"
+                    "FSM rejected event; failing brief with DaemonError"
                 );
+                let detail = format!(
+                    "FSM rejected event {:?} in state {:?}",
+                    invalid.event, invalid.from
+                );
+                let failed_state = BriefState::Failed {
+                    reason: orchestrator_types::lifecycle::Reason::DaemonError { detail },
+                };
+                let record = BriefStateRecord {
+                    brief_id: brief_id.clone(),
+                    state: failed_state.clone(),
+                    parent_brief_id: None,
+                    composition_role: None,
+                    at: now(),
+                };
+                projector
+                    .write(&record, &cursor)
+                    .await
+                    .map_err(|e| Error::Config(format!("state projector: {e}")))?;
+                state = failed_state;
+                if let Some(ref mut conn) = verdict_conn {
+                    emit_terminal_verdict(conn, &brief_id, &state, no_op_reason.as_deref()).await?;
+                }
+                cleanup_failed_brief(&brief_id, verdict_conn.as_mut()).await;
+                break;
             }
         }
     }
