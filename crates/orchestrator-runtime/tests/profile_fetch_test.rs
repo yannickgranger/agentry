@@ -35,7 +35,9 @@ async fn profile_fetch_404_returns_none() {
         .await;
 
     let url = format!("{}{PROFILE_PATH}?ref=develop", server.uri());
-    let got = fetch_profile_url(&url, "tok").await.expect("fetch ok");
+    let got = fetch_profile_url(&url, "tok", false)
+        .await
+        .expect("fetch ok");
     assert!(got.is_none(), "404 should return Ok(None), got {got:?}");
 }
 
@@ -62,7 +64,7 @@ gates = ["discover", "prescribe"]
         .await;
 
     let url = format!("{}{PROFILE_PATH}?ref=develop", server.uri());
-    let profile = fetch_profile_url(&url, "tok")
+    let profile = fetch_profile_url(&url, "tok", false)
         .await
         .expect("fetch ok")
         .expect("profile present");
@@ -86,7 +88,7 @@ gates = ["discover", "prescribe"]
 
 #[tokio::test]
 async fn profile_fetch_malformed_target_repo() {
-    let err = fetch_profile("no-slash-here", "develop", "forge.example", "tok")
+    let err = fetch_profile("no-slash-here", "develop", "forge.example", "tok", false)
         .await
         .expect_err("malformed target_repo must error");
     match err {
@@ -107,7 +109,7 @@ async fn profile_fetch_500_returns_http_error() {
         .await;
 
     let url = format!("{}{PROFILE_PATH}?ref=develop", server.uri());
-    let err = fetch_profile_url(&url, "tok")
+    let err = fetch_profile_url(&url, "tok", false)
         .await
         .expect_err("500 must surface as Http variant");
     match err {
@@ -130,11 +132,41 @@ async fn profile_fetch_invalid_toml() {
         .await;
 
     let url = format!("{}{PROFILE_PATH}?ref=develop", server.uri());
-    let err = fetch_profile_url(&url, "tok")
+    let err = fetch_profile_url(&url, "tok", false)
         .await
         .expect_err("invalid toml must surface as Parse variant");
     assert!(
         matches!(err, ProfileFetchError::Parse(_)),
         "expected Parse, got {err:?}"
     );
+}
+
+/// Lab-internal forges run with a self-signed cert; `tls_insecure` is the
+/// escape hatch. Setting up wiremock with HTTPS + a self-signed cert is
+/// non-trivial in this test harness, so this just verifies the client builder
+/// accepts both `tls_insecure=true` and `tls_insecure=false` without panicking.
+/// Both calls hit a known-bad URL so we just need the network attempt to not
+/// blow up at builder construction time.
+#[tokio::test]
+async fn profile_fetch_with_tls_insecure() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(PROFILE_PATH))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+
+    let url = format!("{}{PROFILE_PATH}?ref=develop", server.uri());
+
+    // tls_insecure = false: builder must succeed; 404 returns Ok(None).
+    let got_strict = fetch_profile_url(&url, "tok", false)
+        .await
+        .expect("strict client builder must succeed");
+    assert!(got_strict.is_none());
+
+    // tls_insecure = true: builder must succeed; 404 returns Ok(None).
+    let got_lax = fetch_profile_url(&url, "tok", true)
+        .await
+        .expect("lax client builder must succeed");
+    assert!(got_lax.is_none());
 }

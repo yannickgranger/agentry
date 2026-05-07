@@ -1275,7 +1275,15 @@ async fn fetch_brief_profile(
         return None;
     }
 
-    match redis_io::fetch_profile(target_repo, base_branch, forge_host, &gitea_token).await {
+    match redis_io::fetch_profile(
+        target_repo,
+        base_branch,
+        forge_host,
+        &gitea_token,
+        cfg.forge.tls_insecure,
+    )
+    .await
+    {
         Ok(Some(p)) => {
             tracing::info!(
                 brief = %brief.id,
