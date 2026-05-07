@@ -10,6 +10,7 @@ pub mod brief;
 pub mod event;
 pub mod lifecycle;
 pub mod permit;
+pub mod profile;
 pub mod project;
 pub mod review;
 pub mod role;
@@ -19,6 +20,10 @@ pub mod verdict;
 pub use brief::{Brief, BriefId, BriefKind, Budget, EscalationMode, Payload};
 pub use event::{DoneReason, Event, EventKind, EventVerdict, ToolCall};
 pub use permit::{PermitScope, ToolAllowlist, WorkPermit};
+pub use profile::{
+    parse_profile_toml, Profile, ProfileAcceptanceSection, ProfileMethodologySection,
+    ProfileParseError, ProfileRoleSection,
+};
 pub use project::{Project, ProjectSlug, StandingOrders};
 pub use review::{FindingOrigin, ReviewFinding, Severity};
 pub use role::{

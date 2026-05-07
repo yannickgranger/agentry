@@ -64,6 +64,7 @@ clap = { version = "4", features = ["derive"] }
 
 # Config (typed, layered: defaults + TOML + env overlay)
 figment = { version = "0.10", features = ["toml", "env"] }
+toml = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 [workspace.lints.rust]
