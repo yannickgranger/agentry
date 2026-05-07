@@ -32,13 +32,18 @@ use std::sync::{Arc, Mutex};
 
 fn no_gates() -> std::sync::Arc<orchestrator_types::lifecycle::PhaseGates> {
     use orchestrator_types::lifecycle::{GateConfig, GatePolicy, PhaseGates};
+    // Non-empty expected roles in both phases: with the E/1 empty-phase
+    // auto-skip, an empty/empty config would short-circuit Authoring →
+    // Shipping and the trail asserted below would be unreachable. These
+    // tests are about the full FSM trail, not the auto-skip path; the
+    // dedicated auto-skip tests live in orchestrator-types/tests/lifecycle.rs.
     std::sync::Arc::new(PhaseGates {
         verifying: GateConfig {
-            expected_roles: vec![],
+            expected_roles: vec!["ac-verifier-test".to_owned()],
             policy: GatePolicy::AllMustPass,
         },
         reviewing: GateConfig {
-            expected_roles: vec![],
+            expected_roles: vec!["reviewer-test".to_owned()],
             policy: GatePolicy::AllMustPass,
         },
     })

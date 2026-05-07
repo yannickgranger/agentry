@@ -18,6 +18,20 @@ fn no_gates() -> orchestrator_types::lifecycle::PhaseGates {
     }
 }
 
+fn single_role_gates() -> orchestrator_types::lifecycle::PhaseGates {
+    use orchestrator_types::lifecycle::{GateConfig, GatePolicy, PhaseGates};
+    PhaseGates {
+        verifying: GateConfig {
+            expected_roles: vec!["ac-verifier-test".to_owned()],
+            policy: GatePolicy::AllMustPass,
+        },
+        reviewing: GateConfig {
+            expected_roles: vec!["reviewer-test".to_owned()],
+            policy: GatePolicy::AllMustPass,
+        },
+    }
+}
+
 fn fresh_retry() -> RetryBudget {
     RetryBudget {
         attempt: 1,
@@ -43,8 +57,9 @@ fn abort() -> BriefEvent {
 #[test]
 fn happy_path_submitted_to_shipped() {
     let s0 = BriefState::Submitted;
+    let gates = single_role_gates();
 
-    let s1 = handle(&s0, &coder_started(), &no_gates()).expect("submitted + coder_started");
+    let s1 = handle(&s0, &coder_started(), &gates).expect("submitted + coder_started");
     let retry = match &s1 {
         BriefState::Authoring {
             agent_id, retry, ..
@@ -62,7 +77,7 @@ fn happy_path_submitted_to_shipped() {
         &BriefEvent::CoderDone {
             verdict: EventVerdict::Shipped,
         },
-        &no_gates(),
+        &gates,
     )
     .expect("authoring + coder_done(shipped)");
     assert_eq!(
@@ -70,7 +85,7 @@ fn happy_path_submitted_to_shipped() {
         BriefState::Verifying {
             retry,
             received: std::collections::BTreeMap::new(),
-            expected: vec![],
+            expected: vec!["ac-verifier-test".to_owned()],
             policy: orchestrator_types::lifecycle::GatePolicy::AllMustPass
         }
     );
@@ -81,7 +96,7 @@ fn happy_path_submitted_to_shipped() {
             verdict: EventVerdict::Shipped,
             role_name: "ac-verifier-test".to_owned(),
         },
-        &no_gates(),
+        &gates,
     )
     .expect("verifying + ac_verifier_done(shipped)");
     assert_eq!(
@@ -89,7 +104,7 @@ fn happy_path_submitted_to_shipped() {
         BriefState::Reviewing {
             retry,
             received: std::collections::BTreeMap::new(),
-            expected: vec![],
+            expected: vec!["reviewer-test".to_owned()],
             policy: orchestrator_types::lifecycle::GatePolicy::AllMustPass
         }
     );
@@ -101,7 +116,7 @@ fn happy_path_submitted_to_shipped() {
             findings: vec![],
             role_name: "reviewer-test".to_owned(),
         },
-        &no_gates(),
+        &gates,
     )
     .expect("reviewing + reviewer_done(shipped)");
     assert!(matches!(s4, BriefState::Shipping { .. }));
@@ -112,7 +127,7 @@ fn happy_path_submitted_to_shipped() {
             pr_number: 42,
             head_sha: "abc123".to_owned(),
         },
-        &no_gates(),
+        &gates,
     )
     .expect("shipping + shipper_done");
     assert_eq!(
@@ -130,7 +145,7 @@ fn happy_path_submitted_to_shipped() {
             state: CiState::Success,
             head_sha: "abc123".to_owned(),
         },
-        &no_gates(),
+        &gates,
     )
     .expect("watching + ci_success");
     assert_eq!(s6, BriefState::Shipped);
@@ -992,7 +1007,10 @@ fn three_ac_verifier_gates() -> orchestrator_types::lifecycle::PhaseGates {
             policy: GatePolicy::AllMustPass,
         },
         reviewing: GateConfig {
-            expected_roles: vec![],
+            // Non-empty so the post-Verifying chained auto-skip does
+            // not short-circuit straight to Shipping; this helper is
+            // used by tests pinning the verifier-phase gate behavior.
+            expected_roles: vec!["reviewer-test".to_owned()],
             policy: GatePolicy::AllMustPass,
         },
     }
@@ -1267,5 +1285,159 @@ fn reviewing_one_reviewer_rework_needed_transitions_to_reworking() {
             assert_eq!(retry.attempt, 2);
         }
         other => panic!("expected Reworking, got {other:?}"),
+    }
+}
+
+// --- E/1: empty-phase auto-skip ---
+
+fn gates_with_empty(
+    verifying_empty: bool,
+    reviewing_empty: bool,
+) -> orchestrator_types::lifecycle::PhaseGates {
+    use orchestrator_types::lifecycle::{GateConfig, GatePolicy, PhaseGates};
+    PhaseGates {
+        verifying: GateConfig {
+            expected_roles: if verifying_empty {
+                vec![]
+            } else {
+                vec!["ac-verifier-claude".to_owned()]
+            },
+            policy: GatePolicy::AllMustPass,
+        },
+        reviewing: GateConfig {
+            expected_roles: if reviewing_empty {
+                vec![]
+            } else {
+                vec!["reviewer-mech".to_owned()]
+            },
+            policy: GatePolicy::AllMustPass,
+        },
+    }
+}
+
+#[test]
+fn authoring_to_verifying_auto_skips_empty_verifying() {
+    use orchestrator_types::lifecycle::GatePolicy;
+    let gates = gates_with_empty(true, false);
+    let s = BriefState::Authoring {
+        agent_id: "c".into(),
+        started_at: Ts::default(),
+        retry: fresh_retry(),
+    };
+    let next = handle(
+        &s,
+        &BriefEvent::CoderDone {
+            verdict: EventVerdict::Shipped,
+        },
+        &gates,
+    )
+    .expect("ok");
+    match next {
+        BriefState::Reviewing {
+            received,
+            expected,
+            policy,
+            ..
+        } => {
+            assert!(received.is_empty());
+            assert_eq!(expected, vec!["reviewer-mech".to_owned()]);
+            assert_eq!(policy, GatePolicy::AllMustPass);
+        }
+        other => panic!("expected Reviewing (auto-skipped Verifying), got {other:?}"),
+    }
+}
+
+#[test]
+fn authoring_to_verifying_auto_skips_both_empty_phases_to_shipping() {
+    let gates = gates_with_empty(true, true);
+    let s = BriefState::Authoring {
+        agent_id: "c".into(),
+        started_at: Ts::default(),
+        retry: fresh_retry(),
+    };
+    let next = handle(
+        &s,
+        &BriefEvent::CoderDone {
+            verdict: EventVerdict::Shipped,
+        },
+        &gates,
+    )
+    .expect("ok");
+    match next {
+        BriefState::Shipping {
+            pr_number,
+            head_sha,
+            ..
+        } => {
+            assert_eq!(pr_number, 0);
+            assert!(head_sha.is_empty());
+        }
+        other => panic!("expected Shipping (auto-skipped both phases), got {other:?}"),
+    }
+}
+
+#[test]
+fn authoring_to_verifying_no_skip_when_verifying_has_expected() {
+    use orchestrator_types::lifecycle::GatePolicy;
+    let gates = gates_with_empty(false, true);
+    let s = BriefState::Authoring {
+        agent_id: "c".into(),
+        started_at: Ts::default(),
+        retry: fresh_retry(),
+    };
+    let next = handle(
+        &s,
+        &BriefEvent::CoderDone {
+            verdict: EventVerdict::Shipped,
+        },
+        &gates,
+    )
+    .expect("ok");
+    match next {
+        BriefState::Verifying {
+            received,
+            expected,
+            policy,
+            ..
+        } => {
+            assert!(received.is_empty());
+            assert_eq!(expected, vec!["ac-verifier-claude".to_owned()]);
+            assert_eq!(policy, GatePolicy::AllMustPass);
+        }
+        other => panic!("expected Verifying (no auto-skip), got {other:?}"),
+    }
+}
+
+#[test]
+fn verifying_to_reviewing_auto_skips_empty_reviewing() {
+    use orchestrator_types::lifecycle::GatePolicy;
+    let gates = gates_with_empty(false, true);
+    let mut received = std::collections::BTreeMap::new();
+    received.insert("ac-verifier-claude".to_owned(), EventVerdict::Shipped);
+    let s = BriefState::Verifying {
+        retry: fresh_retry(),
+        received,
+        expected: vec!["ac-verifier-claude".to_owned()],
+        policy: GatePolicy::AllMustPass,
+    };
+    let next = handle(
+        &s,
+        &BriefEvent::AcVerifierDone {
+            verdict: EventVerdict::Shipped,
+            role_name: "ac-verifier-claude".to_owned(),
+        },
+        &gates,
+    )
+    .expect("ok");
+    match next {
+        BriefState::Shipping {
+            pr_number,
+            head_sha,
+            ..
+        } => {
+            assert_eq!(pr_number, 0);
+            assert!(head_sha.is_empty());
+        }
+        other => panic!("expected Shipping (auto-skipped empty Reviewing), got {other:?}"),
     }
 }
