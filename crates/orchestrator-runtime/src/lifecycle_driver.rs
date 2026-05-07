@@ -52,6 +52,7 @@ pub async fn projector_task(
     mut source: Box<dyn EventSource + Send>,
     mut projector: Box<dyn StateProjector + Send>,
     mut verdict_conn: Option<ConnectionManager>,
+    phase_gates: std::sync::Arc<orchestrator_types::lifecycle::PhaseGates>,
 ) -> Result<()> {
     let mut state = BriefState::Submitted;
     let mut step: u64 = 0;
@@ -73,7 +74,7 @@ pub async fn projector_task(
         }
         step = step.saturating_add(1);
         let cursor = format!("step-{step}");
-        match handle(&state, &event) {
+        match handle(&state, &event, &phase_gates) {
             Ok(new_state) => {
                 let record = BriefStateRecord {
                     brief_id: brief_id.clone(),
@@ -320,5 +321,38 @@ async fn cleanup_brief_at(
                 "trace append for workspace-cleanup event failed"
             );
         }
+    }
+}
+
+/// Project a team's role list into the per-phase `PhaseGates` the FSM
+/// driver threads through `handle()`. Walks `team.roles` and partitions
+/// by `crate::lifecycle::role_kind`: `ac-verifier` / `verifier` roles
+/// feed the verifying gate's `expected_roles`, `reviewer` roles feed the
+/// reviewing gate's. Policy is hardcoded `AllMustPass` for both phases —
+/// Pattern 3 (#397) lifts policy to per-edge config in topology JSON.
+#[must_use]
+pub fn build_phase_gates(
+    team: &orchestrator_types::TeamTopology,
+) -> orchestrator_types::lifecycle::PhaseGates {
+    use orchestrator_types::lifecycle::{GateConfig, GatePolicy, PhaseGates};
+    let mut verifying_roles: Vec<String> = Vec::new();
+    let mut reviewing_roles: Vec<String> = Vec::new();
+    for r in &team.roles {
+        let role_name = &r.name.0;
+        match crate::lifecycle::role_kind(role_name) {
+            Some("ac-verifier") | Some("verifier") => verifying_roles.push(role_name.clone()),
+            Some("reviewer") => reviewing_roles.push(role_name.clone()),
+            _ => {}
+        }
+    }
+    PhaseGates {
+        verifying: GateConfig {
+            expected_roles: verifying_roles,
+            policy: GatePolicy::AllMustPass,
+        },
+        reviewing: GateConfig {
+            expected_roles: reviewing_roles,
+            policy: GatePolicy::AllMustPass,
+        },
     }
 }

@@ -30,6 +30,20 @@ use orchestrator_types::{BriefId, EventVerdict};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
+fn no_gates() -> std::sync::Arc<orchestrator_types::lifecycle::PhaseGates> {
+    use orchestrator_types::lifecycle::{GateConfig, GatePolicy, PhaseGates};
+    std::sync::Arc::new(PhaseGates {
+        verifying: GateConfig {
+            expected_roles: vec![],
+            policy: GatePolicy::AllMustPass,
+        },
+        reviewing: GateConfig {
+            expected_roles: vec![],
+            policy: GatePolicy::AllMustPass,
+        },
+    })
+}
+
 struct MemEventSource {
     events: VecDeque<BriefEvent>,
 }
@@ -71,7 +85,7 @@ async fn run_to_completion(
     let projector: Box<dyn StateProjector + Send> = Box::new(MemStateProjector {
         written: written.clone(),
     });
-    projector_task(brief_id, source, projector, None)
+    projector_task(brief_id, source, projector, None, no_gates())
         .await
         .expect("projector_task");
     let log = written.lock().expect("mutex").clone();

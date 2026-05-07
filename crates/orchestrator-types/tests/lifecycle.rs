@@ -4,6 +4,20 @@ use orchestrator_types::lifecycle::{
 };
 use orchestrator_types::{now, BriefId, EventVerdict, ReviewFinding, Ts};
 
+fn no_gates() -> orchestrator_types::lifecycle::PhaseGates {
+    use orchestrator_types::lifecycle::{GateConfig, GatePolicy, PhaseGates};
+    PhaseGates {
+        verifying: GateConfig {
+            expected_roles: vec![],
+            policy: GatePolicy::AllMustPass,
+        },
+        reviewing: GateConfig {
+            expected_roles: vec![],
+            policy: GatePolicy::AllMustPass,
+        },
+    }
+}
+
 fn fresh_retry() -> RetryBudget {
     RetryBudget {
         attempt: 1,
@@ -30,7 +44,7 @@ fn abort() -> BriefEvent {
 fn happy_path_submitted_to_shipped() {
     let s0 = BriefState::Submitted;
 
-    let s1 = handle(&s0, &coder_started()).expect("submitted + coder_started");
+    let s1 = handle(&s0, &coder_started(), &no_gates()).expect("submitted + coder_started");
     let retry = match &s1 {
         BriefState::Authoring {
             agent_id, retry, ..
@@ -48,9 +62,18 @@ fn happy_path_submitted_to_shipped() {
         &BriefEvent::CoderDone {
             verdict: EventVerdict::Shipped,
         },
+        &no_gates(),
     )
     .expect("authoring + coder_done(shipped)");
-    assert_eq!(s2, BriefState::Verifying { retry });
+    assert_eq!(
+        s2,
+        BriefState::Verifying {
+            retry,
+            received: std::collections::BTreeMap::new(),
+            expected: vec![],
+            policy: orchestrator_types::lifecycle::GatePolicy::AllMustPass
+        }
+    );
 
     let s3 = handle(
         &s2,
@@ -58,9 +81,18 @@ fn happy_path_submitted_to_shipped() {
             verdict: EventVerdict::Shipped,
             role_name: "ac-verifier-test".to_owned(),
         },
+        &no_gates(),
     )
     .expect("verifying + ac_verifier_done(shipped)");
-    assert_eq!(s3, BriefState::Reviewing { retry });
+    assert_eq!(
+        s3,
+        BriefState::Reviewing {
+            retry,
+            received: std::collections::BTreeMap::new(),
+            expected: vec![],
+            policy: orchestrator_types::lifecycle::GatePolicy::AllMustPass
+        }
+    );
 
     let s4 = handle(
         &s3,
@@ -69,6 +101,7 @@ fn happy_path_submitted_to_shipped() {
             findings: vec![],
             role_name: "reviewer-test".to_owned(),
         },
+        &no_gates(),
     )
     .expect("reviewing + reviewer_done(shipped)");
     assert!(matches!(s4, BriefState::Shipping { .. }));
@@ -79,6 +112,7 @@ fn happy_path_submitted_to_shipped() {
             pr_number: 42,
             head_sha: "abc123".to_owned(),
         },
+        &no_gates(),
     )
     .expect("shipping + shipper_done");
     assert_eq!(
@@ -96,6 +130,7 @@ fn happy_path_submitted_to_shipped() {
             state: CiState::Success,
             head_sha: "abc123".to_owned(),
         },
+        &no_gates(),
     )
     .expect("watching + ci_success");
     assert_eq!(s6, BriefState::Shipped);
@@ -115,6 +150,7 @@ fn authoring_coder_done_failed_goes_to_failed_acceptance() {
         &BriefEvent::CoderDone {
             verdict: EventVerdict::Failed,
         },
+        &no_gates(),
     )
     .expect("ok");
     assert!(
@@ -140,6 +176,7 @@ fn authoring_coder_done_rework_needed_is_invalid() {
         &BriefEvent::CoderDone {
             verdict: EventVerdict::ReworkNeeded,
         },
+        &no_gates(),
     )
     .expect_err("coder cannot self-rework");
     assert_eq!(err.from, s);
@@ -151,6 +188,9 @@ fn authoring_coder_done_rework_needed_is_invalid() {
 fn verifier_failed_pushes_to_reworking_and_increments_retry() {
     let s = BriefState::Verifying {
         retry: RetryBudget { attempt: 1, max: 3 },
+        received: std::collections::BTreeMap::new(),
+        expected: vec![],
+        policy: orchestrator_types::lifecycle::GatePolicy::AllMustPass,
     };
     let next = handle(
         &s,
@@ -158,6 +198,7 @@ fn verifier_failed_pushes_to_reworking_and_increments_retry() {
             verdict: EventVerdict::Failed,
             role_name: "ac-verifier-test".to_owned(),
         },
+        &no_gates(),
     )
     .expect("ok");
     match next {
@@ -175,6 +216,9 @@ fn verifier_failed_pushes_to_reworking_and_increments_retry() {
 fn reviewer_rework_increments_retry() {
     let s = BriefState::Reviewing {
         retry: RetryBudget { attempt: 1, max: 3 },
+        received: std::collections::BTreeMap::new(),
+        expected: vec![],
+        policy: orchestrator_types::lifecycle::GatePolicy::AllMustPass,
     };
     let next = handle(
         &s,
@@ -183,6 +227,7 @@ fn reviewer_rework_increments_retry() {
             findings: vec![],
             role_name: "reviewer-test".to_owned(),
         },
+        &no_gates(),
     )
     .expect("ok");
     match next {
@@ -198,6 +243,9 @@ fn reviewer_rework_increments_retry() {
 fn reviewer_rejected_goes_to_failed() {
     let s = BriefState::Reviewing {
         retry: fresh_retry(),
+        received: std::collections::BTreeMap::new(),
+        expected: vec![],
+        policy: orchestrator_types::lifecycle::GatePolicy::AllMustPass,
     };
     let next = handle(
         &s,
@@ -206,6 +254,7 @@ fn reviewer_rejected_goes_to_failed() {
             findings: vec![],
             role_name: "reviewer-test".to_owned(),
         },
+        &no_gates(),
     )
     .expect("ok");
     assert!(matches!(
@@ -225,7 +274,7 @@ fn reworking_coder_started_returns_to_authoring_with_same_retry() {
         target: ReworkTarget::Coder,
         retry,
     };
-    let next = handle(&s, &coder_started()).expect("ok");
+    let next = handle(&s, &coder_started(), &no_gates()).expect("ok");
     match next {
         BriefState::Authoring {
             agent_id, retry: r, ..
@@ -251,6 +300,7 @@ fn watching_rebased_updates_head_sha() {
         &BriefEvent::Rebased {
             new_head_sha: "new".into(),
         },
+        &no_gates(),
     )
     .expect("ok");
     assert_eq!(
@@ -270,7 +320,7 @@ fn watching_rebase_started_is_a_no_op() {
         head_sha: "h".into(),
         retry: fresh_retry(),
     };
-    let next = handle(&s, &BriefEvent::RebaseStarted).expect("ok");
+    let next = handle(&s, &BriefEvent::RebaseStarted, &no_gates()).expect("ok");
     assert_eq!(next, s);
 }
 
@@ -287,6 +337,7 @@ fn watching_ci_pending_stays_in_watching() {
             state: CiState::Pending,
             head_sha: "h".into(),
         },
+        &no_gates(),
     )
     .expect("ok");
     assert_eq!(next, s);
@@ -305,6 +356,7 @@ fn watching_ci_failed_kicks_off_rework() {
             state: CiState::Failed,
             head_sha: "h".into(),
         },
+        &no_gates(),
     )
     .expect("ok");
     assert!(matches!(next, BriefState::Reworking { .. }));
@@ -316,6 +368,9 @@ fn watching_ci_failed_kicks_off_rework() {
 fn rework_at_cap_short_circuits_to_budget_exhausted() {
     let s = BriefState::Reviewing {
         retry: RetryBudget { attempt: 3, max: 3 },
+        received: std::collections::BTreeMap::new(),
+        expected: vec![],
+        policy: orchestrator_types::lifecycle::GatePolicy::AllMustPass,
     };
     let next = handle(
         &s,
@@ -324,6 +379,7 @@ fn rework_at_cap_short_circuits_to_budget_exhausted() {
             findings: vec![],
             role_name: "reviewer-test".to_owned(),
         },
+        &no_gates(),
     )
     .expect("ok");
     assert_eq!(
@@ -347,6 +403,7 @@ fn ci_failed_at_cap_short_circuits_to_budget_exhausted() {
             state: CiState::Failed,
             head_sha: "h".into(),
         },
+        &no_gates(),
     )
     .expect("ok");
     assert_eq!(
@@ -370,9 +427,15 @@ fn abort_from_every_non_terminal_state_yields_failed_abort() {
         },
         BriefState::Verifying {
             retry: fresh_retry(),
+            received: std::collections::BTreeMap::new(),
+            expected: vec![],
+            policy: orchestrator_types::lifecycle::GatePolicy::AllMustPass,
         },
         BriefState::Reviewing {
             retry: fresh_retry(),
+            received: std::collections::BTreeMap::new(),
+            expected: vec![],
+            policy: orchestrator_types::lifecycle::GatePolicy::AllMustPass,
         },
         BriefState::Reworking {
             target: ReworkTarget::Coder,
@@ -395,7 +458,8 @@ fn abort_from_every_non_terminal_state_yields_failed_abort() {
         },
     ];
     for s in states {
-        let next = handle(&s, &abort()).unwrap_or_else(|_| panic!("abort denied from {s:?}"));
+        let next =
+            handle(&s, &abort(), &no_gates()).unwrap_or_else(|_| panic!("abort denied from {s:?}"));
         assert!(
             matches!(
                 next,
@@ -414,13 +478,19 @@ fn budget_exhausted_event_from_every_non_terminal_state_yields_failed_budget() {
         BriefState::Submitted,
         BriefState::Verifying {
             retry: fresh_retry(),
+            received: std::collections::BTreeMap::new(),
+            expected: vec![],
+            policy: orchestrator_types::lifecycle::GatePolicy::AllMustPass,
         },
         BriefState::Reviewing {
             retry: fresh_retry(),
+            received: std::collections::BTreeMap::new(),
+            expected: vec![],
+            policy: orchestrator_types::lifecycle::GatePolicy::AllMustPass,
         },
     ];
     for s in states {
-        let next = handle(&s, &BriefEvent::BudgetExhausted)
+        let next = handle(&s, &BriefEvent::BudgetExhausted, &no_gates())
             .unwrap_or_else(|_| panic!("budget_exhausted denied from {s:?}"));
         assert_eq!(
             next,
@@ -470,7 +540,7 @@ fn shipped_rejects_every_event() {
         BriefEvent::BudgetExhausted,
     ];
     for e in events {
-        let err = handle(&s, &e).expect_err("Shipped is terminal");
+        let err = handle(&s, &e, &no_gates()).expect_err("Shipped is terminal");
         assert_eq!(err.from, s);
         assert_eq!(err.event, e);
     }
@@ -488,6 +558,7 @@ fn failed_accepts_only_retry_requested() {
             actor: "h".into(),
             reason: "manual retry".into(),
         },
+        &no_gates(),
     )
     .expect("retry resets failed brief");
     assert_eq!(next, BriefState::Submitted);
@@ -511,7 +582,7 @@ fn failed_accepts_only_retry_requested() {
         BriefEvent::BudgetExhausted,
     ];
     for e in bad {
-        let err = handle(&s, &e).expect_err("Failed rejects non-retry events");
+        let err = handle(&s, &e, &no_gates()).expect_err("Failed rejects non-retry events");
         assert_eq!(err.from, s);
         assert_eq!(err.event, e);
     }
@@ -553,7 +624,7 @@ fn submitted_rejects_non_starter_events() {
         },
     ];
     for e in bad {
-        handle(&s, &e).expect_err("submitted rejects non-starter events");
+        handle(&s, &e, &no_gates()).expect_err("submitted rejects non-starter events");
     }
 }
 
@@ -593,7 +664,7 @@ fn authoring_rejects_unrelated_events() {
         },
     ];
     for e in bad {
-        handle(&s, &e).expect_err("transition should be invalid");
+        handle(&s, &e, &no_gates()).expect_err("transition should be invalid");
     }
 }
 
@@ -628,7 +699,7 @@ fn watching_rejects_unrelated_events() {
         },
     ];
     for e in bad {
-        handle(&s, &e).expect_err("transition should be invalid");
+        handle(&s, &e, &no_gates()).expect_err("transition should be invalid");
     }
 }
 
@@ -667,7 +738,7 @@ fn shipping_rejects_unrelated_events() {
         },
     ];
     for e in bad {
-        handle(&s, &e).expect_err("transition should be invalid");
+        handle(&s, &e, &no_gates()).expect_err("transition should be invalid");
     }
 }
 
@@ -690,10 +761,10 @@ fn extension_rejects_unrelated_events() {
         },
     ];
     for e in bad {
-        handle(&s, &e).expect_err("transition should be invalid");
+        handle(&s, &e, &no_gates()).expect_err("transition should be invalid");
     }
     // Aborts still apply.
-    let next = handle(&s, &abort()).expect("abort still works in extension");
+    let next = handle(&s, &abort(), &no_gates()).expect("abort still works in extension");
     assert!(matches!(
         next,
         BriefState::Failed {
@@ -723,9 +794,15 @@ fn brief_state_roundtrip_every_variant() {
         },
         BriefState::Verifying {
             retry: fresh_retry(),
+            received: std::collections::BTreeMap::new(),
+            expected: vec![],
+            policy: orchestrator_types::lifecycle::GatePolicy::AllMustPass,
         },
         BriefState::Reviewing {
             retry: fresh_retry(),
+            received: std::collections::BTreeMap::new(),
+            expected: vec![],
+            policy: orchestrator_types::lifecycle::GatePolicy::AllMustPass,
         },
         BriefState::Reworking {
             target: ReworkTarget::Reviewer,
@@ -843,6 +920,9 @@ fn brief_state_record_roundtrip() {
         brief_id: BriefId("brf_test".into()),
         state: BriefState::Verifying {
             retry: fresh_retry(),
+            received: std::collections::BTreeMap::new(),
+            expected: vec![],
+            policy: orchestrator_types::lifecycle::GatePolicy::AllMustPass,
         },
         parent_brief_id: Some(BriefId("brf_parent".into())),
         composition_role: Some("planner-child".into()),
@@ -891,7 +971,7 @@ fn invalid_transition_carries_owned_pair() {
     let s = BriefState::Shipped;
     let e = coder_started();
     let err: Box<InvalidTransition> =
-        handle(&s, &e).expect_err("Shipped + CoderStarted is invalid");
+        handle(&s, &e, &no_gates()).expect_err("Shipped + CoderStarted is invalid");
     assert_eq!(err.from, s);
     assert_eq!(err.event, e);
     // Cloneable so the daemon can attach the pair to a log line.

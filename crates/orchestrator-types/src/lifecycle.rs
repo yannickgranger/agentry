@@ -100,9 +100,15 @@ pub enum BriefState {
     },
     Verifying {
         retry: RetryBudget,
+        received: BTreeMap<String, EventVerdict>,
+        expected: Vec<String>,
+        policy: GatePolicy,
     },
     Reviewing {
         retry: RetryBudget,
+        received: BTreeMap<String, EventVerdict>,
+        expected: Vec<String>,
+        policy: GatePolicy,
     },
     Reworking {
         target: ReworkTarget,
@@ -225,6 +231,7 @@ pub struct InvalidTransition {
 pub fn handle(
     state: &BriefState,
     event: &BriefEvent,
+    gates: &PhaseGates,
 ) -> Result<BriefState, Box<InvalidTransition>> {
     let invalid = || {
         Err(Box::new(InvalidTransition {
@@ -291,7 +298,12 @@ pub fn handle(
         (BriefState::Authoring { .. }, BriefEvent::CoderDoneNoOp { .. }) => Ok(BriefState::Shipped),
 
         (BriefState::Authoring { retry, .. }, BriefEvent::CoderDone { verdict }) => match verdict {
-            EventVerdict::Shipped => Ok(BriefState::Verifying { retry: *retry }),
+            EventVerdict::Shipped => Ok(BriefState::Verifying {
+                retry: *retry,
+                received: BTreeMap::new(),
+                expected: gates.verifying.expected_roles.clone(),
+                policy: gates.verifying.policy.clone(),
+            }),
             EventVerdict::Failed => Ok(BriefState::Failed {
                 reason: Reason::AcceptanceFailed {
                     detail: "coder reported failed".to_owned(),
@@ -311,9 +323,14 @@ pub fn handle(
         },
 
         // ---- Verifying ----
-        (BriefState::Verifying { retry }, BriefEvent::AcVerifierDone { verdict, .. }) => {
+        (BriefState::Verifying { retry, .. }, BriefEvent::AcVerifierDone { verdict, .. }) => {
             match verdict {
-                EventVerdict::Shipped => Ok(BriefState::Reviewing { retry: *retry }),
+                EventVerdict::Shipped => Ok(BriefState::Reviewing {
+                    retry: *retry,
+                    received: BTreeMap::new(),
+                    expected: gates.reviewing.expected_roles.clone(),
+                    policy: gates.reviewing.policy.clone(),
+                }),
                 EventVerdict::ReworkNeeded | EventVerdict::Failed => {
                     Ok(increment_or_fail(*retry, |next| BriefState::Reworking {
                         target: ReworkTarget::Coder,
@@ -335,7 +352,7 @@ pub fn handle(
 
         // ---- Reviewing ----
         (
-            BriefState::Reviewing { retry },
+            BriefState::Reviewing { retry, .. },
             BriefEvent::ReviewerDone {
                 verdict,
                 findings: _,

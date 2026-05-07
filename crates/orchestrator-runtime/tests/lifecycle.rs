@@ -23,6 +23,20 @@ use orchestrator_types::{BriefId, Event, EventKind, EventVerdict};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
+fn no_gates() -> orchestrator_types::lifecycle::PhaseGates {
+    use orchestrator_types::lifecycle::{GateConfig, GatePolicy, PhaseGates};
+    PhaseGates {
+        verifying: GateConfig {
+            expected_roles: vec![],
+            policy: GatePolicy::AllMustPass,
+        },
+        reviewing: GateConfig {
+            expected_roles: vec![],
+            policy: GatePolicy::AllMustPass,
+        },
+    }
+}
+
 struct MemEventSource {
     events: VecDeque<BriefEvent>,
 }
@@ -97,7 +111,7 @@ async fn mem_adapters_drive_handle() {
     let mut state = BriefState::Submitted;
     let mut step: u64 = 0;
     while let Some(ev) = source.next().await.expect("mem next") {
-        state = handle(&state, &ev).expect("legal transition");
+        state = handle(&state, &ev, &no_gates()).expect("legal transition");
         step += 1;
         let trace_id = format!("0-{step}");
         projector
@@ -152,7 +166,7 @@ async fn mem_adapters_carry_retry_budget_through_rework() {
     let mut state = BriefState::Submitted;
     let mut step: u64 = 0;
     while let Some(ev) = source.next().await.expect("mem next") {
-        state = handle(&state, &ev).expect("legal transition");
+        state = handle(&state, &ev, &no_gates()).expect("legal transition");
         step += 1;
         projector
             .write(&record_for(&brief_id, state.clone()), &format!("0-{step}"))
