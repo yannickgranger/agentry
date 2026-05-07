@@ -152,6 +152,31 @@ Before writing the payload:
    are forbidden — they give the coder too much latitude and make the
    mechanical reviewer's acceptance command the only real spec.
 
+## Topology selection for big Rust projects
+
+For briefs targeting big Rust projects (workspace with many crates,
+where running cargo workspace-wide blows the brief budget), use the
+agentry-bugfix-v0 topology and quality-mech acceptance:
+
+```
+topology: { name: "agentry-bugfix-v0", version: 1 }
+payload.acceptance: "cargo run -p quality-fast --bin quality-mech --release --quiet && bash scripts/arch-check.sh"
+```
+
+Why agentry-bugfix-v0:
+- 4-role linear pipeline (coder → reviewer-mechanical → shipper → ci-watcher); no LLM verifier ensemble
+- Per-brief LLM container count: 1 (coder), down from 5 in agentry-self-host-v0 (1 coder + 3 ac-verifiers + 1 reviewer-claude)
+- reviewer-mechanical (Rust binary) runs the brief's acceptance command in an isolated CARGO_TARGET_DIR=/tmp/review-target as the cargo correctness gate
+
+Why quality-mech:
+- Scopes cargo clippy + cargo test to changed crates plus their reverse-dep closure (computed via cargo metadata)
+- Falls back to full workspace on root-level changes (Cargo.toml / Cargo.lock / rust-toolchain.toml) — no scope-cheating soft fence
+- sccache covers cold-start; on warm cache the scoped pair runs an order of magnitude faster than `cargo clippy --workspace --all-targets && cargo test --workspace`
+
+When to NOT use this combination:
+- Briefs touching FSM logic, lifecycle, or other cross-context invariants where the LLM ensemble's cross-checking adds real safety. Use agentry-self-host-v0 for those.
+- Briefs where the workspace is small enough that workspace-wide cargo fits the budget — quality-mech adds metadata-walking overhead with no gain.
+
 ## Brief payload
 
 ```json
