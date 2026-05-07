@@ -69,6 +69,7 @@ authoring, deliberation, implementation, and enforcement.
 Each target_repo ships its own `.agentry/profile.toml` declaring which tool packs the coder and reviewer consume, the canonical brief acceptance command, and methodology gates. The substrate fetches the profile at brief dispatch and augments the spawned role's effective config — N projects with N requirements without N hardcoded role copies.
 
 - **Profile-driven roles (Phase 1+2 shipped 2026-05-07):** target repos declare their tool requirements in `.agentry/profile.toml`; the substrate is generic across projects. See `specs/concepts/profile.md` and `specs/concepts/tool_pack.md`. Agentry's own profile lives at `.agentry/profile.toml`.
+- **rtk substrate fix validated 2026-05-07T21:17Z** — coder containers now have rtk available at /usr/local/bin/rtk via ~/.local/bin/rtk symlink; PreToolUse hook resolves cleanly.
 
 ## Big Rust Projects
 
