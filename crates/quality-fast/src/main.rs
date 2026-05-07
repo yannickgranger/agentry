@@ -5,7 +5,7 @@
 //! workspace-wide compile and test in the slow tier.
 
 use anyhow::Result;
-use quality_fast::{cargo_check_targets_with, derive_changed_crates, Check};
+use quality_fast::{cargo_check_targets_with, derive_changed_crates, run, Check};
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -53,23 +53,6 @@ fn changed_files() -> Result<Vec<String>> {
         .map(|l| l.trim().to_string())
         .filter(|l| !l.is_empty())
         .collect())
-}
-
-fn run(name: &str, prog: &str, args: &[&str]) -> Check {
-    match Command::new(prog).args(args).output() {
-        Ok(out) => Check {
-            name: name.to_string(),
-            ok: out.status.success(),
-            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
-        },
-        Err(e) => Check {
-            name: name.to_string(),
-            ok: false,
-            stdout: String::new(),
-            stderr: format!("failed to spawn {prog}: {e}"),
-        },
-    }
 }
 
 fn cfdb_checks(changed: &[String]) -> Vec<Check> {
