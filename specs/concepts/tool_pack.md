@@ -19,6 +19,17 @@ The pack itself. Persisted as JSON; seeded into Redis under
 effective config at spawn time (slice I/1c). The `version` field is a
 monotonic `u32`, mirroring `AgentRole`'s versioning semantics.
 
+The first concrete pack `quality-fast` lives at
+`seed/packs/quality-fast.json` and is consumed by `coder-claude-agentry`
+(slice I/1d). It is partially redundant with the consuming role's
+hardcoded `binaries` and `allowed_tools` to exercise the merge dedup path
+on a real role spawn, while contributing a genuinely new
+`system_prompt_fragment` that the role does not carry hardcoded — proof
+that pack contributions actually flow through to the spawned coder's
+effective system prompt. Subsequent packs (`cfdb-grounding`,
+`graph-specs-drift`, `audit-split-brain`) will follow the same pattern in
+slice I/5.
+
 Slice I/1c added a `tool_packs: Vec<String>` field on `AgentRole`. The
 spawner's `spawner::resolve_role_with_packs` resolves each pack name into a
 `ToolPack` body fetched from Redis and applies the pure

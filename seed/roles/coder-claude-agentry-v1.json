@@ -1,6 +1,7 @@
 {
   "name": "coder-claude-agentry",
   "version": 1,
+  "tool_packs": ["quality-fast"],
   "model": "claude-max",
   "system_prompt": null,
   "image": "docker.io/library/rust:1.93",
