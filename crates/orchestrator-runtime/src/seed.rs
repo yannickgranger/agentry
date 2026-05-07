@@ -9,9 +9,9 @@
 use crate::{redis_io, role_dir_loader, Config, Error, Result};
 use orchestrator_types::{
     AgentRole, MessageEdge, Mount, PackageManager, PermitScope, RoleName, RoleRef, SubstrateClass,
-    TeamName, TeamTopology, ToolAllowlist, WorkspaceMount,
+    TeamName, TeamTopology, ToolAllowlist, ToolPack, WorkspaceMount,
 };
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Derive the `net:allow:<host>` permit for the configured forge from
 /// `cfg.forge.default_host`. The port suffix (if any) is stripped so a
@@ -1020,6 +1020,14 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         );
     }
 
+    let packs_dir = seed_packs_dir();
+    let packs_loaded = load_packs_from_dir(&mut conn, &packs_dir).await?;
+    tracing::info!(
+        count = packs_loaded,
+        dir = %packs_dir.display(),
+        "loaded JSON tool-pack catalog from seed directory",
+    );
+
     let topologies_dir = seed_topologies_dir();
     if topologies_dir.exists() {
         let loaded = load_topologies_from_dir(&mut conn, &topologies_dir).await?;
@@ -1036,7 +1044,8 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
     }
 
     tracing::info!(
-"seeded: roles [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker, listener, grok-echo, claude-echo, synthesizer, narrowed-coder, coder-claude-agentry, ac-verifier-claude-agentry, ac-verifier-gemini-agentry, ac-verifier-grok-agentry, reviewer-claude-agentry, null-agent-agentry] (inline entrypoint scripts); teams [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker-listener, grok-echo, claude-echo, narrowed-team] (Rust literals); teams [agentry-null-v0, agentry-pr-rebaser-v0, agentry-discovery-v0, agentry-verify-v0, agentry-planner-v0, agentry-self-host-v0, agentry-self-audit-v0] (loaded from seed/topologies/*.json)"
+        packs = packs_loaded,
+"seeded: roles [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker, listener, grok-echo, claude-echo, synthesizer, narrowed-coder, coder-claude-agentry, ac-verifier-claude-agentry, ac-verifier-gemini-agentry, ac-verifier-grok-agentry, reviewer-claude-agentry, null-agent-agentry] (inline entrypoint scripts); teams [echo, workspace-probe, sccache-probe, timeout-probe, naughty, speaker-listener, grok-echo, claude-echo, narrowed-team] (Rust literals); teams [agentry-null-v0, agentry-pr-rebaser-v0, agentry-discovery-v0, agentry-verify-v0, agentry-planner-v0, agentry-self-host-v0, agentry-self-audit-v0] (loaded from seed/topologies/*.json); packs (loaded from seed/packs/*.json)"
     );
     Ok(())
 }
@@ -1077,6 +1086,88 @@ fn seed_topologies_dir() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or(manifest);
     workspace_root.join("seed").join("topologies")
+}
+
+/// Resolve the directory containing tool-pack JSON files for seed-time
+/// loading. Mirrors [`seed_topologies_dir`] / [`seed_roles_dir`]: defaults
+/// to `<workspace_root>/seed/packs`, overridable via
+/// `AGENTRY_SEED_PACKS_DIR` for substrates that ship the catalog elsewhere.
+fn seed_packs_dir() -> PathBuf {
+    if let Ok(override_path) = std::env::var("AGENTRY_SEED_PACKS_DIR") {
+        return PathBuf::from(override_path);
+    }
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let workspace_root = manifest
+        .parent()
+        .and_then(|p| p.parent())
+        .map(PathBuf::from)
+        .unwrap_or(manifest);
+    workspace_root.join("seed").join("packs")
+}
+
+/// Load every `*.json` tool-pack file in `packs_dir` into Redis via
+/// [`redis_io::seed_pack`]. Returns the number of packs successfully loaded.
+///
+/// * Missing directory: returns `Ok(0)` without error (mirrors
+///   `load_topologies_from_dir`'s "absent dir is fine" idiom — slice I/1d
+///   adds the first concrete pack JSON, until then steady state is zero).
+/// * Files that fail to parse as `ToolPack` are skipped with a `warn` log
+///   so an operator-edited bad file doesn't block seed of the rest. The
+///   topology loader propagates parse errors instead; pack loading is
+///   purely additive infrastructure (no required dependency yet) so
+///   skip-and-warn is the safer default until I/1c wires roles to packs.
+pub async fn load_packs_from_dir(
+    conn: &mut redis::aio::ConnectionManager,
+    packs_dir: &Path,
+) -> Result<usize> {
+    if !packs_dir.exists() {
+        return Ok(0);
+    }
+
+    let mut json_files: Vec<PathBuf> = Vec::new();
+    let mut rd = tokio::fs::read_dir(packs_dir).await?;
+    while let Some(entry) = rd.next_entry().await? {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) == Some("json") {
+            json_files.push(path);
+        }
+    }
+    json_files.sort();
+
+    let mut count: usize = 0;
+    for path in json_files {
+        let text = match tokio::fs::read_to_string(&path).await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(
+                    file_path = %path.display(),
+                    error = %e,
+                    "skipping tool-pack file: read failed",
+                );
+                continue;
+            }
+        };
+        let pack: ToolPack = match serde_json::from_str(&text) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(
+                    file_path = %path.display(),
+                    error = %e,
+                    "skipping tool-pack file: JSON parse failed",
+                );
+                continue;
+            }
+        };
+        redis_io::seed_pack(conn, &pack).await?;
+        tracing::info!(
+            pack_name = %pack.name,
+            version = pack.version,
+            file_path = %path.display(),
+            "loaded tool pack from JSON file",
+        );
+        count += 1;
+    }
+    Ok(count)
 }
 
 /// Load every `*.json` topology file in `dir` into Redis via

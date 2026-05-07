@@ -3,7 +3,7 @@
 use crate::{Error, Result};
 use orchestrator_types::lifecycle::MAXIMUM_ATTEMPT_CAP;
 use orchestrator_types::{
-    AgentRole, Brief, BriefId, Event, Project, RoleName, TeamName, TeamTopology, Verdict,
+    AgentRole, Brief, BriefId, Event, Project, RoleName, TeamName, TeamTopology, ToolPack, Verdict,
     VersionedRef,
 };
 use redis::aio::ConnectionManager;
@@ -211,6 +211,61 @@ pub async fn list_teams(conn: &mut ConnectionManager) -> Result<Vec<(TeamName, u
         }
     }
     out.sort_by(|a, b| a.0 .0.cmp(&b.0 .0).then_with(|| a.1.cmp(&b.1)));
+    Ok(out)
+}
+
+/// Save a tool pack under `agentry:tool_pack:<name>:v<version>`. Mirrors
+/// [`save_role`] / [`save_team`]: overwrites any pre-existing key so seed
+/// passes are idempotent.
+pub async fn seed_pack(conn: &mut ConnectionManager, pack: &ToolPack) -> Result<()> {
+    let key = format!("agentry:tool_pack:{}:v{}", pack.name, pack.version);
+    let body = serde_json::to_string(pack)?;
+    let _: () = conn.set(&key, body).await?;
+    Ok(())
+}
+
+/// Fetch a previously-seeded tool pack by `(name, version)`. Returns
+/// [`Error::NotFound`] when the key is absent.
+pub async fn fetch_pack(
+    conn: &mut ConnectionManager,
+    name: &str,
+    version: u32,
+) -> Result<ToolPack> {
+    let key = format!("agentry:tool_pack:{name}:v{version}");
+    let raw: Option<String> = conn.get(&key).await?;
+    let raw = raw.ok_or_else(|| Error::NotFound {
+        kind: "tool_pack",
+        key: key.clone(),
+    })?;
+    Ok(serde_json::from_str(&raw)?)
+}
+
+/// Scan the tool-pack catalog and return every `(name, version)` pair
+/// currently registered, sorted by name then version ascending. Mirrors
+/// [`list_roles`] / [`list_teams`].
+pub async fn list_packs(conn: &mut ConnectionManager) -> Result<Vec<(String, u32)>> {
+    let mut out: Vec<(String, u32)> = Vec::new();
+    let mut cursor: u64 = 0;
+    loop {
+        let (next, batch): (u64, Vec<String>) = redis::cmd("SCAN")
+            .arg(cursor)
+            .arg("MATCH")
+            .arg("agentry:tool_pack:*:v*")
+            .arg("COUNT")
+            .arg(100)
+            .query_async(conn)
+            .await?;
+        for key in batch {
+            if let Some((name, version)) = parse_versioned_key(&key, "tool_pack") {
+                out.push((name, version));
+            }
+        }
+        cursor = next;
+        if cursor == 0 {
+            break;
+        }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
     Ok(out)
 }
 
