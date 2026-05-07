@@ -1,0 +1,25 @@
+# agentry self-host profile.
+#
+# Declared per-project per the profile-driven roles architecture
+# (specs/concepts/profile.md). The daemon fetches this file at brief
+# dispatch via the forge contents API, parses it, and augments the
+# spawned coder/reviewer roles with the tool_packs declared here.
+#
+# For agentry self-host, the profile mirrors what the coder role
+# already references hardcoded (quality-fast). The augmentation
+# dedups, so the effective config is unchanged. This file's role is
+# to validate the FETCH path against a real forge repo and serve as
+# the canonical example for other projects authoring their own
+# .agentry/profile.toml.
+
+[coder]
+tool_packs = ["quality-fast"]
+
+[reviewer]
+tool_packs = []
+
+[acceptance]
+default = "cargo run -p quality-fast --bin quality-mech --release --quiet && bash scripts/arch-check.sh"
+
+[methodology]
+gates = []
