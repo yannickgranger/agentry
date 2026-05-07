@@ -221,6 +221,7 @@ async fn fetch_role_resolves_exact_version() {
         workspace_mount: None,
         sccache: false,
         extra_bootstrap: vec![],
+        tool_packs: vec![],
     };
     let mut v2 = v1.clone();
     v2.version = 2;

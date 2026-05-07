@@ -37,6 +37,7 @@ fn role_roundtrip_json() {
         }),
         sccache: true,
         extra_bootstrap: vec![],
+        tool_packs: vec![],
     };
     let s = serde_json::to_string_pretty(&r).expect("ser");
     let back: AgentRole = serde_json::from_str(&s).expect("de");
@@ -65,6 +66,7 @@ fn agent_role_roundtrips_with_extra_bootstrap() {
         workspace_mount: None,
         sccache: false,
         extra_bootstrap: vec!["rustup component add rustfmt clippy".into()],
+        tool_packs: vec![],
     };
     let s = serde_json::to_string(&r).expect("ser");
     let back: AgentRole = serde_json::from_str(&s).expect("de");
@@ -98,6 +100,7 @@ fn agent_role_roundtrips_with_exitpoint() {
         workspace_mount: None,
         sccache: false,
         extra_bootstrap: vec![],
+        tool_packs: vec![],
     };
     let s = serde_json::to_string(&r).expect("ser");
     let back: AgentRole = serde_json::from_str(&s).expect("de");
@@ -166,6 +169,7 @@ fn role_with_allowed_tools(allowed: Option<AllowedTools>) -> AgentRole {
         workspace_mount: None,
         sccache: false,
         extra_bootstrap: vec![],
+        tool_packs: vec![],
     }
 }
 

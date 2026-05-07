@@ -646,6 +646,7 @@ async fn role_create(
         // form when a dashboard-author wants a workspace-using role.
         workspace_mount: None,
         sccache: false,
+        tool_packs: vec![],
     };
     state
         .store

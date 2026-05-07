@@ -14,7 +14,8 @@ use crate::{delivery, permit as permit_mod, redis_io, workspace::BriefWorkspace,
 use async_trait::async_trait;
 use ed25519_dalek::VerifyingKey;
 use orchestrator_types::{
-    AgentRole, Brief, BriefId, Event, EventKind, PackageManager, Verdict, VerdictKind, WorkPermit,
+    merge_role_with_packs, AgentRole, Brief, BriefId, Event, EventKind, PackageManager, Verdict,
+    VerdictKind, WorkPermit,
 };
 use redis::aio::ConnectionManager;
 use redis::AsyncCommands;
@@ -231,6 +232,13 @@ impl Spawner for PodmanSpawner {
         } = ctx;
         // Defence in depth: verify the permit we're about to hand out.
         permit_mod::verify(permit, verifying_key)?;
+
+        // Resolve tool packs once, up front. The rest of the spawn logic
+        // operates on the merged role (binaries, allowed_tools,
+        // system_prompt, entrypoint_script all reflect pack contributions).
+        // For roles without `tool_packs`, this is a cheap clone.
+        let resolved_role = resolve_role_with_packs(role, conn).await?;
+        let role = &resolved_role;
 
         let agent_id = &permit.agent_id;
         let name = Self::container_name(agent_id);
@@ -806,6 +814,49 @@ fn effective_binaries(role: &AgentRole) -> Vec<String> {
         out.push("sccache".into());
     }
     out
+}
+
+/// Resolve and merge tool packs for a role. Fetches each pack named in
+/// `role.tool_packs` from Redis (latest seeded version) and applies
+/// [`merge_role_with_packs`]. If `role.tool_packs` is empty, returns the role
+/// cloned unchanged (cheap fast path).
+///
+/// Errors propagate from the fetch — a missing pack reference is a daemon
+/// misconfiguration and fails the brief at spawn time rather than silently
+/// dropping the role's tool requirements.
+///
+/// # Latest-version transient
+///
+/// "Latest seeded version" is computed by scanning [`redis_io::list_packs`]
+/// and picking the highest `version` for each requested name. This is a
+/// known transient: slice I/2's profile-driven roles will pin
+/// `(name, version)` pairs in `profile.toml` so a pack update doesn't
+/// silently change role behavior.
+pub async fn resolve_role_with_packs(
+    role: &AgentRole,
+    conn: &mut ConnectionManager,
+) -> Result<AgentRole> {
+    if role.tool_packs.is_empty() {
+        return Ok(role.clone());
+    }
+
+    let registry = redis_io::list_packs(conn).await?;
+    let mut packs: Vec<orchestrator_types::ToolPack> = Vec::with_capacity(role.tool_packs.len());
+    for name in &role.tool_packs {
+        let latest = registry
+            .iter()
+            .filter(|(n, _)| n == name)
+            .map(|(_, v)| *v)
+            .max()
+            .ok_or_else(|| Error::NotFound {
+                kind: "tool_pack",
+                key: name.clone(),
+            })?;
+        let pack = redis_io::fetch_pack(conn, name, latest).await?;
+        packs.push(pack);
+    }
+
+    Ok(merge_role_with_packs(role, &packs))
 }
 
 fn bootstrap_command(
