@@ -163,7 +163,7 @@ Before writing the payload:
     "issue_number": <N>,
     "issue_title": "...",
     "issue_body": "CREATE crates/foo/src/bar.rs: pub struct Baz { ... }\nUPDATE crates/foo/src/lib.rs:42: re-export Baz",
-    "acceptance": "cargo clippy --workspace -- -D warnings && cargo test --workspace && scripts/arch-check.sh",
+    "acceptance": "cargo run -p quality-fast --bin quality-mech --release --quiet && bash scripts/arch-check.sh",
     "target_repo": "yg/agentry",
     "base_branch": "develop",
     "pr_title": "feat(<context>): <summary> (closes #<N>)",
@@ -178,6 +178,18 @@ Before writing the payload:
   "submitted_at": "<iso-8601>"
 }
 ```
+
+`quality-mech` (introduced in PR #403) runs `cargo clippy -p <crate>
+--all-targets -- -D warnings` and `cargo test -p <crate>` on the
+closure of changed crates and their reverse-dep closure (computed via
+cargo metadata). For big Rust projects this scopes the reviewer's
+compile and test cost to changed work plus what depends on it; sccache
+covers cold-start. Falls back to full workspace on root-level changes
+(`Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`) — the scoping fence
+does not skip when the change could affect the whole workspace. For
+briefs targeting tiny projects or where scoping has no benefit, the
+workspace-wide pair `cargo clippy --workspace --all-targets -- -D
+warnings && cargo test --workspace` remains valid.
 
 `max_wall_seconds` covers the full role-by-role sequential run — coder
 (claude prompt + cargo check) + reviewer (clippy + test) + shipper
