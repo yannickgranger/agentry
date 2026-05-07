@@ -58,3 +58,24 @@ intent is that the coder role uses `quality-fast` for ALL compile
 feedback, with the heavier whole-workspace pass deferred to the slow
 tier so the inner-loop signal stays scoped to what the coder actually
 touched.
+
+A second binary in the same crate, **`quality-mech`**, is the
+reviewer-grade scoped acceptance tool — intended for use as a brief's
+`payload.acceptance` command on Rust workspaces too large to fit
+`cargo {clippy,test} --workspace` inside the brief budget. Scope:
+`cargo clippy -p <crate> --all-targets -- -D warnings` for every
+changed crate, plus `cargo test -p <crate>` for the reverse-dependency
+closure of those crates (computed via `compute_rev_deps_closure`,
+which walks `cargo metadata` to invert the workspace dep graph). When
+a workspace-root file changes (root `Cargo.toml`, `Cargo.lock`,
+`rust-toolchain.toml`), the changed-crates set is overridden to all
+workspace members — root edits affect every crate, so scoping would
+miss regressions (`workspace_root_touched: true` in the report).
+`quality-mech` does NOT invoke cfdb / ra-query / arch-check —
+inner-loop coder-triage tools stay in `quality-fast`; arch-check is
+invoked separately at brief acceptance. Diff base defaults to
+`origin/develop...HEAD` and falls back to `HEAD~1..HEAD`; override
+with `--base <branch>`. Adopt opt-in by setting `payload.acceptance`
+to a `quality-mech`-based command on a per-brief basis; the
+reviewer-mechanical runner's `DEFAULT_ACCEPTANCE` remains
+`cargo test --workspace`.
