@@ -29,6 +29,20 @@ use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+fn no_gates() -> std::sync::Arc<orchestrator_types::lifecycle::PhaseGates> {
+    use orchestrator_types::lifecycle::{GateConfig, GatePolicy, PhaseGates};
+    std::sync::Arc::new(PhaseGates {
+        verifying: GateConfig {
+            expected_roles: vec![],
+            policy: GatePolicy::AllMustPass,
+        },
+        reviewing: GateConfig {
+            expected_roles: vec![],
+            policy: GatePolicy::AllMustPass,
+        },
+    })
+}
+
 fn brief(id: &str) -> BriefId {
     BriefId(id.into())
 }
@@ -269,7 +283,7 @@ async fn projector_task_cleans_up_on_terminal_failed() {
         written: written.clone(),
     });
 
-    projector_task(bid.clone(), source, projector, None)
+    projector_task(bid.clone(), source, projector, None, no_gates())
         .await
         .expect("projector_task");
 

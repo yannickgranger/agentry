@@ -34,6 +34,20 @@ fn fresh_retry() -> RetryBudget {
     }
 }
 
+fn no_gates() -> orchestrator_types::lifecycle::PhaseGates {
+    use orchestrator_types::lifecycle::{GateConfig, GatePolicy, PhaseGates};
+    PhaseGates {
+        verifying: GateConfig {
+            expected_roles: vec![],
+            policy: GatePolicy::AllMustPass,
+        },
+        reviewing: GateConfig {
+            expected_roles: vec![],
+            policy: GatePolicy::AllMustPass,
+        },
+    }
+}
+
 fn record(id: &str, state: BriefState, at_secs: i64) -> BriefStateRecord {
     BriefStateRecord {
         brief_id: BriefId(id.to_string()),
@@ -72,6 +86,9 @@ fn is_orphan_exactly_at_budget_is_false() {
         "brf_boundary",
         BriefState::Verifying {
             retry: fresh_retry(),
+            received: std::collections::BTreeMap::new(),
+            expected: vec![],
+            policy: orchestrator_types::lifecycle::GatePolicy::AllMustPass,
         },
         0,
     );
@@ -84,6 +101,9 @@ fn is_orphan_one_second_over_budget_is_true() {
         "brf_over",
         BriefState::Reviewing {
             retry: fresh_retry(),
+            received: std::collections::BTreeMap::new(),
+            expected: vec![],
+            policy: orchestrator_types::lifecycle::GatePolicy::AllMustPass,
         },
         0,
     );
@@ -198,6 +218,9 @@ async fn tick_emits_one_abort_for_one_expired_non_terminal_brief() {
                 "brf_expired",
                 BriefState::Verifying {
                     retry: fresh_retry(),
+                    received: std::collections::BTreeMap::new(),
+                    expected: vec![],
+                    policy: orchestrator_types::lifecycle::GatePolicy::AllMustPass,
                 },
                 0,
             ),
@@ -296,9 +319,15 @@ fn handle_maps_budget_exhausted_to_failed_with_budget_reason_from_every_non_term
         },
         BriefState::Verifying {
             retry: fresh_retry(),
+            received: std::collections::BTreeMap::new(),
+            expected: vec![],
+            policy: orchestrator_types::lifecycle::GatePolicy::AllMustPass,
         },
         BriefState::Reviewing {
             retry: fresh_retry(),
+            received: std::collections::BTreeMap::new(),
+            expected: vec![],
+            policy: orchestrator_types::lifecycle::GatePolicy::AllMustPass,
         },
         BriefState::Reworking {
             target: orchestrator_types::lifecycle::ReworkTarget::Coder,
@@ -321,7 +350,7 @@ fn handle_maps_budget_exhausted_to_failed_with_budget_reason_from_every_non_term
         },
     ];
     for s in states {
-        let next = handle(&s, &BriefEvent::BudgetExhausted)
+        let next = handle(&s, &BriefEvent::BudgetExhausted, &no_gates())
             .unwrap_or_else(|_| panic!("BudgetExhausted denied from {s:?}"));
         assert_eq!(
             next,

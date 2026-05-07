@@ -169,6 +169,27 @@ pub async fn run(
                     let _permit = permit; // released on drop
                     let mut conn_for_brief = conn_clone;
 
+                    // Project the team topology into the FSM's
+                    // per-phase gate config (verifier/reviewer fan-in
+                    // expected_roles, policy hardcoded AllMustPass for
+                    // Phase 1). The projector_task threads this through
+                    // every `handle()` call so Verifying/Reviewing
+                    // construct with the gate config available;
+                    // 396b-3 will swap the serial transitions for
+                    // evidence-based gating using these fields.
+                    let phase_gates = match redis_io::fetch_team(
+                        &mut conn_for_brief,
+                        &brief.topology,
+                    )
+                    .await
+                    {
+                        Ok(team) => Arc::new(lifecycle_driver::build_phase_gates(&team)),
+                        Err(e) => {
+                            tracing::error!(brief = %brief_id, error = %e, "fetch_team failed; skipping brief");
+                            return;
+                        }
+                    };
+
                     // FSM projector: drives the brief lifecycle and is
                     // the sole writer to `agentry:verdicts`. The role
                     // chain below produces the trace events the
@@ -180,6 +201,7 @@ pub async fn run(
                         event_source,
                         state_projector,
                         Some(conn_for_verdict_emit),
+                        phase_gates,
                     ));
 
                     let outcome = handle_brief(

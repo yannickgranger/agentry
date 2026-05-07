@@ -50,6 +50,19 @@ team-specific intermediate states the core FSM does not need to know
 about (e.g. a planner's child-fanout phase) — only the universal
 aborts apply to it; all other events return `InvalidTransition`.
 
+`Verifying` and `Reviewing` additionally carry three evidence-shape
+fields landed in 396b-2: `received` (a `BTreeMap<String, EventVerdict>`
+of `role_name` → verdict, accumulating sibling reports as they arrive),
+`expected` (the list of `role_name` strings the gate waits on,
+populated from the team topology at phase entry by
+`build_phase_gates`), and `policy` (a `GatePolicy` variant indicating
+the fan-in rule). The fields are populated at construction (empty
+`received`, gate config from `PhaseGates`) but are NOT consulted by
+`handle()` yet — 396b-2 is a pure shape change preserving the existing
+serial first-event semantics. 396b-3 will swap the serial transitions
+for evidence-based gating that folds each new sibling verdict into
+`received` and calls `decide(received, &GateConfig{expected, policy})`.
+
 ## BriefEvent
 
 The discrete inputs the FSM accepts. One variant per externally
@@ -325,3 +338,14 @@ prerequisite — `handle()` still uses the existing serial-first-event
 semantics and pattern-matches the new field with `..` so behavior is
 unchanged. 396b-2 will land the `BriefState` evidence shape and the
 3-arg `handle()` that consumes `role_name` to key the multiset.
+
+396b-2 has landed the `BriefState` evidence shape (`received` /
+`expected` / `policy` on `Verifying` and `Reviewing`), the third
+`&PhaseGates` argument to `handle()`, and the daemon's
+`build_phase_gates(team)` projection that walks `team.roles` to derive
+each phase's `expected_roles` list (verifier-kind roles → verifying
+gate, reviewer-kind roles → reviewing gate). Policy is currently
+hardcoded to `AllMustPass` for both phases — Pattern 3 (#397) will
+lift this to per-edge config in topology JSON. The transition logic in
+`handle()` is still serial-first-event; 396b-3 swaps that for
+evidence-based gating via `decide()`.
