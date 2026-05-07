@@ -241,6 +241,19 @@ shells out via `tokio::process::Command`.
   out roles in parallel. The structural fence is: every (state, event)
   pair either transitions or fails the brief; there is no third path.
 
+- **Empty-phase auto-skip.** When a phase's `expected_roles` is empty
+  (the topology has no role of that kind, e.g. agentry-bugfix-v0 with
+  no ac-verifier), the FSM transitions straight through that phase
+  rather than stalling on a never-arriving event. The Authoring →
+  Verifying transition consults `decide()` on the proposed Verifying
+  state's evidence (empty received, gate config from gates.verifying)
+  and short-circuits to Reviewing if Pass; same chained logic from
+  Verifying → Reviewing skips to Shipping. **WHY:** the FSM phase enum
+  is denser than the topology DAG — without auto-skip, leaner
+  topologies fail with `DaemonError` because the phase has no event
+  source. Pattern 3 (#397) collapses the phase enum entirely; this
+  auto-skip is the tactical bridge.
+
 #### Wall-clock reaper transition (not enforced by graph-specs)
 
 The daemon's wall-clock reaper closes the orphan-without-Failed class

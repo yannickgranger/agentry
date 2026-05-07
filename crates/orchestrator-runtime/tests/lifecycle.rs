@@ -27,13 +27,16 @@ use std::sync::{Arc, Mutex};
 
 fn no_gates() -> orchestrator_types::lifecycle::PhaseGates {
     use orchestrator_types::lifecycle::{GateConfig, GatePolicy, PhaseGates};
+    // Non-empty expected roles: with the E/1 empty-phase auto-skip,
+    // empty/empty would short-circuit Authoring → Shipping and the
+    // multi-step trail asserted by these tests would be unreachable.
     PhaseGates {
         verifying: GateConfig {
-            expected_roles: vec![],
+            expected_roles: vec!["ac-verifier-test".to_owned()],
             policy: GatePolicy::AllMustPass,
         },
         reviewing: GateConfig {
-            expected_roles: vec![],
+            expected_roles: vec!["reviewer-test".to_owned()],
             policy: GatePolicy::AllMustPass,
         },
     }

@@ -298,12 +298,46 @@ pub fn handle(
         (BriefState::Authoring { .. }, BriefEvent::CoderDoneNoOp { .. }) => Ok(BriefState::Shipped),
 
         (BriefState::Authoring { retry, .. }, BriefEvent::CoderDone { verdict }) => match verdict {
-            EventVerdict::Shipped => Ok(BriefState::Verifying {
-                retry: *retry,
-                received: BTreeMap::new(),
-                expected: gates.verifying.expected_roles.clone(),
-                policy: gates.verifying.policy.clone(),
-            }),
+            EventVerdict::Shipped => {
+                // Empty-phase auto-skip: when a phase's expected_roles is
+                // empty (the topology has no role of that kind), decide()
+                // returns Pass vacuously over an empty received multiset, so
+                // the FSM short-circuits past the phase rather than stalling
+                // on a never-arriving event. See E/1 + brief_lifecycle.md.
+                let received_v = BTreeMap::new();
+                let gate_v = GateConfig {
+                    expected_roles: gates.verifying.expected_roles.clone(),
+                    policy: gates.verifying.policy.clone(),
+                };
+                match decide(&received_v, &gate_v) {
+                    Decide::Pass => {
+                        let received_r = BTreeMap::new();
+                        let gate_r = GateConfig {
+                            expected_roles: gates.reviewing.expected_roles.clone(),
+                            policy: gates.reviewing.policy.clone(),
+                        };
+                        match decide(&received_r, &gate_r) {
+                            Decide::Pass => Ok(BriefState::Shipping {
+                                pr_number: 0,
+                                head_sha: String::new(),
+                                retry: *retry,
+                            }),
+                            _ => Ok(BriefState::Reviewing {
+                                retry: *retry,
+                                received: received_r,
+                                expected: gate_r.expected_roles,
+                                policy: gate_r.policy,
+                            }),
+                        }
+                    }
+                    _ => Ok(BriefState::Verifying {
+                        retry: *retry,
+                        received: received_v,
+                        expected: gate_v.expected_roles,
+                        policy: gate_v.policy,
+                    }),
+                }
+            }
             EventVerdict::Failed => Ok(BriefState::Failed {
                 reason: Reason::AcceptanceFailed {
                     detail: "coder reported failed".to_owned(),
@@ -345,12 +379,29 @@ pub fn handle(
                     expected: expected.clone(),
                     policy: policy.clone(),
                 }),
-                Decide::Pass => Ok(BriefState::Reviewing {
-                    retry: *retry,
-                    received: BTreeMap::new(),
-                    expected: gates.reviewing.expected_roles.clone(),
-                    policy: gates.reviewing.policy.clone(),
-                }),
+                Decide::Pass => {
+                    // Empty-phase auto-skip: if reviewing has no expected
+                    // roles, decide() Passes vacuously and we short-circuit
+                    // straight to Shipping rather than stalling in Reviewing.
+                    let received_r = BTreeMap::new();
+                    let gate_r = GateConfig {
+                        expected_roles: gates.reviewing.expected_roles.clone(),
+                        policy: gates.reviewing.policy.clone(),
+                    };
+                    match decide(&received_r, &gate_r) {
+                        Decide::Pass => Ok(BriefState::Shipping {
+                            pr_number: 0,
+                            head_sha: String::new(),
+                            retry: *retry,
+                        }),
+                        _ => Ok(BriefState::Reviewing {
+                            retry: *retry,
+                            received: received_r,
+                            expected: gate_r.expected_roles,
+                            policy: gate_r.policy,
+                        }),
+                    }
+                }
                 Decide::Rework { detail: _ } => {
                     Ok(increment_or_fail(*retry, |next| BriefState::Reworking {
                         target: ReworkTarget::Coder,
