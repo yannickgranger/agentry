@@ -544,6 +544,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         mounts: vec![],
         workspace_mount: None,
         sccache: false,
+        tool_packs: vec![],
     };
     let echo_team = TeamTopology {
         name: TeamName("echo-team".into()),
@@ -581,6 +582,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         mounts: vec![],
         workspace_mount: None,
         sccache: false,
+        tool_packs: vec![],
     };
     let naughty_team = TeamTopology {
         name: TeamName("naughty-team".into()),
@@ -618,6 +620,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         mounts: vec![],
         workspace_mount: None,
         sccache: false,
+        tool_packs: vec![],
     };
     let listener = AgentRole {
         name: RoleName("listener-agent".into()),
@@ -639,6 +642,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         mounts: vec![],
         workspace_mount: None,
         sccache: false,
+        tool_packs: vec![],
     };
     let speaker_listener_team = TeamTopology {
         name: TeamName("speaker-listener-team".into()),
@@ -693,6 +697,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         mounts: vec![],
         workspace_mount: None,
         sccache: false,
+        tool_packs: vec![],
     };
     let grok_team = TeamTopology {
         name: TeamName("grok-echo-team".into()),
@@ -757,6 +762,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         ],
         workspace_mount: None,
         sccache: false,
+        tool_packs: vec![],
     };
     let claude_team = TeamTopology {
         name: TeamName("claude-echo-team".into()),
@@ -794,6 +800,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         mounts: vec![],
         workspace_mount: None,
         sccache: false,
+        tool_packs: vec![],
     };
     let narrowed_coder = AgentRole {
         name: RoleName("narrowed-coder".into()),
@@ -820,6 +827,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         mounts: vec![],
         workspace_mount: None,
         sccache: false,
+        tool_packs: vec![],
     };
     let narrowed_team = TeamTopology {
         name: TeamName("narrowed-team".into()),
@@ -880,6 +888,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
             readonly: false,
         }),
         sccache: false,
+        tool_packs: vec![],
     };
     let workspace_probe_team = TeamTopology {
         name: TeamName("workspace-probe-team".into()),
@@ -923,6 +932,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         mounts: vec![],
         workspace_mount: None,
         sccache: sccache_net_allow.is_some(),
+        tool_packs: vec![],
     };
     let sccache_probe_team = TeamTopology {
         name: TeamName("sccache-probe-team".into()),
@@ -960,6 +970,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
         mounts: vec![],
         workspace_mount: None,
         sccache: false,
+        tool_packs: vec![],
     };
     let timeout_probe_team = TeamTopology {
         name: TeamName("timeout-probe-team".into()),

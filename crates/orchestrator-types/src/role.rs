@@ -219,6 +219,21 @@ pub struct AgentRole {
     /// no extras.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extra_bootstrap: Vec<String>,
+    /// Names of tool packs this role consumes. Resolved at spawn time:
+    /// each pack is fetched from Redis (agentry:tool_pack:<name>:<version>)
+    /// and merged into the role's effective config — binaries appended,
+    /// allowed_tools appended, system_prompt fragment concatenated,
+    /// container_bootstrap lines prepended to entrypoint_script.
+    ///
+    /// Pack version resolution is deferred for now: the daemon fetches
+    /// the latest seeded version of each pack name. Profile-driven roles
+    /// in slice I/2 will pin (name, version) pairs explicitly. The list
+    /// stays Vec<String> for this slice.
+    ///
+    /// Defaults to empty (no packs) so roles that pre-date this field
+    /// continue working with no behavior change.
+    #[serde(default)]
+    pub tool_packs: Vec<String>,
 }
 
 /// A composable bundle of role configuration. A `ToolPack` contributes
@@ -270,4 +285,82 @@ pub struct ToolPack {
     /// time, separated by two newlines.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system_prompt_fragment: Option<String>,
+}
+
+/// Pure merge: produce a new [`AgentRole`] that combines the input role with
+/// the contributions of the given packs. The input role is not mutated. Merge
+/// semantics:
+///
+/// - `binaries`: appended after the role's binaries; deduplicated by string
+///   equality, preserving first-occurrence order (role's binaries first,
+///   then each pack's binaries in pack-list order).
+/// - `allowed_tools`: each pack's `allowed_tools_added` is appended to the
+///   role's `allowed_tools`. If `role.allowed_tools` is `None`, packs'
+///   contributions become the role's `allowed_tools` (only if any pack
+///   contributes; otherwise stays `None`).
+/// - `system_prompt`: each pack's `system_prompt_fragment` is appended to
+///   `role.system_prompt`, separated by two newlines. `None+None` stays
+///   `None`; `None+Some(fragment)` becomes `Some(fragment)`; `Some(prompt)`
+///   stays `Some(prompt)` when the pack contributes `None`.
+/// - `entrypoint_script`: each pack's `container_bootstrap` lines are
+///   prepended (in pack-list order, in entry order within each pack) to the
+///   role's `entrypoint_script`. Each line is its own bash statement, joined
+///   by newlines, then a newline separator before the role's own script body.
+///
+/// All other [`AgentRole`] fields (image, package_manager, mcp_servers,
+/// permit_scope, passthru_env, mounts, etc.) come from the input role
+/// unchanged.
+#[must_use]
+pub fn merge_role_with_packs(role: &AgentRole, packs: &[ToolPack]) -> AgentRole {
+    let mut merged = role.clone();
+    if packs.is_empty() {
+        return merged;
+    }
+
+    // binaries: append, dedup by string equality preserving first occurrence.
+    for p in packs {
+        for b in &p.binaries {
+            if !merged.binaries.iter().any(|existing| existing == b) {
+                merged.binaries.push(b.clone());
+            }
+        }
+    }
+
+    // allowed_tools: append each pack's allowed_tools_added.
+    let pack_tools: Vec<String> = packs
+        .iter()
+        .flat_map(|p| p.allowed_tools_added.iter().cloned())
+        .collect();
+    if !pack_tools.is_empty() {
+        match merged.allowed_tools.as_mut() {
+            Some(a) => a.0.extend(pack_tools),
+            None => merged.allowed_tools = Some(AllowedTools(pack_tools)),
+        }
+    }
+
+    // system_prompt: append each pack's fragment, separated by two newlines.
+    for p in packs {
+        if let Some(frag) = &p.system_prompt_fragment {
+            merged.system_prompt = match merged.system_prompt.take() {
+                Some(prev) => Some(format!("{prev}\n\n{frag}")),
+                None => Some(frag.clone()),
+            };
+        }
+    }
+
+    // entrypoint_script: prepend each pack's container_bootstrap lines (in
+    // pack-list order, in entry order within each pack), then a newline
+    // separator before the role's own script body.
+    let bootstrap_lines: Vec<String> = packs
+        .iter()
+        .flat_map(|p| p.container_bootstrap.iter().cloned())
+        .collect();
+    if !bootstrap_lines.is_empty() {
+        let mut ep = bootstrap_lines.join("\n");
+        ep.push('\n');
+        ep.push_str(&merged.entrypoint_script);
+        merged.entrypoint_script = ep;
+    }
+
+    merged
 }

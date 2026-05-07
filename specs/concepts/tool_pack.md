@@ -19,6 +19,14 @@ The pack itself. Persisted as JSON; seeded into Redis under
 effective config at spawn time (slice I/1c). The `version` field is a
 monotonic `u32`, mirroring `AgentRole`'s versioning semantics.
 
+Slice I/1c added a `tool_packs: Vec<String>` field on `AgentRole`. The
+spawner's `spawner::resolve_role_with_packs` resolves each pack name into a
+`ToolPack` body fetched from Redis and applies the pure
+`role::merge_role_with_packs` to produce the role's effective config before
+the container starts. Today the daemon picks the latest seeded version per
+name; this is a known transient (see invariants below) until profile-driven
+roles in slice I/2 pin `(name, version)` pairs explicitly.
+
 #### Operational invariants (not enforced by graph-specs)
 
 - Additive merge. Pack contributions append to the role's existing fields;
@@ -32,3 +40,8 @@ monotonic `u32`, mirroring `AgentRole`'s versioning semantics.
   `(name, version)` — never `latest` — so a pack update doesn't silently
   change role behavior; bumping the consumed version is an explicit role
   edit.
+- Latest-version transient. Slice I/1c resolves pack references by name
+  only; the daemon fetches the highest-version seeded for each name. This
+  is a known transient — slice I/2's profile-driven roles will pin
+  `(name, version)` pairs in `profile.toml` so a pack update doesn't
+  silently change role behavior.

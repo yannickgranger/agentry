@@ -22,8 +22,8 @@ pub use permit::{PermitScope, ToolAllowlist, WorkPermit};
 pub use project::{Project, ProjectSlug, StandingOrders};
 pub use review::{FindingOrigin, ReviewFinding, Severity};
 pub use role::{
-    AgentRole, AllowedTools, Mount, PackageManager, RoleName, RoleRef, SubstrateClass, ToolPack,
-    WorkspaceMount,
+    merge_role_with_packs, AgentRole, AllowedTools, Mount, PackageManager, RoleName, RoleRef,
+    SubstrateClass, ToolPack, WorkspaceMount,
 };
 pub use team::{MessageEdge, PermitOverrides, TeamName, TeamTopology};
 

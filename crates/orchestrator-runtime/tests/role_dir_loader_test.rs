@@ -56,6 +56,7 @@ fn minimal_role(name: &str) -> AgentRole {
         workspace_mount: None,
         sccache: false,
         extra_bootstrap: vec![],
+        tool_packs: vec![],
     }
 }
 
