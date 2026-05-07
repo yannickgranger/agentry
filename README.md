@@ -64,6 +64,12 @@ authoring, deliberation, implementation, and enforcement.
 - Not a single-shot tool. agentry holds the loop: change → review →
   commit → push → CI → on-failure route back to coder, repeat.
 
+## Project Profiles
+
+Each target_repo ships its own `.agentry/profile.toml` declaring which tool packs the coder and reviewer consume, the canonical brief acceptance command, and methodology gates. The substrate fetches the profile at brief dispatch and augments the spawned role's effective config — N projects with N requirements without N hardcoded role copies.
+
+- **Profile-driven roles (Phase 1+2 shipped 2026-05-07):** target repos declare their tool requirements in `.agentry/profile.toml`; the substrate is generic across projects. See `specs/concepts/profile.md` and `specs/concepts/tool_pack.md`. Agentry's own profile lives at `.agentry/profile.toml`.
+
 ## Big Rust Projects
 
 - Big-rust workflow ready: dispatch briefs against `agentry-bugfix-v0` topology with `quality-mech` as the acceptance command for scoped reviewer cargo cost. See `docs/dogfood-protocol.md` for the recipe.
