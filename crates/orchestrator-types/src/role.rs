@@ -220,3 +220,54 @@ pub struct AgentRole {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extra_bootstrap: Vec<String>,
 }
+
+/// A composable bundle of role configuration. A `ToolPack` contributes
+/// binaries, allowed-tools allowlist additions, an optional system-prompt
+/// fragment, and optional bootstrap script lines to a consuming
+/// [`AgentRole`] at spawn time. Multiple roles can reference the same pack,
+/// and a role can reference multiple packs.
+///
+/// # Merge semantics
+///
+/// Pack contributions APPEND to the consuming role's existing fields; they
+/// never replace.
+///
+/// - `binaries` are appended to `AgentRole.binaries` (deduplicated by the
+///   merge logic in slice I/1c) and installed at spawn via the consuming
+///   role's `package_manager`.
+/// - `allowed_tools_added` entries are appended to the consuming role's
+///   `allowed_tools` (e.g. `Bash(cargo:*)`, `Read`, `Bash(cfdb:*)`).
+/// - `system_prompt_fragment`, when present, is concatenated to
+///   `AgentRole.system_prompt` separated by two newlines.
+/// - `container_bootstrap` entries are PREPENDED to the role's
+///   `entrypoint_script`; useful for `rustup-init`, `cargo install`, or
+///   `PATH` setup that must run before the role's main work.
+///
+/// Packs are seeded into Redis under
+/// `agentry:tool_pack:<name>:<version>` in slice I/1b and merged into the
+/// effective role config at spawn time in slice I/1c.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ToolPack {
+    /// Pack identifier, e.g. `rust-cargo`.
+    pub name: String,
+    /// Monotonic version; mirrors [`AgentRole::version`] semantics.
+    pub version: u32,
+    /// Package names to install at spawn via the consuming role's
+    /// `package_manager`; appended to `AgentRole.binaries` (deduplicated by
+    /// the merge logic in slice I/1c).
+    #[serde(default)]
+    pub binaries: Vec<String>,
+    /// Bash lines prepended to the role's `entrypoint_script`; useful for
+    /// `rustup-init`, `cargo install`, or `PATH` setup.
+    #[serde(default)]
+    pub container_bootstrap: Vec<String>,
+    /// Tool allowlist patterns appended to the role's `allowed_tools`
+    /// (e.g. `Bash(cargo:*)`, `Read`, `Bash(cfdb:*)`).
+    #[serde(default)]
+    pub allowed_tools_added: Vec<String>,
+    /// Markdown fragment concatenated to `AgentRole.system_prompt` at spawn
+    /// time, separated by two newlines.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt_fragment: Option<String>,
+}
