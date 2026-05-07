@@ -300,6 +300,14 @@ async fn handle_brief(
 ) -> Result<VerdictKind> {
     let team = redis_io::fetch_team(conn, &brief.topology).await?;
 
+    // Slice I/2b — fetch `.agentry/profile.toml` from target_repo via the
+    // forge contents API. The resolved profile is logged here but not yet
+    // consumed; slice I/2c will thread it through to the spawner so
+    // profile.{coder,reviewer}.tool_packs augment the role's tool_packs at
+    // spawn time. Fetch errors are NOT fatal — a missing or unreachable
+    // profile downgrades to "use defaults" and the brief proceeds.
+    let _resolved_profile = fetch_brief_profile(brief, cfg).await;
+
     // Dispatch-time validation hook: catch malformed topologies before
     // spawning anything. The validator catches `roles.is_empty()` via the
     // Type check, but the explicit guard below is kept as defense-in-depth.
@@ -1228,6 +1236,75 @@ async fn resolve_repo_for_brief(
     }
 
     Ok(None)
+}
+
+/// Slice I/2b: resolve `.agentry/profile.toml` for the brief's target_repo.
+///
+/// Skips the network call when any of `target_repo`, `cfg.forge.default_host`,
+/// or `GITEA_TOKEN` is absent — the profile is optional and the brief should
+/// proceed using role defaults in those cases. Logs the outcome at INFO
+/// (success/absent/skipped) or WARN (fetch error). The returned `Option<Profile>`
+/// is captured into a local in `handle_brief` and is not yet consumed; slice
+/// I/2c will thread it to the spawner.
+async fn fetch_brief_profile(
+    brief: &Brief,
+    cfg: &crate::Config,
+) -> Option<orchestrator_types::Profile> {
+    let target_repo = brief
+        .payload
+        .get("target_repo")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let base_branch = brief
+        .payload
+        .get("base_branch")
+        .and_then(|v| v.as_str())
+        .unwrap_or("develop");
+    let forge_host = cfg.forge.default_host.as_deref().unwrap_or("");
+    let gitea_token = std::env::var("GITEA_TOKEN").unwrap_or_default();
+
+    if target_repo.is_empty() || forge_host.is_empty() || gitea_token.is_empty() {
+        tracing::info!(
+            brief = %brief.id,
+            target_repo = %target_repo,
+            forge_host = %forge_host,
+            has_token = !gitea_token.is_empty(),
+            "profile fetch skipped: missing target_repo/forge_host/GITEA_TOKEN"
+        );
+        return None;
+    }
+
+    match redis_io::fetch_profile(target_repo, base_branch, forge_host, &gitea_token).await {
+        Ok(Some(p)) => {
+            tracing::info!(
+                brief = %brief.id,
+                target_repo = %target_repo,
+                tool_packs_coder = ?p.coder.tool_packs,
+                tool_packs_reviewer = ?p.reviewer.tool_packs,
+                acceptance_default = ?p.acceptance.default,
+                gates = ?p.methodology.gates,
+                "fetched .agentry/profile.toml from target_repo"
+            );
+            Some(p)
+        }
+        Ok(None) => {
+            tracing::info!(
+                brief = %brief.id,
+                target_repo = %target_repo,
+                "no .agentry/profile.toml in target_repo; using defaults"
+            );
+            None
+        }
+        Err(e) => {
+            tracing::warn!(
+                brief = %brief.id,
+                target_repo = %target_repo,
+                error = %e,
+                "profile fetch failed; using defaults"
+            );
+            None
+        }
+    }
 }
 
 /// Build a token-bearing forge URL for the FIRST bare clone. Subsequent

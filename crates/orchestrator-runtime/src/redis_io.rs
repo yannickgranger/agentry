@@ -1,10 +1,11 @@
 //! Redis operations: brief submission, stream reads, verdict appends, trace writes.
 
 use crate::{Error, Result};
+use base64::Engine;
 use orchestrator_types::lifecycle::MAXIMUM_ATTEMPT_CAP;
 use orchestrator_types::{
-    AgentRole, Brief, BriefId, Event, Project, RoleName, TeamName, TeamTopology, ToolPack, Verdict,
-    VersionedRef,
+    parse_profile_toml, AgentRole, Brief, BriefId, Event, Profile, ProfileParseError, Project,
+    RoleName, TeamName, TeamTopology, ToolPack, Verdict, VersionedRef,
 };
 use redis::aio::ConnectionManager;
 use redis::AsyncCommands;
@@ -349,3 +350,108 @@ pub async fn read_next_brief(
 /// Hint that we're skipping fields (silences dead-code warnings on unused helper types).
 #[allow(dead_code)]
 fn _unused(_: TeamName) {}
+
+// ---------------------------------------------------------------------------
+// Profile fetcher (slice I/2b).
+//
+// At brief dispatch the daemon issues a forge contents API GET for
+// `.agentry/profile.toml` from the target_repo at the brief's base_branch.
+// 404 means "no profile, use defaults"; 200 + valid TOML produces a
+// `Profile`; other statuses are surfaced as `ProfileFetchError::Http` so the
+// caller can log and proceed with defaults. Composing the resolved profile
+// with role.tool_packs at spawn time is slice I/2c.
+// ---------------------------------------------------------------------------
+
+/// Errors returned by [`fetch_profile`].
+#[derive(Debug, thiserror::Error)]
+pub enum ProfileFetchError {
+    /// Reserved for callers that prefer an explicit not-found variant; the
+    /// 404 branch in [`fetch_profile`] returns `Ok(None)` instead, so this
+    /// variant is currently unused at the call site. Kept for forward-compat
+    /// in case operator tooling wants to distinguish explicit absence.
+    #[error("profile not found")]
+    NotFound,
+    #[error("forge http {status}: {body}")]
+    Http { status: u16, body: String },
+    #[error("profile toml parse: {0}")]
+    Parse(toml::de::Error),
+    #[error("profile content base64 decode: {0}")]
+    Base64(#[from] base64::DecodeError),
+    #[error("forge network: {0}")]
+    Network(#[from] reqwest::Error),
+    #[error("malformed target_repo (expected `<owner>/<repo>`): {0}")]
+    MalformedTargetRepo(String),
+}
+
+/// Fetch `.agentry/profile.toml` from the target_repo via the forge contents
+/// API. 404 → `Ok(None)` (profile is optional). 200 → base64-decode the
+/// response's `content` field and parse it as a [`Profile`]. Other statuses
+/// surface as [`ProfileFetchError::Http`].
+///
+/// `forge_host` is the bare host[:port] without scheme — the URL is built as
+/// `https://<forge_host>/api/v1/repos/<owner>/<repo>/contents/.agentry/profile.toml?ref=<base_branch>`.
+pub async fn fetch_profile(
+    target_repo: &str,
+    base_branch: &str,
+    forge_host: &str,
+    forge_token: &str,
+) -> std::result::Result<Option<Profile>, ProfileFetchError> {
+    let (owner, repo) = parse_target_repo(target_repo)?;
+    let url = format!(
+        "https://{forge_host}/api/v1/repos/{owner}/{repo}/contents/.agentry/profile.toml?ref={base_branch}"
+    );
+    fetch_profile_url(&url, forge_token).await
+}
+
+/// Fetch a profile from an explicit URL. Production callers use
+/// [`fetch_profile`] which constructs the canonical `https://...` URL; this
+/// lower-level entry point exists so integration tests can point at a mock
+/// HTTP server (where the hardcoded `https://` of [`fetch_profile`] would
+/// require self-signed-cert plumbing on top of `wiremock`).
+pub async fn fetch_profile_url(
+    url: &str,
+    forge_token: &str,
+) -> std::result::Result<Option<Profile>, ProfileFetchError> {
+    let client = reqwest::Client::builder().build()?;
+    let resp = client
+        .get(url)
+        .header("Authorization", format!("token {forge_token}"))
+        .send()
+        .await?;
+
+    let status = resp.status();
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if !status.is_success() {
+        let code = status.as_u16();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(ProfileFetchError::Http { status: code, body });
+    }
+
+    let body: serde_json::Value = resp.json().await?;
+    let content_b64 = body
+        .get("content")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    // Forge content fields commonly arrive line-wrapped (60-char chunks);
+    // strip whitespace before decode.
+    let cleaned: String = content_b64.chars().filter(|c| !c.is_whitespace()).collect();
+    let decoded = base64::engine::general_purpose::STANDARD.decode(cleaned.as_bytes())?;
+    let text = String::from_utf8_lossy(&decoded);
+    let profile = parse_profile_toml(&text)
+        .map_err(|ProfileParseError::Toml(e)| ProfileFetchError::Parse(e))?;
+    Ok(Some(profile))
+}
+
+fn parse_target_repo(target_repo: &str) -> std::result::Result<(&str, &str), ProfileFetchError> {
+    let (owner, repo) = target_repo
+        .split_once('/')
+        .ok_or_else(|| ProfileFetchError::MalformedTargetRepo(target_repo.to_string()))?;
+    if owner.is_empty() || repo.is_empty() || repo.contains('/') {
+        return Err(ProfileFetchError::MalformedTargetRepo(
+            target_repo.to_string(),
+        ));
+    }
+    Ok((owner, repo))
+}

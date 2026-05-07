@@ -52,6 +52,18 @@ plus any additional validation errors layered on later. The parser does
 no I/O; fetching the profile content from disk or forge is a downstream
 concern (slice I/2b).
 
+## ProfileFetchError
+
+Typed error returned by the fetcher (slice I/2b) that pulls
+`.agentry/profile.toml` from the target_repo via the forge contents API.
+Variants distinguish the layers a fetch can fail at: a malformed
+target_repo input, network/transport, non-success HTTP status, base64
+decode of the content field, and TOML parse. The 404 path is NOT an
+error — fetcher returns `Ok(None)` so the daemon proceeds with role
+defaults.
+
+- depends on: Error
+
 #### Operational invariants (not enforced by graph-specs)
 
 - Profile is checked-in to target_repo. The substrate fetches it via
@@ -64,3 +76,9 @@ concern (slice I/2b).
 - Optional everywhere. A profile with only `[coder]` tool_packs is
   valid; missing sections default to empty. Avoids forcing every
   project to specify every dimension.
+- Profile fetched at brief dispatch via forge contents API. The daemon
+  issues `GET https://<forge>/api/v1/repos/<owner>/<repo>/contents/.agentry/profile.toml?ref=<base_branch>`.
+  404 means "no profile, use defaults"; 200 + valid TOML produces a
+  Profile; other errors log a WARN and the brief proceeds with defaults.
+  Slice I/2c will compose `Profile.{coder,reviewer}.tool_packs` with the
+  role's tool_packs at spawn time.

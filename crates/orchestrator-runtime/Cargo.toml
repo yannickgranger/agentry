@@ -41,10 +41,13 @@ reqwest.workspace = true
 anyhow = "1.0.102"
 rusqlite = { version = "0.32", features = ["bundled", "chrono"] }
 humantime = "2"
+base64 = "0.22"
+toml = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3.14"
 filetime = "0.2"
+wiremock = "0.6"
 
 [lints]
 workspace = true
