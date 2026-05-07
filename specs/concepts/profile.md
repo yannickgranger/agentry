@@ -31,6 +31,12 @@ Per-role config. Used for both `[coder]` and `[reviewer]` sections in
 (model override, system prompt prefix, custom permits) will follow the
 same pattern — opt-in additions, defaulting to no-op.
 
+At spawn time the daemon augments the role's tool_packs with this
+section's tool_packs (deduplicated, profile additions appended).
+Augmentation applies based on role kind: profile.coder augments coder
+roles, profile.reviewer augments reviewer roles. Other role kinds
+(shipper, ci-watcher, ac-verifier) are not augmented in slice I/2c.
+
 ## ProfileAcceptanceSection
 
 The brief acceptance command default. When a brief is dispatched against
@@ -82,3 +88,9 @@ defaults.
   Profile; other errors log a WARN and the brief proceeds with defaults.
   Slice I/2c will compose `Profile.{coder,reviewer}.tool_packs` with the
   role's tool_packs at spawn time.
+- Profile augments, never replaces. The role's hardcoded tool_packs
+  always run; the profile's packs are appended after. A target_repo
+  profile cannot strip a pack the role declared; it can only add. This
+  preserves operator-set guarantees: a coder role declaring
+  `tool_packs = ["quality-fast"]` always gets quality-fast's bits, even
+  if the project profile forgets to mention it.

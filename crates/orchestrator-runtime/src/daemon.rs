@@ -301,12 +301,12 @@ async fn handle_brief(
     let team = redis_io::fetch_team(conn, &brief.topology).await?;
 
     // Slice I/2b — fetch `.agentry/profile.toml` from target_repo via the
-    // forge contents API. The resolved profile is logged here but not yet
-    // consumed; slice I/2c will thread it through to the spawner so
-    // profile.{coder,reviewer}.tool_packs augment the role's tool_packs at
-    // spawn time. Fetch errors are NOT fatal — a missing or unreachable
-    // profile downgrades to "use defaults" and the brief proceeds.
-    let _resolved_profile = fetch_brief_profile(brief, cfg).await;
+    // forge contents API. Slice I/2c threads the resolved profile through
+    // to the spawner so `profile.{coder,reviewer}.tool_packs` augment the
+    // matching role's `tool_packs` at spawn time. Fetch errors are NOT
+    // fatal — a missing or unreachable profile downgrades to "use
+    // defaults" and the brief proceeds.
+    let resolved_profile = fetch_brief_profile(brief, cfg).await;
 
     // Dispatch-time validation hook: catch malformed topologies before
     // spawning anything. The validator catches `roles.is_empty()` via the
@@ -447,6 +447,7 @@ async fn handle_brief(
                     verifying_key,
                     team_context: &run.team_ctx,
                     workspace: workspace_ref,
+                    profile: resolved_profile.as_ref(),
                 };
                 spawner.run_agent(ctx, conn_for_role)
             })

@@ -14,12 +14,13 @@ use crate::{delivery, permit as permit_mod, redis_io, workspace::BriefWorkspace,
 use async_trait::async_trait;
 use ed25519_dalek::VerifyingKey;
 use orchestrator_types::{
-    merge_role_with_packs, AgentRole, Brief, BriefId, Event, EventKind, PackageManager, Verdict,
-    VerdictKind, WorkPermit,
+    merge_role_with_packs, AgentRole, Brief, BriefId, Event, EventKind, PackageManager, Profile,
+    Verdict, VerdictKind, WorkPermit,
 };
 use redis::aio::ConnectionManager;
 use redis::AsyncCommands;
 use serde::Serialize;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -181,6 +182,11 @@ pub struct RunAgentCtx<'a> {
     /// `role.workspace_mount.is_some()`. `None` is valid for briefs whose
     /// team has no workspace-using roles.
     pub workspace: Option<&'a BriefWorkspace>,
+    /// Resolved `.agentry/profile.toml` for the brief's target_repo (slice
+    /// I/2c). When present and the role's kind is `coder` or `reviewer`,
+    /// the profile's matching `tool_packs` are appended to the role's
+    /// declared `tool_packs` before pack resolution.
+    pub profile: Option<&'a Profile>,
 }
 
 #[async_trait]
@@ -229,15 +235,36 @@ impl Spawner for PodmanSpawner {
             verifying_key,
             team_context,
             workspace,
+            profile,
         } = ctx;
         // Defence in depth: verify the permit we're about to hand out.
         permit_mod::verify(permit, verifying_key)?;
+
+        // Slice I/2c — augment the role's tool_packs with the resolved
+        // profile's matching section (coder ↔ profile.coder, reviewer ↔
+        // profile.reviewer). Other role kinds and the no-profile path
+        // borrow the role unchanged.
+        let role_kind = crate::lifecycle::role_kind(&role.name.0);
+        let augmented_role = augment_role_with_profile(role, role_kind, profile);
+        if let Cow::Owned(_) = &augmented_role {
+            tracing::info!(
+                brief = %brief.id,
+                role = %augmented_role.name,
+                role_kind = ?role_kind,
+                profile_packs = ?role_kind.and_then(|k| match k {
+                    "coder" => profile.map(|p| &p.coder.tool_packs),
+                    "reviewer" => profile.map(|p| &p.reviewer.tool_packs),
+                    _ => None,
+                }),
+                "augmented role with profile tool_packs"
+            );
+        }
 
         // Resolve tool packs once, up front. The rest of the spawn logic
         // operates on the merged role (binaries, allowed_tools,
         // system_prompt, entrypoint_script all reflect pack contributions).
         // For roles without `tool_packs`, this is a cheap clone.
-        let resolved_role = resolve_role_with_packs(role, conn).await?;
+        let resolved_role = resolve_role_with_packs(augmented_role.as_ref(), conn).await?;
         let role = &resolved_role;
 
         let agent_id = &permit.agent_id;
@@ -814,6 +841,43 @@ fn effective_binaries(role: &AgentRole) -> Vec<String> {
         out.push("sccache".into());
     }
     out
+}
+
+/// Slice I/2c — append the matching section's `tool_packs` from `profile`
+/// onto `role.tool_packs`, deduplicating against entries already declared
+/// by the role. Augmentation applies only to coder and reviewer kinds; all
+/// other kinds (and the no-profile path, and the empty-section path)
+/// return `Cow::Borrowed(role)` so no clone is performed.
+///
+/// This helper is kept pure so the peer test suite can exercise it
+/// directly without standing up a `RunAgentCtx`.
+#[must_use]
+pub fn augment_role_with_profile<'a>(
+    role: &'a AgentRole,
+    role_kind: Option<&str>,
+    profile: Option<&Profile>,
+) -> Cow<'a, AgentRole> {
+    let Some(profile) = profile else {
+        return Cow::Borrowed(role);
+    };
+    let extra_packs: &[String] = match role_kind {
+        Some("coder") => &profile.coder.tool_packs,
+        Some("reviewer") => &profile.reviewer.tool_packs,
+        _ => return Cow::Borrowed(role),
+    };
+    if extra_packs.is_empty() {
+        return Cow::Borrowed(role);
+    }
+    let mut role_clone = role.clone();
+    for pack in extra_packs {
+        if !role_clone.tool_packs.contains(pack) {
+            role_clone.tool_packs.push(pack.clone());
+        }
+    }
+    if role_clone.tool_packs == role.tool_packs {
+        return Cow::Borrowed(role);
+    }
+    Cow::Owned(role_clone)
 }
 
 /// Resolve and merge tool packs for a role. Fetches each pack named in
