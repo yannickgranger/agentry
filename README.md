@@ -64,6 +64,12 @@ authoring, deliberation, implementation, and enforcement.
 - Not a single-shot tool. agentry holds the loop: change → review →
   commit → push → CI → on-failure route back to coder, repeat.
 
+## Big Rust Projects
+
+- Big-rust workflow ready: dispatch briefs against `agentry-bugfix-v0` topology with `quality-mech` as the acceptance command for scoped reviewer cargo cost. See `docs/dogfood-protocol.md` for the recipe.
+
+agentry's reviewer-mechanical scopes cargo clippy + cargo test to changed crates plus their reverse-dep closure (via quality-mech), and the leaner agentry-bugfix-v0 topology drops the LLM ac-verifier ensemble. Together, brief LLM container count drops from 5 to 1 and cargo cost drops from workspace-wide to scoped — making agentry suitable for big Rust workspaces where the workspace-wide pair blows the brief budget.
+
 ## Shape
 
 ```mermaid
