@@ -12,8 +12,9 @@
 //!   advancing per event,
 //! * stops at the terminal state and does not consume events appended
 //!   beyond it,
-//! * skips (does not fail on) events the FSM rejects in the current
-//!   state — the driver is FSM-resilient by spec.
+//! * fails the brief to `Failed{DaemonError}` when the FSM rejects an
+//!   event in the current state — the driver is FSM-strict by spec
+//!   (#396b-3) so silent drops are structurally impossible.
 //!
 //! `verdict_conn` is passed `None` here so the test exercises the
 //! projector pipeline without a Redis dependency. The
@@ -30,7 +31,7 @@ use orchestrator_runtime::lifecycle::{
     EventSource, EventSourceError, StateProjector, StateProjectorError,
 };
 use orchestrator_runtime::lifecycle_driver::projector_task;
-use orchestrator_types::lifecycle::{BriefEvent, BriefState, BriefStateRecord, CiState};
+use orchestrator_types::lifecycle::{BriefEvent, BriefState, BriefStateRecord, CiState, Reason};
 use orchestrator_types::{BriefId, EventVerdict};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -157,29 +158,24 @@ async fn projector_task_walks_happy_path_to_shipped() {
     }
 }
 
-/// Drive a stream that includes events the FSM rejects in the current
-/// state. The driver must skip them at WARN, not fail, and continue
-/// onward to the legal terminal transition.
+/// Drive a stream whose first event is illegal in the starting state.
+/// Per 396b-3, the driver no longer warns-and-skips: it fails the brief
+/// to `Failed{DaemonError}`, writes a single record, and breaks the
+/// loop without consuming the trailing legal events.
 #[tokio::test]
-async fn projector_task_skips_invalid_transitions_and_continues() {
+async fn projector_task_fails_brief_on_invalid_transition() {
     let brief_id = BriefId("brf_parallel_run_invalid".into());
     let events = VecDeque::from(vec![
-        // Submitted state — `AcVerifierDone` is illegal here, must be skipped.
+        // Submitted state — `AcVerifierDone` is illegal here. The new
+        // fence transitions the brief into Failed{DaemonError} and
+        // breaks the loop, so the trailing events below never run.
         BriefEvent::AcVerifierDone {
             verdict: EventVerdict::Shipped,
             role_name: "ac-verifier-test".to_owned(),
         },
-        // Now the legal start.
         BriefEvent::CoderStarted {
             agent_id: "agent-1".into(),
         },
-        // Authoring state — `ReviewerDone` is illegal here, must be skipped.
-        BriefEvent::ReviewerDone {
-            verdict: EventVerdict::Shipped,
-            findings: vec![],
-            role_name: "reviewer-test".to_owned(),
-        },
-        // Legal continuation that drives toward terminal.
         BriefEvent::CoderDone {
             verdict: EventVerdict::Failed,
         },
@@ -193,17 +189,25 @@ async fn projector_task_skips_invalid_transitions_and_continues() {
 
     projector_task(brief_id, source, projector, None, no_gates())
         .await
-        .expect("projector_task tolerates rejected events");
+        .expect("projector_task fences on invalid transition without erroring");
 
     let log = written.lock().expect("mutex").clone();
-    // Two valid transitions: Submitted→Authoring, Authoring→Failed.
     assert_eq!(
         log.len(),
-        2,
-        "only legal transitions produce projector writes"
+        1,
+        "InvalidTransition fence writes exactly one record then breaks"
     );
-    assert!(matches!(log[0].0.state, BriefState::Authoring { .. }));
-    assert!(matches!(log[1].0.state, BriefState::Failed { .. }));
+    match &log[0].0.state {
+        BriefState::Failed {
+            reason: Reason::DaemonError { detail },
+        } => {
+            assert!(
+                detail.contains("FSM rejected"),
+                "DaemonError detail must mention the FSM rejection: {detail}"
+            );
+        }
+        other => panic!("expected Failed{{DaemonError}}, got {other:?}"),
+    }
 }
 
 /// Drive an empty stream. The driver must terminate cleanly when the

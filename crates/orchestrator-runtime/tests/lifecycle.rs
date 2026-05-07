@@ -16,8 +16,10 @@ use orchestrator_runtime::lifecycle::{
     role_kind, translate_trace_entry, EventSource, EventSourceError, RedisEventSource,
     RedisStateProjector, StateProjector, StateProjectorError,
 };
+use orchestrator_runtime::lifecycle_driver::projector_task;
 use orchestrator_types::lifecycle::{
-    handle, BriefEvent, BriefState, BriefStateRecord, CiState, RetryBudget, DEFAULT_ATTEMPT_CAP,
+    handle, BriefEvent, BriefState, BriefStateRecord, CiState, Reason, RetryBudget,
+    DEFAULT_ATTEMPT_CAP,
 };
 use orchestrator_types::{BriefId, Event, EventKind, EventVerdict};
 use std::collections::{HashMap, VecDeque};
@@ -484,4 +486,63 @@ fn translate_done_from_ci_watcher_maps_verdict_to_ci_state() {
             other => panic!("expected CiResult for {verdict:?}, got {other:?}"),
         }
     }
+}
+
+// --- 396b-3: lifecycle_driver fails the brief on InvalidTransition ---
+
+/// Drive `projector_task` with an event sequence that the FSM rejects
+/// (start at `Submitted`, then yield `ShipperDone` — there is no
+/// `Submitted + ShipperDone` arm). The driver must translate the
+/// `InvalidTransition` into a written `BriefStateRecord` carrying
+/// `Failed{DaemonError}` whose detail mentions the rejected event,
+/// then break out of its loop returning `Ok(())`.
+#[tokio::test]
+async fn lifecycle_driver_fails_brief_on_invalid_transition() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    std::env::set_var("AGENTRY_WORKSPACE_ROOT", tmp.path());
+
+    let bid = BriefId("brf_invalid_transition_fence".into());
+    let written: Arc<Mutex<Vec<(BriefStateRecord, String)>>> = Arc::new(Mutex::new(Vec::new()));
+    let source: Box<dyn EventSource + Send> = Box::new(MemEventSource {
+        events: VecDeque::from(vec![BriefEvent::ShipperDone {
+            pr_number: 1,
+            head_sha: "h".into(),
+        }]),
+    });
+    let projector: Box<dyn StateProjector + Send> = Box::new(MemStateProjector {
+        written: written.clone(),
+    });
+
+    let result = projector_task(
+        bid.clone(),
+        source,
+        projector,
+        None,
+        std::sync::Arc::new(no_gates()),
+    )
+    .await;
+    assert!(
+        result.is_ok(),
+        "projector_task must return Ok after fencing on InvalidTransition: {result:?}"
+    );
+
+    let log = written.lock().expect("mutex").clone();
+    assert_eq!(
+        log.len(),
+        1,
+        "one record written for the InvalidTransition fence"
+    );
+    match &log[0].0.state {
+        BriefState::Failed {
+            reason: Reason::DaemonError { detail },
+        } => {
+            assert!(
+                detail.contains("FSM rejected"),
+                "detail must mention the FSM rejection: {detail}"
+            );
+        }
+        other => panic!("expected Failed{{DaemonError}}, got {other:?}"),
+    }
+
+    std::env::remove_var("AGENTRY_WORKSPACE_ROOT");
 }

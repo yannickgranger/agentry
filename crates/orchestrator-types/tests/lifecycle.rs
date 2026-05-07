@@ -977,3 +977,295 @@ fn invalid_transition_carries_owned_pair() {
     // Cloneable so the daemon can attach the pair to a log line.
     let _cloned = err.clone();
 }
+
+// --- 396b-3: evidence-based gating ---
+
+fn three_ac_verifier_gates() -> orchestrator_types::lifecycle::PhaseGates {
+    use orchestrator_types::lifecycle::{GateConfig, GatePolicy, PhaseGates};
+    PhaseGates {
+        verifying: GateConfig {
+            expected_roles: vec![
+                "ac-verifier-claude".to_owned(),
+                "ac-verifier-gemini".to_owned(),
+                "ac-verifier-grok".to_owned(),
+            ],
+            policy: GatePolicy::AllMustPass,
+        },
+        reviewing: GateConfig {
+            expected_roles: vec![],
+            policy: GatePolicy::AllMustPass,
+        },
+    }
+}
+
+fn two_reviewer_gates() -> orchestrator_types::lifecycle::PhaseGates {
+    use orchestrator_types::lifecycle::{GateConfig, GatePolicy, PhaseGates};
+    PhaseGates {
+        verifying: GateConfig {
+            expected_roles: vec![],
+            policy: GatePolicy::AllMustPass,
+        },
+        reviewing: GateConfig {
+            expected_roles: vec![
+                "reviewer-mechanical".to_owned(),
+                "reviewer-claude".to_owned(),
+            ],
+            policy: GatePolicy::AllMustPass,
+        },
+    }
+}
+
+#[test]
+fn verifying_waits_for_all_three_ac_verifiers_under_all_must_pass() {
+    use orchestrator_types::lifecycle::GatePolicy;
+    let gates = three_ac_verifier_gates();
+    let expected = vec![
+        "ac-verifier-claude".to_owned(),
+        "ac-verifier-gemini".to_owned(),
+        "ac-verifier-grok".to_owned(),
+    ];
+    let s0 = BriefState::Verifying {
+        retry: fresh_retry(),
+        received: std::collections::BTreeMap::new(),
+        expected: expected.clone(),
+        policy: GatePolicy::AllMustPass,
+    };
+
+    let s1 = handle(
+        &s0,
+        &BriefEvent::AcVerifierDone {
+            verdict: EventVerdict::Shipped,
+            role_name: "ac-verifier-claude".to_owned(),
+        },
+        &gates,
+    )
+    .expect("first ac-verifier shipped");
+    match &s1 {
+        BriefState::Verifying {
+            received,
+            expected: e,
+            policy,
+            ..
+        } => {
+            assert_eq!(received.len(), 1);
+            assert_eq!(
+                received.get("ac-verifier-claude"),
+                Some(&EventVerdict::Shipped)
+            );
+            assert_eq!(e, &expected);
+            assert_eq!(policy, &GatePolicy::AllMustPass);
+        }
+        other => panic!("expected Verifying after first report, got {other:?}"),
+    }
+
+    let s2 = handle(
+        &s1,
+        &BriefEvent::AcVerifierDone {
+            verdict: EventVerdict::Shipped,
+            role_name: "ac-verifier-gemini".to_owned(),
+        },
+        &gates,
+    )
+    .expect("second ac-verifier shipped");
+    match &s2 {
+        BriefState::Verifying { received, .. } => {
+            assert_eq!(received.len(), 2);
+            assert_eq!(
+                received.get("ac-verifier-claude"),
+                Some(&EventVerdict::Shipped)
+            );
+            assert_eq!(
+                received.get("ac-verifier-gemini"),
+                Some(&EventVerdict::Shipped)
+            );
+        }
+        other => panic!("expected Verifying after two reports, got {other:?}"),
+    }
+
+    let s3 = handle(
+        &s2,
+        &BriefEvent::AcVerifierDone {
+            verdict: EventVerdict::Shipped,
+            role_name: "ac-verifier-grok".to_owned(),
+        },
+        &gates,
+    )
+    .expect("third ac-verifier shipped");
+    assert!(
+        matches!(s3, BriefState::Reviewing { .. }),
+        "expected Reviewing after third Shipped, got {s3:?}"
+    );
+}
+
+#[test]
+fn verifying_one_ac_verifier_failed_under_all_must_pass_transitions_to_reworking() {
+    use orchestrator_types::lifecycle::GatePolicy;
+    let gates = three_ac_verifier_gates();
+    let s0 = BriefState::Verifying {
+        retry: fresh_retry(),
+        received: std::collections::BTreeMap::new(),
+        expected: vec![
+            "ac-verifier-claude".to_owned(),
+            "ac-verifier-gemini".to_owned(),
+            "ac-verifier-grok".to_owned(),
+        ],
+        policy: GatePolicy::AllMustPass,
+    };
+    let s1 = handle(
+        &s0,
+        &BriefEvent::AcVerifierDone {
+            verdict: EventVerdict::Shipped,
+            role_name: "ac-verifier-claude".to_owned(),
+        },
+        &gates,
+    )
+    .expect("first shipped");
+    let s2 = handle(
+        &s1,
+        &BriefEvent::AcVerifierDone {
+            verdict: EventVerdict::Shipped,
+            role_name: "ac-verifier-gemini".to_owned(),
+        },
+        &gates,
+    )
+    .expect("second shipped");
+    let s3 = handle(
+        &s2,
+        &BriefEvent::AcVerifierDone {
+            verdict: EventVerdict::Failed,
+            role_name: "ac-verifier-grok".to_owned(),
+        },
+        &gates,
+    )
+    .expect("third failed");
+    match s3 {
+        BriefState::Reworking { target, retry } => {
+            assert_eq!(target, ReworkTarget::Coder);
+            assert_eq!(retry.attempt, 2);
+        }
+        BriefState::Failed {
+            reason: Reason::BudgetExhausted,
+        } => {
+            // Acceptable when the retry was at cap; not the case for fresh_retry().
+            panic!("budget exhausted unexpectedly with fresh retry");
+        }
+        other => panic!("expected Reworking, got {other:?}"),
+    }
+}
+
+#[test]
+fn verifying_one_ac_verifier_rejected_terminates_brief() {
+    use orchestrator_types::lifecycle::GatePolicy;
+    let gates = three_ac_verifier_gates();
+    let s0 = BriefState::Verifying {
+        retry: fresh_retry(),
+        received: std::collections::BTreeMap::new(),
+        expected: vec![
+            "ac-verifier-claude".to_owned(),
+            "ac-verifier-gemini".to_owned(),
+            "ac-verifier-grok".to_owned(),
+        ],
+        policy: GatePolicy::AllMustPass,
+    };
+    let s1 = handle(
+        &s0,
+        &BriefEvent::AcVerifierDone {
+            verdict: EventVerdict::Rejected,
+            role_name: "ac-verifier-claude".to_owned(),
+        },
+        &gates,
+    )
+    .expect("rejected verdict drives a transition");
+    match s1 {
+        BriefState::Failed {
+            reason: Reason::AcceptanceFailed { detail },
+        } => {
+            assert!(
+                detail.contains("ac-verifier-claude"),
+                "detail should mention the rejecting role: {detail}"
+            );
+        }
+        other => panic!("expected Failed{{AcceptanceFailed}}, got {other:?}"),
+    }
+}
+
+#[test]
+fn reviewing_waits_for_both_reviewers_under_all_must_pass() {
+    use orchestrator_types::lifecycle::GatePolicy;
+    let gates = two_reviewer_gates();
+    let s0 = BriefState::Reviewing {
+        retry: fresh_retry(),
+        received: std::collections::BTreeMap::new(),
+        expected: vec![
+            "reviewer-mechanical".to_owned(),
+            "reviewer-claude".to_owned(),
+        ],
+        policy: GatePolicy::AllMustPass,
+    };
+    let s1 = handle(
+        &s0,
+        &BriefEvent::ReviewerDone {
+            verdict: EventVerdict::Shipped,
+            findings: vec![],
+            role_name: "reviewer-mechanical".to_owned(),
+        },
+        &gates,
+    )
+    .expect("first reviewer shipped");
+    match &s1 {
+        BriefState::Reviewing { received, .. } => {
+            assert_eq!(received.len(), 1);
+            assert_eq!(
+                received.get("reviewer-mechanical"),
+                Some(&EventVerdict::Shipped)
+            );
+        }
+        other => panic!("expected Reviewing after first report, got {other:?}"),
+    }
+    let s2 = handle(
+        &s1,
+        &BriefEvent::ReviewerDone {
+            verdict: EventVerdict::Shipped,
+            findings: vec![],
+            role_name: "reviewer-claude".to_owned(),
+        },
+        &gates,
+    )
+    .expect("second reviewer shipped");
+    assert!(
+        matches!(s2, BriefState::Shipping { .. }),
+        "expected Shipping after both reviewers Shipped, got {s2:?}"
+    );
+}
+
+#[test]
+fn reviewing_one_reviewer_rework_needed_transitions_to_reworking() {
+    use orchestrator_types::lifecycle::GatePolicy;
+    let gates = two_reviewer_gates();
+    let s0 = BriefState::Reviewing {
+        retry: fresh_retry(),
+        received: std::collections::BTreeMap::new(),
+        expected: vec![
+            "reviewer-mechanical".to_owned(),
+            "reviewer-claude".to_owned(),
+        ],
+        policy: GatePolicy::AllMustPass,
+    };
+    let s1 = handle(
+        &s0,
+        &BriefEvent::ReviewerDone {
+            verdict: EventVerdict::ReworkNeeded,
+            findings: vec![],
+            role_name: "reviewer-mechanical".to_owned(),
+        },
+        &gates,
+    )
+    .expect("rework verdict short-circuits the gate");
+    match s1 {
+        BriefState::Reworking { target, retry } => {
+            assert_eq!(target, ReworkTarget::Coder);
+            assert_eq!(retry.attempt, 2);
+        }
+        other => panic!("expected Reworking, got {other:?}"),
+    }
+}

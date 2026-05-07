@@ -323,64 +323,89 @@ pub fn handle(
         },
 
         // ---- Verifying ----
-        (BriefState::Verifying { retry, .. }, BriefEvent::AcVerifierDone { verdict, .. }) => {
-            match verdict {
-                EventVerdict::Shipped => Ok(BriefState::Reviewing {
+        (
+            BriefState::Verifying {
+                retry,
+                received,
+                expected,
+                policy,
+            },
+            BriefEvent::AcVerifierDone { verdict, role_name },
+        ) => {
+            let mut new_received = received.clone();
+            new_received.insert(role_name.clone(), *verdict);
+            let gate_config = GateConfig {
+                expected_roles: expected.clone(),
+                policy: policy.clone(),
+            };
+            match decide(&new_received, &gate_config) {
+                Decide::Wait => Ok(BriefState::Verifying {
+                    retry: *retry,
+                    received: new_received,
+                    expected: expected.clone(),
+                    policy: policy.clone(),
+                }),
+                Decide::Pass => Ok(BriefState::Reviewing {
                     retry: *retry,
                     received: BTreeMap::new(),
                     expected: gates.reviewing.expected_roles.clone(),
                     policy: gates.reviewing.policy.clone(),
                 }),
-                EventVerdict::ReworkNeeded | EventVerdict::Failed => {
+                Decide::Rework { detail: _ } => {
                     Ok(increment_or_fail(*retry, |next| BriefState::Reworking {
                         target: ReworkTarget::Coder,
                         retry: next,
                     }))
                 }
-                EventVerdict::Rejected => Ok(BriefState::Failed {
-                    reason: Reason::AcceptanceFailed {
-                        detail: "ac-verifier rejected".to_owned(),
-                    },
-                }),
-                EventVerdict::Escalated => Ok(BriefState::Failed {
-                    reason: Reason::AcceptanceFailed {
-                        detail: "ac-verifier escalated".to_owned(),
-                    },
+                Decide::Reject { detail } => Ok(BriefState::Failed {
+                    reason: Reason::AcceptanceFailed { detail },
                 }),
             }
         }
 
         // ---- Reviewing ----
         (
-            BriefState::Reviewing { retry, .. },
+            BriefState::Reviewing {
+                retry,
+                received,
+                expected,
+                policy,
+            },
             BriefEvent::ReviewerDone {
                 verdict,
                 findings: _,
-                ..
+                role_name,
             },
-        ) => match verdict {
-            EventVerdict::Shipped => Ok(BriefState::Shipping {
-                pr_number: 0,
-                head_sha: String::new(),
-                retry: *retry,
-            }),
-            EventVerdict::ReworkNeeded => {
-                Ok(increment_or_fail(*retry, |next| BriefState::Reworking {
-                    target: ReworkTarget::Coder,
-                    retry: next,
-                }))
+        ) => {
+            let mut new_received = received.clone();
+            new_received.insert(role_name.clone(), *verdict);
+            let gate_config = GateConfig {
+                expected_roles: expected.clone(),
+                policy: policy.clone(),
+            };
+            match decide(&new_received, &gate_config) {
+                Decide::Wait => Ok(BriefState::Reviewing {
+                    retry: *retry,
+                    received: new_received,
+                    expected: expected.clone(),
+                    policy: policy.clone(),
+                }),
+                Decide::Pass => Ok(BriefState::Shipping {
+                    pr_number: 0,
+                    head_sha: String::new(),
+                    retry: *retry,
+                }),
+                Decide::Rework { detail: _ } => {
+                    Ok(increment_or_fail(*retry, |next| BriefState::Reworking {
+                        target: ReworkTarget::Coder,
+                        retry: next,
+                    }))
+                }
+                Decide::Reject { detail } => Ok(BriefState::Failed {
+                    reason: Reason::AcceptanceFailed { detail },
+                }),
             }
-            EventVerdict::Failed | EventVerdict::Rejected => Ok(BriefState::Failed {
-                reason: Reason::AcceptanceFailed {
-                    detail: "reviewer rejected".to_owned(),
-                },
-            }),
-            EventVerdict::Escalated => Ok(BriefState::Failed {
-                reason: Reason::AcceptanceFailed {
-                    detail: "reviewer escalated".to_owned(),
-                },
-            }),
-        },
+        }
 
         // ---- Reworking ----
         (BriefState::Reworking { retry, .. }, BriefEvent::CoderStarted { agent_id }) => {

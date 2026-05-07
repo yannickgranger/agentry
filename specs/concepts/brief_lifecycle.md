@@ -56,12 +56,15 @@ of `role_name` → verdict, accumulating sibling reports as they arrive),
 `expected` (the list of `role_name` strings the gate waits on,
 populated from the team topology at phase entry by
 `build_phase_gates`), and `policy` (a `GatePolicy` variant indicating
-the fan-in rule). The fields are populated at construction (empty
-`received`, gate config from `PhaseGates`) but are NOT consulted by
-`handle()` yet — 396b-2 is a pure shape change preserving the existing
-serial first-event semantics. 396b-3 will swap the serial transitions
-for evidence-based gating that folds each new sibling verdict into
-`received` and calls `decide(received, &GateConfig{expected, policy})`.
+the fan-in rule). Per 396b-3 `handle()` transitions out of the phase
+only when the gate's policy declares Pass over the accumulated
+`received` multiset; transitions to Reworking on soft fails
+(Failed/ReworkNeeded), to Failed{AcceptanceFailed} on hard fails
+(Rejected/Escalated). Each new sibling verdict is folded into
+`received` and `handle()` calls
+`decide(received, &GateConfig{expected, policy})` to pick Wait /
+Pass / Rework / Reject — the FSM is now parallel-aware and no
+sibling's report is silently dropped.
 
 ## BriefEvent
 
@@ -228,6 +231,16 @@ stream as `EventKind::Event { payload: <BriefEvent JSON> }` — the
 carried `BriefEvent` to the per-brief FSM driver. `podman kill`
 shells out via `tokio::process::Command`.
 
+#### Operational invariants (not enforced by graph-specs)
+
+- FSM rejects no events silently. The lifecycle driver translates
+  `InvalidTransition` into `BriefState::Failed { reason: DaemonError }`
+  instead of WARN-and-skip. WHY: silent drops were the root cause of
+  #396 — the 2nd and 3rd reports of an ensemble verifier were lost
+  when the FSM model assumed serial transitions but the runtime fanned
+  out roles in parallel. The structural fence is: every (state, event)
+  pair either transitions or fails the brief; there is no third path.
+
 #### Wall-clock reaper transition (not enforced by graph-specs)
 
 The daemon's wall-clock reaper closes the orphan-without-Failed class
@@ -349,3 +362,13 @@ hardcoded to `AllMustPass` for both phases — Pattern 3 (#397) will
 lift this to per-edge config in topology JSON. The transition logic in
 `handle()` is still serial-first-event; 396b-3 swaps that for
 evidence-based gating via `decide()`.
+
+396b-3 lands the behavior change: `handle()` Verifying and Reviewing
+arms accumulate `received` verdicts and call `decide()` to determine
+Wait/Pass/Rework/Reject; `lifecycle_driver` fails the brief on
+`InvalidTransition`. With this slice merged, the
+`agentry-self-host-v0` ensemble (3 ac-verifiers + 2 reviewers under
+`AllMustPass`) is correct: every sibling's verdict is captured, no
+Failed report is silently dropped. Pattern 3 (#397) lifts the
+hardcoded `AllMustPass` policy to per-edge config in the topology
+JSON.
