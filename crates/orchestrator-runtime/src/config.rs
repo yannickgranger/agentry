@@ -77,6 +77,12 @@ pub struct ForgeConfig {
     pub default_host: Option<String>,
     #[serde(default)]
     pub allowed_owners: Vec<String>,
+    /// Disable TLS certificate validation on the forge HTTP client. Defaults
+    /// to false (production-safe). Set true only for lab-internal forges with
+    /// self-signed certs; mirrors the substrate's existing `curl -k` pattern
+    /// used by shipper-agentry / ci-watcher-agentry.
+    #[serde(default)]
+    pub tls_insecure: bool,
 }
 
 /// Shared sccache backend used by roles that compile Rust. `endpoint`

@@ -390,17 +390,22 @@ pub enum ProfileFetchError {
 ///
 /// `forge_host` is the bare host[:port] without scheme — the URL is built as
 /// `https://<forge_host>/api/v1/repos/<owner>/<repo>/contents/.agentry/profile.toml?ref=<base_branch>`.
+///
+/// `tls_insecure` disables TLS certificate validation on the underlying
+/// reqwest client; production callers pass `false`, lab-internal callers
+/// running against a self-signed forge cert pass `true`.
 pub async fn fetch_profile(
     target_repo: &str,
     base_branch: &str,
     forge_host: &str,
     forge_token: &str,
+    tls_insecure: bool,
 ) -> std::result::Result<Option<Profile>, ProfileFetchError> {
     let (owner, repo) = parse_target_repo(target_repo)?;
     let url = format!(
         "https://{forge_host}/api/v1/repos/{owner}/{repo}/contents/.agentry/profile.toml?ref={base_branch}"
     );
-    fetch_profile_url(&url, forge_token).await
+    fetch_profile_url(&url, forge_token, tls_insecure).await
 }
 
 /// Fetch a profile from an explicit URL. Production callers use
@@ -411,8 +416,13 @@ pub async fn fetch_profile(
 pub async fn fetch_profile_url(
     url: &str,
     forge_token: &str,
+    tls_insecure: bool,
 ) -> std::result::Result<Option<Profile>, ProfileFetchError> {
-    let client = reqwest::Client::builder().build()?;
+    let mut builder = reqwest::Client::builder();
+    if tls_insecure {
+        builder = builder.danger_accept_invalid_certs(true);
+    }
+    let client = builder.build()?;
     let resp = client
         .get(url)
         .header("Authorization", format!("token {forge_token}"))

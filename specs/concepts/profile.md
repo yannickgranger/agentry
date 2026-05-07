@@ -94,3 +94,8 @@ defaults.
   preserves operator-set guarantees: a coder role declaring
   `tool_packs = ["quality-fast"]` always gets quality-fast's bits, even
   if the project profile forgets to mention it.
+- tls_insecure config knob. The forge HTTP client respects
+  `[forge] tls_insecure` in agentry.toml. Default false for production;
+  set true for lab-internal forges with self-signed certs. Mirrors the
+  substrate's existing `curl -k` pattern in shipper-agentry /
+  ci-watcher-agentry.
