@@ -16,6 +16,7 @@ pub mod config;
 pub mod daemon;
 pub mod delivery;
 pub mod errors;
+pub mod intake_validation;
 pub mod lifecycle;
 pub mod lifecycle_driver;
 pub mod permit;
