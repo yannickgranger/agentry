@@ -7,6 +7,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod captain_ground;
 pub mod cli_agents;
 pub mod cli_roles;
 pub mod cli_teams;
