@@ -51,6 +51,16 @@ mandatory; an Assertion without an anchor is rejected at parse time by
 Newtype wrapper for assertion identifiers (e.g., `"A1"`, `"A2"`).
 String inside, hashable, used as a key.
 
+#### Brief.contract field
+
+Optional field on Brief.Payload. When
+`Brief.payload.kind.requires_contract()` is true and
+`Brief.payload.contract.is_none()`, the daemon logs a WARN at intake
+(B3 of the captain-doctrine slices). Existing briefs without the field
+deserialize via `#[serde(default)]` with `contract: None`. A later
+slice (B6) will switch the WARN to a REJECT, after evidence accrues
+that captains author contracts when expected.
+
 #### Operational invariants (not enforced by graph-specs)
 
 - Every Assertion has exactly one anchor.
@@ -59,3 +69,7 @@ String inside, hashable, used as a key.
   at intake.
 - Contracts are immutable once dispatched; the typed shape is what
   makes them auditable across captain sessions.
+- Brief.contract is observed but not validated against ground truth in
+  B3. Anchor existence (cfdb qname resolution, graph-specs concept
+  resolution, file-system path resolution for precursor_artifacts) is
+  checked at intake in B6.

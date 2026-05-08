@@ -118,7 +118,23 @@ pub async fn run(
         match redis_io::read_next_brief(&mut conn, &last_id, 5_000).await {
             Ok(Some((sid, brief))) => {
                 last_id = sid;
-                tracing::info!(brief = %brief.id, "received brief");
+                tracing::info!(
+                    brief = %brief.id,
+                    kind = ?brief.kind,
+                    contract_present = brief.contract.is_some(),
+                    assertion_count = brief.contract.as_ref().map(|c| c.assertions.len()).unwrap_or(0),
+                    requires_contract = brief.kind.map(|k| k.requires_contract()).unwrap_or(false),
+                    "received brief",
+                );
+                if brief.kind.map(|k| k.requires_contract()).unwrap_or(false)
+                    && brief.contract.is_none()
+                {
+                    tracing::warn!(
+                        brief = %brief.id,
+                        kind = ?brief.kind,
+                        "non-trivial brief kind missing contract — log-only observation; future slice (B6) will reject at intake",
+                    );
+                }
                 // Defensive backfill of agentry:brief:<id>:body so the
                 // dashboard's SMEMBERS+MGET render path doesn't depend
                 // on intake going through `submit_brief` (raw XADD,
@@ -848,6 +864,7 @@ async fn on_all_children_resolved(conn: &mut ConnectionManager, meta_id: &str) -
             topology: VersionedRef::new(DOL_VERIFIER_TOPOLOGY, 1),
             payload: serde_json::Value::Object(payload_obj),
             kind: None,
+            contract: None,
             budget: Budget {
                 max_tokens: None,
                 max_wall_seconds: Some(600),

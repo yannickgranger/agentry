@@ -68,6 +68,13 @@ pub struct Brief {
     /// `pipeline.rs` before dispatching validators.
     #[serde(default)]
     pub kind: Option<crate::kind::TaskShape>,
+    /// Optional validation contract authored by the captain. When
+    /// `kind.requires_contract()` is true and `contract` is None, the daemon
+    /// logs a WARN at intake (B3) and will reject at intake in a later slice
+    /// (B6). Existing briefs without this field deserialize with
+    /// `contract: None`.
+    #[serde(default)]
+    pub contract: Option<crate::contract::Contract>,
     /// Hard budget; runtime enforces.
     #[serde(default)]
     pub budget: Budget,
@@ -99,6 +106,7 @@ impl Brief {
             topology,
             payload,
             kind: None,
+            contract: None,
             budget: Budget::default(),
             escalation: EscalationMode::default(),
             parent_brief: None,
