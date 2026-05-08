@@ -3,7 +3,7 @@
   "version": 1,
   "model": null,
   "system_prompt": null,
-  "image": "docker.io/library/debian:bookworm-slim",
+  "image": "docker.io/library/debian:trixie-slim",
   "substrate_class": "podman",
   "package_manager": "apt",
   "entrypoint_script": "#!/bin/sh\nexec /usr/local/bin/shipper-runner\n",

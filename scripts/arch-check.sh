@@ -25,11 +25,17 @@ if compgen -G ".cfdb/queries/*.cypher" > /dev/null; then
     fail=0
     for rule in .cfdb/queries/*.cypher; do
         printf '  rule: %s ... ' "$(basename "$rule")"
-        if cfdb violations --db "$DB_DIR" --keyspace agentry --rule "$rule" 2>&1 | grep -q "^violations: 0 "; then
+        # Capture combined output regardless of cfdb's exit code (older
+        # cfdb versions return non-zero on EmptyResult warnings even when
+        # violations=0). Decision is based on the parsed violations count,
+        # not pipefail propagation.
+        out=$(cfdb violations --db "$DB_DIR" --keyspace agentry --rule "$rule" 2>&1 || true)
+        count=$(printf '%s\n' "$out" | sed -nE 's/^violations:[[:space:]]+([0-9]+).*/\1/p' | head -n1)
+        if [ "${count:-}" = "0" ]; then
             echo "ok"
         else
             echo "FAIL"
-            cfdb violations --db "$DB_DIR" --keyspace agentry --rule "$rule" || true
+            printf '%s\n' "$out"
             fail=1
         fi
     done

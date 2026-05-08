@@ -1,7 +1,7 @@
 {
   "name": "quality-fast",
   "version": 1,
-  "binaries": ["quality-fast"],
+  "binaries": [],
   "container_bootstrap": [],
   "allowed_tools_added": ["Bash(quality-fast:*)"],
   "system_prompt_fragment": "You have quality-fast on PATH. Use it for fast scoped compile and lint feedback on the changed crates of your work tree. Prefer quality-fast over running cargo workspace-wide; the substrate's reviewer-mechanical re-runs the brief acceptance command separately so you do not need to verify the full workspace. quality-fast outputs a JSON report of per-crate fmt + check + clippy + cfdb + arch-check results."

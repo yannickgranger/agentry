@@ -73,9 +73,10 @@ fn seeded_role_references_quality_fast_pack_on_disk() {
 /// End-to-end: seed the on-disk role and pack into Redis, resolve, and
 /// inspect the merged effective role.
 ///
-/// - `binaries` already declares `quality-fast` on the role; the pack
-///   contributes the same name. The merge dedups by string equality so the
-///   resolved role lists `quality-fast` exactly once.
+/// - `binaries` is the role's apt-install list. `quality-fast` is a
+///   host-mounted binary, NOT a Debian package, so neither the role nor
+///   the pack puts it in `binaries` (otherwise apt-get install fails with
+///   exit 100). The pack's empty `binaries` is intentional.
 /// - `allowed_tools` already declares `Bash(quality-fast:*)` on the role;
 ///   the pack contributes the same pattern. The merge dedups so the
 ///   resolved role lists the pattern exactly once.
@@ -102,14 +103,12 @@ async fn coder_claude_agentry_resolves_quality_fast_pack() {
         .await
         .expect("resolve");
 
-    let bin_count = resolved
-        .binaries
-        .iter()
-        .filter(|b| b.as_str() == "quality-fast")
-        .count();
-    assert_eq!(
-        bin_count, 1,
-        "binaries must contain `quality-fast` exactly once after dedup; got {:?}",
+    assert!(
+        !resolved
+            .binaries
+            .iter()
+            .any(|b| b.as_str() == "quality-fast"),
+        "quality-fast is host-mounted, not apt-installed; binaries must NOT contain it; got {:?}",
         resolved.binaries,
     );
 
