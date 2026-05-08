@@ -1,8 +1,14 @@
-//! BriefKind — typed classification of a brief by task shape.
+//! TaskShape — typed classification of a brief by authoring intent.
 //!
-//! Drives the contract-required predicate at intake (later slices) and seeds
-//! the vocabulary the topology catalog draws from. Pure types + predicate;
-//! Brief integration is B3, daemon validation is B6.
+//! Captain-facing enum: the brief author declares which task shape they
+//! scoped. Drives the contract-required predicate at intake (later slices)
+//! and seeds the vocabulary the topology catalog draws from. The daemon
+//! consumes a derived `ValidatorPipeline` produced by
+//! `From<TaskShape> for ValidatorPipeline`; see `pipeline.rs`.
+//!
+//! Renamed from `BriefKind` by B2.5 of the captain-doctrine work to
+//! resolve a name collision with the validator-pipeline enum. File path
+//! preserved for git-history continuity from B2.
 
 use serde::{Deserialize, Serialize};
 
@@ -10,7 +16,7 @@ use serde::{Deserialize, Serialize};
 /// future slices key contract requirements and topology selection off this.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-pub enum BriefKind {
+pub enum TaskShape {
     TrivialDoc,
     TrivialMechanical,
     Mechanical,
@@ -22,7 +28,7 @@ pub enum BriefKind {
     Triage,
 }
 
-impl BriefKind {
+impl TaskShape {
     /// Whether a brief of this kind requires a typed Contract at intake.
     ///
     /// Match is exhaustive over all variants on purpose: adding a future
@@ -31,14 +37,14 @@ impl BriefKind {
     #[must_use]
     pub fn requires_contract(self) -> bool {
         match self {
-            BriefKind::TrivialDoc | BriefKind::TrivialMechanical => false,
-            BriefKind::Mechanical
-            | BriefKind::BugFix
-            | BriefKind::Feature
-            | BriefKind::Migration
-            | BriefKind::Portage
-            | BriefKind::Sweep
-            | BriefKind::Triage => true,
+            TaskShape::TrivialDoc | TaskShape::TrivialMechanical => false,
+            TaskShape::Mechanical
+            | TaskShape::BugFix
+            | TaskShape::Feature
+            | TaskShape::Migration
+            | TaskShape::Portage
+            | TaskShape::Sweep
+            | TaskShape::Triage => true,
         }
     }
 }

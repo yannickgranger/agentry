@@ -738,21 +738,22 @@ async fn append_audit(
 }
 
 /// Build the `KEY=VALUE` strings injected as universal brief context env
-/// vars on every role spawn. Kept as a free function so the snake_case
-/// kind serialization round-trip with `BriefKind`'s serde tag is unit-testable
+/// vars on every role spawn. Kept as a free function so the kebab-case
+/// kind serialization round-trip with `TaskShape`'s serde tag is unit-testable
 /// without spawning podman.
 ///
 /// Order: `AGENTRY_BRIEF_ID`, `AGENTRY_BRIEF_KIND`, `AGENTRY_BASE_BRANCH`.
-/// `kind` falls back to `new_feature` (the safe default — fullest pipeline)
-/// when the brief omits it. `base_branch` is read from the JSON payload
-/// (`brief.payload.base_branch`) and falls back to `develop`.
+/// `kind` falls back to `feature` (the safe default — `TaskShape::Feature`,
+/// which maps to the fullest validator pipeline) when the brief omits it.
+/// `base_branch` is read from the JSON payload (`brief.payload.base_branch`)
+/// and falls back to `develop`.
 fn brief_env_args(brief: &Brief) -> Vec<String> {
     let kind_str = brief
         .kind
         .as_ref()
         .and_then(|k| serde_json::to_value(k).ok())
         .and_then(|v| v.as_str().map(String::from))
-        .unwrap_or_else(|| "new_feature".to_string());
+        .unwrap_or_else(|| "feature".to_string());
     let base = brief
         .payload
         .get("base_branch")

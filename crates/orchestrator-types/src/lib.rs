@@ -12,6 +12,7 @@ pub mod event;
 pub mod kind;
 pub mod lifecycle;
 pub mod permit;
+pub mod pipeline;
 pub mod profile;
 pub mod project;
 pub mod review;
@@ -19,10 +20,12 @@ pub mod role;
 pub mod team;
 pub mod verdict;
 
-pub use brief::{Brief, BriefId, BriefKind, Budget, EscalationMode, Payload};
+pub use brief::{Brief, BriefId, Budget, EscalationMode, Payload};
 pub use contract::{Assertion, AssertionAnchor, AssertionId, Contract};
 pub use event::{DoneReason, Event, EventKind, EventVerdict, ToolCall};
+pub use kind::TaskShape;
 pub use permit::{PermitScope, ToolAllowlist, WorkPermit};
+pub use pipeline::ValidatorPipeline;
 pub use profile::{
     parse_profile_toml, Profile, ProfileAcceptanceSection, ProfileMethodologySection,
     ProfileParseError, ProfileRoleSection,
