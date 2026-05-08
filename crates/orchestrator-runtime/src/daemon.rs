@@ -8,6 +8,8 @@
 //! resetting that upstream and its downstream sub-DAG to pending so they
 //! re-fire once the upstream re-ships.
 
+use crate::anchor_resolver::ResolverContext;
+use crate::intake_validation;
 use crate::{
     lifecycle::{EventSource, StateProjector},
     lifecycle_driver, permit as permit_mod, projector, reaper, redis_io,
@@ -134,6 +136,51 @@ pub async fn run(
                         kind = ?brief.kind,
                         "non-trivial brief kind missing contract — log-only observation; future slice (B6) will reject at intake",
                     );
+                }
+                // B6b — anchor validation. If the brief carries a contract,
+                // resolve every assertion's anchor against the local cfdb
+                // keyspace and `specs/concepts/`. Any unresolved anchor
+                // produces a Failed verdict at intake; the brief is not
+                // spawned. A brief without a contract is unaffected (the
+                // B3 WARN above remains log-only — this slice does not
+                // flip it to a reject).
+                if let Some(contract) = brief.contract.as_ref() {
+                    let assertion_count = contract.assertions.len();
+                    let ctx = ResolverContext::from_env();
+                    let failures = intake_validation::validate_brief_contract(&brief, &ctx);
+                    if failures.is_empty() {
+                        tracing::info!(
+                            brief = %brief.id,
+                            assertions_resolved = assertion_count,
+                            "intake: all contract anchors resolved",
+                        );
+                    } else {
+                        let detail = format!(
+                            "intake-reject: anchor unresolved — {} of {} assertions failed: {}",
+                            failures.len(),
+                            assertion_count,
+                            failures
+                                .iter()
+                                .map(|(id, why)| format!("{id}={why}"))
+                                .collect::<Vec<_>>()
+                                .join("; ")
+                        );
+                        let verdict =
+                            Verdict::new(brief.id.clone(), VerdictKind::Failed).with_reason(detail);
+                        if let Err(e) = redis_io::append_verdict(&mut conn, &verdict).await {
+                            tracing::error!(
+                                brief = %brief.id,
+                                error = %e,
+                                "intake-reject: failed to append Failed verdict to verdicts stream",
+                            );
+                        }
+                        tracing::warn!(
+                            brief = %brief.id,
+                            failures = ?failures,
+                            "intake-reject: contract anchors unresolved — brief will not be spawned",
+                        );
+                        continue;
+                    }
                 }
                 // Defensive backfill of agentry:brief:<id>:body so the
                 // dashboard's SMEMBERS+MGET render path doesn't depend
