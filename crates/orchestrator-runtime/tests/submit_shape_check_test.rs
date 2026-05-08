@@ -13,6 +13,7 @@ fn brief_with(topology: &str, payload: serde_json::Value) -> Brief {
         topology: VersionedRef::new(topology, 1),
         payload,
         kind: None,
+        contract: None,
         budget: Default::default(),
         escalation: EscalationMode::Autonomous,
         parent_brief: None,

@@ -1,4 +1,7 @@
-use orchestrator_types::{now, Brief, BriefId, EscalationMode, TaskShape, VersionedRef};
+use orchestrator_types::{
+    now, Assertion, AssertionAnchor, AssertionId, Brief, BriefId, Contract, EscalationMode,
+    TaskShape, VersionedRef,
+};
 use serde_json::json;
 
 #[test]
@@ -57,6 +60,61 @@ fn brief_without_kind_field_deserializes_to_none() {
     let s = serde_json::to_string(&raw).expect("serialize value");
     let b: Brief = serde_json::from_str(&s).expect("deserialize");
     assert_eq!(b.kind, None);
+}
+
+#[test]
+fn payload_default_contract_is_none() {
+    let b = Brief::new(
+        "user@example.com",
+        VersionedRef::new("echo-team", 1),
+        json!({"msg": "hi"}),
+    );
+    let s = serde_json::to_string(&b).expect("serialize");
+    let back: Brief = serde_json::from_str(&s).expect("deserialize");
+    assert!(back.contract.is_none());
+}
+
+#[test]
+fn payload_with_contract_roundtrips() {
+    let mut b = Brief::new(
+        "user@example.com",
+        VersionedRef::new("echo-team", 1),
+        json!({"msg": "hi"}),
+    );
+    b.contract = Some(Contract {
+        brief_id: b.id.clone(),
+        assertions: vec![Assertion {
+            id: AssertionId("A1".into()),
+            prose: "structural anchor in cfdb".into(),
+            anchor: AssertionAnchor::Cfdb {
+                qname: "foo::bar".into(),
+            },
+        }],
+        precursor_artifacts: vec![],
+    });
+    let s = serde_json::to_string(&b).expect("serialize");
+    let back: Brief = serde_json::from_str(&s).expect("deserialize");
+    assert_eq!(b, back);
+}
+
+#[test]
+fn payload_rejects_unknown_field_on_contract() {
+    let raw = json!({
+        "id": "brf_test",
+        "project": null,
+        "topology": { "name": "echo-team", "version": 1 },
+        "payload": { "msg": "hi" },
+        "contract": {
+            "brief_id": "brf_test",
+            "assertions": [],
+            "precursor_artifacts": [],
+            "extra_top_level_field": true
+        },
+        "submitted_by": "tester",
+        "submitted_at": now(),
+    });
+    let s = serde_json::to_string(&raw).expect("serialize value");
+    assert!(serde_json::from_str::<Brief>(&s).is_err());
 }
 
 #[test]
