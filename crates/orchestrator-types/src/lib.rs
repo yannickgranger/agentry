@@ -9,6 +9,7 @@
 pub mod brief;
 pub mod contract;
 pub mod event;
+pub mod kind;
 pub mod lifecycle;
 pub mod permit;
 pub mod profile;
