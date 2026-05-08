@@ -71,6 +71,7 @@ Each target_repo ships its own `.agentry/profile.toml` declaring which tool pack
 - **Profile-driven roles (Phase 1+2 shipped 2026-05-07):** target repos declare their tool requirements in `.agentry/profile.toml`; the substrate is generic across projects. See `specs/concepts/profile.md` and `specs/concepts/tool_pack.md`. Agentry's own profile lives at `.agentry/profile.toml`.
 - **rtk substrate fix validated 2026-05-07T21:17Z** — coder containers now have rtk available at /usr/local/bin/rtk via ~/.local/bin/rtk symlink; PreToolUse hook resolves cleanly.
 - **Dogfood loop verification 2026-05-07T23:05Z** — second consecutive healthcheck Shipped through coder + reviewer-mech + shipper + ci-watcher; substrate reconciliation in PR #420.
+- **Captain doctrine foundation 2026-05-08** — typed Contract / Assertion / TaskShape / ValidatorPipeline + log-only daemon contract observer (B1-B3). Captain authoring discipline encoded as types, not prose.
 
 ## Big Rust Projects
 
