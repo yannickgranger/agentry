@@ -18,6 +18,10 @@ path = "src/bin/orchestrator.rs"
 name = "agentry-workspace"
 path = "src/bin/agentry-workspace.rs"
 
+[[bin]]
+name = "captain"
+path = "src/bin/captain.rs"
+
 [dependencies]
 orchestrator-types = { path = "../orchestrator-types" }
 schemars = { workspace = true }
