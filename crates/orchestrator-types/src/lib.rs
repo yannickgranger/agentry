@@ -1,6 +1,7 @@
 //! Pure types for the agentry orchestrator.
 //!
-//! Four data records (Brief, AgentRole, TeamTopology, Project) plus the runtime
+//! Data records (Brief, AgentRole, TeamTopology, Project, Contract), task-shape
+//! and validator descriptors (TaskShape, ValidatorPipeline), plus the runtime
 //! bookkeeping types (WorkPermit, Verdict, Event). No logic here — only shapes
 //! and serde round-trip.
 
