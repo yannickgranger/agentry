@@ -19,7 +19,7 @@ use orchestrator_types::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 #[derive(Parser, Debug)]
 #[command(name = "captain", version)]
@@ -90,6 +90,16 @@ enum Cmd {
         /// keyspace name is `ground` inside that db directory.
         #[arg(long)]
         keyspace_db: Option<PathBuf>,
+    },
+    /// Validate a brief file against the Brief schema and shell out to
+    /// `orchestrator submit`. The dispatch summary is emitted on stderr to
+    /// keep stdout clean for downstream pipe consumers.
+    Dispatch {
+        /// Path to the brief JSON file to validate and dispatch.
+        brief_file: PathBuf,
+        /// Validate only — do not invoke `orchestrator submit`.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -328,6 +338,59 @@ fn cmd_ground(
     Ok(())
 }
 
+// Returns the exit code captain dispatch should terminate with. The actual
+// `std::process::exit` call happens in `main` to satisfy the
+// arch-ban-process-exit-outside-bin rule (only the bin entry point's `main`
+// may terminate the process; library/non-main code propagates via Result).
+fn cmd_dispatch(brief_file: PathBuf, dry_run: bool) -> Result<i32> {
+    let raw = std::fs::read_to_string(&brief_file)
+        .with_context(|| format!("failed to read brief file {}", brief_file.display()))?;
+    let brief: Brief = serde_json::from_str(&raw)
+        .with_context(|| format!("failed to parse {} as Brief", brief_file.display()))?;
+
+    let brief_id = brief.id.0.clone();
+    let kind = brief.kind;
+    let contract_present = brief.contract.is_some();
+    let assertion_count = brief
+        .contract
+        .as_ref()
+        .map(|c| c.assertions.len())
+        .unwrap_or(0);
+    let target_repo = brief
+        .payload
+        .get("target_repo")
+        .and_then(|v| v.as_str())
+        .unwrap_or("<unset>");
+    let topology_name = brief.topology.name.clone();
+    let topology_version = brief.topology.version;
+
+    eprintln!(
+        "// dispatch: validated {brief_id} kind={kind:?} contract_present={contract_present} assertions={assertion_count} target_repo={target_repo} topology={topology_name}:{topology_version}"
+    );
+
+    if kind.map(TaskShape::requires_contract).unwrap_or(false) && !contract_present {
+        eprintln!(
+            "// WARN: kind {kind:?} requires contract per TaskShape::requires_contract — daemon B3 observer will log a warning at intake"
+        );
+    }
+
+    if dry_run {
+        return Ok(0);
+    }
+
+    let brief_file_str = brief_file.display().to_string();
+    let status = Command::new("orchestrator")
+        .args(["submit", &brief_file_str])
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .with_context(|| {
+            "failed to spawn `orchestrator`; the orchestrator binary must be on PATH (canonical local build path: /var/mnt/workspaces/agentry/target/release/orchestrator)".to_string()
+        })?;
+    Ok(status.code().unwrap_or(1))
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
@@ -380,6 +443,13 @@ fn main() -> Result<()> {
                 specs_dir,
                 keyspace_db,
             )?;
+        }
+        Cmd::Dispatch {
+            brief_file,
+            dry_run,
+        } => {
+            let code = cmd_dispatch(brief_file, dry_run)?;
+            std::process::exit(code);
         }
     }
     Ok(())
