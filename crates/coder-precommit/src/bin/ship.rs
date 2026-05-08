@@ -4,7 +4,7 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use orchestrator_types::BriefKind;
+use orchestrator_types::{TaskShape, ValidatorPipeline};
 use std::path::PathBuf;
 use tokio::process::Command;
 use validators::{registry_for, BriefCtx, ValidatorReport};
@@ -22,10 +22,11 @@ async fn main() -> Result<()> {
 
     let brief_id = std::env::var("AGENTRY_BRIEF_ID")
         .context("AGENTRY_BRIEF_ID not set; ship must be invoked from a coder container")?;
-    let kind = std::env::var("AGENTRY_BRIEF_KIND")
+    let shape = std::env::var("AGENTRY_BRIEF_KIND")
         .ok()
-        .and_then(|s| serde_json::from_value::<BriefKind>(serde_json::Value::String(s)).ok())
-        .unwrap_or(BriefKind::NewFeature);
+        .and_then(|s| serde_json::from_value::<TaskShape>(serde_json::Value::String(s)).ok())
+        .unwrap_or(TaskShape::Feature);
+    let pipeline: ValidatorPipeline = shape.into();
     let base_branch = std::env::var("AGENTRY_BASE_BRANCH").unwrap_or_else(|_| "develop".into());
     let workspace_path = PathBuf::from("/workspace");
 
@@ -39,7 +40,7 @@ async fn main() -> Result<()> {
         changed_files,
     };
 
-    let validators_list = registry_for(kind);
+    let validators_list = registry_for(pipeline);
     let mut tasks: tokio::task::JoinSet<Result<ValidatorReport>> = tokio::task::JoinSet::new();
     for v in validators_list {
         let ctx = ctx.clone();
@@ -65,7 +66,8 @@ async fn main() -> Result<()> {
     let output = serde_json::json!({
         "ok": all_passed,
         "brief_id": brief_id,
-        "kind": kind,
+        "kind": shape,
+        "pipeline": pipeline,
         "validators": reports,
     });
     println!("{}", serde_json::to_string(&output)?);

@@ -7,23 +7,6 @@ use crate::{now, Ts, VersionedRef};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-/// Logical kind of a brief — selects the validator pipeline.
-///
-/// Optional on `Brief`: existing payloads that don't set it deserialize to
-/// `None`. Brief 4 wires the ship tool to dispatch validators per-kind via
-/// `validators::registry_for`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum BriefKind {
-    Refactor,
-    Debug,
-    Mechanical,
-    NewFeature,
-    Substrate,
-    Audit,
-    Doc,
-}
-
 /// Brief identifier: `brf_<uuidv7>`. Sortable by creation time.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -79,10 +62,12 @@ pub struct Brief {
     pub topology: VersionedRef,
     /// Opaque payload — the team interprets it.
     pub payload: Payload,
-    /// Logical kind of brief — dispatches the validator pipeline. Optional
-    /// for backwards compatibility; existing payloads deserialize to `None`.
+    /// Captain-authored task shape. Optional for backwards compatibility;
+    /// existing payloads deserialize to `None`. The daemon translates this
+    /// into a `crate::pipeline::ValidatorPipeline` via the `From` impl in
+    /// `pipeline.rs` before dispatching validators.
     #[serde(default)]
-    pub kind: Option<BriefKind>,
+    pub kind: Option<crate::kind::TaskShape>,
     /// Hard budget; runtime enforces.
     #[serde(default)]
     pub budget: Budget,

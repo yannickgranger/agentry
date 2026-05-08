@@ -1,4 +1,4 @@
-use orchestrator_types::{now, Brief, BriefId, BriefKind, EscalationMode, VersionedRef};
+use orchestrator_types::{now, Brief, BriefId, EscalationMode, TaskShape, VersionedRef};
 use serde_json::json;
 
 #[test]
@@ -28,20 +28,20 @@ fn default_escalation_is_supervised() {
 }
 
 #[test]
-fn brief_kind_roundtrip_serializes_snake_case() {
+fn brief_kind_roundtrip_serializes_kebab_case() {
     let mut b = Brief::new(
         "user@example.com",
         VersionedRef::new("echo-team", 1),
         json!({"msg": "hi"}),
     );
-    b.kind = Some(BriefKind::Refactor);
+    b.kind = Some(TaskShape::Mechanical);
     let s = serde_json::to_string(&b).expect("serialize");
     assert!(
-        s.contains("\"kind\":\"refactor\""),
-        "expected snake_case kind in {s}"
+        s.contains("\"kind\":\"mechanical\""),
+        "expected kebab-case kind in {s}"
     );
     let back: Brief = serde_json::from_str(&s).expect("deserialize");
-    assert_eq!(back.kind, Some(BriefKind::Refactor));
+    assert_eq!(back.kind, Some(TaskShape::Mechanical));
 }
 
 #[test]
@@ -60,15 +60,17 @@ fn brief_without_kind_field_deserializes_to_none() {
 }
 
 #[test]
-fn brief_kind_variants_serialize_snake_case() {
+fn brief_kind_variants_serialize_kebab_case() {
     let cases = [
-        (BriefKind::Refactor, "\"refactor\""),
-        (BriefKind::Debug, "\"debug\""),
-        (BriefKind::Mechanical, "\"mechanical\""),
-        (BriefKind::NewFeature, "\"new_feature\""),
-        (BriefKind::Substrate, "\"substrate\""),
-        (BriefKind::Audit, "\"audit\""),
-        (BriefKind::Doc, "\"doc\""),
+        (TaskShape::TrivialDoc, "\"trivial-doc\""),
+        (TaskShape::TrivialMechanical, "\"trivial-mechanical\""),
+        (TaskShape::Mechanical, "\"mechanical\""),
+        (TaskShape::BugFix, "\"bug-fix\""),
+        (TaskShape::Feature, "\"feature\""),
+        (TaskShape::Migration, "\"migration\""),
+        (TaskShape::Portage, "\"portage\""),
+        (TaskShape::Sweep, "\"sweep\""),
+        (TaskShape::Triage, "\"triage\""),
     ];
     for (k, want) in cases {
         let s = serde_json::to_string(&k).expect("serialize");
