@@ -7,6 +7,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod anchor_resolver;
 pub mod captain_ground;
 pub mod cli_agents;
 pub mod cli_roles;
