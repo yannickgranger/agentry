@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 pub mod brief;
+pub mod contract;
 pub mod event;
 pub mod lifecycle;
 pub mod permit;
@@ -18,6 +19,7 @@ pub mod team;
 pub mod verdict;
 
 pub use brief::{Brief, BriefId, BriefKind, Budget, EscalationMode, Payload};
+pub use contract::{Assertion, AssertionAnchor, AssertionId, Contract};
 pub use event::{DoneReason, Event, EventKind, EventVerdict, ToolCall};
 pub use permit::{PermitScope, ToolAllowlist, WorkPermit};
 pub use profile::{
