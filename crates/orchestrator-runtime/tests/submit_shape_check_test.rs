@@ -18,6 +18,7 @@ fn brief_with(topology: &str, payload: serde_json::Value) -> Brief {
         escalation: EscalationMode::Autonomous,
         parent_brief: None,
         cohort_labels: Vec::new(),
+        redeploy_required: vec![],
         submitted_by: "test".into(),
         submitted_at: chrono::Utc::now(),
     }

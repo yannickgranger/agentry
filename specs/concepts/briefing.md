@@ -57,6 +57,18 @@ interpret them. Monitoring selectors use cohort labels to address subsets of
 the agent fleet — "every coder in the self-host topology", "every agent in
 phase X" — without the orchestrator having to know what those subsets mean.
 
+A brief may also carry `redeploy_required`: a list of `RedeployTarget` values
+indicating which binaries must be rebuilt after the brief merges. Empty (and
+omitted on the wire) for briefs that don't touch redeployable code.
+
+## RedeployTarget
+
+Names a binary that must be redeployed after a brief merges. Variants:
+`Daemon`, `OrchestratorCli`, `CaptainCli`. Carried on `Brief.redeploy_required`
+as data only — F8a defines the schema; the captain CLI's `redeploy` subcommand
+(F8b) is what reads the field and runs the rebuild. Wire form is snake_case
+(`daemon`, `orchestrator_cli`, `captain_cli`).
+
 ## Bundle
 
 Stdin envelope a Rust role binary reads when the orchestrator dispatches a

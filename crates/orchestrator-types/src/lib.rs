@@ -21,7 +21,7 @@ pub mod role;
 pub mod team;
 pub mod verdict;
 
-pub use brief::{Brief, BriefId, Budget, EscalationMode, Payload};
+pub use brief::{Brief, BriefId, Budget, EscalationMode, Payload, RedeployTarget};
 pub use contract::{Assertion, AssertionAnchor, AssertionId, Contract};
 pub use event::{DoneReason, Event, EventKind, EventVerdict, ToolCall};
 pub use kind::TaskShape;

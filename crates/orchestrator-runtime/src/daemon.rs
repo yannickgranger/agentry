@@ -921,6 +921,7 @@ async fn on_all_children_resolved(conn: &mut ConnectionManager, meta_id: &str) -
             // Verifier is in its own DOL slot — NOT a child of the meta-brief.
             parent_brief: None,
             cohort_labels: meta_brief.cohort_labels.clone(),
+            redeploy_required: vec![],
             submitted_by: "daemon-dol-verifier".into(),
             submitted_at: now(),
         };

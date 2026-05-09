@@ -51,6 +51,17 @@ pub struct Budget {
 /// opaque to the orchestrator.
 pub type Payload = serde_json::Value;
 
+/// Redeploy targets a brief may require after merge. The captain CLI's
+/// `redeploy` subcommand (F8b) reads this field and runs the appropriate
+/// rebuild for each listed target.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RedeployTarget {
+    Daemon,
+    OrchestratorCli,
+    CaptainCli,
+}
+
 /// A Brief — the unit of work.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Brief {
@@ -90,6 +101,12 @@ pub struct Brief {
     /// selectors use these to address subsets of the agent fleet.
     #[serde(default)]
     pub cohort_labels: Vec<String>,
+    /// Targets that must be redeployed after this brief merges. F8b's
+    /// captain `redeploy` subcommand reads this and runs the rebuild;
+    /// F8a only carries the data. Empty (and skipped on the wire) for
+    /// briefs that don't touch redeployable code.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub redeploy_required: Vec<RedeployTarget>,
     /// Who submitted this brief (opaque identifier of the client).
     pub submitted_by: String,
     /// Submission time.
@@ -111,6 +128,7 @@ impl Brief {
             escalation: EscalationMode::default(),
             parent_brief: None,
             cohort_labels: Vec::new(),
+            redeploy_required: Vec::new(),
             submitted_by: submitted_by.into(),
             submitted_at: now(),
         }

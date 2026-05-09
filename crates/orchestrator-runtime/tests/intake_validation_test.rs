@@ -41,6 +41,7 @@ fn build_brief(contract: Option<Contract>) -> Brief {
         escalation: EscalationMode::Autonomous,
         parent_brief: None,
         cohort_labels: vec![],
+        redeploy_required: vec![],
         submitted_by: "test".into(),
         submitted_at: now(),
     }

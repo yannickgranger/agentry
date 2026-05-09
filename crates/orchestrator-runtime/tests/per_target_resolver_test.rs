@@ -28,6 +28,7 @@ fn build_brief_for_target(target_repo: &str, anchor: AssertionAnchor) -> Brief {
         escalation: EscalationMode::Autonomous,
         parent_brief: None,
         cohort_labels: vec![],
+        redeploy_required: vec![],
         submitted_by: "test".into(),
         submitted_at: orchestrator_types::now(),
     }
