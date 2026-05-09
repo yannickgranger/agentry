@@ -149,6 +149,58 @@ pub async fn run(
                         std::env::var("AGENTRY_WORK_ROOT")
                             .unwrap_or_else(|_| "/var/lib/agentry".to_string()),
                     );
+                    // F1d — populate per-target keyspace before resolution. ensure_target_extracted
+                    // is idempotent (cache hit on (slug + head_sha)). Cache miss clones target_repo
+                    // + runs cfdb extract + copies specs. Failure to extract is logged but does NOT
+                    // abort intake — anchor resolution will simply return NotFound for affected
+                    // anchors and the existing intake-reject path handles it.
+                    let target_repo = brief
+                        .payload
+                        .get("target_repo")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("_unknown")
+                        .to_string();
+                    let head_sha = brief
+                        .payload
+                        .get("base_branch")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("develop")
+                        .to_string();
+                    let clone_url = format!(
+                        "https://{}/{}.git",
+                        cfg.forge
+                            .default_host
+                            .as_deref()
+                            .unwrap_or("agency.lab:3000"),
+                        target_repo,
+                    );
+                    let extract_req = intake_validation::EnsureExtractedRequest {
+                        target_repo: target_repo.clone(),
+                        head_sha: head_sha.clone(),
+                        clone_url,
+                        work_root: workspace_root.clone(),
+                    };
+                    let extract_outcome = tokio::task::spawn_blocking(move || {
+                        intake_validation::ensure_target_extracted(&extract_req)
+                    })
+                    .await
+                    .map_err(|e| {
+                        tracing::warn!(brief = %brief.id, error = %e, "ensure_target_extracted join failed");
+                    });
+                    match extract_outcome {
+                        Ok(intake_validation::EnsureExtractedOutcome::CacheHit) => {
+                            tracing::debug!(brief = %brief.id, target_repo = %target_repo, "ensure_target_extracted: cache hit");
+                        }
+                        Ok(intake_validation::EnsureExtractedOutcome::Extracted { items }) => {
+                            tracing::info!(brief = %brief.id, target_repo = %target_repo, items = items, "ensure_target_extracted: extracted");
+                        }
+                        Ok(intake_validation::EnsureExtractedOutcome::Failed { reason }) => {
+                            tracing::warn!(brief = %brief.id, target_repo = %target_repo, reason = %reason, "ensure_target_extracted: failed (degraded; resolution may NotFound)");
+                        }
+                        Err(_) => {
+                            // join error already logged
+                        }
+                    }
                     let failures = intake_validation::validate_brief_contract_for_target(
                         &brief,
                         &workspace_root,
