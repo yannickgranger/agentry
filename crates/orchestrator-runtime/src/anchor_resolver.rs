@@ -21,6 +21,45 @@ pub struct ResolverContext {
     pub specs_dir: PathBuf,
 }
 
+impl ResolverContext {
+    /// Build a [`ResolverContext`] keyed off a `target_repo` slug, with paths
+    /// rooted at `workspace_root`.
+    ///
+    /// The cfdb db path follows the convention `/var/lib/agentry/cfdb/<slug>`
+    /// — F1a does not create the directory; F1b will, on first intake.
+    #[must_use]
+    pub fn for_target_repo(target_repo: &str, workspace_root: &Path) -> Self {
+        let slug = sanitize_target_repo_slug(target_repo);
+        let cfdb_db = PathBuf::from(format!("/var/lib/agentry/cfdb/{slug}"));
+        let cfdb_keyspace = slug.clone();
+        let specs_dir = workspace_root.join("specs/concepts");
+        Self {
+            cfdb_db,
+            cfdb_keyspace,
+            specs_dir,
+        }
+    }
+}
+
+/// Sanitize a `target_repo` value into a filesystem- and keyspace-safe slug.
+///
+/// Replaces `/` and any non-alphanumeric/underscore character with `_`. The
+/// empty string and slugs with leading/trailing underscores are returned
+/// as-is — daemon callers pre-validate before reaching here.
+#[must_use]
+pub fn sanitize_target_repo_slug(target_repo: &str) -> String {
+    target_repo
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 /// Outcome of resolving a single assertion anchor.
 pub enum AnchorResolution {
     Resolved,

@@ -14,7 +14,7 @@
 use crate::anchor_resolver::{self, AnchorResolution, ResolverContext};
 use orchestrator_types::contract::AssertionId;
 use orchestrator_types::Brief;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Resolve every assertion anchor in `brief.contract` against `ctx`.
 ///
@@ -34,6 +34,26 @@ pub fn validate_brief_contract(brief: &Brief, ctx: &ResolverContext) -> Vec<(Ass
         }
     }
     failures
+}
+
+/// Brief-aware entry point: derive a per-target [`ResolverContext`] from
+/// `brief.payload.target_repo` + `workspace_root`, then run the existing
+/// contract validator.
+///
+/// Briefs without a `target_repo` payload field fall back to the slug
+/// `_unknown`. F1a does not enforce presence — the daemon caller in F1b is
+/// responsible for pre-validating the payload.
+pub fn validate_brief_contract_for_target(
+    brief: &Brief,
+    workspace_root: &Path,
+) -> Vec<(AssertionId, String)> {
+    let target = brief
+        .payload
+        .get("target_repo")
+        .and_then(|v| v.as_str())
+        .unwrap_or("_unknown");
+    let ctx = ResolverContext::for_target_repo(target, workspace_root);
+    validate_brief_contract(brief, &ctx)
 }
 
 impl ResolverContext {
