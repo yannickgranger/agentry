@@ -11,10 +11,11 @@
 //!
 //! [`anchor_resolver`]: crate::anchor_resolver
 
-use crate::anchor_resolver::{self, AnchorResolution, ResolverContext};
+use crate::anchor_resolver::{self, sanitize_target_repo_slug, AnchorResolution, ResolverContext};
 use orchestrator_types::contract::AssertionId;
 use orchestrator_types::Brief;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 /// Resolve every assertion anchor in `brief.contract` against `ctx`.
 ///
@@ -54,6 +55,170 @@ pub fn validate_brief_contract_for_target(
         .unwrap_or("_unknown");
     let ctx = ResolverContext::for_target_repo(target, workspace_root);
     validate_brief_contract(brief, &ctx)
+}
+
+/// Inputs to [`ensure_target_extracted`].
+#[derive(Debug, Clone)]
+pub struct EnsureExtractedRequest {
+    pub target_repo: String,
+    pub head_sha: String,
+    pub clone_url: String,
+    pub work_root: PathBuf,
+}
+
+/// Outcome of [`ensure_target_extracted`].
+#[derive(Debug)]
+pub enum EnsureExtractedOutcome {
+    CacheHit,
+    Extracted { items: usize },
+    Failed { reason: String },
+}
+
+/// Populate the per-target_repo cfdb keyspace and specs cache under `work_root`.
+///
+/// Idempotent — keyed by `(slug + head_sha)` via a marker file. The function
+/// is synchronous; the daemon (F1d) wraps it in `tokio::task::spawn_blocking`.
+///
+/// Layout under `work_root` after a successful extraction:
+///   - `work_root/cfdb/<slug>/<slug>.json` — cfdb keyspace
+///   - `work_root/cfdb/<slug>/<slug>.head_sha` — cache marker
+///   - `work_root/specs/<slug>/` — copy of `specs/concepts/` (skipped if absent)
+///
+/// V1 limitation: shallow-clones the default branch HEAD rather than the
+/// requested `head_sha`. F1c.tight (future) will fetch + checkout the exact
+/// sha.
+pub fn ensure_target_extracted(req: &EnsureExtractedRequest) -> EnsureExtractedOutcome {
+    let slug = sanitize_target_repo_slug(&req.target_repo);
+    let db_path = req.work_root.join("cfdb").join(&slug);
+    let marker_path = db_path.join(format!("{slug}.head_sha"));
+
+    if let Ok(existing) = std::fs::read_to_string(&marker_path) {
+        if existing.trim_end_matches('\n') == req.head_sha {
+            return EnsureExtractedOutcome::CacheHit;
+        }
+    }
+
+    let clone_dir = match tempfile::TempDir::new() {
+        Ok(d) => d,
+        Err(e) => {
+            return EnsureExtractedOutcome::Failed {
+                reason: format!("tempdir creation failed: {e}"),
+            };
+        }
+    };
+
+    let clone_status = Command::new("git")
+        .args([
+            "clone",
+            "--depth",
+            "1",
+            &req.clone_url,
+            &clone_dir.path().display().to_string(),
+        ])
+        .output();
+    match clone_status {
+        Err(e) => {
+            return EnsureExtractedOutcome::Failed {
+                reason: format!("git clone spawn failed: {e}"),
+            };
+        }
+        Ok(out) if !out.status.success() => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return EnsureExtractedOutcome::Failed {
+                reason: format!("git clone failed: {}", stderr.trim()),
+            };
+        }
+        Ok(_) => {}
+    }
+
+    if let Err(e) = std::fs::create_dir_all(&db_path) {
+        return EnsureExtractedOutcome::Failed {
+            reason: format!("cfdb db dir create failed at {}: {e}", db_path.display()),
+        };
+    }
+
+    let extract_status = Command::new("cfdb")
+        .args([
+            "extract",
+            "--workspace",
+            &clone_dir.path().display().to_string(),
+            "--db",
+            &db_path.display().to_string(),
+            "--keyspace",
+            &slug,
+        ])
+        .output();
+    match extract_status {
+        Err(e) => {
+            return EnsureExtractedOutcome::Failed {
+                reason: format!("cfdb spawn failed: {e}"),
+            };
+        }
+        Ok(out) if !out.status.success() => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return EnsureExtractedOutcome::Failed {
+                reason: format!("cfdb extract failed: {}", stderr.trim()),
+            };
+        }
+        Ok(_) => {}
+    }
+
+    let specs_src = clone_dir.path().join("specs/concepts");
+    if specs_src.is_dir() {
+        let specs_dst = req.work_root.join("specs").join(&slug);
+        if let Err(e) = copy_dir_recursive(&specs_src, &specs_dst) {
+            return EnsureExtractedOutcome::Failed {
+                reason: format!(
+                    "specs copy failed from {} to {}: {e}",
+                    specs_src.display(),
+                    specs_dst.display()
+                ),
+            };
+        }
+    }
+
+    if let Err(e) = std::fs::write(&marker_path, &req.head_sha) {
+        return EnsureExtractedOutcome::Failed {
+            reason: format!("marker write failed at {}: {e}", marker_path.display()),
+        };
+    }
+
+    let items = count_keyspace_items(&db_path.join(format!("{slug}.json")));
+    EnsureExtractedOutcome::Extracted { items }
+}
+
+fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_dir_recursive(&from, &to)?;
+        } else if file_type.is_file() {
+            std::fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
+}
+
+fn count_keyspace_items(json_path: &Path) -> usize {
+    let body = match std::fs::read_to_string(json_path) {
+        Ok(s) => s,
+        Err(_) => return 0,
+    };
+    let value: serde_json::Value = match serde_json::from_str(&body) {
+        Ok(v) => v,
+        Err(_) => return 0,
+    };
+    if let Some(nodes) = value.get("nodes").and_then(|n| n.as_array()) {
+        return nodes.len();
+    }
+    if let Some(items) = value.get("items").and_then(|n| n.as_array()) {
+        return items.len();
+    }
+    0
 }
 
 impl ResolverContext {
