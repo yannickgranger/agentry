@@ -1469,11 +1469,40 @@ pub struct BriefContext {
     pub allowed_tools: Vec<String>,
 }
 
+/// One unapplied verb surfaced by self-review. `applied_form` and
+/// `rationale` are optional (empty string ⇒ unset) so legacy coders that
+/// emit only a string verb description still parse.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct UnappliedVerb {
+    pub verb: String,
+    #[serde(default)]
+    pub applied_form: String,
+    #[serde(default)]
+    pub rationale: String,
+}
+
+impl UnappliedVerb {
+    pub fn applied_form_or_dash(&self) -> &str {
+        if self.applied_form.is_empty() {
+            "—"
+        } else {
+            &self.applied_form
+        }
+    }
+    pub fn rationale_or_dash(&self) -> &str {
+        if self.rationale.is_empty() {
+            "—"
+        } else {
+            &self.rationale
+        }
+    }
+}
+
 /// Parsed self-review JSON object (`{all_applied, unapplied}`).
 #[derive(Debug, PartialEq, Eq)]
 pub struct SelfReviewResult {
     pub all_applied: bool,
-    pub unapplied: Vec<String>,
+    pub unapplied: Vec<UnappliedVerb>,
 }
 
 /// Build a [`BriefContext`] from a startup bundle JSON value.
@@ -1687,16 +1716,29 @@ pub fn build_self_review_prompt(issue_body: &str, staged_diff: &str) -> String {
          {staged_diff}\n\
          \n\
          For each verb declared in the task body, check whether it has been applied\n\
-         in the diff at the named location. Output EXACTLY a JSON object — no\n\
-         markdown fences, no prose:\n\
+         in the diff at the named location. Output EXACTLY a JSON object — no markdown fences, no prose:\n\
          \n\
          {{\n\
          \x20\x20\"all_applied\": true,\n\
          \x20\x20\"unapplied\": []\n\
          }}\n\
          \n\
-         If any verb is missing, set all_applied:false and list each missing verb\n\
-         as a short description (max 200 chars each, max 6 entries).\n\
+         When all verbs were applied as specified, set all_applied:true and leave\n\
+         unapplied empty. When a verb was NOT applied, OR was applied with a\n\
+         deliberate variant (different file content, different naming, different\n\
+         structure than the brief literally specified), include it in unapplied\n\
+         as an object:\n\
+         \n\
+         {{\n\
+         \x20\x20\"verb\": \"<short verb description, max 200 chars>\",\n\
+         \x20\x20\"applied_form\": \"<what was actually done in the diff, max 200 chars>\",\n\
+         \x20\x20\"rationale\": \"<why the applied form differs, max 300 chars; empty when the verb was simply not done>\"\n\
+         }}\n\
+         \n\
+         Maximum 6 entries. The rationale field is the most important: when you\n\
+         deliberately deviated from the brief because it would conflict with project\n\
+         convention or produce broken output, EXPLAIN why. The captain reads this\n\
+         to decide accept/reject; an empty rationale signals an honest miss.\n\
          \n\
          Your response, right now, starting with {{ and ending with }}:\n",
     )
@@ -1721,7 +1763,34 @@ pub fn parse_self_review_object(raw: &str) -> Option<SelfReviewResult> {
         .and_then(Value::as_array)
         .map(|arr| {
             arr.iter()
-                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .filter_map(|x| {
+                    // Object form (new): {verb, applied_form, rationale}
+                    if let Some(obj) = x.as_object() {
+                        let verb = obj.get("verb").and_then(Value::as_str)?.to_string();
+                        let applied_form = obj
+                            .get("applied_form")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        let rationale = obj
+                            .get("rationale")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        Some(UnappliedVerb {
+                            verb,
+                            applied_form,
+                            rationale,
+                        })
+                    // String form (legacy): just the verb description
+                    } else {
+                        x.as_str().map(|s| UnappliedVerb {
+                            verb: s.to_string(),
+                            applied_form: String::new(),
+                            rationale: String::new(),
+                        })
+                    }
+                })
                 .collect()
         })
         .unwrap_or_default();

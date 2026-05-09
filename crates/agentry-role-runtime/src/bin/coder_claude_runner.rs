@@ -637,7 +637,7 @@ fn run_self_review(ctx: &BriefContext, staged_diff: &str) -> Result<(), ()> {
         return Ok(());
     }
 
-    for item in &parsed.unapplied {
+    for v in &parsed.unapplied {
         emit_finding(&ReviewFinding {
             file: None,
             line: None,
@@ -646,7 +646,12 @@ fn run_self_review(ctx: &BriefContext, staged_diff: &str) -> Result<(), ()> {
                 reviewer_agent_id: "coder-self-review".into(),
             },
             category: "completeness".into(),
-            message: format!("unapplied verb: {item}"),
+            message: format!(
+                "unapplied verb: {} (coder did: {}, rationale: {})",
+                v.verb,
+                v.applied_form_or_dash(),
+                v.rationale_or_dash()
+            ),
             suggested_fix: None,
             prohibitions: Vec::new(),
             requirements: Vec::new(),

@@ -131,7 +131,31 @@ fn parse_self_review_object_extracts_fields() {
     ```"#;
     let r = parse_self_review_object(raw).expect("parse");
     assert!(!r.all_applied);
-    assert_eq!(r.unapplied, vec!["verb 1", "verb 2"]);
+    assert_eq!(r.unapplied.len(), 2);
+    assert_eq!(r.unapplied[0].verb, "verb 1");
+    assert_eq!(r.unapplied[1].verb, "verb 2");
+}
+
+#[test]
+fn parse_self_review_object_handles_structured_unapplied() {
+    let raw = r#"{"all_applied": false, "unapplied": [{"verb": "CREATE foo.md uses StageA heading", "applied_form": "wrote ## SizeCatalog instead", "rationale": "graph-specs convention is CamelCase code-anchored heading, not em-dash prose"}]}"#;
+    let parsed = parse_self_review_object(raw).expect("parses");
+    assert_eq!(parsed.unapplied.len(), 1);
+    assert_eq!(
+        parsed.unapplied[0].verb,
+        "CREATE foo.md uses StageA heading"
+    );
+    assert!(parsed.unapplied[0].rationale.contains("graph-specs"));
+}
+
+#[test]
+fn parse_self_review_object_back_compat_accepts_string_array() {
+    let raw = r#"{"all_applied": false, "unapplied": ["legacy string verb"]}"#;
+    let parsed = parse_self_review_object(raw).expect("parses");
+    assert_eq!(parsed.unapplied.len(), 1);
+    assert_eq!(parsed.unapplied[0].verb, "legacy string verb");
+    assert!(parsed.unapplied[0].applied_form.is_empty());
+    assert!(parsed.unapplied[0].rationale.is_empty());
 }
 
 #[test]
