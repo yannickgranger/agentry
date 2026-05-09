@@ -101,6 +101,19 @@ enum Cmd {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Rebuild release binaries listed by a brief's `redeploy_required`.
+    Redeploy {
+        /// Comma-separated list of targets to rebuild. Accepted values
+        /// (matching `orchestrator_types::brief::RedeployTarget`):
+        /// `daemon`, `orchestrator-cli`, `captain-cli`. Use `all` to
+        /// rebuild every known target.
+        #[arg(long, default_value = "all")]
+        target: String,
+        /// Skip the actual cargo build; just print what would be run.
+        /// Useful for dry-run inspection in CI logs and demos.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+    },
 }
 
 fn parse_kind(s: &str) -> Result<TaskShape> {
@@ -392,6 +405,72 @@ fn cmd_dispatch(brief_file: PathBuf, dry_run: bool) -> Result<i32> {
     Ok(status.code().unwrap_or(1))
 }
 
+fn target_build_command(target: &str) -> Result<(Vec<&'static str>, &'static str)> {
+    match target {
+        "daemon" => Ok((
+            vec!["build", "--release", "-p", "orchestrator-runtime", "--bin", "orchestratord"],
+            "target/release/orchestratord",
+        )),
+        "orchestrator-cli" => Ok((
+            vec!["build", "--release", "-p", "orchestrator-runtime", "--bin", "orchestrator"],
+            "target/release/orchestrator",
+        )),
+        "captain-cli" => Ok((
+            vec!["build", "--release", "-p", "orchestrator-runtime", "--bin", "captain"],
+            "target/release/captain",
+        )),
+        other => Err(anyhow!("unknown redeploy target: {other} (expected daemon, orchestrator-cli, captain-cli, or all)")),
+    }
+}
+
+fn cmd_redeploy(target: &str, dry_run: bool) -> Result<()> {
+    let targets: Vec<&str> = if target == "all" {
+        vec!["daemon", "orchestrator-cli", "captain-cli"]
+    } else {
+        target.split(',').map(str::trim).collect()
+    };
+
+    for t in &targets {
+        let (args, bin_path) = target_build_command(t)?;
+        eprintln!(
+            "// captain redeploy: target={t} cmd=cargo {}",
+            args.join(" ")
+        );
+        if dry_run {
+            eprintln!("// captain redeploy: dry-run; skipping build");
+            continue;
+        }
+        let status = std::process::Command::new("cargo")
+            .args(&args)
+            .status()
+            .with_context(|| format!("spawn cargo for target {t}"))?;
+        if !status.success() {
+            return Err(anyhow!(
+                "cargo build failed for target {t} (exit {})",
+                status.code().unwrap_or(-1)
+            ));
+        }
+        eprintln!("// captain redeploy: built {t} at {bin_path}");
+    }
+
+    if !dry_run {
+        // Operator-facing next-step hints. Not executed automatically —
+        // the captain doctrine keeps deploy as a deliberate human-mediated
+        // step. F8c (future) may add atomic binary swap + daemon restart.
+        eprintln!();
+        eprintln!("// next steps (operator-mediated):");
+        eprintln!("//   1. Verify the new binaries built into target/release/");
+        eprintln!("//   2. For daemon redeploy: kill the running orchestratord pid,");
+        eprintln!(
+            "//      restart with the same AGENTRY_REDIS__URL / AGENTRY_SIGNING__KEY_PATH env."
+        );
+        eprintln!("//   3. For CLI redeploys (orchestrator, captain): the new binaries are");
+        eprintln!("//      live the moment they finish building — no restart needed.");
+    }
+
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
@@ -452,6 +531,7 @@ fn main() -> Result<()> {
             let code = cmd_dispatch(brief_file, dry_run)?;
             std::process::exit(code);
         }
+        Cmd::Redeploy { target, dry_run } => cmd_redeploy(&target, dry_run)?,
     }
     Ok(())
 }

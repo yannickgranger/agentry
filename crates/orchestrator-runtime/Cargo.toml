@@ -52,6 +52,8 @@ tempfile = "3.14"
 [dev-dependencies]
 filetime = "0.2"
 wiremock = "0.6"
+assert_cmd = "2"
+predicates = "3"
 
 [lints]
 workspace = true
