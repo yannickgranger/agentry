@@ -8,7 +8,6 @@
 //! resetting that upstream and its downstream sub-DAG to pending so they
 //! re-fire once the upstream re-ships.
 
-use crate::anchor_resolver::ResolverContext;
 use crate::intake_validation;
 use crate::{
     lifecycle::{EventSource, StateProjector},
@@ -146,8 +145,14 @@ pub async fn run(
                 // flip it to a reject).
                 if let Some(contract) = brief.contract.as_ref() {
                     let assertion_count = contract.assertions.len();
-                    let ctx = ResolverContext::from_env();
-                    let failures = intake_validation::validate_brief_contract(&brief, &ctx);
+                    let workspace_root = std::path::PathBuf::from(
+                        std::env::var("AGENTRY_WORK_ROOT")
+                            .unwrap_or_else(|_| "/var/lib/agentry".to_string()),
+                    );
+                    let failures = intake_validation::validate_brief_contract_for_target(
+                        &brief,
+                        &workspace_root,
+                    );
                     if failures.is_empty() {
                         tracing::info!(
                             brief = %brief.id,
