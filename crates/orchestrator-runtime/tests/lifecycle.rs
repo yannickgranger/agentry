@@ -549,3 +549,86 @@ async fn lifecycle_driver_fails_brief_on_invalid_transition() {
 
     std::env::remove_var("AGENTRY_WORKSPACE_ROOT");
 }
+
+/// F7 / #438: when reviewer-claude finishes first with `ReworkNeeded`
+/// the FSM lands in `Reworking { target: Coder }`. A second reviewer's
+/// later `ReviewerDone` is illegal in that state — Option C demotes
+/// that one rejection from a brief-killing `DaemonError` to a
+/// `tracing::warn!` and a continue. Other rejections stay terminal
+/// (covered by `lifecycle_driver_fails_brief_on_invalid_transition`).
+///
+/// This test drives `projector_task` to `Reworking { target: Coder }`
+/// via the canonical Reviewing-rework path, then yields one more
+/// `ReviewerDone { Shipped }` and asserts the brief stays in
+/// `Reworking` and no terminal record is written.
+#[tokio::test]
+async fn late_reviewer_done_in_reworking_is_dropped_not_failed() {
+    let bid = BriefId("brf_late_reviewer_in_reworking".into());
+    let written: Arc<Mutex<Vec<(BriefStateRecord, String)>>> = Arc::new(Mutex::new(Vec::new()));
+    let source: Box<dyn EventSource + Send> = Box::new(MemEventSource {
+        events: VecDeque::from(vec![
+            BriefEvent::CoderStarted {
+                agent_id: "agent-1".into(),
+            },
+            BriefEvent::CoderDone {
+                verdict: EventVerdict::Shipped,
+            },
+            BriefEvent::AcVerifierDone {
+                verdict: EventVerdict::Shipped,
+                role_name: "ac-verifier-test".to_owned(),
+            },
+            BriefEvent::ReviewerDone {
+                verdict: EventVerdict::ReworkNeeded,
+                findings: vec![],
+                role_name: "reviewer-test".to_owned(),
+            },
+            // Late ReviewerDone from a second reviewer arriving after
+            // the FSM has already left Reviewing for Reworking. The
+            // FSM rejects this; the driver must warn-and-drop.
+            BriefEvent::ReviewerDone {
+                verdict: EventVerdict::Shipped,
+                findings: vec![],
+                role_name: "reviewer-mechanical-test".to_owned(),
+            },
+        ]),
+    });
+    let projector: Box<dyn StateProjector + Send> = Box::new(MemStateProjector {
+        written: written.clone(),
+    });
+
+    let result = projector_task(
+        bid.clone(),
+        source,
+        projector,
+        None,
+        std::sync::Arc::new(no_gates()),
+    )
+    .await;
+    assert!(
+        result.is_ok(),
+        "projector_task must return Ok when the late ReviewerDone is dropped: {result:?}"
+    );
+
+    let log = written.lock().expect("mutex").clone();
+    // Four valid transitions: Authoring, Verifying, Reviewing,
+    // Reworking. The fifth event is dropped without writing a record.
+    assert_eq!(
+        log.len(),
+        4,
+        "late ReviewerDone in Reworking must not produce a state record"
+    );
+    match &log.last().expect("at least one record").0.state {
+        BriefState::Reworking { .. } => {}
+        other => panic!("expected last state Reworking, got {other:?}"),
+    }
+    for (record, _) in &log {
+        assert!(
+            !matches!(
+                record.state,
+                BriefState::Failed { .. } | BriefState::Shipped
+            ),
+            "no terminal record should be written: {:?}",
+            record.state
+        );
+    }
+}
