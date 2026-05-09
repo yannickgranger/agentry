@@ -10,11 +10,12 @@
 //! invariants so the regression cannot recur.
 
 use agentry_role_runtime::shipper_runner::{
-    build_pr_create_body, classify_pre_push_rebase, git_fetch_argv, git_push_argv,
+    build_pr_create_body, classify_pre_push_rebase, compose_pr_body, git_fetch_argv, git_push_argv,
     parse_pr_response, parse_shipper_payload, push_url_credential_free, scrub_token,
     split_target_repo, tail_stderr_scrubbed, PrCreateResponse, PrePushRebaseDecision,
     ShipperPayload,
 };
+use orchestrator_types::RedeployTarget;
 use serde_json::json;
 
 const FAKE_TOKEN: &str = "ghs_FAKE_TOKEN_abcdef0123456789";
@@ -43,6 +44,7 @@ fn parse_shipper_payload_happy_path() {
             pr_title: "feat: thing".into(),
             pr_body: "body text".into(),
             forge_host: "agency.lab:3000".into(),
+            redeploy_required: vec![],
         }
     );
 }
@@ -280,4 +282,88 @@ fn pre_push_clean_rebase_proceeds_to_push() {
     // Rebase exit 0 with empty porcelain -> Proceed (push step is reached).
     let decision = classify_pre_push_rebase(0, "");
     assert_eq!(decision, PrePushRebaseDecision::Proceed);
+}
+
+#[test]
+fn compose_pr_body_empty_redeploy_returns_unchanged() {
+    assert_eq!(compose_pr_body("hello body", &[]), "hello body");
+}
+
+#[test]
+fn compose_pr_body_single_daemon_appends_block() {
+    let composed = compose_pr_body("orig", &[RedeployTarget::Daemon]);
+    assert!(
+        composed.ends_with(
+            "\n- `daemon`\n\nRun `captain redeploy --target <target>` (or `--target all`) to rebuild."
+        ),
+        "composed body must end with the daemon bullet + closing instruction: {composed}",
+    );
+    assert!(
+        composed.contains("\n\n## Redeploy required"),
+        "composed body must contain the heading after a blank-line separator: {composed}",
+    );
+}
+
+#[test]
+fn compose_pr_body_multiple_targets_lists_all_in_order() {
+    let composed = compose_pr_body(
+        "orig",
+        &[
+            RedeployTarget::Daemon,
+            RedeployTarget::OrchestratorCli,
+            RedeployTarget::CaptainCli,
+        ],
+    );
+    let daemon_idx = composed.find("- `daemon`").expect("daemon bullet present");
+    let orch_idx = composed
+        .find("- `orchestrator-cli`")
+        .expect("orchestrator-cli bullet present");
+    let cap_idx = composed
+        .find("- `captain-cli`")
+        .expect("captain-cli bullet present");
+    assert!(
+        daemon_idx < orch_idx && orch_idx < cap_idx,
+        "bullets must appear in input order daemon < orchestrator-cli < captain-cli: {composed}",
+    );
+}
+
+#[test]
+fn parse_shipper_payload_extracts_redeploy_required_from_top_level_brief() {
+    let bundle = json!({
+        "brief": {
+            "id": "brf_redep",
+            "redeploy_required": ["daemon"],
+            "payload": {
+                "target_repo": "yg/agentry",
+                "base_branch": "develop",
+                "pr_title": "feat: thing",
+                "pr_body": "body",
+                "forge_host": "agency.lab:3000",
+            },
+        },
+    });
+    let p = parse_shipper_payload(&bundle);
+    assert_eq!(p.redeploy_required, vec![RedeployTarget::Daemon]);
+}
+
+#[test]
+fn parse_shipper_payload_defaults_redeploy_required_to_empty_when_absent() {
+    let bundle = json!({
+        "brief": {
+            "id": "brf_no_redep",
+            "payload": {
+                "target_repo": "yg/agentry",
+                "base_branch": "develop",
+                "pr_title": "feat: thing",
+                "pr_body": "body",
+                "forge_host": "agency.lab:3000",
+            },
+        },
+    });
+    let p = parse_shipper_payload(&bundle);
+    assert!(
+        p.redeploy_required.is_empty(),
+        "redeploy_required must default to empty when absent: {:?}",
+        p.redeploy_required,
+    );
 }

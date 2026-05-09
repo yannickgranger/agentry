@@ -12,6 +12,8 @@
 
 use serde_json::{json, Value};
 
+use orchestrator_types::RedeployTarget;
+
 use crate::tail_bytes;
 
 /// Build the credential-free https URL for `git push` / `git fetch`.
@@ -147,6 +149,43 @@ pub fn build_pr_create_body(title: &str, body: &str, head: &str, base: &str) -> 
     })
 }
 
+/// Append a `## Redeploy required` block to the PR body when the brief
+/// carries any redeploy targets. Closes the F8 visibility loop on the
+/// shipper side: an operator scanning merged PRs sees the cue without
+/// inspecting the brief JSON.
+///
+/// Returns `payload_body` unchanged when `redeploy_required` is empty.
+/// When non-empty, appends a `## Redeploy required` heading, a
+/// human-readable sentence, one bullet per target in input order
+/// (kebab-case names), and a closing instruction referencing the
+/// `captain redeploy` CLI.
+pub fn compose_pr_body(payload_body: &str, redeploy_required: &[RedeployTarget]) -> String {
+    if redeploy_required.is_empty() {
+        return payload_body.to_string();
+    }
+    let mut out = String::new();
+    out.push_str(payload_body);
+    out.push_str("\n\n## Redeploy required\n\nAfter this PR merges, the operator must redeploy the following targets:\n\n");
+    for target in redeploy_required {
+        out.push_str("- `");
+        out.push_str(redeploy_target_kebab(*target));
+        out.push_str("`\n");
+    }
+    out.push_str("\nRun `captain redeploy --target <target>` (or `--target all`) to rebuild.");
+    out
+}
+
+/// Kebab-case wire name for a `RedeployTarget`. Independent of serde
+/// (which uses snake_case for this enum) — the PR body is
+/// operator-facing prose, not a serialized payload.
+fn redeploy_target_kebab(target: RedeployTarget) -> &'static str {
+    match target {
+        RedeployTarget::Daemon => "daemon",
+        RedeployTarget::OrchestratorCli => "orchestrator-cli",
+        RedeployTarget::CaptainCli => "captain-cli",
+    }
+}
+
 /// Parsed PR-creation response: the bits the shipper forwards to
 /// `ci-watcher-agentry` via `emit_message`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -182,6 +221,7 @@ pub struct ShipperPayload {
     pub pr_title: String,
     pub pr_body: String,
     pub forge_host: String,
+    pub redeploy_required: Vec<RedeployTarget>,
 }
 
 /// Extract the shipper inputs from a startup bundle JSON value. Mirrors:
@@ -205,6 +245,11 @@ pub fn parse_shipper_payload(bundle: &Value) -> ShipperPayload {
         "Agentry-produced PR. See brief trace stream.",
     );
     let forge_host = crate::pointer_str_or(bundle, "/brief/payload/forge_host", "agency.lab:3000");
+    let redeploy_required = bundle
+        .pointer("/brief/redeploy_required")
+        .filter(|v| !v.is_null())
+        .and_then(|v| serde_json::from_value::<Vec<RedeployTarget>>(v.clone()).ok())
+        .unwrap_or_default();
     ShipperPayload {
         brief_id,
         target_repo,
@@ -212,6 +257,7 @@ pub fn parse_shipper_payload(bundle: &Value) -> ShipperPayload {
         pr_title,
         pr_body,
         forge_host,
+        redeploy_required,
     }
 }
 

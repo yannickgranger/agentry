@@ -42,7 +42,7 @@
 use std::process::{Command, Stdio};
 
 use agentry_role_runtime::shipper_runner::{
-    build_pr_create_body, classify_pre_push_rebase, git_fetch_argv, git_push_argv,
+    build_pr_create_body, classify_pre_push_rebase, compose_pr_body, git_fetch_argv, git_push_argv,
     parse_pr_response, parse_shipper_payload, push_url_credential_free, split_target_repo,
     tail_stderr_scrubbed, PrePushRebaseDecision, ShipperPayload,
 };
@@ -87,6 +87,7 @@ fn main() {
         pr_title,
         pr_body,
         forge_host,
+        redeploy_required: _,
     } = &payload;
     let branch = format!("auto/{brief_id}");
     let (owner, repo_name) = split_target_repo(target_repo);
@@ -301,7 +302,8 @@ fn main() {
         "repo": target_repo,
         "head": branch,
     }));
-    let body = build_pr_create_body(pr_title, pr_body, &branch, base_branch);
+    let composed_pr_body = compose_pr_body(pr_body, &payload.redeploy_required);
+    let body = build_pr_create_body(pr_title, &composed_pr_body, &branch, base_branch);
     let pr_api_url = format!("https://{forge_host}/api/v1/repos/{owner}/{repo_name}/pulls");
     let pr_resp_text = match http_post_json(&pr_api_url, &token, &body.to_string()) {
         Ok(t) => t,
