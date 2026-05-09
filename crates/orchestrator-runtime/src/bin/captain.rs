@@ -12,6 +12,7 @@
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use orchestrator_runtime::captain_ground::{render_grounding_sheet, CfdbItem, SpecMatch};
+use orchestrator_runtime::captain_ground_cache::captain_ground_cache_dir;
 use orchestrator_types::{
     now, Assertion, AssertionAnchor, AssertionId, Brief, BriefId, Budget, Contract, EscalationMode,
     TaskShape, VersionedRef,
@@ -75,9 +76,28 @@ enum Cmd {
     },
     /// Emit a grounding sheet for a directive by combining cfdb and specs.
     Ground {
-        /// Target repo workspace root.
+        /// Target repo workspace root. Mutually exclusive with
+        /// `--target-repo`; exactly one must be set.
+        #[arg(
+            long,
+            conflicts_with = "target_repo",
+            required_unless_present = "target_repo"
+        )]
+        workspace: Option<PathBuf>,
+        /// Forge shorthand (e.g. `yg/glean`) for a remote target repo.
+        /// Captain runs `cfdb extract --rev <url>@<rev>` into a per-
+        /// `(target_repo, rev)` cache under `$XDG_CACHE_HOME/captain/ground/`.
+        /// Mutually exclusive with `--workspace`.
+        #[arg(
+            long,
+            conflicts_with = "workspace",
+            required_unless_present = "workspace"
+        )]
+        target_repo: Option<String>,
+        /// Branch name or commit sha for `--target-repo`. Defaults to
+        /// `develop` when `--target-repo` is set; ignored otherwise.
         #[arg(long)]
-        workspace: PathBuf,
+        rev: Option<String>,
         /// Free-form directive describing the intended brief.
         #[arg(long)]
         directive: String,
@@ -87,11 +107,14 @@ enum Cmd {
         /// Optional comma-separated cfdb item kinds (passed through to cfdb).
         #[arg(long)]
         kinds: Option<String>,
-        /// Optional specs directory; defaults to `<workspace>/specs/concepts`.
+        /// Optional specs directory; defaults to `<workspace>/specs/concepts`
+        /// in `--workspace` mode, and is skipped in `--target-repo` mode
+        /// unless explicitly provided.
         #[arg(long)]
         specs_dir: Option<PathBuf>,
         /// Optional pre-extracted cfdb db dir. When omitted, captain runs
-        /// `cfdb extract` into a tempdir. When given, captain assumes the
+        /// `cfdb extract` into a tempdir (or per-`(target_repo, rev)` cache
+        /// in `--target-repo` mode). When given, captain assumes the
         /// keyspace name is `ground` inside that db directory.
         #[arg(long)]
         keyspace_db: Option<PathBuf>,
@@ -264,46 +287,120 @@ struct CfdbListResponse {
     rows: Vec<CfdbItem>,
 }
 
+const DEFAULT_TARGET_REV: &str = "develop";
+const DEFAULT_FORGE_HOST: &str = "agency.lab:3000";
+
+fn target_repo_slug(target_repo: &str) -> String {
+    target_repo.replace('/', "_")
+}
+
+fn forge_host_from_env() -> String {
+    std::env::var("AGENTRY_FORGE_HOST").unwrap_or_else(|_| DEFAULT_FORGE_HOST.to_string())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn cmd_ground(
-    workspace: PathBuf,
+    workspace: Option<PathBuf>,
+    target_repo: Option<String>,
+    rev: Option<String>,
     directive: String,
     name_pattern: String,
     kinds: Option<String>,
     specs_dir: Option<PathBuf>,
     keyspace_db: Option<PathBuf>,
 ) -> Result<()> {
-    let workspace_str = workspace.display().to_string();
-
     let _tempdir_guard;
-    let db_path: PathBuf = match keyspace_db {
-        Some(p) => p,
-        None => {
-            let tmp =
-                tempfile::TempDir::new().context("failed to allocate tempdir for cfdb extract")?;
-            let tmp_str = tmp.path().display().to_string();
-            let extract_out = Command::new("cfdb")
-                .args([
-                    "extract",
-                    "--workspace",
-                    &workspace_str,
-                    "--db",
-                    &tmp_str,
-                    "--keyspace",
-                    "ground",
-                ])
-                .output()
-                .context("failed to spawn cfdb extract")?;
-            if !extract_out.status.success() {
-                let code = extract_out
-                    .status
-                    .code()
-                    .map_or_else(|| "?".to_string(), |c| c.to_string());
-                let stderr = String::from_utf8_lossy(&extract_out.stderr);
-                return Err(anyhow!("cfdb extract failed (status {code}): {stderr}"));
+    let (db_path, keyspace): (PathBuf, String) = match (&workspace, &target_repo) {
+        (Some(ws), None) => match keyspace_db.clone() {
+            Some(p) => (p, "ground".to_string()),
+            None => {
+                let tmp = tempfile::TempDir::new()
+                    .context("failed to allocate tempdir for cfdb extract")?;
+                let tmp_str = tmp.path().display().to_string();
+                let workspace_str = ws.display().to_string();
+                let extract_out = Command::new("cfdb")
+                    .args([
+                        "extract",
+                        "--workspace",
+                        &workspace_str,
+                        "--db",
+                        &tmp_str,
+                        "--keyspace",
+                        "ground",
+                    ])
+                    .output()
+                    .context("failed to spawn cfdb extract")?;
+                if !extract_out.status.success() {
+                    let code = extract_out
+                        .status
+                        .code()
+                        .map_or_else(|| "?".to_string(), |c| c.to_string());
+                    let stderr = String::from_utf8_lossy(&extract_out.stderr);
+                    return Err(anyhow!("cfdb extract failed (status {code}): {stderr}"));
+                }
+                let path = tmp.path().to_path_buf();
+                _tempdir_guard = Some(tmp);
+                (path, "ground".to_string())
             }
-            let path = tmp.path().to_path_buf();
-            _tempdir_guard = Some(tmp);
-            path
+        },
+        (None, Some(repo)) => match keyspace_db.clone() {
+            Some(p) => (p, "ground".to_string()),
+            None => {
+                let slug = target_repo_slug(repo);
+                let rev_value = rev
+                    .clone()
+                    .unwrap_or_else(|| DEFAULT_TARGET_REV.to_string());
+                let xdg = std::env::var("XDG_CACHE_HOME").ok();
+                let home = std::env::var("HOME").ok();
+                let cache_dir = captain_ground_cache_dir(&slug, &rev_value, xdg, home);
+                let cache_db_file = cache_dir.join(format!("{slug}.json"));
+                let cache_hit = cache_db_file
+                    .metadata()
+                    .map(|m| m.is_file() && m.len() > 0)
+                    .unwrap_or(false);
+                if !cache_hit {
+                    std::fs::create_dir_all(&cache_dir).with_context(|| {
+                        format!("failed to create cache dir {}", cache_dir.display())
+                    })?;
+                    let forge_host = forge_host_from_env();
+                    let url = format!("https://{forge_host}/{repo}.git@{rev_value}");
+                    let cache_str = cache_dir.display().to_string();
+                    let extract_out = Command::new("cfdb")
+                        .args([
+                            "extract",
+                            "--rev",
+                            &url,
+                            "--db",
+                            &cache_str,
+                            "--keyspace",
+                            &slug,
+                        ])
+                        .output()
+                        .context("failed to spawn cfdb extract --rev")?;
+                    if !extract_out.status.success() {
+                        let code = extract_out
+                            .status
+                            .code()
+                            .map_or_else(|| "?".to_string(), |c| c.to_string());
+                        let stderr = String::from_utf8_lossy(&extract_out.stderr);
+                        return Err(anyhow!(
+                            "cfdb extract --rev failed (status {code}): {stderr}"
+                        ));
+                    }
+                } else {
+                    eprintln!(
+                        "// captain ground: cache hit at {} (skipping cfdb extract)",
+                        cache_dir.display()
+                    );
+                }
+                _tempdir_guard = None;
+                (cache_dir, slug)
+            }
+        },
+        _ => {
+            return Err(anyhow!(
+                "captain ground: exactly one of --workspace or --target-repo must be set"
+            ));
         }
     };
 
@@ -313,7 +410,7 @@ fn cmd_ground(
         "--db".to_string(),
         db_str,
         "--keyspace".to_string(),
-        "ground".to_string(),
+        keyspace,
         "--name-pattern".to_string(),
         name_pattern,
     ];
@@ -339,58 +436,60 @@ fn cmd_ground(
         .context("failed to parse cfdb list-items-matching output as JSON")?;
     let items = parsed.rows;
 
-    let resolved_specs_dir = specs_dir.unwrap_or_else(|| workspace.join("specs/concepts"));
+    let resolved_specs_dir =
+        specs_dir.or_else(|| workspace.as_ref().map(|w| w.join("specs/concepts")));
     let mut spec_matches: Vec<SpecMatch> = Vec::new();
-    if !resolved_specs_dir.is_dir() {
-        eprintln!(
-            "// WARN: specs dir not found at {}",
-            resolved_specs_dir.display()
-        );
-    } else {
-        let directive_tokens: Vec<String> = directive
-            .split_whitespace()
-            .map(str::to_lowercase)
-            .collect();
-        let entries = std::fs::read_dir(&resolved_specs_dir).with_context(|| {
-            format!("failed to read specs dir {}", resolved_specs_dir.display())
-        })?;
-        let mut paths: Vec<PathBuf> = entries
-            .filter_map(std::result::Result::ok)
-            .map(|e| e.path())
-            .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("md"))
-            .collect();
-        paths.sort();
-        for path in paths {
-            let body = std::fs::read_to_string(&path)
-                .with_context(|| format!("failed to read {}", path.display()))?;
-            let mut matched_headings: Vec<String> = Vec::new();
-            for line in body.lines() {
-                let trimmed = line.trim_start();
-                let hash_count = trimmed.chars().take_while(|c| *c == '#').count();
-                if hash_count == 0 {
-                    continue;
+    match resolved_specs_dir {
+        Some(dir) if dir.is_dir() => {
+            let directive_tokens: Vec<String> = directive
+                .split_whitespace()
+                .map(str::to_lowercase)
+                .collect();
+            let entries = std::fs::read_dir(&dir)
+                .with_context(|| format!("failed to read specs dir {}", dir.display()))?;
+            let mut paths: Vec<PathBuf> = entries
+                .filter_map(std::result::Result::ok)
+                .map(|e| e.path())
+                .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("md"))
+                .collect();
+            paths.sort();
+            for path in paths {
+                let body = std::fs::read_to_string(&path)
+                    .with_context(|| format!("failed to read {}", path.display()))?;
+                let mut matched_headings: Vec<String> = Vec::new();
+                for line in body.lines() {
+                    let trimmed = line.trim_start();
+                    let hash_count = trimmed.chars().take_while(|c| *c == '#').count();
+                    if hash_count == 0 {
+                        continue;
+                    }
+                    let after_hashes = &trimmed[hash_count..];
+                    if !after_hashes.starts_with(' ') {
+                        continue;
+                    }
+                    let heading = after_hashes[1..].trim_end().to_string();
+                    let lower = heading.to_lowercase();
+                    if directive_tokens.iter().any(|tok| lower.contains(tok)) {
+                        matched_headings.push(heading);
+                    }
                 }
-                let after_hashes = &trimmed[hash_count..];
-                if !after_hashes.starts_with(' ') {
-                    continue;
+                if !matched_headings.is_empty() {
+                    let display_path =
+                        match workspace.as_ref().and_then(|w| path.strip_prefix(w).ok()) {
+                            Some(rel) => rel.display().to_string(),
+                            None => path.display().to_string(),
+                        };
+                    spec_matches.push(SpecMatch {
+                        file: display_path,
+                        headings: matched_headings,
+                    });
                 }
-                let heading = after_hashes[1..].trim_end().to_string();
-                let lower = heading.to_lowercase();
-                if directive_tokens.iter().any(|tok| lower.contains(tok)) {
-                    matched_headings.push(heading);
-                }
-            }
-            if !matched_headings.is_empty() {
-                let display_path = match path.strip_prefix(&workspace) {
-                    Ok(rel) => rel.display().to_string(),
-                    Err(_) => path.display().to_string(),
-                };
-                spec_matches.push(SpecMatch {
-                    file: display_path,
-                    headings: matched_headings,
-                });
             }
         }
+        Some(dir) => {
+            eprintln!("// WARN: specs dir not found at {}", dir.display());
+        }
+        None => {}
     }
 
     let sheet = render_grounding_sheet(&directive, &items, &spec_matches);
@@ -569,6 +668,8 @@ fn main() -> Result<()> {
         }
         Cmd::Ground {
             workspace,
+            target_repo,
+            rev,
             directive,
             name_pattern,
             kinds,
@@ -577,6 +678,8 @@ fn main() -> Result<()> {
         } => {
             cmd_ground(
                 workspace,
+                target_repo,
+                rev,
                 directive,
                 name_pattern,
                 kinds,
