@@ -29,6 +29,36 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
+/// Pure inner: resolve the daemon's work-root directory from explicit inputs.
+///
+/// Precedence: explicit `AGENTRY_WORK_ROOT` value, then `$HOME/.local/share/agentry/work`,
+/// then `/tmp/agentry-work`. Pulled out as a pure function so integration tests can
+/// exercise the precedence rules without mutating process env.
+pub fn default_work_root_inner(
+    env_var: Option<String>,
+    home: Option<String>,
+) -> std::path::PathBuf {
+    if let Some(s) = env_var {
+        if !s.is_empty() {
+            return std::path::PathBuf::from(s);
+        }
+    }
+    if let Some(h) = home {
+        if !h.is_empty() {
+            return std::path::PathBuf::from(h).join(".local/share/agentry/work");
+        }
+    }
+    std::path::PathBuf::from("/tmp/agentry-work")
+}
+
+/// Public wrapper: read `AGENTRY_WORK_ROOT` and `HOME` from the process env and
+/// delegate to [`default_work_root_inner`].
+pub fn default_work_root() -> std::path::PathBuf {
+    let env_var = std::env::var("AGENTRY_WORK_ROOT").ok();
+    let home = std::env::var("HOME").ok();
+    default_work_root_inner(env_var, home)
+}
+
 /// Run the daemon loop forever using the given `Config`.
 ///
 /// `event_source_factory` and `state_projector_factory` are invoked
@@ -145,10 +175,7 @@ pub async fn run(
                 // flip it to a reject).
                 if let Some(contract) = brief.contract.as_ref() {
                     let assertion_count = contract.assertions.len();
-                    let workspace_root = std::path::PathBuf::from(
-                        std::env::var("AGENTRY_WORK_ROOT")
-                            .unwrap_or_else(|_| "/var/lib/agentry".to_string()),
-                    );
+                    let workspace_root = default_work_root();
                     // F1d — populate per-target keyspace before resolution. ensure_target_extracted
                     // is idempotent (cache hit on (slug + head_sha)). Cache miss clones target_repo
                     // + runs cfdb extract + copies specs. Failure to extract is logged but does NOT
