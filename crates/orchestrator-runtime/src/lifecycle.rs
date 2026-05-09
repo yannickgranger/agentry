@@ -32,25 +32,25 @@ pub const NO_OP_SHORT_CIRCUIT_CAUSE: &str = "no_op_short_circuit";
 pub const NO_OP_VERDICT_REASON: &str = "no-op brief — coder produced no diff against base";
 
 /// Errors surfaced by [`EventSource`] implementations. Production adapters
-/// can hit [`Self::Redis`] on connection or read failures, and
+/// can hit [`Self::Backend`] on connection or read failures, and
 /// [`Self::Parse`] when a trace stream entry does not deserialise into an
 /// [`Event`] or carries the unexpected field shape.
 #[derive(Debug, Error)]
 pub enum EventSourceError {
-    #[error("redis error: {0}")]
-    Redis(#[from] redis::RedisError),
+    #[error("backend error: {detail}")]
+    Backend { detail: String },
     #[error("trace event parse failed: {detail}")]
     Parse { detail: String },
 }
 
 /// Errors surfaced by [`StateProjector`] implementations. Production
-/// adapters can hit [`Self::Redis`] on connection or write failures, and
+/// adapters can hit [`Self::Backend`] on connection or write failures, and
 /// [`Self::LuaFailed`] when the embedded Lua script body returns an error
 /// reply (most commonly a Redis OOM abort, which is atomic per spec).
 #[derive(Debug, Error)]
 pub enum StateProjectorError {
-    #[error("redis error: {0}")]
-    Redis(#[from] redis::RedisError),
+    #[error("backend error: {detail}")]
+    Backend { detail: String },
     #[error("lua script eval failed: {detail}")]
     LuaFailed { detail: String },
 }
@@ -274,7 +274,10 @@ impl EventSource for RedisEventSource {
             let reply: Option<StreamReadReply> = self
                 .conn
                 .xread_options(&[stream.as_str()], &[self.cursor.as_str()], &opts)
-                .await?;
+                .await
+                .map_err(|e| EventSourceError::Backend {
+                    detail: e.to_string(),
+                })?;
             let Some(reply) = reply else {
                 return Ok(None);
             };
@@ -375,7 +378,10 @@ impl StateProjector for RedisStateProjector {
                     .arg("LOAD")
                     .arg(LUA_PROJECTOR_WRITE)
                     .query_async(&mut self.conn)
-                    .await?;
+                    .await
+                    .map_err(|e| StateProjectorError::Backend {
+                        detail: e.to_string(),
+                    })?;
                 self.lua_sha = Some(loaded.clone());
                 loaded
             }
@@ -390,7 +396,10 @@ impl StateProjector for RedisStateProjector {
             .arg(json)
             .arg(last_trace_id)
             .query_async(&mut self.conn)
-            .await?;
+            .await
+            .map_err(|e| StateProjectorError::Backend {
+                detail: e.to_string(),
+            })?;
         Ok(())
     }
 }
