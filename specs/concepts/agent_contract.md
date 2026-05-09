@@ -137,8 +137,27 @@ slices between the first `{` and last `}`, and decodes the object —
 returning `None` when the reply is not a parseable JSON object so the
 caller can apply the soft-fail tolerance (degrade to `all_applied: true`
 and proceed). When `all_applied: false`, the runner emits one
-`completeness` blocker per entry in `unapplied` and `done failed` with
-cause `self_review_unapplied`.
+`completeness` blocker per `UnappliedVerb` in `unapplied` (carrying the
+verb description, the applied form, and the rationale) and `done failed`
+with cause `self_review_unapplied`.
+
+## UnappliedVerb
+
+One entry in a `SelfReviewResult.unapplied` list. Carries the original
+brief verb (`verb`), the form actually committed (`applied_form`, may be
+empty when the verb was simply not done), and the coder's natural-language
+`rationale` for any deliberate deviation. The structured shape lets the
+captain see *why* the diff diverges from the literal brief without
+digging redis traces — the rationale is composed into the
+`completeness` blocker message and surfaces in the `agentry:verdicts`
+stream and the dashboard. `parse_self_review_object` accepts both the
+new object form `{verb, applied_form, rationale}` and the legacy plain
+string form (back-compat with already-deployed coders), promoting the
+string into an `UnappliedVerb` with empty `applied_form` and
+`rationale`. Empty `rationale` signals an honest miss; non-empty
+rationale signals a deliberate convention-driven deviation that the
+captain may later choose to accept (planned for F6b's
+`Disagreed`-outcome path).
 
 ## PlannerPayload
 
