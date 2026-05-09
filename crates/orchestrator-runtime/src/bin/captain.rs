@@ -48,6 +48,11 @@ enum Cmd {
         /// Issue title used in the emitted payload.
         #[arg(long)]
         issue_title: String,
+        /// Emit a Contract with three Behavior anchors instead of the default
+        /// single Cfdb-TODO anchor. Greenfield projects with no existing
+        /// qname surface get a discoverable, doctrine-aligned default.
+        #[arg(long, default_value_t = false)]
+        bootstrap: bool,
         /// Optional brief id. Defaults to `BriefId::fresh()`.
         #[arg(long)]
         id: Option<String>,
@@ -156,6 +161,36 @@ fn stub_contract(brief_id: &BriefId) -> Contract {
     }
 }
 
+fn bootstrap_contract(brief_id: &BriefId) -> Contract {
+    Contract {
+        brief_id: brief_id.clone(),
+        assertions: vec![
+            Assertion {
+                id: AssertionId("A1".into()),
+                prose: "TODO: replace with the test that this brief makes pass.".into(),
+                anchor: AssertionAnchor::Behavior {
+                    live_target: "TODO: e.g. \"test crates/<crate>/tests/<test_file>.rs::<test_fn> passes\"".into(),
+                },
+            },
+            Assertion {
+                id: AssertionId("A2".into()),
+                prose: "TODO: replace with the user-facing output invariant this brief delivers.".into(),
+                anchor: AssertionAnchor::Behavior {
+                    live_target: "TODO: e.g. \"output of <command> contains <substring>\" or \"file <path> exists with <property>\"".into(),
+                },
+            },
+            Assertion {
+                id: AssertionId("A3".into()),
+                prose: "TODO: replace with the structural invariant this brief preserves.".into(),
+                anchor: AssertionAnchor::Behavior {
+                    live_target: "TODO: e.g. \"no destructive filesystem operations in <module>\" or \"no panics in the request handler path\"".into(),
+                },
+            },
+        ],
+        precursor_artifacts: Vec::new(),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_brief(
     kind_str: &str,
@@ -163,6 +198,7 @@ fn build_brief(
     topology_str: &str,
     pr_title: &str,
     issue_title: &str,
+    bootstrap: bool,
     id: Option<String>,
     issue_body: Option<String>,
     pr_body: Option<String>,
@@ -186,7 +222,11 @@ fn build_brief(
     });
 
     let contract = if kind.requires_contract() {
-        Some(stub_contract(&id))
+        Some(if bootstrap {
+            bootstrap_contract(&id)
+        } else {
+            stub_contract(&id)
+        })
     } else {
         None
     };
@@ -480,6 +520,7 @@ fn main() -> Result<()> {
             topology,
             pr_title,
             issue_title,
+            bootstrap,
             id,
             issue_body,
             pr_body,
@@ -493,6 +534,7 @@ fn main() -> Result<()> {
                 &topology,
                 &pr_title,
                 &issue_title,
+                bootstrap,
                 id,
                 issue_body,
                 pr_body,
@@ -501,7 +543,14 @@ fn main() -> Result<()> {
                 submitted_by,
             )?;
             println!("{}", serde_json::to_string_pretty(&brief)?);
-            if brief.contract.is_some() {
+            if bootstrap {
+                eprintln!();
+                eprintln!("REMINDER: bootstrap mode emitted three Behavior anchors. Behavior anchors are pass-through");
+                eprintln!("at intake — the daemon does not verify them. Use this for greenfield projects with no existing");
+                eprintln!("qname surface. As the project grows and stable types/functions/specs exist, replace Behavior");
+                eprintln!("anchors with Cfdb {{ qname: \"...\" }} or SpecConcept {{ path, section }} anchors so the daemon can");
+                eprintln!("validate them at intake. See docs/captain-doctrine.md for guidance.");
+            } else if brief.contract.is_some() {
                 eprintln!(
                     "// REMINDER: replace `{TODO_QNAME}` and the placeholder assertion prose with a real anchor before dispatching."
                 );

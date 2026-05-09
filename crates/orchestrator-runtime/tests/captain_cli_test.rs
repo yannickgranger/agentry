@@ -108,6 +108,111 @@ fn captain_new_brief_uses_provided_id() {
 }
 
 #[test]
+fn new_brief_default_emits_single_cfdb_anchor() {
+    let out = run_new_brief(&[
+        "--kind",
+        "mechanical",
+        "--target-repo",
+        "yg/agentry",
+        "--topology",
+        "agentry-bugfix-v0:1",
+        "--pr-title",
+        "test",
+        "--issue-title",
+        "test",
+    ]);
+    let brief = parse_stdout(&out);
+    let contract = brief
+        .contract
+        .as_ref()
+        .expect("Mechanical must stub a contract");
+    assert_eq!(
+        contract.assertions.len(),
+        1,
+        "default contract must have exactly one assertion"
+    );
+    match &contract.assertions[0].anchor {
+        AssertionAnchor::Cfdb { .. } => {}
+        other => panic!("expected Cfdb anchor in default mode, got {other:?}"),
+    }
+}
+
+#[test]
+fn new_brief_bootstrap_emits_three_behavior_anchors() {
+    let out = run_new_brief(&[
+        "--kind",
+        "mechanical",
+        "--target-repo",
+        "yg/agentry",
+        "--topology",
+        "agentry-bugfix-v0:1",
+        "--pr-title",
+        "test",
+        "--issue-title",
+        "test",
+        "--bootstrap",
+    ]);
+    let brief = parse_stdout(&out);
+    let contract = brief
+        .contract
+        .as_ref()
+        .expect("bootstrap mode must stub a contract for kinds that require one");
+    assert_eq!(
+        contract.assertions.len(),
+        3,
+        "bootstrap contract must have exactly three assertions"
+    );
+    let expected_ids = ["A1", "A2", "A3"];
+    for (idx, assertion) in contract.assertions.iter().enumerate() {
+        assert_eq!(
+            assertion.id.0, expected_ids[idx],
+            "assertion at index {idx} has wrong id"
+        );
+        match &assertion.anchor {
+            AssertionAnchor::Behavior { .. } => {}
+            other => panic!("expected Behavior anchor at index {idx}, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn new_brief_bootstrap_assertions_have_behavior_live_targets() {
+    let out = run_new_brief(&[
+        "--kind",
+        "mechanical",
+        "--target-repo",
+        "yg/agentry",
+        "--topology",
+        "agentry-bugfix-v0:1",
+        "--pr-title",
+        "test",
+        "--issue-title",
+        "test",
+        "--bootstrap",
+    ]);
+    let brief = parse_stdout(&out);
+    let contract = brief
+        .contract
+        .as_ref()
+        .expect("bootstrap mode must stub a contract for kinds that require one");
+    for assertion in &contract.assertions {
+        match &assertion.anchor {
+            AssertionAnchor::Behavior { live_target } => {
+                assert!(
+                    !live_target.is_empty(),
+                    "behavior anchor live_target must be non-empty for {}",
+                    assertion.id
+                );
+            }
+            other => panic!(
+                "expected Behavior anchor for {}, got {other:?}",
+                assertion.id
+            ),
+        }
+    }
+}
+
+#[test]
 fn captain_new_brief_rejects_unknown_kind() {
     let out = run_new_brief(&[
         "--kind",
