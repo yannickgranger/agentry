@@ -215,7 +215,10 @@ impl BriefInventory for RedisInventory {
                 .arg("COUNT")
                 .arg(100)
                 .query_async(&mut self.conn)
-                .await?;
+                .await
+                .map_err(|e| EventSourceError::Backend {
+                    detail: e.to_string(),
+                })?;
             for key in batch {
                 if key.ends_with(":state") && !key.ends_with(":state_log") {
                     keys.push(key);
@@ -228,7 +231,13 @@ impl BriefInventory for RedisInventory {
         }
         let mut out = Vec::with_capacity(keys.len());
         for key in keys {
-            let raw: Option<String> = self.conn.get(&key).await?;
+            let raw: Option<String> =
+                self.conn
+                    .get(&key)
+                    .await
+                    .map_err(|e| EventSourceError::Backend {
+                        detail: e.to_string(),
+                    })?;
             let Some(s) = raw else { continue };
             match serde_json::from_str::<BriefStateRecord>(&s) {
                 Ok(r) => out.push(r),
@@ -245,7 +254,13 @@ impl BriefInventory for RedisInventory {
         brief_id: &BriefId,
     ) -> Result<Option<u64>, EventSourceError> {
         let key = format!("agentry:brief:{}:body", brief_id.0);
-        let raw: Option<String> = self.conn.get(&key).await?;
+        let raw: Option<String> =
+            self.conn
+                .get(&key)
+                .await
+                .map_err(|e| EventSourceError::Backend {
+                    detail: e.to_string(),
+                })?;
         let Some(raw) = raw else { return Ok(None) };
         let value: JsonValue = match serde_json::from_str(&raw) {
             Ok(v) => v,
@@ -300,7 +315,10 @@ impl ReaperSink for RedisReaperSink {
                 "*",
                 &[("agent", REAPER_AGENT_ID), ("event", body.as_str())],
             )
-            .await?;
+            .await
+            .map_err(|e| EventSourceError::Backend {
+                detail: e.to_string(),
+            })?;
         Ok(())
     }
 
