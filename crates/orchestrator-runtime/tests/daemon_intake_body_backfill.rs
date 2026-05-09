@@ -51,6 +51,7 @@ fn make_brief(id: &str) -> Brief {
         escalation: EscalationMode::default(),
         parent_brief: None,
         cohort_labels: vec![],
+        redeploy_required: vec![],
         submitted_by: "test".into(),
         submitted_at: Utc::now(),
     }

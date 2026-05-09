@@ -189,6 +189,7 @@ fn build_brief(
         escalation: EscalationMode::Autonomous,
         parent_brief: None,
         cohort_labels: Vec::new(),
+        redeploy_required: vec![],
         submitted_by: submitted_by.unwrap_or_else(|| DEFAULT_SUBMITTED_BY.to_string()),
         submitted_at: now(),
     })
