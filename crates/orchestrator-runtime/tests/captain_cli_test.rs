@@ -7,6 +7,7 @@
 //! Brief schema with `kind` + `contract` at the correct top-level fields —
 //! that is the exact failure mode the captain CLI exists to prevent.
 
+use orchestrator_runtime::captain_new_spec::render_spec_skeleton;
 use orchestrator_types::{AssertionAnchor, Brief, BriefId, TaskShape};
 use std::process::Command;
 
@@ -210,6 +211,31 @@ fn new_brief_bootstrap_assertions_have_behavior_live_targets() {
             ),
         }
     }
+}
+
+#[test]
+fn render_spec_skeleton_h1_matches_concept() {
+    let out = render_spec_skeleton("ScanReport", "yg/glean");
+    let first_line = out.lines().next().expect("output has at least one line");
+    assert_eq!(first_line, "# ScanReport");
+}
+
+#[test]
+fn render_spec_skeleton_h2_matches_concept() {
+    let out = render_spec_skeleton("ScanReport", "yg/glean");
+    assert!(
+        out.contains("\n## ScanReport\n"),
+        "expected level-2 heading `## ScanReport` in output:\n{out}"
+    );
+}
+
+#[test]
+fn render_spec_skeleton_includes_status_draft_marker() {
+    let out = render_spec_skeleton("ScanReport", "yg/glean");
+    assert!(
+        out.contains("> Status: **draft**."),
+        "expected status draft marker in output:\n{out}"
+    );
 }
 
 #[test]

@@ -106,6 +106,17 @@ enum Cmd {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Emit a graph-specs-compliant `specs/concepts/<concept>.md` skeleton
+    /// to stdout, with a stderr REMINDER about graph-specs equivalence.
+    NewSpec {
+        /// CamelCase concept name (e.g. `ScanReport`). Must match a Rust
+        /// type, function, or trait of the same name in `target_repo`.
+        #[arg(long)]
+        concept: String,
+        /// Forge shorthand for the target repo, e.g. `yg/glean`.
+        #[arg(long)]
+        target_repo: String,
+    },
     /// Rebuild release binaries listed by a brief's `redeploy_required`.
     Redeploy {
         /// Comma-separated list of targets to rebuild. Accepted values
@@ -579,6 +590,27 @@ fn main() -> Result<()> {
         } => {
             let code = cmd_dispatch(brief_file, dry_run)?;
             std::process::exit(code);
+        }
+        Cmd::NewSpec {
+            concept,
+            target_repo,
+        } => {
+            let skeleton = orchestrator_runtime::captain_new_spec::render_spec_skeleton(
+                &concept,
+                &target_repo,
+            );
+            print!("{skeleton}");
+            eprintln!();
+            eprintln!(
+                "REMINDER: graph-specs convention requires the level-2 heading (## <Concept>) to match"
+            );
+            eprintln!(
+                "a Rust type, function, or trait of the same name in the target_repo's source tree."
+            );
+            eprintln!(
+                "Use CamelCase concept names. Level-4 (####) headings are local subsections and do not"
+            );
+            eprintln!("need to match code Items. The graph-specs check enforces this at PR time.");
         }
         Cmd::Redeploy { target, dry_run } => cmd_redeploy(&target, dry_run)?,
     }
