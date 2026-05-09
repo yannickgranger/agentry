@@ -111,6 +111,19 @@ pub async fn projector_task(
                 }
             }
             Err(invalid) => {
+                let is_late_reviewer_in_reworking =
+                    matches!(invalid.event, BriefEvent::ReviewerDone { .. })
+                        && matches!(invalid.from, BriefState::Reworking { .. });
+                if is_late_reviewer_in_reworking {
+                    tracing::warn!(
+                        brief = %brief_id.0,
+                        from = ?invalid.from,
+                        event = ?invalid.event,
+                        outcome = "dropped_late_reviewer_in_reworking",
+                        "FSM rejected late ReviewerDone in Reworking; dropping event without state transition"
+                    );
+                    continue;
+                }
                 tracing::error!(
                     brief = %brief_id.0,
                     from = ?invalid.from,
