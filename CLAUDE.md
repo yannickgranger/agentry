@@ -111,6 +111,13 @@ Example skeleton:
 See `docs/dogfood-protocol.md` for the full dispatch + observation
 recipe.
 
+## Redeploy after merge
+
+Briefs touching the daemon binary, captain CLI, or orchestrator CLI
+must set `redeploy_required` on the brief, and the operator must run
+captain redeploy + daemon swap after merge. See `docs/captain-doctrine.md`
+for the source of truth on the protocol.
+
 ## Post-mortems go in the session save
 
 If something goes wrong, the diagnosis + corrective measure goes in a
