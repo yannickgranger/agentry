@@ -575,3 +575,10 @@ list` shows currently parked briefs as one JSON object per line,
 subcommands push their event onto `agentry:brief:<id>:trace` with
 `agent` set to `captain-cli`, where the per-brief lifecycle driver
 consumes it like any other FSM event.
+
+The dashboard surfaces parked briefs in the standard in-flight list
+with a prominent AWAITING CAPTAIN DECISION badge and the disagreements
+rendered inline (verb, what the coder did instead, rationale). The
+operator resolves via the `captain decide accept <brief_id>` or
+`captain decide reject <brief_id> --reason '...'` CLI. Form-based
+resolution from the dashboard is a future enhancement.

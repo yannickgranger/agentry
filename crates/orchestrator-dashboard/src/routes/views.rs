@@ -27,6 +27,14 @@ use crate::{AppError, AppState};
 /// (`agentry:brief:*:state`) and materialise their bodies. Returns the
 /// same shape `active_briefs` previously produced (a Vec of brief-body
 /// JSON values) so the index template's field reads keep working.
+///
+/// Each returned body has two synthetic fields merged in for the index
+/// renderer: `_dashboard_state` (the state.kind discriminator string)
+/// and, when the state is `AwaitingCaptainDecision`, `_dashboard_disagreements`
+/// (the disagreements vec from the state). The synthetic `_dashboard_*`
+/// names sit outside `Brief`'s schema so deserialising a body back to
+/// `Brief` would fail — the dashboard never round-trips bodies, only
+/// reads fields by name from `Value`.
 pub(crate) async fn derive_active_briefs(store: &DashboardStore) -> anyhow::Result<Vec<Value>> {
     let mut conn = redis_io::connect(store.redis_url())
         .await
@@ -42,7 +50,7 @@ pub(crate) async fn derive_active_briefs(store: &DashboardStore) -> anyhow::Resu
         }
     }
 
-    let mut active_ids: Vec<String> = Vec::new();
+    let mut active: Vec<(String, BriefStateRecord)> = Vec::new();
     for key in &state_keys {
         let raw: Option<String> = conn.get(key).await?;
         let Some(s) = raw else { continue };
@@ -53,26 +61,114 @@ pub(crate) async fn derive_active_briefs(store: &DashboardStore) -> anyhow::Resu
             record.state,
             BriefState::Shipped | BriefState::Failed { .. }
         ) {
-            active_ids.push(record.brief_id.0);
+            active.push((record.brief_id.0.clone(), record));
         }
     }
 
-    if active_ids.is_empty() {
+    if active.is_empty() {
         return Ok(Vec::new());
     }
 
-    let body_keys: Vec<String> = active_ids
+    let body_keys: Vec<String> = active
         .iter()
-        .map(|id| format!("agentry:brief:{id}:body"))
+        .map(|(id, _)| format!("agentry:brief:{id}:body"))
         .collect();
     let bodies: Vec<Option<String>> = conn.mget(&body_keys).await?;
     let mut out = Vec::with_capacity(bodies.len());
-    for body in bodies.into_iter().flatten() {
-        if let Ok(v) = serde_json::from_str::<Value>(&body) {
-            out.push(v);
+    for ((_id, record), body) in active.into_iter().zip(bodies.into_iter()) {
+        let Some(body) = body else { continue };
+        let Ok(mut v) = serde_json::from_str::<Value>(&body) else {
+            continue;
+        };
+        if let Value::Object(map) = &mut v {
+            map.insert(
+                "_dashboard_state".into(),
+                Value::String(state_kind(&record.state).to_owned()),
+            );
+            if let BriefState::AwaitingCaptainDecision { disagreements, .. } = &record.state {
+                if let Ok(d) = serde_json::to_value(disagreements) {
+                    map.insert("_dashboard_disagreements".into(), d);
+                }
+            }
         }
+        out.push(v);
     }
     Ok(out)
+}
+
+/// Render the disagreements block for a parked brief — one row per
+/// `DisagreementSummary` plus a one-line resolution hint pointing at
+/// the `captain decide` CLI. Coder-supplied strings are html-escaped
+/// because they're free-text input from upstream and the rest of the
+/// row is unstyled markup.
+fn render_disagreements(brief_id: &str, items: &[Value]) -> String {
+    let mut rows = String::new();
+    for item in items {
+        let verb = item.get("verb").and_then(Value::as_str).unwrap_or("");
+        let applied_form = item
+            .get("applied_form")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let rationale = item.get("rationale").and_then(Value::as_str).unwrap_or("");
+        rows.push_str(&format!(
+            r#"<tr class="align-top">
+  <td class="px-2 py-1 font-mono text-xs text-slate-200">{verb}</td>
+  <td class="px-2 py-1 font-mono text-xs text-slate-400">{applied}</td>
+  <td class="px-2 py-1 text-xs text-slate-300">{rationale}</td>
+</tr>"#,
+            verb = html_escape(verb),
+            applied = html_escape(applied_form),
+            rationale = html_escape(rationale),
+        ));
+    }
+    let id_safe = html_escape(brief_id);
+    format!(
+        r#"<div class="mt-2 ml-4 p-3 rounded bg-slate-900 border border-slate-800">
+  <table class="w-full text-left">
+    <thead><tr class="text-slate-500 text-xs uppercase tracking-wider">
+      <th class="px-2 py-1">verb</th>
+      <th class="px-2 py-1">applied form</th>
+      <th class="px-2 py-1">rationale</th>
+    </tr></thead>
+    <tbody>{rows}</tbody>
+  </table>
+  <p class="mt-2 text-xs text-slate-400">Resolve via: <code class="font-mono text-slate-200">captain decide accept {id_safe}</code> OR <code class="font-mono text-slate-200">captain decide reject {id_safe} --reason '...'</code></p>
+</div>"#
+    )
+}
+
+fn html_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Discriminator string for a `BriefState` — matches the serde
+/// `tag = "kind", rename_all = "snake_case"` projection on the type
+/// so dashboard badge text aligns with what's persisted in `:state`.
+fn state_kind(state: &BriefState) -> &'static str {
+    match state {
+        BriefState::Submitted => "submitted",
+        BriefState::Authoring { .. } => "authoring",
+        BriefState::Verifying { .. } => "verifying",
+        BriefState::Reviewing { .. } => "reviewing",
+        BriefState::Reworking { .. } => "reworking",
+        BriefState::Shipping { .. } => "shipping",
+        BriefState::Watching { .. } => "watching",
+        BriefState::Extension { .. } => "extension",
+        BriefState::AwaitingCaptainDecision { .. } => "awaiting_captain_decision",
+        BriefState::Shipped => "shipped",
+        BriefState::Failed { .. } => "failed",
+    }
 }
 
 // ---------- index ----------
@@ -112,12 +208,35 @@ pub async fn index(State(state): State<AppState>) -> Result<Html<String>, AppErr
             .and_then(Value::as_str)
             .unwrap_or("?");
         let at = b.get("submitted_at").and_then(Value::as_str).unwrap_or("");
+        let kind = b
+            .get("_dashboard_state")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let state_badge = if kind.is_empty() {
+            String::new()
+        } else if kind == "awaiting_captain_decision" {
+            r#"<span class="ml-2 px-2 py-0.5 rounded text-xs font-semibold bg-amber-300 text-amber-950">⚠ AWAITING CAPTAIN DECISION</span>"#
+                .to_string()
+        } else {
+            format!(
+                r#"<span class="ml-2 px-2 py-0.5 rounded text-xs bg-slate-800 text-slate-300">{kind}</span>"#
+            )
+        };
+
+        let disagreements_section = b
+            .get("_dashboard_disagreements")
+            .and_then(Value::as_array)
+            .map(|items| render_disagreements(brief_id, items))
+            .unwrap_or_default();
+
         active_items.push_str(&format!(
             r#"<li class="py-1 border-b border-slate-800 last:border-0">
   <a class="text-indigo-300 hover:text-indigo-200 font-mono text-sm" href="/brief/{brief_id}">{brief_id}</a>
   <span class="text-slate-400 text-xs mx-2">{topology}</span>
   <span class="text-slate-500 text-xs">{at}</span>
+  {state_badge}
   {badge}
+  {disagreements_section}
 </li>"#
         ));
     }
