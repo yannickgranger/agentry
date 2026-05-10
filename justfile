@@ -293,7 +293,7 @@ dev-redis-up:
             -p 127.0.0.1:6380:6379 \
             -v agentry-dev-redis-data:/data \
             docker.io/library/redis:7-alpine \
-            redis-server --requirepass "$PW" --appendonly yes > /dev/null
+            redis-server --requirepass "$PW" --appendonly yes --maxmemory 4gb --maxmemory-policy noeviction > /dev/null
         echo "created agentry-dev-redis"
     fi
     sleep 1

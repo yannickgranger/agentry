@@ -44,8 +44,14 @@ pub async fn submit_brief(conn: &mut ConnectionManager, brief: &Brief) -> Result
         let _: () = conn.sadd(&pending_key, brief.id.0.as_str()).await?;
     }
 
-    let id: String = conn
-        .xadd(STREAM_BRIEFS, "*", &[("brief", body.as_str())])
+    let id: String = redis::cmd("XADD")
+        .arg(STREAM_BRIEFS)
+        .arg("MAXLEN")
+        .arg("~")
+        .arg(10000)
+        .arg("*")
+        .arg(&[("brief", body.as_str())])
+        .query_async(conn)
         .await?;
     Ok(id)
 }

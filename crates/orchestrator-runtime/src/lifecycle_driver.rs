@@ -358,6 +358,66 @@ async fn cleanup_brief_at(
                 "trace append for workspace-cleanup event failed"
             );
         }
+        apply_terminal_ttl(conn, brief_id).await;
+    }
+}
+
+/// Retention window applied to every `agentry:brief:{id}:*` sibling key
+/// when a brief reaches a terminal disposition (Failed or no-op
+/// Shipped). 30 days = 2_592_000 seconds. Long enough for operator
+/// forensics, short enough to keep Redis bounded in steady state.
+/// Single source of truth per the "no metric ratchets" rule generalised
+/// to retention: tunable here, no env var, no allowlist.
+pub const TERMINAL_BRIEF_TTL_SECONDS: usize = 30 * 24 * 60 * 60;
+
+/// Best-effort TTL pass over every `agentry:brief:{brief_id}:*` sibling
+/// key. Discovers keys via `SCAN` (future-proof against new sibling keys
+/// landing without an audit of this list) and sets `EXPIRE` on each to
+/// [`TERMINAL_BRIEF_TTL_SECONDS`]. Failures (key already gone, transient
+/// Redis blip) are logged at DEBUG and skipped — TTL is best-effort and
+/// must not block the FSM driver's terminal step.
+async fn apply_terminal_ttl(conn: &mut ConnectionManager, brief_id: &BriefId) {
+    let pattern = format!("agentry:brief:{}:*", brief_id.0);
+    let mut cursor: u64 = 0;
+    loop {
+        let scan: redis::RedisResult<(u64, Vec<String>)> = redis::cmd("SCAN")
+            .arg(cursor)
+            .arg("MATCH")
+            .arg(&pattern)
+            .arg("COUNT")
+            .arg(100)
+            .query_async(conn)
+            .await;
+        let (next, batch) = match scan {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::debug!(
+                    brief = %brief_id.0,
+                    error = %e,
+                    "terminal TTL SCAN failed; skipping remainder"
+                );
+                return;
+            }
+        };
+        for key in batch {
+            let res: redis::RedisResult<i64> = redis::cmd("EXPIRE")
+                .arg(&key)
+                .arg(TERMINAL_BRIEF_TTL_SECONDS)
+                .query_async(conn)
+                .await;
+            if let Err(e) = res {
+                tracing::debug!(
+                    brief = %brief_id.0,
+                    key = %key,
+                    error = %e,
+                    "terminal TTL EXPIRE failed; skipping"
+                );
+            }
+        }
+        cursor = next;
+        if cursor == 0 {
+            break;
+        }
     }
 }
 
