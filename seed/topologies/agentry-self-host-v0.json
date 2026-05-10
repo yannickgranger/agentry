@@ -33,10 +33,6 @@
     {
       "name": "ci-watcher-agentry",
       "version": 1
-    },
-    {
-      "name": "captain-decide-agentry",
-      "version": 1
     }
   ],
   "message_graph": [
@@ -95,10 +91,6 @@
     {
       "from": { "name": "shipper-agentry", "version": 1 },
       "to": { "name": "ci-watcher-agentry", "version": 1 }
-    },
-    {
-      "from": { "name": "coder-claude-agentry", "version": 1 },
-      "to": { "name": "captain-decide-agentry", "version": 1 }
     }
   ],
   "terminal_role": {
@@ -114,7 +106,6 @@
     "reviewer-mechanical-agentry": "container_bound",
     "reviewer-claude-agentry": "container_bound",
     "shipper-agentry": "container_bound",
-    "ci-watcher-agentry": "container_bound",
-    "captain-decide-agentry": "operator_gated"
+    "ci-watcher-agentry": "container_bound"
   }
 }
