@@ -431,23 +431,89 @@ position checks whether the named container (`agentry-{agent_id}`) is
 still alive via `podman ps`. The scan is non-blocking SCAN, never
 `KEYS`, so the cost is bounded on a populated production Redis.
 
-For dead containers the resume path writes a fresh
-`BriefStateRecord { state: Failed { reason: DaemonRestartedDuringExecution } }`
-back to the `:state` key and appends it to `:state_log`, so the FSM
-lands in a consistent terminal state and the operator can resubmit.
-For records whose container is found alive the 471a path is
-deliberately conservative: the record is left untouched and counted in
-`ResumeReport.kept_alive`. The follow-up brief 471b will replace that
-no-op with a true reattach into the per-brief lifecycle driver; the
-`ResumeReport` shape is stable across the change so dashboards and
-operator scripts that consume it do not need to re-key.
+Each non-terminal record lands in exactly one of three buckets, all
+exposed on `ResumeReport`:
 
-The scan is conservative by design. Losing all in-flight work on a
-restart is preferable to the pre-471a behaviour where the FSM stayed
-in `Authoring`/`Verifying`/etc forever and the dashboard showed
-phantom "running" briefs indefinitely. Terminal records (`Shipped`,
-`Failed`) are skipped silently, so re-running the scan is idempotent
-and never re-writes or duplicates `state_log` entries for already-
-finished briefs. If the operator needs the orphaned work redone they
-can resubmit with the same brief id; the new run will be a fresh
-trip through the FSM.
+- **Live container, reattach OK** → `kept_alive`. The daemon re-spawns
+  `lifecycle_driver::projector_task` for the brief: it reads the brief
+  body from `agentry:brief:{id}:body`, fetches the team topology via
+  `redis_io::fetch_team`, builds the per-phase gates with
+  `lifecycle_driver::build_phase_gates`, and hands the resulting
+  `EventSource` / `StateProjector` (constructed via the same factories
+  the original dispatch used) to a fresh `projector_task`. The
+  projector resumes reading the brief's trace stream and observes any
+  subsequent terminal event the agent container produces. The `:state`
+  record is left untouched — the brief is genuinely still in flight.
+- **Live container, reattach setup failed** → `reattach_failed`. The
+  body GET, body deserialization, team fetch, or phase-gate build
+  failed (most commonly: the body key was evicted or never written).
+  The brief is marked `Failed { DaemonRestartedDuringExecution }`
+  exactly as if the container were dead, so the FSM lands cleanly
+  terminal and the operator can resubmit. The container itself is
+  intentionally NOT killed — operator may want to inspect.
+- **Dead container** → `failed_dead`. The named container is gone (or
+  the record's state has no `agent_id` to probe). The resume path
+  writes a fresh
+  `BriefStateRecord { state: Failed { reason: DaemonRestartedDuringExecution } }`
+  back to the `:state` key and appends it to `:state_log`, so the FSM
+  lands in a consistent terminal state and the operator can resubmit.
+
+Terminal records (`Shipped`, `Failed`) are skipped silently and are
+NOT counted in `scanned`, so re-running the scan is idempotent and
+never re-writes or duplicates `state_log` entries for already-finished
+briefs. The invariant `scanned == kept_alive + failed_dead +
+reattach_failed` holds for the records the scan touched.
+
+**Reattach limitation (v0).** The reattach path only re-spawns the
+per-brief lifecycle driver — the projector that consumes the trace
+stream and writes the terminal verdict. It does NOT re-spawn the
+daemon's role chain (the in-process `handle_brief` outbox-watching
+loop). The role chain's transient state — polling cursors, in-memory
+retry budgets, semaphores — is gone at restart and is not
+reconstructed here. Concretely: a reattached brief whose coder is
+still running WILL ship the coder's work and emit the terminal verdict
+via the projector; it will NOT auto-progress to the next role in the
+chain (e.g., the reviewer is not spawned after the coder ships
+post-reattach). A v2 reattach can re-spawn the role chain via a
+follow-up brief; for v0 this is the acceptable cost for not losing all
+in-flight work on every daemon redeploy.
+
+**Trace cursor on reattach.** The new `RedisEventSource` constructed
+by the reattach factory begins reading at `"0-0"` (the spec invariant
+matches the original-dispatch cursor). The projector therefore replays
+every past trace event for the brief through `handle()`. FSM
+transitions are pure so the final state is deterministic, but the
+projector's `:state_log` XADDs are NOT idempotent — replay produces
+duplicate `:state_log` entries for transitions that already landed
+pre-restart. The terminal verdict is only emitted when the FSM
+actually reaches a terminal state, so it is NOT double-emitted at
+reattach time for in-flight briefs (their pre-restart events are not
+terminal by definition). This is the v0 cost of the cursor-from-zero
+reattach; a future slice can land a real
+`agentry:brief:{id}:state_projector_cursor` cursor in the trace-stream
+id space (the existing `:state_projector_cursor` key today carries a
+synthetic `step-N` counter, not a redis stream id, and so cannot be
+fed to `XREAD` directly).
+
+**Race: container exits between scan and projector spawn.** The boot
+scan runs `podman ps` then schedules the `projector_task` spawn; the
+container can exit in the gap. If the container produced its terminal
+trace event before exiting, the projector observes it on first
+`XREAD` and writes the verdict — same happy-path code as a normal
+shipping brief. If the container exited without emitting a terminal
+event (e.g., crashed mid-execution), the projector blocks on `XREAD`
+until the wall-clock reaper fires `BriefEvent::BudgetExhausted` into
+the trace stream, at which point the FSM's universal-aborts arm
+transitions the brief to `Failed{BudgetExhausted}` and the projector
+emits the verdict and exits. So the worst-case behaviour is "projector
+waits up to one wall-clock budget interval before terminating," not
+"projector loops forever."
+
+The pre-471a behaviour — the FSM staying in
+`Authoring`/`Verifying`/etc forever and the dashboard showing phantom
+"running" briefs indefinitely — is closed by the failed-bucket paths.
+The pre-471b behaviour — every operator-initiated daemon redeploy
+killing all in-flight work even when the containers were still
+running — is closed by the reattach (kept_alive) path. If the
+operator needs orphaned work redone, they can resubmit with the same
+brief id; the new run will be a fresh trip through the FSM.

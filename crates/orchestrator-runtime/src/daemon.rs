@@ -107,11 +107,19 @@ pub async fn run(
     // Reason::DaemonRestartedDuringExecution. A corrupt :state must not
     // prevent boot — log and continue so the daemon comes up.
     match redis_io::connect(&cfg.redis.url).await {
-        Ok(mut resume_conn) => match daemon_resume::resume_orphans(&mut resume_conn).await {
+        Ok(mut resume_conn) => match daemon_resume::resume_orphans(
+            &mut resume_conn,
+            &event_source_factory,
+            &state_projector_factory,
+            cfg,
+        )
+        .await
+        {
             Ok(report) => tracing::info!(
                 scanned = report.scanned,
                 failed_dead = report.failed_dead,
                 kept_alive = report.kept_alive,
+                reattach_failed = report.reattach_failed,
                 "boot: daemon resume scan complete",
             ),
             Err(e) => tracing::warn!(error = %e, "boot: daemon resume scan failed (non-fatal)"),
