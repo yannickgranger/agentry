@@ -24,6 +24,7 @@ path = "src/bin/captain.rs"
 
 [dependencies]
 orchestrator-types = { path = "../orchestrator-types" }
+orchestrator-infra = { path = "../orchestrator-infra" }
 schemars = { workspace = true }
 serde.workspace = true
 serde_json.workspace = true

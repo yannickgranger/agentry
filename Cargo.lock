@@ -1364,6 +1364,7 @@ dependencies = [
  "futures",
  "getrandom 0.2.17",
  "http-body-util",
+ "orchestrator-infra",
  "orchestrator-runtime",
  "orchestrator-types",
  "redis",
@@ -1377,6 +1378,22 @@ dependencies = [
  "trace-query",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "orchestrator-infra"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "figment",
+ "orchestrator-types",
+ "redis",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "toml",
 ]
 
 [[package]]
@@ -1395,6 +1412,7 @@ dependencies = [
  "futures",
  "hex",
  "humantime",
+ "orchestrator-infra",
  "orchestrator-types",
  "predicates",
  "rand_core 0.6.4",

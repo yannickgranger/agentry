@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use orchestrator_runtime::redis_io;
+use orchestrator_infra::redis_io;
 use orchestrator_types::{Brief, Verdict};
 use redis::aio::ConnectionManager;
 use redis::streams::{StreamReadOptions, StreamReadReply};

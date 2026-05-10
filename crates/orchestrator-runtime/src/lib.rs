@@ -14,10 +14,8 @@ pub mod captain_new_spec;
 pub mod cli_agents;
 pub mod cli_roles;
 pub mod cli_teams;
-pub mod config;
 pub mod daemon;
 pub mod delivery;
-pub mod errors;
 pub mod intake_validation;
 pub mod lifecycle;
 pub mod lifecycle_driver;
@@ -28,7 +26,6 @@ pub mod projector;
 pub mod reaper;
 pub mod reaper_ports;
 pub mod reaper_redis;
-pub mod redis_io;
 pub mod role_dir_loader;
 pub mod seed;
 pub mod spawner;
@@ -39,6 +36,5 @@ pub mod transcript;
 pub mod watchdog;
 pub mod workspace;
 
-pub use config::Config;
-
-pub use errors::{Error, Result};
+pub use orchestrator_infra::{config, errors, redis_io};
+pub use orchestrator_infra::{Config, Error, Result};
