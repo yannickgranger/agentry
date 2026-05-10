@@ -3,9 +3,14 @@
 > Status: **draft**. Council-authored 2026-05-09 to canonicalize the
 > routing-key concept currently scattered across `brief.payload.target_repo:
 > String`, `Project.repo_url: Option<String>`, and `Project.forges:
-> Vec<String>`. Type lands in this brief; migration of the 60+ existing
-> call sites proceeds brief-by-brief per the migration plan below; new
-> ad-hoc construction is fenced by `.cfdb/queries/arch-ban-target-repo-*.cypher`.
+> Vec<String>`. The typed surface (`TargetRepo`, `TargetRepoParseError`,
+> `Brief::target_repo()`) lands in brief 1a; the security gates
+> (intake REJECT for missing `target_repo`, owner-allowlist intersection,
+> collision-resistant slug, typed clone-URL builder migration, removal of
+> `unwrap_or("_unknown")` fallbacks) ship in brief 1b on top of this
+> scaffold. Migration of the 60+ existing call sites proceeds brief-by-brief
+> per the migration plan below; new ad-hoc construction is fenced by
+> `.cfdb/queries/arch-ban-target-repo-*.cypher`.
 
 `target_repo` names the repository a brief acts on. It is the routing
 key for the daemon, the cfdb keyspace selector, the credential-scope
@@ -25,10 +30,12 @@ forge identity, owner, and repo name as typed fields (`forge`, `owner`,
 newtype in a follow-up Configuration council).
 
 Construction is monopolistic: `TargetRepo::from_str` is the sole
-parser. It accepts both bare `owner/repo` (binding `forge` from
-`ForgeConfig.default_host` at parse time and capturing the resolved
-value into the type) and forge-qualified `forge:owner/repo` (forward-
-compatible with the eventual Shape C migration on `Project.forges[]`).
+parser. It accepts both bare `owner/repo` (binding `forge` to a
+placeholder constant in brief 1a — brief 1b / a follow-up Configuration
+council swaps in real default-forge resolution from
+`ForgeConfig.default_host`) and forge-qualified `forge:owner/repo`
+(forward-compatible with the eventual Shape C migration on
+`Project.forges[]`).
 
 `TargetRepo::Display` emits the bare `owner/repo` form for wire
 compatibility with existing brief payloads and dispatched briefs in
@@ -73,76 +80,101 @@ parse errors with transport errors.
 
 #### Operational invariants (not enforced by graph-specs)
 
-- **Construction is monopolistic.** Every `TargetRepo` is constructed
-  by `TargetRepo::from_str` or its serde `Deserialize` impl (which
-  delegates to `from_str`). No alternative parse paths in production
-  code.
+Each invariant is annotated with the brief that lands it. Brief 1a lands
+the typed surface, the lazy `Brief::target_repo()` accessor, and the two
+cfdb fence rules listed under the migration plan. Brief 1b lands the
+security gates (intake REJECT, owner-allowlist intersection, collision-
+resistant slug, typed clone-URL builder migration, removal of legacy
+parse fallbacks at the production call sites).
 
-- **Wire shape is bare `owner/repo`.** `brief.payload.target_repo` is
-  a JSON string in `<owner>/<repo>` form. The forge identity is bound
-  at parse time from `ForgeConfig.default_host` and captured into the
-  typed value; it is not re-resolved per use site. This preserves
-  wire compatibility with every dispatched brief in flight while
-  giving downstream callers a self-contained typed value.
+- **Construction is monopolistic.** *(Brief 1a — typed surface.)* Every
+  `TargetRepo` in production code is constructed by `TargetRepo::from_str`
+  or its serde `Deserialize` impl (which delegates to `from_str`). No
+  alternative parse paths in production code; legacy free-fn parsers
+  (`parse_target_repo`, `sanitize_target_repo_slug`) are fenced by the
+  cfdb rules below — the slug free-fn remains as a transitional bridge
+  with a single migration-window caller (`for_target_repo`) that
+  delegates to `TargetRepo::slug()` for valid inputs.
 
-- **Charset and shape (parse-time validation).** Owner and repo each
-  match `^[A-Za-z0-9._-]{1,64}$`; neither starts with `.` or `-`.
-  Total length ≤ 200 bytes. Inputs failing this rule are rejected at
-  intake; they never reach slug derivation, clone-URL construction,
-  or permit-mint.
+- **Wire shape is bare `owner/repo`.** *(Brief 1a — typed surface.)*
+  `brief.payload.target_repo` is a JSON string in `<owner>/<repo>` form.
+  In brief 1a the forge identity is bound to a placeholder constant
+  (`agency-default`) at parse time and captured into the typed value;
+  brief 1b (or a follow-up Configuration council) replaces the
+  placeholder with real default-forge resolution from
+  `ForgeConfig.default_host`. The wire shape itself is preserved across
+  every dispatched brief in flight.
 
-- **No `_unknown` fallback.** A brief whose payload lacks
-  `target_repo` is rejected at intake with
-  `IntakeError::MissingTargetRepo`. There is no shared keyspace, no
-  fallback slug, no `_unknown` literal anywhere in source. The
-  `unwrap_or("_unknown")` patterns at `intake_validation.rs:55` and
-  `daemon.rs:188` are removed in this brief.
+- **Charset and shape (parse-time validation).** *(Brief 1a — typed
+  surface.)* Owner and repo each match `^[A-Za-z0-9._-]{1,64}$`; neither
+  starts with `.` or `-`. Total length ≤ 200 bytes. `TargetRepo::from_str`
+  enforces the rule today. Brief 1b adds intake REJECT so failing inputs
+  never reach slug derivation, clone-URL construction, or permit-mint;
+  in 1a the validator is reachable but not yet hooked to intake.
 
-- **Owner-allowlist intersection at intake.** The brief's
-  `target_repo.owner()` MUST be present in
-  `cfg.forge.allowed_owners` before intake admits the brief.
-  Out-of-allowlist owners are rejected before clone, extract, or
+- **No `_unknown` fallback.** *(Brief 1b — security gate.)* A brief
+  whose payload lacks `target_repo` will be rejected at intake with
+  `IntakeError::MissingTargetRepo`; the shared `_unknown` keyspace and
+  fallback slug will be removed. The current `unwrap_or("_unknown")`
+  patterns at `intake_validation.rs:55` and `daemon.rs:188` are NOT
+  touched by brief 1a — they are scoped to brief 1b alongside the
+  intake-REJECT path. Brief 1a's `Brief::target_repo()` accessor
+  returns `Option<TargetRepo>` precisely because the upstream `_unknown`
+  fallback still exists.
+
+- **Owner-allowlist intersection at intake.** *(Brief 1b — security
+  gate.)* The brief's `target_repo.owner()` will be required to be
+  present in `cfg.forge.allowed_owners` before intake admits the brief.
+  Out-of-allowlist owners will be rejected before clone, extract, or
   spawn — defense in depth ahead of the permit-broker
-  `forge:write:<owner>/*` gate. This closes the
-  permit-scope-decoupled gap where a brief targeting an
-  out-of-allowlist owner currently reaches filesystem extraction,
-  clone (with token), and container spawn before the eventual
-  `forge:write` is blocked.
+  `forge:write:<owner>/*` gate. Brief 1a does NOT add this check; the
+  permit-scope-decoupled gap where a brief targeting an out-of-allowlist
+  owner reaches filesystem extraction, clone (with token), and container
+  spawn before the eventual `forge:write` is blocked remains open until
+  brief 1b lands.
 
-- **Slug derivation is collision-resistant.** `TargetRepo::slug()`
-  first encodes `_` → `__` in the input, then applies the byte map
-  (replace non-alphanumeric/`_` with `_`). This makes derivation
-  injective over `[A-Za-z0-9._-]/[A-Za-z0-9._-]`: distinct
-  `(owner, repo)` tuples produce distinct slugs. The cache marker
-  (`<slug>.head_sha`) and cfdb keyspace are now collision-free,
-  closing the cross-target data-leak path where `yg/foo` and
-  `yg_foo` collapsed to the same slug.
+- **Slug derivation is collision-resistant.** *(Brief 1b — security
+  gate.)* `TargetRepo::slug()` will first encode `_` → `__` in the
+  input, then apply the byte map (replace non-alphanumeric/`_` with
+  `_`), making derivation injective over `[A-Za-z0-9._-]/[A-Za-z0-9._-]`.
+  Brief 1a deliberately does NOT add the `_` → `__` pre-encoding: the
+  1a `slug()` body produces byte-identical output to the legacy
+  `sanitize_target_repo_slug` to preserve cache markers
+  (`<slug>.head_sha`) and cfdb keyspace names for the single in-flight
+  production routing key (`yg/agentry`). The cross-target collision
+  path where `yg/foo` and `yg_foo` collapse to the same slug remains
+  open until brief 1b ships.
 
-- **No raw `target_repo` interpolation into URLs.** Clone-URL
-  construction goes through `TargetRepo::clone_url(&forge_host)`. The
-  pattern `format!("https://...{target_repo}.git")` is forbidden in
-  production code. This closes the token-exfiltration vector at
-  `daemon.rs:1470-1475` where a `target_repo` like
-  `yg/agentry@evil.example.com/foo` could redirect the
-  token-bearing clone to an attacker-controlled host.
+- **No raw `target_repo` interpolation into URLs.** *(Brief 1b —
+  security gate.)* Clone-URL construction will go through
+  `TargetRepo::clone_url(&forge_host)`; the pattern
+  `format!("https://...{target_repo}.git")` will be forbidden in
+  production code. Brief 1a defines the `clone_url` method on the typed
+  value but does NOT migrate the existing daemon and shipper call sites
+  to use it. The token-exfiltration vector at `daemon.rs:1470-1475`
+  where a `target_repo` like `yg/agentry@evil.example.com/foo` could
+  redirect the token-bearing clone to an attacker-controlled host
+  remains open until brief 1b lands.
 
-- **`Brief::target_repo()` is the sole accessor.** Direct
-  `brief.payload.get("target_repo")` outside
-  `orchestrator-types::brief` is a cfdb ban-rule violation after the
-  role-runner sweep completes (brief 3 of the migration). Until
-  then it remains an operational invariant for new code.
+- **`Brief::target_repo()` is the sole accessor.** *(Brief 1a —
+  accessor; brief 3 — broad ban rule.)* Brief 1a adds the lazy
+  `Brief::target_repo()` accessor on `orchestrator-types::brief`.
+  Direct `brief.payload.get("target_repo")` outside that module
+  becomes a cfdb ban-rule violation after the role-runner sweep
+  completes (brief 3 of the migration). Until then it is an
+  operational invariant for new code only.
 
-- **`Project.repo_url` is a derived field.** Computed from the
-  primary `TargetRepo` + forge host at workspace-allocation time.
-  Not stored independently going forward. Slated for removal in a
-  follow-up Project/Registry council.
+- **`Project.repo_url` is a derived field.** *(Out of scope for the
+  brief 1 sequence.)* Will be computed from the primary `TargetRepo`
+  + forge host at workspace-allocation time, not stored independently.
+  Slated for removal in a follow-up Project/Registry council.
 
-- **`Project.forges[]` is a different concept.** A 1:N enumeration of
-  forge identities the project participates in, NOT a list of
-  routing keys. NOT a synonym for `target_repo`. The forge-prefixed
-  shorthand `agency:yg/qbot-core` lives there as a project-level
-  enumeration; the per-brief routing key is always a single
-  `TargetRepo`.
+- **`Project.forges[]` is a different concept.** *(Documentation only —
+  no behavior change in any brief.)* A 1:N enumeration of forge
+  identities the project participates in, NOT a list of routing keys.
+  NOT a synonym for `target_repo`. The forge-prefixed shorthand
+  `agency:yg/qbot-core` lives there as a project-level enumeration;
+  the per-brief routing key is always a single `TargetRepo`.
 
 #### Context mapping
 
@@ -239,9 +271,34 @@ council survey.
 
 #### Migration plan
 
-This brief (brief 1 of the canonical sequence) lands the spec, the
-typed surface, the security gates, and two cfdb rules. The remaining
-two briefs follow:
+The canonical migration sequence is brief 1a → 1b → 2 → 3. Brief 1a is
+the substrate; the remaining briefs build on it incrementally.
+
+- **Brief 1a (this brief)** — lands the spec, the canonical
+  `TargetRepo` and `TargetRepoParseError` types in
+  `orchestrator-types`, the lazy `Brief::target_repo()` accessor, and
+  two cfdb fence rules
+  (`arch-ban-target-repo-slug-free-fn.cypher`,
+  `arch-ban-parse-target-repo-free-fn.cypher`). Migrates the existing
+  `parse_target_repo` callsite in `redis_io::fetch_profile` to delegate
+  through `TargetRepo::from_str`, deletes `parse_target_repo`, and
+  bridges `sanitize_target_repo_slug` through `TargetRepo::slug()` for
+  valid inputs while preserving the legacy byte-map for inputs the
+  strict validator rejects (transitional fallback, removed in brief
+  1b). ZERO behavior change is visible to dispatched briefs after this
+  lands: same wire shape, same slug bytes for the in-flight production
+  routing key (`yg/agentry`), same forge API URL composition.
+
+- **Brief 1b** — lands the security gates on top of the 1a substrate:
+  intake REJECT for missing/malformed `target_repo` (removing the
+  `unwrap_or("_unknown")` fallbacks at `intake_validation.rs:55` and
+  `daemon.rs:188`), owner-allowlist intersection at intake,
+  collision-resistant slug (`_` → `__` pre-encoding in
+  `TargetRepo::slug()`), migration of the daemon and shipper clone
+  call sites to `TargetRepo::clone_url(&forge_host)`, and removal of
+  the transitional fallback in `sanitize_target_repo_slug`. May
+  introduce additional cfdb fence rules covering the
+  `format!("https://...{target_repo}.git")` interpolation pattern.
 
 - **Brief 2** — sweep role-runner direct payload reads. Adds
   `agentry-role-runtime::ParsedBundle::target_repo()` typed bundle
@@ -255,7 +312,7 @@ two briefs follow:
   completes the sweep.
 
 The dogfood team's own use of `target_repo: "yg/agentry"` MUST remain
-wire-compatible across all three briefs. The JSON payload shape is
+wire-compatible across all four briefs. The JSON payload shape is
 `{"target_repo": "<owner>/<repo>", ...}` and remains valid input to
 the daemon throughout. Renaming the JSON key, adding a required
 top-level `target_repo` field on `Brief`, or removing the
