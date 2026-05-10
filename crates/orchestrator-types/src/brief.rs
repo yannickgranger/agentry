@@ -3,9 +3,11 @@
 //! Submitted on the `agentry:briefs` Redis stream. Immutable after submission.
 //! Scope changes = a new Brief with `parent_brief` set.
 
+use crate::target_repo::TargetRepo;
 use crate::{now, Ts, VersionedRef};
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::str::FromStr;
 
 /// Brief identifier: `brf_<uuidv7>`. Sortable by creation time.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -156,5 +158,19 @@ impl Brief {
     pub fn with_cohort_labels(mut self, labels: Vec<String>) -> Self {
         self.cohort_labels = labels;
         self
+    }
+
+    /// Lazy accessor for the brief's `target_repo` routing key.
+    ///
+    /// Reads `payload.target_repo` as a JSON string and parses it through
+    /// [`TargetRepo::from_str`]. Returns `None` when the field is absent,
+    /// non-string, or fails parse validation. Every call re-parses; no
+    /// caching.
+    #[must_use]
+    pub fn target_repo(&self) -> Option<TargetRepo> {
+        self.payload
+            .get("target_repo")
+            .and_then(|v| v.as_str())
+            .and_then(|s| TargetRepo::from_str(s).ok())
     }
 }

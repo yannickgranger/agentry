@@ -18,6 +18,7 @@ pub mod profile;
 pub mod project;
 pub mod review;
 pub mod role;
+pub mod target_repo;
 pub mod team;
 pub mod verdict;
 
@@ -37,6 +38,7 @@ pub use role::{
     merge_role_with_packs, AgentRole, AllowedTools, Mount, PackageManager, RoleName, RoleRef,
     SubstrateClass, ToolPack, WorkspaceMount,
 };
+pub use target_repo::{TargetRepo, TargetRepoParseError};
 pub use team::{MessageEdge, PermitOverrides, TeamName, TeamTopology};
 
 /// Apply a `PermitOverrides` payload to an already-minted permit, in place.

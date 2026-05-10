@@ -5,10 +5,11 @@ use base64::Engine;
 use orchestrator_types::lifecycle::MAXIMUM_ATTEMPT_CAP;
 use orchestrator_types::{
     parse_profile_toml, AgentRole, Brief, BriefId, Event, Profile, ProfileParseError, Project,
-    RoleName, TeamName, TeamTopology, ToolPack, Verdict, VersionedRef,
+    RoleName, TargetRepo, TeamName, TeamTopology, ToolPack, Verdict, VersionedRef,
 };
 use redis::aio::ConnectionManager;
 use redis::AsyncCommands;
+use std::str::FromStr;
 
 /// Stream names.
 pub const STREAM_BRIEFS: &str = "agentry:briefs";
@@ -401,7 +402,10 @@ pub async fn fetch_profile(
     forge_token: &str,
     tls_insecure: bool,
 ) -> std::result::Result<Option<Profile>, ProfileFetchError> {
-    let (owner, repo) = parse_target_repo(target_repo)?;
+    let parsed_target = TargetRepo::from_str(target_repo)
+        .map_err(|_| ProfileFetchError::MalformedTargetRepo(target_repo.to_string()))?;
+    let owner = parsed_target.owner();
+    let repo = parsed_target.repo();
     let url = format!(
         "https://{forge_host}/api/v1/repos/{owner}/{repo}/contents/.agentry/profile.toml?ref={base_branch}"
     );
@@ -452,16 +456,4 @@ pub async fn fetch_profile_url(
     let profile = parse_profile_toml(&text)
         .map_err(|ProfileParseError::Toml(e)| ProfileFetchError::Parse(e))?;
     Ok(Some(profile))
-}
-
-fn parse_target_repo(target_repo: &str) -> std::result::Result<(&str, &str), ProfileFetchError> {
-    let (owner, repo) = target_repo
-        .split_once('/')
-        .ok_or_else(|| ProfileFetchError::MalformedTargetRepo(target_repo.to_string()))?;
-    if owner.is_empty() || repo.is_empty() || repo.contains('/') {
-        return Err(ProfileFetchError::MalformedTargetRepo(
-            target_repo.to_string(),
-        ));
-    }
-    Ok((owner, repo))
 }

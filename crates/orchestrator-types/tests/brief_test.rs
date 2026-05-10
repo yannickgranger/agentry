@@ -4,6 +4,36 @@ use orchestrator_types::{
 };
 use serde_json::json;
 
+fn brief_with_payload(payload: serde_json::Value) -> Brief {
+    Brief::new("tests", VersionedRef::new("topology", 1), payload)
+}
+
+#[test]
+fn target_repo_returns_some_for_valid_payload() {
+    let b = brief_with_payload(json!({ "target_repo": "yg/agentry" }));
+    let tr = b.target_repo().expect("must parse");
+    assert_eq!(tr.owner(), "yg");
+    assert_eq!(tr.repo(), "agentry");
+}
+
+#[test]
+fn target_repo_returns_none_when_field_missing() {
+    let b = brief_with_payload(json!({}));
+    assert!(b.target_repo().is_none());
+}
+
+#[test]
+fn target_repo_returns_none_when_payload_null() {
+    let b = brief_with_payload(serde_json::Value::Null);
+    assert!(b.target_repo().is_none());
+}
+
+#[test]
+fn target_repo_returns_none_for_malformed_string() {
+    let b = brief_with_payload(json!({ "target_repo": "yg/agentry@evil" }));
+    assert!(b.target_repo().is_none());
+}
+
 #[test]
 fn brief_roundtrip_json() {
     let b = Brief::new(
