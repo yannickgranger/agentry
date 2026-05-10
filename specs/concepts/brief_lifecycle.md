@@ -518,6 +518,16 @@ running — is closed by the reattach (kept_alive) path. If the
 operator needs orphaned work redone, they can resubmit with the same
 brief id; the new run will be a fresh trip through the FSM.
 
+Briefs in AwaitingCaptainDecision state also reattach on boot —
+projector_task is re-spawned to consume the eventual CaptainAccepted
+or CaptainRejected event the operator will push via captain decide
+CLI. No agent container check is needed for this state; the brief is
+operator-gated, not container-gated. Other non-Authoring non-terminal
+states (Verifying, Reviewing, Shipping, Watching, Extension) continue
+to be marked Failed{DaemonRestartedDuringExecution} on boot — closing
+that gap requires the role-chain re-spawn story which lives in a
+future brief.
+
 ## DisagreementSummary
 
 One coder-flagged disagreement with a brief verb. The struct carries
