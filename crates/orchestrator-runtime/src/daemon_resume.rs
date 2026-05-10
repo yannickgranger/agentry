@@ -1,26 +1,35 @@
 //! Boot-time orphan scan: walks every non-terminal `agentry:brief:*:state`
-//! key and marks the brief `Failed { DaemonRestartedDuringExecution }` when
-//! its named container is no longer alive. Closes the operational hole
-//! where any `orchestratord` restart silently orphans every in-flight
-//! brief — see issue #471.
+//! key and either reattaches to its still-running container by re-spawning
+//! the per-brief lifecycle driver task, or marks the brief
+//! `Failed { DaemonRestartedDuringExecution }` when the named container is
+//! gone. Closes the operational hole where any `orchestratord` restart
+//! either silently orphaned every in-flight brief (#471) or — post-471a
+//! but pre-471b — killed every alive in-flight brief on every redeploy.
 //!
-//! This is the conservative fail-only path of the proposed fix. The
-//! container-alive REATTACH happy path is deferred to a follow-up brief
-//! 471b; until then, an alive container is left as-is and `kept_alive` in
-//! the returned [`ResumeReport`] always stays at zero (the field is kept
-//! for shape stability across the 471b change).
+//! 471a delivered the conservative fail-only path. 471b adds the reattach
+//! happy path: when the agent container is still alive, the daemon
+//! re-spawns `lifecycle_driver::projector_task` for the brief and lets
+//! the projector resume reading from the brief's trace stream cursor.
 
-use crate::{Error, Result};
+use crate::lifecycle::{EventSource, StateProjector};
+use crate::{lifecycle_driver, Config, Error, Result};
+use orchestrator_infra::redis_io;
 use orchestrator_types::lifecycle::{BriefState, BriefStateRecord, Reason};
-use orchestrator_types::now;
+use orchestrator_types::{now, Brief, BriefId};
 use redis::aio::ConnectionManager;
 use redis::AsyncCommands;
+use std::sync::Arc;
 
 /// Counts emitted at the end of one [`resume_orphans`] sweep.
 ///
-/// `kept_alive` is always zero in the 471a fail-only path; the field
-/// exists so the report shape stays stable when 471b lands the reattach
-/// branch.
+/// `kept_alive` is the count of briefs whose container was alive at scan
+/// time AND whose lifecycle driver was successfully re-spawned. A brief
+/// whose container was alive but whose reattach setup failed (body
+/// missing, team lookup failed, etc.) lands in `reattach_failed` instead
+/// — its `:state` is rewritten to `Failed { DaemonRestartedDuringExecution }`
+/// just like a dead-container brief, but the operator-visible counter is
+/// distinct so a half-live recovery is not conflated with a clean
+/// dead-on-arrival case.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResumeReport {
     /// Total non-terminal `:state` records the scan inspected (terminal
@@ -29,18 +38,32 @@ pub struct ResumeReport {
     /// Records transitioned to `Failed { DaemonRestartedDuringExecution }`
     /// because the named container was not alive.
     pub failed_dead: usize,
-    /// Records whose container was found alive — left untouched for the
-    /// future 471b reattach. Always zero in the 471a path.
+    /// Records whose container was alive and whose lifecycle driver was
+    /// successfully re-spawned (the projector resumes reading from the
+    /// brief's trace stream cursor).
     pub kept_alive: usize,
+    /// Count of briefs whose container was alive at scan time but
+    /// reattach failed (e.g., body deserialization, team lookup). These
+    /// briefs are marked `Failed { DaemonRestartedDuringExecution }` and
+    /// their containers are NOT killed (operator may want to inspect).
+    pub reattach_failed: usize,
 }
 
-/// Walk every `agentry:brief:*:state` key, fail any non-terminal record
-/// whose container is no longer alive, and return a [`ResumeReport`].
+/// Walk every `agentry:brief:*:state` key. For each non-terminal record,
+/// either reattach (live container, projector_task spawned) or mark the
+/// brief `Failed { DaemonRestartedDuringExecution }` (dead container or
+/// reattach setup failure). Returns the per-bucket counts as a
+/// [`ResumeReport`].
 ///
 /// The function never panics. Per-record failures (deserialize errors,
 /// SET/XADD failures) are logged at WARN and the scan continues; only a
 /// SCAN-cursor backend error short-circuits with `Err`.
-pub async fn resume_orphans(conn: &mut ConnectionManager) -> Result<ResumeReport> {
+pub async fn resume_orphans(
+    conn: &mut ConnectionManager,
+    event_source_factory: &Arc<dyn Fn(BriefId) -> Box<dyn EventSource + Send> + Send + Sync>,
+    state_projector_factory: &Arc<dyn Fn(BriefId) -> Box<dyn StateProjector + Send> + Send + Sync>,
+    cfg: &Config,
+) -> Result<ResumeReport> {
     tracing::info!("resume scan begun");
 
     let keys = scan_state_keys(conn).await?;
@@ -49,6 +72,7 @@ pub async fn resume_orphans(conn: &mut ConnectionManager) -> Result<ResumeReport
         scanned: 0,
         failed_dead: 0,
         kept_alive: 0,
+        reattach_failed: 0,
     };
 
     for key in keys {
@@ -85,66 +109,176 @@ pub async fn resume_orphans(conn: &mut ConnectionManager) -> Result<ResumeReport
         // Without an agent_id we cannot probe a container — treat as
         // dead and fail conservatively. Past-Authoring states (Verifying,
         // Reviewing, Reworking, Shipping, Watching, Extension) fall in
-        // this bucket today; 471b can refine once it has a per-role
-        // agent inventory to consult.
+        // this bucket today; a future brief can refine once a per-role
+        // agent inventory is queryable here.
         let alive = match agent_id {
             Some(id) => container_alive(id).await,
             None => false,
         };
 
         if alive {
-            report.kept_alive += 1;
-            continue;
-        }
-
-        let new_record = BriefStateRecord {
-            brief_id: brief_id.clone(),
-            state: BriefState::Failed {
-                reason: Reason::DaemonRestartedDuringExecution,
-            },
-            parent_brief_id: record.parent_brief_id.clone(),
-            composition_role: record.composition_role.clone(),
-            at: now(),
-        };
-
-        let json = match serde_json::to_string(&new_record) {
-            Ok(j) => j,
-            Err(e) => {
-                tracing::warn!(brief = %brief_id.0, error = %e, "resume: serialize failed, skipping");
-                continue;
-            }
-        };
-
-        let state_key = format!("agentry:brief:{}:state", brief_id.0);
-        let log_key = format!("agentry:brief:{}:state_log", brief_id.0);
-
-        if let Err(e) = conn.set::<_, _, ()>(&state_key, json.as_str()).await {
-            tracing::warn!(brief = %brief_id.0, error = %e, "resume: SET state failed, skipping");
-            continue;
-        }
-        if let Err(e) = conn
-            .xadd::<_, _, _, _, String>(&log_key, "*", &[("record", json.as_str())])
+            match reattach_brief(
+                &brief_id,
+                event_source_factory,
+                state_projector_factory,
+                cfg,
+                conn,
+            )
             .await
-        {
-            tracing::warn!(brief = %brief_id.0, error = %e, "resume: XADD state_log failed (state already updated)");
+            {
+                Ok(()) => {
+                    tracing::info!(
+                        brief = %brief_id.0,
+                        agent = ?agent_id,
+                        "resume: reattached lifecycle driver to live container",
+                    );
+                    report.kept_alive += 1;
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        brief = %brief_id.0,
+                        agent = ?agent_id,
+                        error = %e,
+                        "resume: reattach failed; falling through to mark Failed",
+                    );
+                    if mark_failed(conn, &record).await {
+                        report.reattach_failed += 1;
+                    }
+                    continue;
+                }
+            }
         }
 
-        tracing::info!(
-            brief = %brief_id.0,
-            agent = ?agent_id,
-            "resume: marked Failed {{ DaemonRestartedDuringExecution }}",
-        );
-        report.failed_dead += 1;
+        if mark_failed(conn, &record).await {
+            report.failed_dead += 1;
+        }
     }
 
     tracing::info!(
         scanned = report.scanned,
         failed_dead = report.failed_dead,
         kept_alive = report.kept_alive,
+        reattach_failed = report.reattach_failed,
         "resume scan complete",
     );
 
     Ok(report)
+}
+
+/// Re-spawn the per-brief `lifecycle_driver::projector_task` for a brief
+/// whose container is still alive on boot. Constructs the same
+/// `EventSource` / `StateProjector` shape the original dispatch used and
+/// hands them to `projector_task`; the projector resumes from the trace
+/// stream cursor and observes any subsequent terminal event the
+/// container produces.
+///
+/// **Limitation (v0 reattach).** This brief (471b) does NOT reattach the
+/// role-chain side of the original dispatch (`handle_brief`'s
+/// outbox-watching loop). The role chain's in-process state — polling
+/// cursors, in-memory retry budgets, semaphores — is gone at restart,
+/// and faithfully resurrecting it is out of scope here. The agent
+/// container itself keeps producing trace events that the new projector
+/// consumes: if the container completes normally the projector observes
+/// the terminal event and writes the verdict via the existing
+/// terminal-emit code path; if the container produces an error event
+/// the FSM transitions to `Failed` via the existing universal handler.
+/// The single observable loss is the role chain's ability to dispatch
+/// the NEXT role in the chain (e.g., spawn the reviewer after the
+/// coder ships) — post-reattach briefs DO complete the in-flight role's
+/// work but do NOT auto-progress to the next role. A v2 reattach can
+/// re-spawn the role chain via a follow-up brief; for v0 this is the
+/// acceptable cost for not losing all in-flight work on every redeploy.
+async fn reattach_brief(
+    brief_id: &BriefId,
+    event_source_factory: &Arc<dyn Fn(BriefId) -> Box<dyn EventSource + Send> + Send + Sync>,
+    state_projector_factory: &Arc<dyn Fn(BriefId) -> Box<dyn StateProjector + Send> + Send + Sync>,
+    cfg: &Config,
+    conn: &mut ConnectionManager,
+) -> Result<()> {
+    // cfg is threaded through for forward-compat with future reattach
+    // policy (e.g., per-config wallclock fence on reattach age) — the v0
+    // reattach does not consult it.
+    let _ = cfg;
+
+    let body_key = format!("agentry:brief:{}:body", brief_id.0);
+    let raw: Option<String> = conn
+        .get(&body_key)
+        .await
+        .map_err(|e| Error::Config(format!("reattach: GET {body_key}: {e}")))?;
+    let raw = raw.ok_or_else(|| {
+        Error::Config(format!(
+            "reattach: missing brief body at {body_key}; cannot resolve topology"
+        ))
+    })?;
+    let brief: Brief = serde_json::from_str(&raw)
+        .map_err(|e| Error::Config(format!("reattach: deserialize brief body: {e}")))?;
+
+    let team = redis_io::fetch_team(conn, &brief.topology)
+        .await
+        .map_err(|e| Error::Config(format!("reattach: fetch_team: {e}")))?;
+    let phase_gates = Arc::new(lifecycle_driver::build_phase_gates(&team));
+
+    let event_source = (event_source_factory)(brief_id.clone());
+    let state_projector = (state_projector_factory)(brief_id.clone());
+    let verdict_conn = conn.clone();
+
+    tokio::spawn(lifecycle_driver::projector_task(
+        brief_id.clone(),
+        event_source,
+        state_projector,
+        Some(verdict_conn),
+        phase_gates,
+    ));
+
+    Ok(())
+}
+
+/// Write `Failed { DaemonRestartedDuringExecution }` for the given
+/// non-terminal record. Returns `true` if the SET landed (the XADD to
+/// `:state_log` is best-effort — its failure is logged but does not
+/// flip the return value, mirroring 471a behaviour). Returns `false`
+/// only on serialization or SET failure, in which case nothing was
+/// written and the caller should NOT bump any counter for this record.
+async fn mark_failed(conn: &mut ConnectionManager, record: &BriefStateRecord) -> bool {
+    let brief_id = record.brief_id.clone();
+    let new_record = BriefStateRecord {
+        brief_id: brief_id.clone(),
+        state: BriefState::Failed {
+            reason: Reason::DaemonRestartedDuringExecution,
+        },
+        parent_brief_id: record.parent_brief_id.clone(),
+        composition_role: record.composition_role.clone(),
+        at: now(),
+    };
+
+    let json = match serde_json::to_string(&new_record) {
+        Ok(j) => j,
+        Err(e) => {
+            tracing::warn!(brief = %brief_id.0, error = %e, "resume: serialize failed, skipping");
+            return false;
+        }
+    };
+
+    let state_key = format!("agentry:brief:{}:state", brief_id.0);
+    let log_key = format!("agentry:brief:{}:state_log", brief_id.0);
+
+    if let Err(e) = conn.set::<_, _, ()>(&state_key, json.as_str()).await {
+        tracing::warn!(brief = %brief_id.0, error = %e, "resume: SET state failed, skipping");
+        return false;
+    }
+    if let Err(e) = conn
+        .xadd::<_, _, _, _, String>(&log_key, "*", &[("record", json.as_str())])
+        .await
+    {
+        tracing::warn!(brief = %brief_id.0, error = %e, "resume: XADD state_log failed (state already updated)");
+    }
+
+    tracing::info!(
+        brief = %brief_id.0,
+        "resume: marked Failed {{ DaemonRestartedDuringExecution }}",
+    );
+    true
 }
 
 async fn scan_state_keys(conn: &mut ConnectionManager) -> Result<Vec<String>> {
