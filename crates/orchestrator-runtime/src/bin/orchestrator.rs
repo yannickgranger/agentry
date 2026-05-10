@@ -6,8 +6,8 @@
 
 use clap::{Parser, Subcommand};
 use orchestrator_runtime::{
-    cli_agents, cli_roles, cli_teams, permit, redis_io, seed, state, submit_shape_check, Config,
-    Result,
+    cli_abort, cli_agents, cli_roles, cli_teams, permit, redis_io, seed, state, submit_shape_check,
+    Config, Error, Result,
 };
 use orchestrator_types::Brief;
 use std::path::{Path, PathBuf};
@@ -33,10 +33,22 @@ enum Cmd {
         #[arg(short, long, default_value_t = 10)]
         count: usize,
     },
-    /// Abort running briefs (M0: kills all labelled containers).
+    /// Abort briefs. Either `--all` (kills all agentry-labelled containers,
+    /// M0 behavior preserved for compat) or `<brief_id>` (surgical: pushes
+    /// AbortRequested event for the named brief, FSM transitions to Failed
+    /// via universal handler).
     Abort {
         #[arg(long)]
         all: bool,
+        /// Brief id to abort surgically. Mutually useful with `--all`: when
+        /// `--all` is set the positional is ignored.
+        brief_id: Option<String>,
+        /// Preserve the brief's workspace dir on disk for forensics.
+        #[arg(long, default_value_t = false)]
+        keep_workspace: bool,
+        /// Preserve the brief's trace stream and state_log for replay/debug.
+        #[arg(long, default_value_t = false)]
+        keep_trace: bool,
     },
     /// Generate an ed25519 signing key for permits (M3).
     KeyGen {
@@ -169,7 +181,12 @@ async fn main() -> Result<()> {
             permit::generate_and_save(path)?;
             println!("{{\"generated\":true,\"path\":\"{}\"}}", path.display());
         }
-        Cmd::Abort { all } => {
+        Cmd::Abort {
+            all,
+            brief_id,
+            keep_workspace,
+            keep_trace,
+        } => {
             if all {
                 // Kill all agentry-labelled containers via podman.
                 let out = tokio::process::Command::new("podman")
@@ -183,9 +200,20 @@ async fn main() -> Result<()> {
                         .output()
                         .await;
                 }
-                println!("{{\"aborted\":true}}");
+                println!("{{\"aborted\":true,\"mode\":\"all\"}}");
+            } else if let Some(brief_id) = brief_id {
+                match cli_abort::run_per_brief_abort(&cfg, &brief_id, keep_workspace, keep_trace)
+                    .await
+                {
+                    Ok(()) => {}
+                    Err(Error::NotFound { kind: "brief", key }) => {
+                        eprintln!("no such brief: {key}");
+                        std::process::exit(1);
+                    }
+                    Err(e) => return Err(e),
+                }
             } else {
-                eprintln!("abort requires --all for M0");
+                eprintln!("abort requires either --all or <brief_id>");
                 std::process::exit(2);
             }
         }

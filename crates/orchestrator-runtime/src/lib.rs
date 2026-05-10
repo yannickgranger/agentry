@@ -11,6 +11,7 @@ pub mod anchor_resolver;
 pub mod captain_ground;
 pub mod captain_ground_cache;
 pub mod captain_new_spec;
+pub mod cli_abort;
 pub mod cli_agents;
 pub mod cli_roles;
 pub mod cli_teams;

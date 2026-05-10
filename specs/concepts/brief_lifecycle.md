@@ -386,6 +386,39 @@ Failed report is silently dropped. Pattern 3 (#397) lifts the
 hardcoded `AllMustPass` policy to per-edge config in the topology
 JSON.
 
+#### Operator abort (not enforced by graph-specs)
+
+`orchestrator abort <brief_id>` is the canonical surgical-shutdown path.
+The CLI looks up the brief's `agentry:brief:{id}:state` record and, when
+the state is non-terminal, pushes a
+`BriefEvent::AbortRequested { actor: "operator", message: "orchestrator
+abort cli" }` onto the brief's `:trace` stream as
+`EventKind::Event { payload: <BriefEvent JSON> }`. The per-brief
+lifecycle driver consumes the event through `RedisEventSource`, the
+universal aborts arm of `handle()` transitions any non-terminal
+`BriefState` to `Failed { AbortRequested }`, and the projector writes
+the resulting `BriefStateRecord` to `:state` and `:state_log`. On a
+terminal `:state` the CLI is idempotent: it prints
+`status: "already_terminal"` and exits cleanly without re-pushing.
+A missing `:state` key returns `no such brief: {id}` with exit code 1.
+The legacy `orchestrator abort --all` path (kill every
+`agentry.brief`-labelled container) is preserved byte-for-byte for
+operator muscle memory.
+
+`--keep-workspace` preserves the brief's workspace dir under
+`<root>/briefs/{brief_id}/` for forensics; without the flag the abort
+path `rm -rf`s the dir after the FSM transition. `--keep-trace`
+preserves the `:trace` stream and `:state_log`; without the flag the
+CLI sleeps briefly so the per-brief driver consumes `AbortRequested`
+and writes the terminal `:state`, then `XTRIM`s `:trace` to `MAXLEN 0`
+and `DEL`s `:state_log` — the verdict has already been recorded in
+`agentry:verdicts` at that point and the trace stream is no longer
+load-bearing for the FSM. NOTE: the per-brief abort assumes a live
+driver; if the daemon restarted pre-471b reattach, the
+`AbortRequested` event sits in `:trace` unconsumed. The operator
+should fall back to the future #471b reattach OR a direct redis
+`:state` patch as the hard escape.
+
 ## ResumeReport
 
 #### Daemon resume on boot
