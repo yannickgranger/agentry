@@ -11,8 +11,10 @@
 //! [`AssertionAnchor`]: orchestrator_types::contract::AssertionAnchor
 
 use orchestrator_types::contract::AssertionAnchor;
+use orchestrator_types::TargetRepo;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+use std::str::FromStr;
 
 /// Where to look when resolving anchors.
 pub struct ResolverContext {
@@ -41,13 +43,18 @@ impl ResolverContext {
     }
 }
 
-/// Sanitize a `target_repo` value into a filesystem- and keyspace-safe slug.
+/// Transitional bridge during brief 1a — delegates to [`TargetRepo::slug`]
+/// for valid inputs, falls back to the legacy inline byte-map for inputs
+/// the new strict validator rejects. Brief 1b removes the fallback.
 ///
 /// Replaces `/` and any non-alphanumeric/underscore character with `_`. The
 /// empty string and slugs with leading/trailing underscores are returned
 /// as-is — daemon callers pre-validate before reaching here.
 #[must_use]
 pub fn sanitize_target_repo_slug(target_repo: &str) -> String {
+    if let Ok(parsed) = TargetRepo::from_str(target_repo) {
+        return parsed.slug();
+    }
     target_repo
         .chars()
         .map(|c| {
