@@ -39,7 +39,7 @@ pub use role::{
     SubstrateClass, ToolPack, WorkspaceMount,
 };
 pub use target_repo::{TargetRepo, TargetRepoParseError};
-pub use team::{MessageEdge, PermitOverrides, TeamName, TeamTopology};
+pub use team::{MessageEdge, NodeClass, PermitOverrides, TeamName, TeamTopology};
 
 /// Apply a `PermitOverrides` payload to an already-minted permit, in place.
 ///

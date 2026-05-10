@@ -15,6 +15,7 @@ use orchestrator_types::{
 use redis::AsyncCommands;
 use serde::Deserialize;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::time::Duration;
 use tokio_stream::wrappers::BroadcastStream;
@@ -710,6 +711,7 @@ fn parse_edge(line: &str) -> Option<MessageEdge> {
         to: parse_role_ref(to),
         permit_overrides_from: overrides,
         rework_target: None,
+        gate_policy: None,
     })
 }
 
@@ -739,6 +741,7 @@ pub async fn team_create(
         message_graph: edges,
         terminal_role: parse_role_ref(&f.terminal_role),
         max_retries: f.max_retries,
+        node_classes: HashMap::new(),
     };
     state
         .store

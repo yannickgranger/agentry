@@ -7,6 +7,7 @@
 //! brief-id wrapping are layered by the daemon caller (see L.2).
 
 use crate::{BriefId, EventVerdict, ReviewFinding, Ts};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -695,7 +696,7 @@ fn post_coder_shipped(retry: RetryBudget, gates: &PhaseGates) -> BriefState {
 
 /// The rule applied at a phase fan-in to fold a multiset of role verdicts
 /// into a single `Decide` outcome.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum GatePolicy {
     AllMustPass,

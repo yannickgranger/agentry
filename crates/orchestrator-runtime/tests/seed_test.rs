@@ -11,6 +11,7 @@
 //! `orchestrator_types` only — keep in sync with `seed::seed_m0`).
 
 use orchestrator_types::{AgentRole, MessageEdge, RoleName, RoleRef, TeamName, TeamTopology};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 /// Issue #175: roles whose entrypoint exec's a host-built runner binary
@@ -112,88 +113,103 @@ fn agentry_self_host_v0_topology_has_ac_verifier_with_correct_edges() {
                 to: reviewer_mechanical_ref.clone(),
                 permit_overrides_from: None,
                 rework_target: None,
+                gate_policy: None,
             },
             MessageEdge {
                 from: coder_ref.clone(),
                 to: reviewer_claude_ref.clone(),
                 permit_overrides_from: None,
                 rework_target: None,
+                gate_policy: None,
             },
             MessageEdge {
                 from: coder_ref.clone(),
                 to: ac_verifier_ref.clone(),
                 permit_overrides_from: None,
                 rework_target: None,
+                gate_policy: None,
             },
             MessageEdge {
                 from: ac_verifier_ref.clone(),
                 to: reviewer_mechanical_ref.clone(),
                 permit_overrides_from: None,
                 rework_target: None,
+                gate_policy: None,
             },
             MessageEdge {
                 from: ac_verifier_ref.clone(),
                 to: reviewer_claude_ref.clone(),
                 permit_overrides_from: None,
                 rework_target: None,
+                gate_policy: None,
             },
             MessageEdge {
                 from: coder_ref.clone(),
                 to: ac_verifier_gemini_ref.clone(),
                 permit_overrides_from: None,
                 rework_target: None,
+                gate_policy: None,
             },
             MessageEdge {
                 from: coder_ref.clone(),
                 to: ac_verifier_grok_ref.clone(),
                 permit_overrides_from: None,
                 rework_target: None,
+                gate_policy: None,
             },
             MessageEdge {
                 from: ac_verifier_gemini_ref.clone(),
                 to: reviewer_mechanical_ref.clone(),
                 permit_overrides_from: None,
                 rework_target: None,
+                gate_policy: None,
             },
             MessageEdge {
                 from: ac_verifier_gemini_ref.clone(),
                 to: reviewer_claude_ref.clone(),
                 permit_overrides_from: None,
                 rework_target: None,
+                gate_policy: None,
             },
             MessageEdge {
                 from: ac_verifier_grok_ref.clone(),
                 to: reviewer_mechanical_ref.clone(),
                 permit_overrides_from: None,
                 rework_target: None,
+                gate_policy: None,
             },
             MessageEdge {
                 from: ac_verifier_grok_ref.clone(),
                 to: reviewer_claude_ref.clone(),
                 permit_overrides_from: None,
                 rework_target: None,
+                gate_policy: None,
             },
             MessageEdge {
                 from: reviewer_mechanical_ref.clone(),
                 to: shipper_ref.clone(),
                 permit_overrides_from: None,
                 rework_target: None,
+                gate_policy: None,
             },
             MessageEdge {
                 from: reviewer_claude_ref.clone(),
                 to: shipper_ref.clone(),
                 permit_overrides_from: None,
                 rework_target: None,
+                gate_policy: None,
             },
             MessageEdge {
                 from: shipper_ref.clone(),
                 to: ci_watcher_ref.clone(),
                 permit_overrides_from: None,
                 rework_target: None,
+                gate_policy: None,
             },
         ],
         terminal_role: ci_watcher_ref.clone(),
         max_retries: 2,
+        node_classes: HashMap::new(),
     };
 
     assert!(
@@ -368,88 +384,103 @@ fn agentry_self_host_v0_topology_has_all_three_ac_verifiers_wired_in_parallel() 
                 to: reviewer_mechanical_ref.clone(),
                 permit_overrides_from: None,
                 rework_target: None,
+                gate_policy: None,
             },
             MessageEdge {
                 from: coder_ref.clone(),
                 to: reviewer_claude_ref.clone(),
                 permit_overrides_from: None,
                 rework_target: None,
+                gate_policy: None,
             },
             MessageEdge {
                 from: coder_ref.clone(),
                 to: ac_verifier_claude_ref.clone(),
                 permit_overrides_from: None,
                 rework_target: None,
+                gate_policy: None,
             },
             MessageEdge {
                 from: ac_verifier_claude_ref.clone(),
                 to: reviewer_mechanical_ref.clone(),
                 permit_overrides_from: None,
                 rework_target: None,
+                gate_policy: None,
             },
             MessageEdge {
                 from: ac_verifier_claude_ref.clone(),
                 to: reviewer_claude_ref.clone(),
                 permit_overrides_from: None,
                 rework_target: None,
+                gate_policy: None,
             },
             MessageEdge {
                 from: coder_ref.clone(),
                 to: ac_verifier_gemini_ref.clone(),
                 permit_overrides_from: None,
                 rework_target: None,
+                gate_policy: None,
             },
             MessageEdge {
                 from: coder_ref.clone(),
                 to: ac_verifier_grok_ref.clone(),
                 permit_overrides_from: None,
                 rework_target: None,
+                gate_policy: None,
             },
             MessageEdge {
                 from: ac_verifier_gemini_ref.clone(),
                 to: reviewer_mechanical_ref.clone(),
                 permit_overrides_from: None,
                 rework_target: None,
+                gate_policy: None,
             },
             MessageEdge {
                 from: ac_verifier_gemini_ref.clone(),
                 to: reviewer_claude_ref.clone(),
                 permit_overrides_from: None,
                 rework_target: None,
+                gate_policy: None,
             },
             MessageEdge {
                 from: ac_verifier_grok_ref.clone(),
                 to: reviewer_mechanical_ref.clone(),
                 permit_overrides_from: None,
                 rework_target: None,
+                gate_policy: None,
             },
             MessageEdge {
                 from: ac_verifier_grok_ref.clone(),
                 to: reviewer_claude_ref.clone(),
                 permit_overrides_from: None,
                 rework_target: None,
+                gate_policy: None,
             },
             MessageEdge {
                 from: reviewer_mechanical_ref.clone(),
                 to: shipper_ref.clone(),
                 permit_overrides_from: None,
                 rework_target: None,
+                gate_policy: None,
             },
             MessageEdge {
                 from: reviewer_claude_ref.clone(),
                 to: shipper_ref.clone(),
                 permit_overrides_from: None,
                 rework_target: None,
+                gate_policy: None,
             },
             MessageEdge {
                 from: shipper_ref.clone(),
                 to: ci_watcher_ref.clone(),
                 permit_overrides_from: None,
                 rework_target: None,
+                gate_policy: None,
             },
         ],
         terminal_role: ci_watcher_ref.clone(),
         max_retries: 2,
+        node_classes: HashMap::new(),
     };
 
     // (a) all three verifier role refs present.
@@ -517,6 +548,7 @@ fn agentry_pr_rebaser_v0_topology_has_pr_rebaser_as_sole_terminal_role() {
         message_graph: Vec::<MessageEdge>::new(),
         terminal_role: pr_rebaser_ref.clone(),
         max_retries: 0,
+        node_classes: HashMap::new(),
     };
 
     assert_eq!(

@@ -11,6 +11,7 @@ use orchestrator_types::{
     AgentRole, MessageEdge, Mount, PackageManager, PermitScope, RoleName, RoleRef, SubstrateClass,
     TeamName, TeamTopology, ToolAllowlist, ToolPack, WorkspaceMount,
 };
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// Derive the `net:allow:<host>` permit for the configured forge from
@@ -559,6 +560,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
             version: echo.version,
         },
         max_retries: 0,
+        node_classes: HashMap::new(),
     };
 
     // ---- naughty-agent (emits illegal tool_call → broker must block) ----
@@ -597,6 +599,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
             version: naughty.version,
         },
         max_retries: 0,
+        node_classes: HashMap::new(),
     };
 
     // ---- speaker + listener (inter-role message routing) ----
@@ -668,12 +671,14 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
             },
             permit_overrides_from: None,
             rework_target: None,
+            gate_policy: None,
         }],
         terminal_role: RoleRef {
             name: listener.name.clone(),
             version: listener.version,
         },
         max_retries: 0,
+        node_classes: HashMap::new(),
     };
 
     // ---- grok-echo (xAI Grok API) ----
@@ -712,6 +717,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
             version: grok_echo.version,
         },
         max_retries: 0,
+        node_classes: HashMap::new(),
     };
 
     // ---- claude-echo (Claude Max via host CLI) ----
@@ -777,6 +783,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
             version: claude_echo.version,
         },
         max_retries: 0,
+        node_classes: HashMap::new(),
     };
 
     // ---- synthesizer + narrowed-coder (permit_overrides narrowing) ----
@@ -853,12 +860,14 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
             },
             permit_overrides_from: Some("permit_overrides".into()),
             rework_target: None,
+            gate_policy: None,
         }],
         terminal_role: RoleRef {
             name: narrowed_coder.name.clone(),
             version: narrowed_coder.version,
         },
         max_retries: 0,
+        node_classes: HashMap::new(),
     };
 
     // ---- workspace-probe (for workspace regression tests) ----
@@ -903,6 +912,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
             version: workspace_probe.version,
         },
         max_retries: 0,
+        node_classes: HashMap::new(),
     };
 
     // ---- sccache-probe (for sccache-wiring regression tests) ----
@@ -947,6 +957,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
             version: sccache_probe.version,
         },
         max_retries: 0,
+        node_classes: HashMap::new(),
     };
 
     // ---- timeout-probe (for wall-clock-timeout regression tests) ----
@@ -985,6 +996,7 @@ pub async fn seed_m0(cfg: &Config) -> Result<()> {
             version: timeout_probe.version,
         },
         max_retries: 0,
+        node_classes: HashMap::new(),
     };
 
     // ---- persist everything ----
