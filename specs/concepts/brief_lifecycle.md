@@ -517,3 +517,47 @@ killing all in-flight work even when the containers were still
 running — is closed by the reattach (kept_alive) path. If the
 operator needs orphaned work redone, they can resubmit with the same
 brief id; the new run will be a fresh trip through the FSM.
+
+## DisagreementSummary
+
+One coder-flagged disagreement with a brief verb. The struct carries
+`verb` (the literal verb the coder did not apply), `applied_form`
+(the variant the coder emitted instead), and `rationale` (the coder's
+reason for the substitution). F6a (PR #443) added these fields to the
+role-runtime `UnappliedVerb` shape; F6b (this brief + 449b) lifts them
+into orchestrator-types so the FSM can carry disagreements across
+phases without a role-runtime dependency. Wire-equivalent to
+`UnappliedVerb` at the JSON level; `serde(deny_unknown_fields)` so
+extra keys are a hard error rather than silently dropped.
+
+`DisagreementSummary` rides on the `BriefEvent::CoderDisagreed`
+payload and is then carried in the `BriefState::AwaitingCaptainDecision`
+state until the captain decides. The flow is captain-mediated: when
+the coder's self-review reports `all_applied=false` but every miss
+carries `applied_form` + `rationale` (deliberate disagreement, not
+failure), the FSM transitions from `Authoring` (or `Reworking`) to
+`AwaitingCaptainDecision`. The brief is parked indefinitely — no
+timeout, no automatic retry — waiting for an explicit captain
+decision. The state carries the disagreements vector and the original
+retry budget so retry semantics are preserved if the captain rejects
+and the operator resubmits.
+
+`CaptainAccepted` treats the disagreed-form output as morally
+equivalent to `CoderDone{Shipped}`. The brief proceeds through
+`Verifying → Reviewing → Shipping → Watching` using the work already
+in the brief workspace, exactly as if the coder had emitted the
+literal verb. The same empty-phase auto-skip rules apply, so a
+topology with no verifier or reviewer roles short-circuits straight
+to `Shipping` just like the regular coder-shipped path.
+
+`CaptainRejected` fails the brief with reason
+`CaptainRejectedDisagreement` carrying the captain's prose
+explanation. The operator can resubmit a fresh brief id with a
+corrected verb after seeing the captain's reason on the terminal
+verdict.
+
+This brief (449a) lands the FSM types only. The daemon-side
+translator that detects the disagreement pattern and emits
+`CoderDisagreed` lives in 449b. The `captain decide` CLI subcommand
+that pushes `CaptainAccepted` / `CaptainRejected` lives in 449b. The
+dashboard surface that lists parked briefs lives in 449c.

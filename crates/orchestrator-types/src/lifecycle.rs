@@ -69,6 +69,11 @@ pub enum Reason {
     /// Fires when the daemon's boot-time resume scan finds a brief in a
     /// non-terminal `:state` whose named container is no longer alive.
     DaemonRestartedDuringExecution,
+    /// Captain rejected a coder-flagged disagreement via captain decide reject.
+    /// The reason carries the captain's prose explanation (audit trail).
+    CaptainRejectedDisagreement {
+        reason: String,
+    },
 }
 
 /// CI status carried by a `BriefEvent::CiResult`.
@@ -87,6 +92,23 @@ pub enum CiState {
 pub enum ReworkTarget {
     Coder,
     Reviewer,
+}
+
+/// One coder-flagged disagreement with a brief verb. The coder produced
+/// applied_form (the variant it actually emitted) and rationale (why)
+/// instead of the literal verb. F6a (PR #443) added these fields to
+/// the role-runtime UnappliedVerb shape; F6b (this brief + 449b) lifts
+/// them into orchestrator-types so the FSM can carry disagreements
+/// across phases without a role-runtime dependency. Wire-equivalent
+/// to UnappliedVerb at the JSON level.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DisagreementSummary {
+    pub verb: String,
+    #[serde(default)]
+    pub applied_form: String,
+    #[serde(default)]
+    pub rationale: String,
 }
 
 /// The position a brief occupies inside the lifecycle FSM. Non-terminal
@@ -132,6 +154,15 @@ pub enum BriefState {
         data: serde_json::Value,
         retry: RetryBudget,
     },
+    /// Coder reported all-applied=false but every miss carries applied_form+rationale
+    /// (deliberate disagreement, not failure). Brief is parked until the captain
+    /// accepts or rejects via CaptainAccepted / CaptainRejected events. Carries
+    /// the original Authoring retry budget so retry semantics are preserved if
+    /// the captain chooses to reject and the operator resubmits.
+    AwaitingCaptainDecision {
+        disagreements: Vec<DisagreementSummary>,
+        retry: RetryBudget,
+    },
     Shipped,
     Failed {
         reason: Reason,
@@ -162,6 +193,12 @@ pub enum BriefEvent {
     CoderDoneNoOp {
         reason: String,
     },
+    /// Self-review found unapplied verbs but every miss has applied_form+rationale
+    /// set. Coder is flagging a deliberate disagreement, not a failure. The FSM
+    /// transitions Authoring (or Reworking) to AwaitingCaptainDecision.
+    CoderDisagreed {
+        disagreements: Vec<DisagreementSummary>,
+    },
     AcVerifierDone {
         verdict: EventVerdict,
         role_name: String,
@@ -190,6 +227,16 @@ pub enum BriefEvent {
     AbortRequested {
         actor: String,
         message: String,
+    },
+    /// Captain endorses the disagreed-form output. The FSM treats the brief as
+    /// if the coder had shipped normally — proceeds to the post-coder phase
+    /// chain (Verifying → Reviewing → Shipping → Watching) using the work
+    /// that's already in the brief workspace.
+    CaptainAccepted,
+    /// Captain explicitly rejects the disagreement. The FSM transitions to
+    /// `Failed{CaptainRejectedDisagreement{reason}}`.
+    CaptainRejected {
+        reason: String,
     },
     BudgetExhausted,
     /// preflight-criterion-agentry's smell heuristics fired on the brief's
@@ -294,6 +341,30 @@ pub fn handle(
                     reason: Reason::BudgetExhausted,
                 });
             }
+            BriefEvent::CoderDisagreed { disagreements } => {
+                // Phase-specific signal: only valid from the coder phase
+                // (Authoring or Reworking). The universal handler's
+                // "always-applies on non-terminal" semantics don't apply
+                // here — from any other state this is an InvalidTransition.
+                return match state {
+                    BriefState::Authoring { retry, .. } => {
+                        Ok(BriefState::AwaitingCaptainDecision {
+                            disagreements: disagreements.clone(),
+                            retry: *retry,
+                        })
+                    }
+                    BriefState::Reworking { retry, .. } => {
+                        Ok(BriefState::AwaitingCaptainDecision {
+                            disagreements: disagreements.clone(),
+                            retry: *retry,
+                        })
+                    }
+                    _ => Err(Box::new(InvalidTransition {
+                        from: state.clone(),
+                        event: event.clone(),
+                    })),
+                };
+            }
             _ => {}
         }
     }
@@ -340,46 +411,7 @@ pub fn handle(
         (BriefState::Authoring { .. }, BriefEvent::CoderDoneNoOp { .. }) => Ok(BriefState::Shipped),
 
         (BriefState::Authoring { retry, .. }, BriefEvent::CoderDone { verdict }) => match verdict {
-            EventVerdict::Shipped => {
-                // Empty-phase auto-skip: when a phase's expected_roles is
-                // empty (the topology has no role of that kind), decide()
-                // returns Pass vacuously over an empty received multiset, so
-                // the FSM short-circuits past the phase rather than stalling
-                // on a never-arriving event. See E/1 + brief_lifecycle.md.
-                let received_v = BTreeMap::new();
-                let gate_v = GateConfig {
-                    expected_roles: gates.verifying.expected_roles.clone(),
-                    policy: gates.verifying.policy.clone(),
-                };
-                match decide(&received_v, &gate_v) {
-                    Decide::Pass => {
-                        let received_r = BTreeMap::new();
-                        let gate_r = GateConfig {
-                            expected_roles: gates.reviewing.expected_roles.clone(),
-                            policy: gates.reviewing.policy.clone(),
-                        };
-                        match decide(&received_r, &gate_r) {
-                            Decide::Pass => Ok(BriefState::Shipping {
-                                pr_number: 0,
-                                head_sha: String::new(),
-                                retry: *retry,
-                            }),
-                            _ => Ok(BriefState::Reviewing {
-                                retry: *retry,
-                                received: received_r,
-                                expected: gate_r.expected_roles,
-                                policy: gate_r.policy,
-                            }),
-                        }
-                    }
-                    _ => Ok(BriefState::Verifying {
-                        retry: *retry,
-                        received: received_v,
-                        expected: gate_v.expected_roles,
-                        policy: gate_v.policy,
-                    }),
-                }
-            }
+            EventVerdict::Shipped => Ok(post_coder_shipped(*retry, gates)),
             EventVerdict::Failed => Ok(BriefState::Failed {
                 reason: Reason::AcceptanceFailed {
                     detail: "coder reported failed".to_owned(),
@@ -513,6 +545,22 @@ pub fn handle(
             retry: *retry,
         }),
 
+        // ---- AwaitingCaptainDecision ----
+        // Captain endorses the disagreed-form output: treat it as if the
+        // coder had emitted CoderDone{Shipped} from Authoring. Use the
+        // shared post_coder_shipped helper so the empty-phase auto-skip
+        // and gate-evaluation logic stays in one place.
+        (BriefState::AwaitingCaptainDecision { retry, .. }, BriefEvent::CaptainAccepted) => {
+            Ok(post_coder_shipped(*retry, gates))
+        }
+        (BriefState::AwaitingCaptainDecision { .. }, BriefEvent::CaptainRejected { reason }) => {
+            Ok(BriefState::Failed {
+                reason: Reason::CaptainRejectedDisagreement {
+                    reason: reason.clone(),
+                },
+            })
+        }
+
         // ---- Shipping ----
         (
             BriefState::Shipping { retry, .. },
@@ -585,6 +633,48 @@ fn increment_or_fail(
         }
     } else {
         build(next)
+    }
+}
+
+/// Post-coder-Shipped phase routing: evaluate verifying then reviewing
+/// gates against an empty received multiset, applying the empty-phase
+/// auto-skip rule (decide() returns Pass vacuously when expected_roles
+/// is empty). Shared by the `Authoring + CoderDone{Shipped}` arm and the
+/// `AwaitingCaptainDecision + CaptainAccepted` arm so both call sites
+/// stay byte-equivalent.
+fn post_coder_shipped(retry: RetryBudget, gates: &PhaseGates) -> BriefState {
+    let received_v = BTreeMap::new();
+    let gate_v = GateConfig {
+        expected_roles: gates.verifying.expected_roles.clone(),
+        policy: gates.verifying.policy.clone(),
+    };
+    match decide(&received_v, &gate_v) {
+        Decide::Pass => {
+            let received_r = BTreeMap::new();
+            let gate_r = GateConfig {
+                expected_roles: gates.reviewing.expected_roles.clone(),
+                policy: gates.reviewing.policy.clone(),
+            };
+            match decide(&received_r, &gate_r) {
+                Decide::Pass => BriefState::Shipping {
+                    pr_number: 0,
+                    head_sha: String::new(),
+                    retry,
+                },
+                _ => BriefState::Reviewing {
+                    retry,
+                    received: received_r,
+                    expected: gate_r.expected_roles,
+                    policy: gate_r.policy,
+                },
+            }
+        }
+        _ => BriefState::Verifying {
+            retry,
+            received: received_v,
+            expected: gate_v.expected_roles,
+            policy: gate_v.policy,
+        },
     }
 }
 

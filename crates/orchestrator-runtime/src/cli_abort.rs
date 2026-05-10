@@ -166,6 +166,7 @@ fn state_kind_str(state: &BriefState) -> &'static str {
         BriefState::Shipping { .. } => "shipping",
         BriefState::Watching { .. } => "watching",
         BriefState::Extension { .. } => "extension",
+        BriefState::AwaitingCaptainDecision { .. } => "awaiting_captain_decision",
         BriefState::Shipped => "shipped",
         BriefState::Failed { .. } => "failed",
     }
