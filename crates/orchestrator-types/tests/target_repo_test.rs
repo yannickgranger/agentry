@@ -28,6 +28,30 @@ fn slug_byte_identity_with_legacy_sanitizer() {
 }
 
 #[test]
+fn slug_doubles_underscore_in_repo_segment() {
+    let tr = TargetRepo::from_str("yg/foo_bar").expect("parse");
+    assert_eq!(tr.slug(), "yg_foo__bar");
+}
+
+#[test]
+fn slug_doubles_underscore_in_owner_segment() {
+    let tr = TargetRepo::from_str("yg_foo/bar").expect("parse");
+    assert_eq!(tr.slug(), "yg__foo_bar");
+}
+
+#[test]
+fn slug_resolves_legacy_yg_foo_collision() {
+    // Pre-1b: both `yg/foo` and `yg_foo/bar`'s prefix collapsed to "yg_foo".
+    // Post-1b: the underscore in `yg_foo` is doubled, so `yg/foo` and
+    // `yg_foo/<r>` are distinguishable.
+    let a = TargetRepo::from_str("yg/foo").expect("parse a");
+    let b = TargetRepo::from_str("yg_foo/bar").expect("parse b");
+    assert_eq!(a.slug(), "yg_foo");
+    assert_eq!(b.slug(), "yg__foo_bar");
+    assert_ne!(a.slug(), b.slug());
+}
+
+#[test]
 fn clone_url_canonical_format() {
     let tr = TargetRepo::from_str("yg/agentry").expect("parse");
     assert_eq!(

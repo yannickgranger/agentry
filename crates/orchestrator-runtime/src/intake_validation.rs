@@ -17,6 +17,38 @@ use orchestrator_types::Brief;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// Typed intake-rejection error.
+///
+/// Brief 1b: the daemon admits a brief only when its `target_repo` parses
+/// and the parsed owner is in `cfg.forge.allowed_owners`. The two pre-mint
+/// gates raise these variants — there is no permissive fallback.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum IntakeError {
+    /// `payload.target_repo` is absent, non-string, or fails
+    /// [`TargetRepo::from_str`] charset/length validation.
+    ///
+    /// [`TargetRepo::from_str`]: orchestrator_types::TargetRepo::from_str
+    MissingTargetRepo,
+    /// `target_repo.owner()` is not in `cfg.forge.allowed_owners`.
+    OwnerNotAllowed { owner: String },
+}
+
+impl std::fmt::Display for IntakeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingTargetRepo => f.write_str(
+                "brief intake rejected: payload.target_repo missing or fails strict validation",
+            ),
+            Self::OwnerNotAllowed { owner } => write!(
+                f,
+                "brief intake rejected: target_repo owner `{owner}` is not in [forge] allowed_owners",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for IntakeError {}
+
 /// Resolve every assertion anchor in `brief.contract` against `ctx`.
 ///
 /// Returns `(AssertionId, reason)` pairs for anchors that did not resolve.
@@ -38,23 +70,18 @@ pub fn validate_brief_contract(brief: &Brief, ctx: &ResolverContext) -> Vec<(Ass
 }
 
 /// Brief-aware entry point: derive a per-target [`ResolverContext`] from
-/// `brief.payload.target_repo` + `workspace_root`, then run the existing
-/// contract validator.
+/// `brief.target_repo()` + `workspace_root`, then run the contract validator.
 ///
-/// Briefs without a `target_repo` payload field fall back to the slug
-/// `_unknown`. F1a does not enforce presence — the daemon caller in F1b is
-/// responsible for pre-validating the payload.
+/// Returns [`IntakeError::MissingTargetRepo`] when the brief lacks a
+/// parseable `payload.target_repo` — there is no `_unknown` keyspace
+/// fallback. The daemon caller treats this as a hard reject.
 pub fn validate_brief_contract_for_target(
     brief: &Brief,
     workspace_root: &Path,
-) -> Vec<(AssertionId, String)> {
-    let target = brief
-        .payload
-        .get("target_repo")
-        .and_then(|v| v.as_str())
-        .unwrap_or("_unknown");
-    let ctx = ResolverContext::for_target_repo(target, workspace_root);
-    validate_brief_contract(brief, &ctx)
+) -> Result<Vec<(AssertionId, String)>, IntakeError> {
+    let target_repo = brief.target_repo().ok_or(IntakeError::MissingTargetRepo)?;
+    let ctx = ResolverContext::for_target_repo(&target_repo.to_string(), workspace_root);
+    Ok(validate_brief_contract(brief, &ctx))
 }
 
 /// Inputs to [`ensure_target_extracted`].

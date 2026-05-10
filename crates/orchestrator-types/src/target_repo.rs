@@ -52,13 +52,16 @@ impl TargetRepo {
 
     /// Filesystem- and keyspace-safe slug.
     ///
-    /// Brief 1a parity with the legacy `sanitize_target_repo_slug` byte map:
-    /// concatenate `<owner>/<repo>` and replace any non-alphanumeric/`_`
-    /// byte with `_`. Brief 1b lands the collision-resistant `_` → `__`
-    /// pre-encoding.
+    /// Collision-resistant derivation: every literal `_` in the input is
+    /// first doubled (`_` → `__`), then `<owner>/<repo>` is concatenated
+    /// and any non-alphanumeric/`_` byte is replaced with `_`. The
+    /// pre-encoding makes the function injective over the allowed
+    /// charset — distinct `(owner, repo)` tuples produce distinct slugs.
     #[must_use]
     pub fn slug(&self) -> String {
-        let temp = format!("{}/{}", self.owner, self.repo);
+        let owner_encoded = self.owner.replace('_', "__");
+        let repo_encoded = self.repo.replace('_', "__");
+        let temp = format!("{owner_encoded}/{repo_encoded}");
         temp.chars()
             .map(|c| {
                 if c.is_ascii_alphanumeric() || c == '_' {
