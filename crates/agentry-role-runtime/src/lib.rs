@@ -173,6 +173,7 @@ impl Drop for DoneGuard {
                 Some(DoneReason {
                     cause: "unexpected_exit".into(),
                     exit_code: None,
+                    disagreements: Vec::new(),
                 }),
             );
         }
@@ -1503,6 +1504,42 @@ impl UnappliedVerb {
 pub struct SelfReviewResult {
     pub all_applied: bool,
     pub unapplied: Vec<UnappliedVerb>,
+}
+
+/// Classification of the `unapplied` set surfaced when `all_applied=false`.
+/// `Disagreement` when EVERY entry carries both `applied_form` AND `rationale`
+/// non-empty — the coder is flagging deliberate divergence from the literal
+/// verb wording, so the FSM should park the brief in `AwaitingCaptainDecision`
+/// via `BriefEvent::CoderDisagreed`. `BareFailure` when at least one entry is
+/// missing applied_form or rationale (current `self_review_unapplied` path —
+/// findings + Failed verdict).
+#[derive(Debug, PartialEq, Eq)]
+pub enum SelfReviewClassification {
+    Disagreement(Vec<orchestrator_types::lifecycle::DisagreementSummary>),
+    BareFailure,
+}
+
+/// Pure classifier for the unapplied-verb set. Caller is responsible for the
+/// associated I/O (emit_event / emit_done / emit_finding) so tests can pin
+/// the decision without mocking the trace stream.
+#[must_use]
+pub fn classify_self_review_unapplied(unapplied: &[UnappliedVerb]) -> SelfReviewClassification {
+    let all_have_disagreement_fields = unapplied
+        .iter()
+        .all(|v| !v.applied_form.is_empty() && !v.rationale.is_empty());
+    if all_have_disagreement_fields && !unapplied.is_empty() {
+        let disagreements = unapplied
+            .iter()
+            .map(|v| orchestrator_types::lifecycle::DisagreementSummary {
+                verb: v.verb.clone(),
+                applied_form: v.applied_form.clone(),
+                rationale: v.rationale.clone(),
+            })
+            .collect();
+        SelfReviewClassification::Disagreement(disagreements)
+    } else {
+        SelfReviewClassification::BareFailure
+    }
 }
 
 /// Build a [`BriefContext`] from a startup bundle JSON value.

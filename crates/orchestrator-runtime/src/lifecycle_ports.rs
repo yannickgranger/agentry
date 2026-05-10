@@ -132,6 +132,13 @@ pub fn translate_trace_entry(
             };
             match orchestrator_types::lifecycle::role_kind(&role_name) {
                 Some("coder") => {
+                    if let Some(reason) = &reason {
+                        if reason.cause == "self_review_disagreed" {
+                            return Ok(Some(BriefEvent::CoderDisagreed {
+                                disagreements: reason.disagreements.clone(),
+                            }));
+                        }
+                    }
                     if verdict == EventVerdict::Shipped
                         && reason.as_ref().map(|r| r.cause.as_str())
                             == Some(NO_OP_SHORT_CIRCUIT_CAUSE)

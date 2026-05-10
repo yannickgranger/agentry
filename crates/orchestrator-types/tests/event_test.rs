@@ -30,6 +30,7 @@ fn done_event_with_reason_roundtrips() {
         reason: Some(DoneReason {
             cause: "unexpected_exit".into(),
             exit_code: Some(5),
+            disagreements: Vec::new(),
         }),
         refusal_count: 0,
     });

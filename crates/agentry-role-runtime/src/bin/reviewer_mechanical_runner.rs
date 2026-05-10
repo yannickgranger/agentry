@@ -66,6 +66,7 @@ fn main() {
                 Some(DoneReason {
                     cause: "bundle_parse_failed".into(),
                     exit_code: None,
+                    disagreements: Vec::new(),
                 }),
             );
             return;

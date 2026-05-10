@@ -64,6 +64,7 @@ fn main() {
                 Some(DoneReason {
                     cause: "bundle_parse_failed".into(),
                     exit_code: None,
+                    disagreements: Vec::new(),
                 }),
             );
             return;
@@ -144,6 +145,7 @@ fn main() {
                 Some(DoneReason {
                     cause: "claude_failed".into(),
                     exit_code: Some(exit_code),
+                    disagreements: Vec::new(),
                 }),
             );
             return;
@@ -158,6 +160,7 @@ fn main() {
                 Some(DoneReason {
                     cause: "transcript_empty".into(),
                     exit_code: None,
+                    disagreements: Vec::new(),
                 }),
             );
             return;

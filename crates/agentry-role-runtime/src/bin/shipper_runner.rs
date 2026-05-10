@@ -73,6 +73,7 @@ fn main() {
                 Some(DoneReason {
                     cause: "bundle_parse_failed".into(),
                     exit_code: None,
+                    disagreements: Vec::new(),
                 }),
             );
             return;
@@ -158,6 +159,7 @@ fn main() {
                 Some(DoneReason {
                     cause: "pre-push fetch failed".into(),
                     exit_code: None,
+                    disagreements: Vec::new(),
                 }),
             );
             return;
@@ -174,6 +176,7 @@ fn main() {
             Some(DoneReason {
                 cause: "pre-push fetch failed".into(),
                 exit_code: fetch_out.status.code(),
+                disagreements: Vec::new(),
             }),
         );
         return;
@@ -198,6 +201,7 @@ fn main() {
                 Some(DoneReason {
                     cause: "pre-push rebase spawn failed".into(),
                     exit_code: None,
+                    disagreements: Vec::new(),
                 }),
             );
             return;
@@ -238,6 +242,7 @@ fn main() {
                         "pre-push rebase conflict — coder branch diverged from base unresolvably"
                             .into(),
                     exit_code: Some(rebase_rc),
+                    disagreements: Vec::new(),
                 }),
             );
             return;
@@ -259,6 +264,7 @@ fn main() {
                 Some(DoneReason {
                     cause: "pre-push rebase failed".into(),
                     exit_code: Some(rebase_rc),
+                    disagreements: Vec::new(),
                 }),
             );
             return;
