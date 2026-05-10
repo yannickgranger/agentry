@@ -244,7 +244,7 @@ impl Spawner for PodmanSpawner {
         // profile's matching section (coder ↔ profile.coder, reviewer ↔
         // profile.reviewer). Other role kinds and the no-profile path
         // borrow the role unchanged.
-        let role_kind = crate::lifecycle::role_kind(&role.name.0);
+        let role_kind = orchestrator_types::lifecycle::role_kind(&role.name.0);
         let augmented_role = augment_role_with_profile(role, role_kind, profile);
         if let Cow::Owned(_) = &augmented_role {
             tracing::info!(

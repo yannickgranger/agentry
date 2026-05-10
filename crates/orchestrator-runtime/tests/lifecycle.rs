@@ -13,12 +13,12 @@
 use async_trait::async_trait;
 use chrono::Utc;
 use orchestrator_runtime::lifecycle::{
-    role_kind, translate_trace_entry, EventSource, EventSourceError, RedisEventSource,
-    RedisStateProjector, StateProjector, StateProjectorError,
+    translate_trace_entry, EventSource, EventSourceError, RedisEventSource, RedisStateProjector,
+    StateProjector, StateProjectorError,
 };
 use orchestrator_runtime::lifecycle_driver::projector_task;
 use orchestrator_types::lifecycle::{
-    handle, BriefEvent, BriefState, BriefStateRecord, CiState, Reason, RetryBudget,
+    handle, role_kind, BriefEvent, BriefState, BriefStateRecord, CiState, Reason, RetryBudget,
     DEFAULT_ATTEMPT_CAP,
 };
 use orchestrator_types::{BriefId, Event, EventKind, EventVerdict};

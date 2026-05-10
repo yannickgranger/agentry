@@ -363,7 +363,7 @@ async fn cleanup_brief_at(
 
 /// Project a team's role list into the per-phase `PhaseGates` the FSM
 /// driver threads through `handle()`. Walks `team.roles` and partitions
-/// by `crate::lifecycle::role_kind`: `ac-verifier` / `verifier` roles
+/// by `orchestrator_types::lifecycle::role_kind`: `ac-verifier` / `verifier` roles
 /// feed the verifying gate's `expected_roles`, `reviewer` roles feed the
 /// reviewing gate's. Policy is hardcoded `AllMustPass` for both phases —
 /// Pattern 3 (#397) lifts policy to per-edge config in topology JSON.
@@ -376,7 +376,7 @@ pub fn build_phase_gates(
     let mut reviewing_roles: Vec<String> = Vec::new();
     for r in &team.roles {
         let role_name = &r.name.0;
-        match crate::lifecycle::role_kind(role_name) {
+        match orchestrator_types::lifecycle::role_kind(role_name) {
             Some("ac-verifier") | Some("verifier") => verifying_roles.push(role_name.clone()),
             Some("reviewer") => reviewing_roles.push(role_name.clone()),
             _ => {}

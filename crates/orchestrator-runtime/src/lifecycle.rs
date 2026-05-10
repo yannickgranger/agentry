@@ -125,39 +125,6 @@ impl RedisEventSource {
     }
 }
 
-/// Map an agent's full role name (as emitted by the spawner — e.g.
-/// `"coder-claude-agentry"`, `"shipper-agentry"`,
-/// `"preflight-criterion-agentry"`) to the short role kind the
-/// translator's `Done`-branch matches against.
-///
-/// Returns `None` for role names outside the recognised families; the
-/// translator skips memoization in that case so the `Done` lookup
-/// falls through to the catch-all (no `BriefEvent` emitted) rather
-/// than mis-classifying an unknown role.
-///
-/// Public so the peer `tests/lifecycle.rs` integration suite can pin
-/// the per-family mapping without re-deriving the prefix table.
-#[must_use]
-pub fn role_kind(role_name: &str) -> Option<&'static str> {
-    if role_name.starts_with("coder-") {
-        Some("coder")
-    } else if role_name.starts_with("ac-verifier-") {
-        Some("ac-verifier")
-    } else if role_name.starts_with("verifier-") {
-        Some("verifier")
-    } else if role_name.starts_with("reviewer-") {
-        Some("reviewer")
-    } else if role_name == "shipper-agentry" {
-        Some("shipper")
-    } else if role_name == "ci-watcher-agentry" {
-        Some("ci-watcher")
-    } else if role_name.starts_with("preflight-criterion") {
-        Some("preflight")
-    } else {
-        None
-    }
-}
-
 /// Translate one trace-stream `(agent_id, Event)` pair into the matching
 /// `BriefEvent`, threading the per-source agent-id → role-kind memo.
 /// Free function so unit tests can drive it without standing up a
@@ -174,7 +141,7 @@ pub fn translate_trace_entry(
         EventKind::Event { payload } => {
             if payload.get("agent_event").and_then(JsonValue::as_str) == Some("spawned") {
                 if let Some(role) = payload.get("role_name").and_then(JsonValue::as_str) {
-                    if let Some(kind) = role_kind(role) {
+                    if let Some(kind) = orchestrator_types::lifecycle::role_kind(role) {
                         role_by_agent.insert(agent_id.clone(), role.to_string());
                         if kind == "coder" {
                             return Ok(Some(BriefEvent::CoderStarted { agent_id }));
@@ -203,7 +170,7 @@ pub fn translate_trace_entry(
             let Some(role_name) = role_by_agent.get(&agent_id).cloned() else {
                 return Ok(None);
             };
-            match role_kind(&role_name) {
+            match orchestrator_types::lifecycle::role_kind(&role_name) {
                 Some("coder") => {
                     if verdict == EventVerdict::Shipped
                         && reason.as_ref().map(|r| r.cause.as_str())
