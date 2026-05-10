@@ -141,6 +141,7 @@ fn main() {
             Some(DoneReason {
                 cause: PREFLIGHT_SMELL_CAUSE.into(),
                 exit_code: None,
+                disagreements: Vec::new(),
             }),
         );
         return;

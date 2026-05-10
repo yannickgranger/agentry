@@ -237,6 +237,7 @@ async fn translator_decodes_no_op_cause_to_coder_done_no_op() {
         reason: Some(DoneReason {
             cause: NO_OP_SHORT_CIRCUIT_CAUSE.to_string(),
             exit_code: None,
+            disagreements: Vec::new(),
         }),
         refusal_count: 0,
     }))

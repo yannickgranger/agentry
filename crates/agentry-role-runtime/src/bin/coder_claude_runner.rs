@@ -39,11 +39,12 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 use agentry_role_runtime::{
-    body_has_verb_syntax, build_coder_prompt, build_self_review_prompt, decide_gate, emit_done,
-    emit_event, emit_finding, is_v1_plus_topology, mech_finding, mech_finding_warn,
-    parse_allowlist_toml, parse_brief_context, parse_new_pub_items, parse_self_review_object,
-    ra_query_present, read_bundle_value, run_ra_query, stream_claude, tail_bytes, tail_lines,
-    BriefContext, DoneGuard, GateDecision, PublicApiAllowlist, StreamErr,
+    body_has_verb_syntax, build_coder_prompt, build_self_review_prompt,
+    classify_self_review_unapplied, decide_gate, emit_done, emit_event, emit_finding,
+    is_v1_plus_topology, mech_finding, mech_finding_warn, parse_allowlist_toml,
+    parse_brief_context, parse_new_pub_items, parse_self_review_object, ra_query_present,
+    read_bundle_value, run_ra_query, stream_claude, tail_bytes, tail_lines, BriefContext,
+    DoneGuard, GateDecision, PublicApiAllowlist, SelfReviewClassification, StreamErr,
 };
 use orchestrator_types::{DoneReason, EventVerdict, FindingOrigin, ReviewFinding, Severity};
 use serde_json::{json, Value};
@@ -66,6 +67,7 @@ fn main() {
             Some(DoneReason {
                 cause: err.cause.into(),
                 exit_code: err.exit_code,
+                disagreements: Vec::new(),
             }),
         );
     }
@@ -211,6 +213,7 @@ fn exitpoint_phase(ctx: &BriefContext) -> Result<(), RunErr> {
             Some(DoneReason {
                 cause: "cargo_fmt_failed".into(),
                 exit_code: None,
+                disagreements: Vec::new(),
             }),
         );
         return Ok(());
@@ -232,6 +235,7 @@ fn exitpoint_phase(ctx: &BriefContext) -> Result<(), RunErr> {
                 Some(DoneReason {
                     cause: "quality_hygiene_failed".into(),
                     exit_code: None,
+                    disagreements: Vec::new(),
                 }),
             );
             return Ok(());
@@ -254,6 +258,7 @@ fn exitpoint_phase(ctx: &BriefContext) -> Result<(), RunErr> {
             Some(DoneReason {
                 cause: "acceptance_failed".into(),
                 exit_code: None,
+                disagreements: Vec::new(),
             }),
         );
         return Ok(());
@@ -281,6 +286,7 @@ fn exitpoint_phase(ctx: &BriefContext) -> Result<(), RunErr> {
                 Some(DoneReason {
                     cause: "no_op_short_circuit".into(),
                     exit_code: None,
+                    disagreements: Vec::new(),
                 }),
             );
             return Ok(());
@@ -317,6 +323,7 @@ fn exitpoint_phase(ctx: &BriefContext) -> Result<(), RunErr> {
             Some(DoneReason {
                 cause: "no_changes".into(),
                 exit_code: None,
+                disagreements: Vec::new(),
             }),
         );
         return Ok(());
@@ -637,35 +644,55 @@ fn run_self_review(ctx: &BriefContext, staged_diff: &str) -> Result<(), ()> {
         return Ok(());
     }
 
-    for v in &parsed.unapplied {
-        emit_finding(&ReviewFinding {
-            file: None,
-            line: None,
-            severity: Severity::Blocker,
-            origin: FindingOrigin::Model {
-                reviewer_agent_id: "coder-self-review".into(),
-            },
-            category: "completeness".into(),
-            message: format!(
-                "unapplied verb: {} (coder did: {}, rationale: {})",
-                v.verb,
-                v.applied_form_or_dash(),
-                v.rationale_or_dash()
-            ),
-            suggested_fix: None,
-            prohibitions: Vec::new(),
-            requirements: Vec::new(),
-        });
+    match classify_self_review_unapplied(&parsed.unapplied) {
+        SelfReviewClassification::Disagreement(disagreements) => {
+            emit_event(json!({
+                "msg": "self-review: deliberate disagreement, parking for captain decision",
+                "disagreement_count": disagreements.len(),
+            }));
+            emit_done(
+                EventVerdict::Failed,
+                Some(DoneReason {
+                    cause: "self_review_disagreed".into(),
+                    exit_code: None,
+                    disagreements,
+                }),
+            );
+            Err(())
+        }
+        SelfReviewClassification::BareFailure => {
+            for v in &parsed.unapplied {
+                emit_finding(&ReviewFinding {
+                    file: None,
+                    line: None,
+                    severity: Severity::Blocker,
+                    origin: FindingOrigin::Model {
+                        reviewer_agent_id: "coder-self-review".into(),
+                    },
+                    category: "completeness".into(),
+                    message: format!(
+                        "unapplied verb: {} (coder did: {}, rationale: {})",
+                        v.verb,
+                        v.applied_form_or_dash(),
+                        v.rationale_or_dash()
+                    ),
+                    suggested_fix: None,
+                    prohibitions: Vec::new(),
+                    requirements: Vec::new(),
+                });
+            }
+            emit_event(json!({"error": "self-review found unapplied verbs"}));
+            emit_done(
+                EventVerdict::Failed,
+                Some(DoneReason {
+                    cause: "self_review_unapplied".into(),
+                    exit_code: None,
+                    disagreements: Vec::new(),
+                }),
+            );
+            Err(())
+        }
     }
-    emit_event(json!({"error": "self-review found unapplied verbs"}));
-    emit_done(
-        EventVerdict::Failed,
-        Some(DoneReason {
-            cause: "self_review_unapplied".into(),
-            exit_code: None,
-        }),
-    );
-    Err(())
 }
 
 // ---------------------------------------------------------------------------
@@ -823,6 +850,7 @@ fn run_pre_commit_callers_gate(ctx: &BriefContext) -> Result<(), ()> {
                 Some(DoneReason {
                     cause: "pre_commit_callers_gate_failed".into(),
                     exit_code: None,
+                    disagreements: Vec::new(),
                 }),
             );
             Err(())

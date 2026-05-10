@@ -260,6 +260,7 @@ fn fail_reason(cause: &str, exit_code: Option<i32>) -> Option<DoneReason> {
     Some(DoneReason {
         cause: cause.into(),
         exit_code,
+        disagreements: Vec::new(),
     })
 }
 

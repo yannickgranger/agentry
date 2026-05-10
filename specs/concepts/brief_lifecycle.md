@@ -561,3 +561,17 @@ translator that detects the disagreement pattern and emits
 `CoderDisagreed` lives in 449b. The `captain decide` CLI subcommand
 that pushes `CaptainAccepted` / `CaptainRejected` lives in 449b. The
 dashboard surface that lists parked briefs lives in 449c.
+
+The daemon's trace translator detects the deliberate-disagreement
+pattern from the coder's `Done` event (`cause = "self_review_disagreed"`
+with `disagreements` populated). When matched, it emits
+`BriefEvent::CoderDisagreed` which routes through the universal handler
+to `AwaitingCaptainDecision`. The operator resolves the brief via
+`captain decide accept <brief_id>` (proceeds through the post-coder
+phase chain) or `captain decide reject <brief_id> --reason '...'`
+(transitions to `Failed{CaptainRejectedDisagreement}`). `captain decide
+list` shows currently parked briefs as one JSON object per line,
+`{"brief_id":"…","disagreements":N,"parked_at":"…"}`. All three
+subcommands push their event onto `agentry:brief:<id>:trace` with
+`agent` set to `captain-cli`, where the per-brief lifecycle driver
+consumes it like any other FSM event.

@@ -13,6 +13,7 @@ use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use orchestrator_runtime::captain_ground::{render_grounding_sheet, CfdbItem, SpecMatch};
 use orchestrator_runtime::captain_ground_cache::captain_ground_cache_dir;
+use orchestrator_runtime::{cli_decide, Config};
 use orchestrator_types::{
     now, Assertion, AssertionAnchor, AssertionId, Brief, BriefId, Budget, Contract, EscalationMode,
     TaskShape, VersionedRef,
@@ -153,6 +154,31 @@ enum Cmd {
         #[arg(long, default_value_t = false)]
         dry_run: bool,
     },
+    /// Resolve a brief parked in `AwaitingCaptainDecision` (coder flagged a
+    /// deliberate disagreement via `BriefEvent::CoderDisagreed`).
+    Decide {
+        #[command(subcommand)]
+        action: DecideAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum DecideAction {
+    /// Accept a parked disagreement — the brief proceeds through the post-coder phase chain.
+    Accept {
+        /// Brief id whose AwaitingCaptainDecision state to clear.
+        brief_id: String,
+    },
+    /// Reject a parked disagreement — the brief transitions to Failed{CaptainRejectedDisagreement}.
+    Reject {
+        /// Brief id whose AwaitingCaptainDecision state to clear.
+        brief_id: String,
+        /// Captain's prose explanation of the rejection (audit trail).
+        #[arg(long)]
+        reason: String,
+    },
+    /// List all briefs currently parked in AwaitingCaptainDecision state.
+    List,
 }
 
 fn parse_kind(s: &str) -> Result<TaskShape> {
@@ -621,6 +647,29 @@ fn cmd_redeploy(target: &str, dry_run: bool) -> Result<()> {
     Ok(())
 }
 
+fn cmd_decide(action: DecideAction) -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("failed to build tokio runtime for captain decide")?;
+    runtime.block_on(async move {
+        let cfg = Config::load().map_err(|e| anyhow!("failed to load config: {e}"))?;
+        match action {
+            DecideAction::Accept { brief_id } => cli_decide::run_accept(&cfg, &brief_id)
+                .await
+                .map_err(|e| anyhow!("captain decide accept failed: {e}")),
+            DecideAction::Reject { brief_id, reason } => {
+                cli_decide::run_reject(&cfg, &brief_id, &reason)
+                    .await
+                    .map_err(|e| anyhow!("captain decide reject failed: {e}"))
+            }
+            DecideAction::List => cli_decide::run_list(&cfg)
+                .await
+                .map_err(|e| anyhow!("captain decide list failed: {e}")),
+        }
+    })
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
@@ -716,6 +765,7 @@ fn main() -> Result<()> {
             eprintln!("need to match code Items. The graph-specs check enforces this at PR time.");
         }
         Cmd::Redeploy { target, dry_run } => cmd_redeploy(&target, dry_run)?,
+        Cmd::Decide { action } => cmd_decide(action)?,
     }
     Ok(())
 }
