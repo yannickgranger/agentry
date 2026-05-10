@@ -120,3 +120,114 @@ fn rejects_repo_starting_with_dash() {
     let err = TargetRepo::from_str("yg/-agentry").expect_err("must reject");
     assert_eq!(err, TargetRepoParseError::RepoStartsWithDotOrDash);
 }
+
+// Brief 1b reviewer BLOCKER: boundary-underscore inputs must be rejected
+// at parse time so the slug derivation cannot collapse `(yg_, foo)` and
+// `(yg, _foo)` to the same `yg___foo`.
+
+#[test]
+fn rejects_owner_trailing_underscore() {
+    let err = TargetRepo::from_str("yg_/foo").expect_err("must reject");
+    assert_eq!(err, TargetRepoParseError::OwnerBoundaryUnderscore);
+}
+
+#[test]
+fn rejects_repo_leading_underscore() {
+    let err = TargetRepo::from_str("yg/_foo").expect_err("must reject");
+    assert_eq!(err, TargetRepoParseError::RepoBoundaryUnderscore);
+}
+
+#[test]
+fn rejects_owner_trailing_and_repo_leading_underscore() {
+    // Owner is checked first; the error names the owner's failure.
+    let err = TargetRepo::from_str("yg_/_foo").expect_err("must reject");
+    assert_eq!(err, TargetRepoParseError::OwnerBoundaryUnderscore);
+}
+
+#[test]
+fn rejects_owner_leading_underscore() {
+    let err = TargetRepo::from_str("_yg/foo").expect_err("must reject");
+    assert_eq!(err, TargetRepoParseError::OwnerBoundaryUnderscore);
+}
+
+#[test]
+fn rejects_repo_trailing_underscore() {
+    let err = TargetRepo::from_str("yg/foo_").expect_err("must reject");
+    assert_eq!(err, TargetRepoParseError::RepoBoundaryUnderscore);
+}
+
+#[test]
+fn rejects_owner_single_underscore() {
+    let err = TargetRepo::from_str("_/foo").expect_err("must reject");
+    assert_eq!(err, TargetRepoParseError::OwnerBoundaryUnderscore);
+}
+
+#[test]
+fn rejects_repo_single_underscore() {
+    let err = TargetRepo::from_str("yg/_").expect_err("must reject");
+    assert_eq!(err, TargetRepoParseError::RepoBoundaryUnderscore);
+}
+
+#[test]
+fn boundary_underscore_class_no_pair_accepted() {
+    // Property: every boundary-underscore permutation in the cartesian
+    // product of {bare,leading_,trailing_,both_} × {bare,leading_,trailing_,both_}
+    // is rejected, except the (bare, bare) base case. This makes the
+    // "no two accepted (owner, repo) pairs collide via boundary
+    // underscores" property vacuously true.
+    let owner_variants = ["yg", "_yg", "yg_", "_yg_"];
+    let repo_variants = ["foo", "_foo", "foo_", "_foo_"];
+    for o in &owner_variants {
+        for r in &repo_variants {
+            let input = format!("{o}/{r}");
+            let parsed = TargetRepo::from_str(&input);
+            let bare = !o.starts_with('_') && !o.ends_with('_');
+            let bare_repo = !r.starts_with('_') && !r.ends_with('_');
+            if bare && bare_repo {
+                let tr =
+                    parsed.unwrap_or_else(|e| panic!("input {input} should parse but got {e:?}"));
+                assert_eq!(tr.owner(), *o);
+                assert_eq!(tr.repo(), *r);
+            } else {
+                assert!(
+                    parsed.is_err(),
+                    "input {input} must be rejected as boundary-underscore variant",
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn slug_distinct_for_internal_underscore_variants() {
+    // Sanity check that ACCEPTED inputs with internal underscores still
+    // produce distinct slugs across owner/repo placement.
+    let cases = [
+        ("yg/foo", "yg_foo"),
+        ("yg/foo_bar", "yg_foo__bar"),
+        ("yg_foo/bar", "yg__foo_bar"),
+        ("y_g/f_o", "y__g_f__o"),
+        ("yg/foo__bar", "yg_foo____bar"),
+    ];
+    let slugs: Vec<String> = cases
+        .iter()
+        .map(|(input, _)| {
+            TargetRepo::from_str(input)
+                .unwrap_or_else(|e| panic!("input {input} should parse but got {e:?}"))
+                .slug()
+        })
+        .collect();
+    for (i, (input, expected)) in cases.iter().enumerate() {
+        assert_eq!(&slugs[i], expected, "slug for {input}");
+    }
+    // No two slugs collide.
+    for i in 0..slugs.len() {
+        for j in (i + 1)..slugs.len() {
+            assert_ne!(
+                slugs[i], slugs[j],
+                "slug collision between cases[{i}]={} and cases[{j}]={}",
+                cases[i].0, cases[j].0,
+            );
+        }
+    }
+}
