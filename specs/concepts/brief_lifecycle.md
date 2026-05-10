@@ -385,3 +385,36 @@ Wait/Pass/Rework/Reject; `lifecycle_driver` fails the brief on
 Failed report is silently dropped. Pattern 3 (#397) lifts the
 hardcoded `AllMustPass` policy to per-edge config in the topology
 JSON.
+
+## ResumeReport
+
+#### Daemon resume on boot
+
+Every `orchestratord` boot runs an orphan scan before the wall-clock
+reaper starts: `crate::daemon_resume::resume_orphans` SCANs every
+`agentry:brief:*:state` key, deserializes each as a
+`BriefStateRecord`, and for every record still in a non-terminal
+position checks whether the named container (`agentry-{agent_id}`) is
+still alive via `podman ps`. The scan is non-blocking SCAN, never
+`KEYS`, so the cost is bounded on a populated production Redis.
+
+For dead containers the resume path writes a fresh
+`BriefStateRecord { state: Failed { reason: DaemonRestartedDuringExecution } }`
+back to the `:state` key and appends it to `:state_log`, so the FSM
+lands in a consistent terminal state and the operator can resubmit.
+For records whose container is found alive the 471a path is
+deliberately conservative: the record is left untouched and counted in
+`ResumeReport.kept_alive`. The follow-up brief 471b will replace that
+no-op with a true reattach into the per-brief lifecycle driver; the
+`ResumeReport` shape is stable across the change so dashboards and
+operator scripts that consume it do not need to re-key.
+
+The scan is conservative by design. Losing all in-flight work on a
+restart is preferable to the pre-471a behaviour where the FSM stayed
+in `Authoring`/`Verifying`/etc forever and the dashboard showed
+phantom "running" briefs indefinitely. Terminal records (`Shipped`,
+`Failed`) are skipped silently, so re-running the scan is idempotent
+and never re-writes or duplicates `state_log` entries for already-
+finished briefs. If the operator needs the orphaned work redone they
+can resubmit with the same brief id; the new run will be a fresh
+trip through the FSM.

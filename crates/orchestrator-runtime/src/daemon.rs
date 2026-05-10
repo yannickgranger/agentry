@@ -10,6 +10,7 @@
 
 use crate::intake_validation::{self, IntakeError};
 use crate::{
+    daemon_resume,
     lifecycle::{EventSource, StateProjector},
     lifecycle_driver, permit as permit_mod, projector, reaper, redis_io,
     spawner::{PodmanSpawner, RoutedMessage, RunAgentCtx, Spawner, TeamContext},
@@ -100,6 +101,23 @@ pub async fn run(
     let state = std::sync::Arc::new(state::open_or_init(std::path::Path::new(&state_path))?);
     tracing::info!(path = %state_path, "agent state store ready");
     tokio::spawn(projector::run(state.clone(), conn.clone()));
+
+    // Boot-time orphan scan (#471a): every non-terminal :state whose named
+    // container is no longer alive is failed with
+    // Reason::DaemonRestartedDuringExecution. A corrupt :state must not
+    // prevent boot — log and continue so the daemon comes up.
+    match redis_io::connect(&cfg.redis.url).await {
+        Ok(mut resume_conn) => match daemon_resume::resume_orphans(&mut resume_conn).await {
+            Ok(report) => tracing::info!(
+                scanned = report.scanned,
+                failed_dead = report.failed_dead,
+                kept_alive = report.kept_alive,
+                "boot: daemon resume scan complete",
+            ),
+            Err(e) => tracing::warn!(error = %e, "boot: daemon resume scan failed (non-fatal)"),
+        },
+        Err(e) => tracing::warn!(error = %e, "boot: daemon resume connect failed (non-fatal)"),
+    }
 
     // Wall-clock reaper (L.5 of EPIC #246): scans every 30s for briefs
     // stuck in non-terminal state past their `budget.max_wall_seconds`,
