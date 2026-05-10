@@ -32,9 +32,8 @@ pub mod spawner;
 pub mod state;
 pub mod submit_shape_check;
 pub mod team_validator;
-pub mod transcript;
 pub mod watchdog;
 pub mod workspace;
 
-pub use orchestrator_infra::{config, errors, redis_io};
+pub use orchestrator_infra::{config, errors, redis_io, transcript};
 pub use orchestrator_infra::{Config, Error, Result};
