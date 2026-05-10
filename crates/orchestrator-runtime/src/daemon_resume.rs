@@ -173,7 +173,17 @@ async fn scan_state_keys(conn: &mut ConnectionManager) -> Result<Vec<String>> {
     Ok(keys)
 }
 
-fn brief_state_agent_id(state: &BriefState) -> Option<&str> {
+/// Extract the `agent_id` named on a brief's current `BriefState`, when the
+/// state variant pins one. Today only `Authoring` carries an `agent_id`;
+/// past-Authoring phases (Verifying, Reviewing, Reworking, Shipping,
+/// Watching, Extension) return `None` and the caller decides what to do
+/// with the missing target.
+///
+/// Public so `crate::cli_abort` can reuse the same accessor when the
+/// per-brief abort path needs to best-effort `podman stop`/`kill` the
+/// brief's container.
+#[must_use]
+pub fn brief_state_agent_id(state: &BriefState) -> Option<&str> {
     match state {
         BriefState::Authoring { agent_id, .. } => Some(agent_id.as_str()),
         _ => None,
