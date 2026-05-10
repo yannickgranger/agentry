@@ -8,6 +8,46 @@ pub mod metrics;
 pub mod routes;
 pub mod store;
 
+use axum::extract::FromRef;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use store::DashboardStore;
+
+/// Shared application state for the dashboard router. Defined here (rather
+/// than in the binary crate) so route modules in this lib can name it.
+#[derive(Clone)]
+pub struct AppState {
+    pub store: DashboardStore,
+    pub webhook_secret: Option<String>,
+}
+
+impl FromRef<AppState> for DashboardStore {
+    fn from_ref(state: &AppState) -> Self {
+        state.store.clone()
+    }
+}
+
+/// Error wrapper so handlers can use `?`. Defined here so route modules
+/// can name it (the binary crate cannot expose its types to the lib).
+pub struct AppError(pub anyhow::Error);
+
+impl<E: Into<anyhow::Error>> From<E> for AppError {
+    fn from(e: E) -> Self {
+        Self(e.into())
+    }
+}
+
+impl IntoResponse for AppError {
+    fn into_response(self) -> Response {
+        tracing::error!(error = %self.0, "handler error");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("error: {}", self.0),
+        )
+            .into_response()
+    }
+}
+
 /// Resolve the webhook shared secret used to guard `POST /submit`.
 ///
 /// Explicit config wins: if `cfg_value` is `Some`, it is returned unchanged.
