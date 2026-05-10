@@ -21,7 +21,7 @@ use orchestrator_types::lifecycle::{
     handle, role_kind, BriefEvent, BriefState, BriefStateRecord, CiState, Reason, RetryBudget,
     DEFAULT_ATTEMPT_CAP,
 };
-use orchestrator_types::{BriefId, Event, EventKind, EventVerdict};
+use orchestrator_types::{now, BriefId, Event, EventKind, EventVerdict};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
@@ -93,6 +93,7 @@ async fn mem_adapters_drive_handle() {
         events: VecDeque::from(vec![
             BriefEvent::CoderStarted {
                 agent_id: "agent-1".into(),
+                started_at: now(),
             },
             BriefEvent::CoderDone {
                 verdict: EventVerdict::Shipped,
@@ -150,6 +151,7 @@ async fn mem_adapters_carry_retry_budget_through_rework() {
         events: VecDeque::from(vec![
             BriefEvent::CoderStarted {
                 agent_id: "agent-1".into(),
+                started_at: now(),
             },
             BriefEvent::CoderDone {
                 verdict: EventVerdict::Shipped,
@@ -160,6 +162,7 @@ async fn mem_adapters_carry_retry_budget_through_rework() {
             },
             BriefEvent::CoderStarted {
                 agent_id: "agent-2".into(),
+                started_at: now(),
             },
         ]),
     };
@@ -407,7 +410,7 @@ fn translate_spawned_coder_claude_agentry_emits_coder_started() {
     )
     .expect("translate spawned coder-claude-agentry");
     match out {
-        Some(BriefEvent::CoderStarted { agent_id }) => {
+        Some(BriefEvent::CoderStarted { agent_id, .. }) => {
             assert_eq!(agent_id, "agent-99");
         }
         other => panic!("expected CoderStarted, got {other:?}"),
@@ -569,6 +572,7 @@ async fn late_reviewer_done_in_reworking_is_dropped_not_failed() {
         events: VecDeque::from(vec![
             BriefEvent::CoderStarted {
                 agent_id: "agent-1".into(),
+                started_at: now(),
             },
             BriefEvent::CoderDone {
                 verdict: EventVerdict::Shipped,

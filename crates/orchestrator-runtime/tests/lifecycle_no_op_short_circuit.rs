@@ -38,7 +38,7 @@ use orchestrator_runtime::lifecycle::{
 use orchestrator_runtime::lifecycle_driver::{cleanup_shipped_no_op_brief_at, projector_task};
 use orchestrator_runtime::workspace::allocate_at;
 use orchestrator_types::lifecycle::{BriefEvent, BriefState, BriefStateRecord};
-use orchestrator_types::{BriefId, DoneReason, Event, EventKind, EventVerdict};
+use orchestrator_types::{now, BriefId, DoneReason, Event, EventKind, EventVerdict};
 use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -117,6 +117,7 @@ async fn coder_done_no_op_short_circuits_authoring_to_shipped() {
     let events = vec![
         BriefEvent::CoderStarted {
             agent_id: "agent-1".into(),
+            started_at: now(),
         },
         BriefEvent::CoderDoneNoOp {
             reason: NO_OP_VERDICT_REASON.into(),
@@ -164,6 +165,7 @@ async fn projector_stops_at_no_op_terminal_and_does_not_consume_tail_events() {
     let events = vec![
         BriefEvent::CoderStarted {
             agent_id: "agent-1".into(),
+            started_at: now(),
         },
         BriefEvent::CoderDoneNoOp {
             reason: NO_OP_VERDICT_REASON.into(),

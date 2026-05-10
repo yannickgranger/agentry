@@ -26,7 +26,7 @@ use orchestrator_runtime::lifecycle::{
 use orchestrator_runtime::lifecycle_driver::projector_task;
 use orchestrator_types::lifecycle::{BriefEvent, BriefState, BriefStateRecord, CiState, Reason};
 use orchestrator_types::review::{FindingOrigin, ReviewFinding, Severity};
-use orchestrator_types::{BriefId, EventVerdict};
+use orchestrator_types::{now, BriefId, EventVerdict};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
@@ -120,6 +120,7 @@ async fn projector_emits_one_shipped_terminal_on_happy_path() {
     let events = vec![
         BriefEvent::CoderStarted {
             agent_id: "agent-1".into(),
+            started_at: now(),
         },
         BriefEvent::CoderDone {
             verdict: EventVerdict::Shipped,
@@ -192,6 +193,7 @@ async fn premature_shipped_event_does_not_yield_shipped_terminal() {
     let events = vec![
         BriefEvent::CoderStarted {
             agent_id: "agent-1".into(),
+            started_at: now(),
         },
         // Premature-shipped claim: pre-#307 a parallel emission site
         // could turn this into a Shipped verdict. The FSM walks it to

@@ -32,7 +32,7 @@ use orchestrator_runtime::lifecycle::{
 };
 use orchestrator_runtime::lifecycle_driver::projector_task;
 use orchestrator_types::lifecycle::{BriefEvent, BriefState, BriefStateRecord, CiState, Reason};
-use orchestrator_types::{BriefId, EventVerdict};
+use orchestrator_types::{now, BriefId, EventVerdict};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
@@ -93,6 +93,7 @@ async fn projector_task_walks_happy_path_to_shipped() {
     let events = VecDeque::from(vec![
         BriefEvent::CoderStarted {
             agent_id: "agent-1".into(),
+            started_at: now(),
         },
         BriefEvent::CoderDone {
             verdict: EventVerdict::Shipped,
@@ -178,6 +179,7 @@ async fn projector_task_fails_brief_on_invalid_transition() {
         },
         BriefEvent::CoderStarted {
             agent_id: "agent-1".into(),
+            started_at: now(),
         },
         BriefEvent::CoderDone {
             verdict: EventVerdict::Failed,

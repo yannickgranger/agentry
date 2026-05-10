@@ -11,7 +11,7 @@
 
 use async_trait::async_trait;
 use orchestrator_types::lifecycle::{BriefEvent, BriefStateRecord, CiState};
-use orchestrator_types::{Event, EventKind, EventVerdict};
+use orchestrator_types::{now, Event, EventKind, EventVerdict};
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use thiserror::Error;
@@ -101,7 +101,10 @@ pub fn translate_trace_entry(
                     if let Some(kind) = orchestrator_types::lifecycle::role_kind(role) {
                         role_by_agent.insert(agent_id.clone(), role.to_string());
                         if kind == "coder" {
-                            return Ok(Some(BriefEvent::CoderStarted { agent_id }));
+                            return Ok(Some(BriefEvent::CoderStarted {
+                                agent_id,
+                                started_at: now(),
+                            }));
                         }
                     }
                 }
