@@ -446,27 +446,64 @@ pub fn slice_json_array(text: &str) -> Option<&str> {
     Some(&text[start..=end])
 }
 
+/// Find the last LINE-ANCHORED JSON array in text (a `[` that begins a line,
+/// plus its matching `]`). Used by parse_findings as a fallback when the
+/// first-pass naive slice (`slice_json_array`) captures prose containing
+/// literal `[]` brackets before the actual JSON findings.
+pub fn slice_last_json_array(text: &str) -> Option<&str> {
+    let bytes = text.as_bytes();
+    let mut start: Option<usize> = None;
+    for i in (0..bytes.len()).rev() {
+        if bytes[i] == b'[' && (i == 0 || bytes[i - 1] == b'\n') {
+            start = Some(i);
+            break;
+        }
+    }
+    let s = start?;
+    let mut depth: i32 = 0;
+    for (j, &b) in bytes[s..].iter().enumerate() {
+        if b == b'[' {
+            depth += 1;
+        } else if b == b']' {
+            depth -= 1;
+            if depth == 0 {
+                return Some(&text[s..s + j + 1]);
+            }
+        }
+    }
+    None
+}
+
 /// Strip optional code fences, slice between first `[` and last `]`, parse
 /// as a JSON array of finding-shape objects. On any failure, salvage the
 /// reply as a single `format_deviation` Blocker finding so the rework loop
 /// has a concrete handle. Returns the emit-ready findings.
 pub fn parse_findings(response: &str, agent_id: &str) -> Vec<ReviewFinding> {
     let cleaned = strip_fences(response);
-    let sliced = match slice_json_array(&cleaned) {
-        Some(s) => s,
-        None => {
-            return vec![salvage_format_deviation(&cleaned, agent_id)];
+    let primary = slice_json_array(&cleaned);
+    if let Some(s) = primary {
+        if let Ok(Value::Array(a)) = serde_json::from_str::<Value>(s) {
+            return a
+                .into_iter()
+                .map(|v| convert_finding(&v, agent_id))
+                .collect();
         }
-    };
-    let arr: Vec<Value> = match serde_json::from_str::<Value>(sliced) {
-        Ok(Value::Array(a)) => a,
-        _ => {
-            return vec![salvage_format_deviation(sliced, agent_id)];
+    }
+    let fallback = slice_last_json_array(&cleaned);
+    if let Some(fb) = fallback {
+        if let Ok(Value::Array(a)) = serde_json::from_str::<Value>(fb) {
+            emit_event(json!({
+                "msg": "reviewer parser: salvaged trailing JSON array after first-pass slice failed",
+                "primary_bytes": primary.map(|p| p.len()).unwrap_or(0),
+                "fallback_bytes": fallback.unwrap_or("").len(),
+            }));
+            return a
+                .into_iter()
+                .map(|v| convert_finding(&v, agent_id))
+                .collect();
         }
-    };
-    arr.into_iter()
-        .map(|v| convert_finding(&v, agent_id))
-        .collect()
+    }
+    vec![salvage_format_deviation(&cleaned, agent_id)]
 }
 
 /// Drop reviewer-emitted Blocker findings whose `message`, `requirements`,
