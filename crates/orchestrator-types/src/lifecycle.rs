@@ -211,6 +211,39 @@ pub struct InvalidTransition {
     pub event: BriefEvent,
 }
 
+/// Map an agent's full role name (as emitted by the spawner — e.g.
+/// `"coder-claude-agentry"`, `"shipper-agentry"`,
+/// `"preflight-criterion-agentry"`) to the short role kind the
+/// translator's `Done`-branch matches against.
+///
+/// Returns `None` for role names outside the recognised families; the
+/// translator skips memoization in that case so the `Done` lookup
+/// falls through to the catch-all (no `BriefEvent` emitted) rather
+/// than mis-classifying an unknown role.
+///
+/// Public so the peer `tests/lifecycle.rs` integration suite can pin
+/// the per-family mapping without re-deriving the prefix table.
+#[must_use]
+pub fn role_kind(role_name: &str) -> Option<&'static str> {
+    if role_name.starts_with("coder-") {
+        Some("coder")
+    } else if role_name.starts_with("ac-verifier-") {
+        Some("ac-verifier")
+    } else if role_name.starts_with("verifier-") {
+        Some("verifier")
+    } else if role_name.starts_with("reviewer-") {
+        Some("reviewer")
+    } else if role_name == "shipper-agentry" {
+        Some("shipper")
+    } else if role_name == "ci-watcher-agentry" {
+        Some("ci-watcher")
+    } else if role_name.starts_with("preflight-criterion") {
+        Some("preflight")
+    } else {
+        None
+    }
+}
+
 /// Pure transition function. Returns the new state for a valid transition,
 /// or `InvalidTransition` for an event that is not allowed in the current
 /// state. Never panics, never awaits, never performs I/O.
