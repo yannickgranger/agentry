@@ -7,6 +7,7 @@ use orchestrator_runtime::{
 use orchestrator_types::{MessageEdge, RoleName, RoleRef, TeamName, TeamTopology};
 use redis::aio::ConnectionManager;
 use redis::AsyncCommands;
+use std::collections::HashMap;
 use std::io::Write;
 
 fn test_redis_url() -> Option<String> {
@@ -49,6 +50,7 @@ fn topo(name: &str, version: u32, role: &str) -> TeamTopology {
         message_graph: vec![],
         terminal_role: rr(role),
         max_retries: 0,
+        node_classes: HashMap::new(),
     }
 }
 
@@ -135,16 +137,19 @@ async fn validate_rejects_cycle() {
                 to: rr(&role_b),
                 permit_overrides_from: None,
                 rework_target: None,
+                gate_policy: None,
             },
             MessageEdge {
                 from: rr(&role_b),
                 to: rr(&role_a),
                 permit_overrides_from: None,
                 rework_target: None,
+                gate_policy: None,
             },
         ],
         terminal_role: rr(&role_b),
         max_retries: 0,
+        node_classes: HashMap::new(),
     };
     let f = write_topology(&t);
     validate(&mut conn, f.path()).await.expect("validate runs");

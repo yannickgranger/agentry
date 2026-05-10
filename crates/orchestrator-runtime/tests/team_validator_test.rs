@@ -1,8 +1,9 @@
 //! Public-surface tests for the team-topology validator.
 
 use orchestrator_runtime::team_validator::{validate, TeamValidationViolation, ViolationKind};
-use orchestrator_types::{MessageEdge, RoleName, RoleRef, TeamName, TeamTopology};
-use std::collections::HashSet;
+use orchestrator_types::lifecycle::GatePolicy;
+use orchestrator_types::{MessageEdge, NodeClass, RoleName, RoleRef, TeamName, TeamTopology};
+use std::collections::{HashMap, HashSet};
 
 type RoleSpec<'a> = (&'a str, u32);
 type EdgeSpec<'a> = (RoleSpec<'a>, RoleSpec<'a>);
@@ -32,10 +33,12 @@ fn topo(
                 to: rr(t, *tv),
                 permit_overrides_from: None,
                 rework_target: None,
+                gate_policy: None,
             })
             .collect(),
         terminal_role: rr(terminal.0, terminal.1),
         max_retries: 0,
+        node_classes: HashMap::new(),
     }
 }
 
@@ -329,6 +332,97 @@ fn rejects_rework_target_not_in_roles() {
         1,
         "expected exactly one Reference violation on message_graph[0].rework_target, got: {v:?}"
     );
+}
+
+#[test]
+fn node_classes_and_gate_policy_round_trip() {
+    // A topology declaring node_classes and per-edge gate_policy must parse,
+    // validate, and round-trip through serde with byte-equivalent shape.
+    let mut t = topo(
+        "t-alpha",
+        &[("a", 1), ("b", 1)],
+        &[(("a", 1), ("b", 1))],
+        ("b", 1),
+        1,
+    );
+    t.message_graph[0].gate_policy = Some(GatePolicy::AllMustPass);
+    t.node_classes
+        .insert(RoleName("a".into()), NodeClass("container_bound".into()));
+    t.node_classes
+        .insert(RoleName("b".into()), NodeClass("container_bound".into()));
+    let v = validate(&t, &registry(&[("a", 1), ("b", 1)]));
+    assert!(v.is_empty(), "expected zero violations, got: {v:?}");
+    let s = serde_json::to_string(&t).expect("serialize");
+    let r: TeamTopology = serde_json::from_str(&s).expect("deserialize");
+    assert_eq!(t, r, "round-trip mismatch");
+}
+
+#[test]
+fn unknown_top_level_field_still_rejected_with_new_shape() {
+    // deny_unknown_fields on TeamTopology must still catch a typo-d new
+    // top-level field even though node_classes itself is now permitted.
+    let json = r#"{
+            "name":"t",
+            "version":1,
+            "roles":[{"name":"a","version":1}],
+            "message_graph":[],
+            "terminal_role":{"name":"a","version":1},
+            "node_classes":{"a":"container_bound"},
+            "extra_top":42
+        }"#;
+    let r: Result<TeamTopology, _> = serde_json::from_str(json);
+    assert!(r.is_err(), "expected unknown-field rejection, got: {r:?}");
+}
+
+#[test]
+fn operator_gated_node_without_registered_role_validates_clean() {
+    // a→b is the live pipeline; c is operator-gated and inbound-only — no
+    // registered AgentRole, no outbound edge. Must produce zero violations.
+    let mut t = topo(
+        "t",
+        &[("a", 1), ("b", 1), ("c", 1)],
+        &[(("a", 1), ("b", 1)), (("a", 1), ("c", 1))],
+        ("b", 1),
+        1,
+    );
+    t.node_classes
+        .insert(RoleName("c".into()), NodeClass("operator_gated".into()));
+    // Note: only a, b registered. c is operator_gated — must NOT need to
+    // resolve in registered_roles and must NOT trip multiple-terminals.
+    let v = validate(&t, &registry(&[("a", 1), ("b", 1)]));
+    assert!(v.is_empty(), "expected zero violations, got: {v:?}");
+}
+
+#[test]
+fn seed_self_host_v0_validates_clean() {
+    let text = include_str!("../../../seed/topologies/agentry-self-host-v0.json");
+    let t: TeamTopology = serde_json::from_str(text).expect("parse self-host-v0");
+    let reg = registry(&[
+        ("coder-claude-agentry", 1),
+        ("ac-verifier-claude-agentry", 1),
+        ("ac-verifier-gemini-agentry", 1),
+        ("ac-verifier-grok-agentry", 1),
+        ("reviewer-mechanical-agentry", 1),
+        ("reviewer-claude-agentry", 1),
+        ("shipper-agentry", 1),
+        ("ci-watcher-agentry", 1),
+    ]);
+    let v = validate(&t, &reg);
+    assert!(v.is_empty(), "expected zero violations, got: {v:?}");
+}
+
+#[test]
+fn seed_bugfix_v0_validates_clean() {
+    let text = include_str!("../../../seed/topologies/agentry-bugfix-v0.json");
+    let t: TeamTopology = serde_json::from_str(text).expect("parse bugfix-v0");
+    let reg = registry(&[
+        ("coder-claude-agentry", 1),
+        ("reviewer-mechanical-agentry", 1),
+        ("shipper-agentry", 1),
+        ("ci-watcher-agentry", 1),
+    ]);
+    let v = validate(&t, &reg);
+    assert!(v.is_empty(), "expected zero violations, got: {v:?}");
 }
 
 #[test]
