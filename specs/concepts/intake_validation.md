@@ -27,6 +27,22 @@ shape to support explicit-sha checkout via `git fetch + git checkout`;
 V1 ships with default-branch-HEAD semantics for the underlying
 shallow clone.
 
+## IntakeError
+
+Brief 1b lands two pre-mint intake gates: the daemon admits a brief only
+when its `payload.target_repo` parses through `TargetRepo::from_str` and
+the parsed `owner` is in `cfg.forge.allowed_owners`. Both gates raise an
+`IntakeError` variant — `MissingTargetRepo` for the absent / malformed
+case (closes the URL-fragment injection vector by ensuring the daemon
+never composes a clone URL from an unvalidated string) and
+`OwnerNotAllowed { owner }` for a target_repo whose owner failed the
+allowlist intersection. The daemon emits a `Failed` verdict plus a
+`BriefRejected` trace event for each rejection and the brief is not
+spawned. There is no permissive fallback — no `_unknown` keyspace, no
+inline byte-map salvage. Permit-broker `forge:write` enforcement remains
+the downstream defence-in-depth gate; `IntakeError` is the pre-mint
+gate.
+
 ## EnsureExtractedOutcome
 
 The outcome of `ensure_target_extracted`. `CacheHit` means the

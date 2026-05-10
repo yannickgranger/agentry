@@ -52,13 +52,33 @@ impl TargetRepo {
 
     /// Filesystem- and keyspace-safe slug.
     ///
-    /// Brief 1a parity with the legacy `sanitize_target_repo_slug` byte map:
-    /// concatenate `<owner>/<repo>` and replace any non-alphanumeric/`_`
-    /// byte with `_`. Brief 1b lands the collision-resistant `_` → `__`
-    /// pre-encoding.
+    /// Derivation: every literal `_` in the input is doubled (`_` → `__`),
+    /// then `<owner>/<repo>` is concatenated and any non-alphanumeric/`_`
+    /// byte is replaced with `_`.
+    ///
+    /// Collision-resistance proof for the boundary-underscore class
+    /// (1b reviewer BLOCKER): [`Self::from_str`] rejects any segment
+    /// whose first or last byte is `_`. So in any accepted `(owner, repo)`
+    /// pair, both segments start and end with a byte that is NOT `_`.
+    /// After the `_` → `__` step, every run of `_` inside `owner_encoded`
+    /// has even length and is bordered on both sides by non-`_` bytes;
+    /// the same holds for `repo_encoded`. The slash separator becomes a
+    /// single `_` after byte-mapping, sandwiched between two non-`_`
+    /// bytes (`owner_encoded`'s last and `repo_encoded`'s first).
+    /// Therefore the separator position is the unique index in the slug
+    /// where a single `_` is bordered on both sides by non-`_` bytes —
+    /// from which `owner_encoded` and `repo_encoded` are recoverable,
+    /// and from each the original segment is recoverable by halving the
+    /// `_` runs. Distinct `(owner, repo)` pairs accepted by `from_str`
+    /// therefore cannot collapse to the same slug across boundary-
+    /// underscore variants. (Other byte classes such as `.` vs `-`
+    /// remain conflated by the byte-map and are out of scope of this
+    /// proof.)
     #[must_use]
     pub fn slug(&self) -> String {
-        let temp = format!("{}/{}", self.owner, self.repo);
+        let owner_encoded = self.owner.replace('_', "__");
+        let repo_encoded = self.repo.replace('_', "__");
+        let temp = format!("{owner_encoded}/{repo_encoded}");
         temp.chars()
             .map(|c| {
                 if c.is_ascii_alphanumeric() || c == '_' {
@@ -105,6 +125,14 @@ pub enum TargetRepoParseError {
     RepoInvalidChars,
     OwnerStartsWithDotOrDash,
     RepoStartsWithDotOrDash,
+    /// Owner starts or ends with `_`. Brief 1b: forbidden so the slug
+    /// derivation is injective across boundary-underscore variants
+    /// (see [`TargetRepo::slug`] proof).
+    OwnerBoundaryUnderscore,
+    /// Repo starts or ends with `_`. Brief 1b: forbidden so the slug
+    /// derivation is injective across boundary-underscore variants
+    /// (see [`TargetRepo::slug`] proof).
+    RepoBoundaryUnderscore,
     TooLong,
     UnknownForgePrefix,
 }
@@ -119,6 +147,8 @@ impl fmt::Display for TargetRepoParseError {
             Self::RepoInvalidChars => "target_repo repo contains invalid characters",
             Self::OwnerStartsWithDotOrDash => "target_repo owner starts with `.` or `-`",
             Self::RepoStartsWithDotOrDash => "target_repo repo starts with `.` or `-`",
+            Self::OwnerBoundaryUnderscore => "target_repo owner starts or ends with `_`",
+            Self::RepoBoundaryUnderscore => "target_repo repo starts or ends with `_`",
             Self::TooLong => "target_repo exceeds maximum length",
             Self::UnknownForgePrefix => "target_repo has unknown forge prefix",
         };
@@ -184,11 +214,23 @@ fn validate_segment(seg: &str, kind: Segment) -> Result<(), TargetRepoParseError
     if seg.len() > MAX_SEGMENT_LEN {
         return Err(TargetRepoParseError::TooLong);
     }
-    let first = seg.as_bytes()[0];
+    let bytes = seg.as_bytes();
+    let first = bytes[0];
     if first == b'.' || first == b'-' {
         return Err(match kind {
             Segment::Owner => TargetRepoParseError::OwnerStartsWithDotOrDash,
             Segment::Repo => TargetRepoParseError::RepoStartsWithDotOrDash,
+        });
+    }
+    // Brief 1b: leading or trailing `_` would let `(yg_, foo)` and
+    // `(yg, _foo)` collapse to the same slug `yg___foo` after the
+    // `_` → `__` doubling step. Forbid both at intake so the slug
+    // proof on [`TargetRepo::slug`] holds.
+    let last = bytes[bytes.len() - 1];
+    if first == b'_' || last == b'_' {
+        return Err(match kind {
+            Segment::Owner => TargetRepoParseError::OwnerBoundaryUnderscore,
+            Segment::Repo => TargetRepoParseError::RepoBoundaryUnderscore,
         });
     }
     let valid = seg

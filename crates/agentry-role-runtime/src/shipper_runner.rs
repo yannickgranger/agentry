@@ -11,8 +11,9 @@
 //! stderr before it lands in an emitted event.
 
 use serde_json::{json, Value};
+use std::str::FromStr;
 
-use orchestrator_types::RedeployTarget;
+use orchestrator_types::{RedeployTarget, TargetRepo};
 
 use crate::tail_bytes;
 
@@ -24,7 +25,10 @@ use crate::tail_bytes;
 /// token never lands in the URL — git's stderr cannot leak it back when
 /// a push fails.
 pub fn push_url_credential_free(forge_host: &str, target_repo: &str) -> String {
-    format!("https://{forge_host}/{target_repo}.git")
+    match TargetRepo::from_str(target_repo) {
+        Ok(parsed) => parsed.clone_url(forge_host),
+        Err(_) => format!("https://{forge_host}/{target_repo}.git"),
+    }
 }
 
 /// Build the argv for the authenticated `git push`.

@@ -8,7 +8,7 @@
 //! resetting that upstream and its downstream sub-DAG to pending so they
 //! re-fire once the upstream re-ships.
 
-use crate::intake_validation;
+use crate::intake_validation::{self, IntakeError};
 use crate::{
     lifecycle::{EventSource, StateProjector},
     lifecycle_driver, permit as permit_mod, projector, reaper, redis_io,
@@ -20,8 +20,9 @@ use crate::{
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use futures::future::join_all;
 use orchestrator_types::{
-    apply_overrides, now, AgentRole, Brief, BriefId, Budget, PermitOverrides, PermitScope, RoleRef,
-    TeamTopology, ToolAllowlist, Verdict, VerdictKind, VersionedRef, WorkPermit,
+    apply_overrides, now, AgentRole, Brief, BriefId, Budget, EventKind, PermitOverrides,
+    PermitScope, RoleRef, TargetRepo, TeamTopology, ToolAllowlist, Verdict, VerdictKind,
+    VersionedRef, WorkPermit,
 };
 use redis::aio::ConnectionManager;
 use redis::AsyncCommands;
@@ -166,6 +167,39 @@ pub async fn run(
                         "non-trivial brief kind missing contract — log-only observation; future slice (B6) will reject at intake",
                     );
                 }
+                // Brief 1b — pre-mint intake gates. Run BEFORE clone, slug
+                // derivation, or permit mint. Two failures land here:
+                //   1. payload.target_repo missing or rejected by
+                //      `TargetRepo::from_str` charset validation
+                //      (closes G3: token-fragment injection).
+                //   2. parsed owner not in cfg.forge.allowed_owners
+                //      (defense-in-depth pre-permit gate; permit-broker
+                //      `forge:write` enforcement remains downstream).
+                let target_repo = match brief.target_repo() {
+                    Some(t) => t,
+                    None => {
+                        emit_brief_rejected(
+                            &mut conn,
+                            &brief,
+                            &IntakeError::MissingTargetRepo,
+                            None,
+                        )
+                        .await;
+                        continue;
+                    }
+                };
+                if !cfg
+                    .forge
+                    .allowed_owners
+                    .iter()
+                    .any(|o| o == target_repo.owner())
+                {
+                    let err = IntakeError::OwnerNotAllowed {
+                        owner: target_repo.owner().to_string(),
+                    };
+                    emit_brief_rejected(&mut conn, &brief, &err, Some(&target_repo)).await;
+                    continue;
+                }
                 // B6b — anchor validation. If the brief carries a contract,
                 // resolve every assertion's anchor against the local cfdb
                 // keyspace and `specs/concepts/`. Any unresolved anchor
@@ -181,28 +215,21 @@ pub async fn run(
                     // + runs cfdb extract + copies specs. Failure to extract is logged but does NOT
                     // abort intake — anchor resolution will simply return NotFound for affected
                     // anchors and the existing intake-reject path handles it.
-                    let target_repo = brief
-                        .payload
-                        .get("target_repo")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("_unknown")
-                        .to_string();
+                    let target_repo_str = target_repo.to_string();
                     let head_sha = brief
                         .payload
                         .get("base_branch")
                         .and_then(|v| v.as_str())
                         .unwrap_or("develop")
                         .to_string();
-                    let clone_url = format!(
-                        "https://{}/{}.git",
-                        cfg.forge
-                            .default_host
-                            .as_deref()
-                            .unwrap_or("agency.lab:3000"),
-                        target_repo,
-                    );
+                    let forge_host = cfg
+                        .forge
+                        .default_host
+                        .as_deref()
+                        .unwrap_or("agency.lab:3000");
+                    let clone_url = target_repo.clone_url(forge_host);
                     let extract_req = intake_validation::EnsureExtractedRequest {
-                        target_repo: target_repo.clone(),
+                        target_repo: target_repo_str.clone(),
                         head_sha: head_sha.clone(),
                         clone_url,
                         work_root: workspace_root.clone(),
@@ -216,22 +243,30 @@ pub async fn run(
                     });
                     match extract_outcome {
                         Ok(intake_validation::EnsureExtractedOutcome::CacheHit) => {
-                            tracing::debug!(brief = %brief.id, target_repo = %target_repo, "ensure_target_extracted: cache hit");
+                            tracing::debug!(brief = %brief.id, target_repo = %target_repo_str, "ensure_target_extracted: cache hit");
                         }
                         Ok(intake_validation::EnsureExtractedOutcome::Extracted { items }) => {
-                            tracing::info!(brief = %brief.id, target_repo = %target_repo, items = items, "ensure_target_extracted: extracted");
+                            tracing::info!(brief = %brief.id, target_repo = %target_repo_str, items = items, "ensure_target_extracted: extracted");
                         }
                         Ok(intake_validation::EnsureExtractedOutcome::Failed { reason }) => {
-                            tracing::warn!(brief = %brief.id, target_repo = %target_repo, reason = %reason, "ensure_target_extracted: failed (degraded; resolution may NotFound)");
+                            tracing::warn!(brief = %brief.id, target_repo = %target_repo_str, reason = %reason, "ensure_target_extracted: failed (degraded; resolution may NotFound)");
                         }
                         Err(_) => {
                             // join error already logged
                         }
                     }
-                    let failures = intake_validation::validate_brief_contract_for_target(
+                    let failures = match intake_validation::validate_brief_contract_for_target(
                         &brief,
                         &workspace_root,
-                    );
+                    ) {
+                        Ok(f) => f,
+                        Err(err) => {
+                            // Should not happen — the gate above already
+                            // checked target_repo parses — but stay defensive.
+                            emit_brief_rejected(&mut conn, &brief, &err, Some(&target_repo)).await;
+                            continue;
+                        }
+                    };
                     if failures.is_empty() {
                         tracing::info!(
                             brief = %brief.id,
@@ -874,6 +909,56 @@ pub async fn backfill_body_key(conn: &mut ConnectionManager, brief: &Brief) -> R
     Ok(())
 }
 
+/// Emit the brief-1b intake rejection signal: a `Failed` verdict on
+/// `agentry:verdicts` plus a `BriefRejected` trace event on the brief's
+/// trace stream. Best-effort — Redis hiccups are logged, never propagated
+/// (the alternative is leaving the brief running through downstream
+/// gates after we've already chosen to reject).
+async fn emit_brief_rejected(
+    conn: &mut ConnectionManager,
+    brief: &Brief,
+    err: &IntakeError,
+    rejected_target_repo: Option<&TargetRepo>,
+) {
+    let reason_code = match err {
+        IntakeError::MissingTargetRepo => "MissingTargetRepo",
+        IntakeError::OwnerNotAllowed { .. } => "OwnerNotAllowed",
+    };
+    let detail = format!("intake-reject: {err}");
+    let verdict = Verdict::new(brief.id.clone(), VerdictKind::Failed).with_reason(detail.clone());
+    if let Err(e) = redis_io::append_verdict(conn, &verdict).await {
+        tracing::error!(
+            brief = %brief.id,
+            error = %e,
+            "intake-reject: failed to append Failed verdict to verdicts stream",
+        );
+    }
+    let target_repo_label = rejected_target_repo
+        .map(TargetRepo::display_qualified)
+        .unwrap_or_default();
+    let payload = serde_json::json!({
+        "kind": "BriefRejected",
+        "reason": reason_code,
+        "detail": detail,
+        "target_repo": target_repo_label,
+        "cohort_labels": brief.cohort_labels,
+    });
+    let event = orchestrator_types::Event::new(EventKind::Event { payload });
+    if let Err(e) = redis_io::append_trace(conn, &brief.id, "daemon", &event).await {
+        tracing::warn!(
+            brief = %brief.id,
+            error = %e,
+            "intake-reject: failed to append BriefRejected trace event",
+        );
+    }
+    tracing::warn!(
+        brief = %brief.id,
+        reason = reason_code,
+        target_repo = %target_repo_label,
+        "intake-reject: brief rejected at pre-mint gate",
+    );
+}
+
 const DOL_VERIFIER_TOPOLOGY: &str = "agentry-verify-v0";
 
 /// Hook called once per brief when it reaches terminal verdict (success or
@@ -953,11 +1038,7 @@ async fn on_all_children_resolved(conn: &mut ConnectionManager, meta_id: &str) -
             return compose_meta_verdict(conn, meta_id).await;
         }
 
-        let target_repo = meta_brief
-            .payload
-            .get("target_repo")
-            .and_then(|v| v.as_str())
-            .map(str::to_string);
+        let target_repo = meta_brief.target_repo().map(|t| t.to_string());
         let base_branch = meta_brief
             .payload
             .get("base_branch")
@@ -1357,11 +1438,7 @@ async fn resolve_repo_for_brief(
         }
     }
 
-    let target_repo = brief
-        .payload
-        .get("target_repo")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
+    let target_repo = brief.target_repo();
     let base_branch = brief
         .payload
         .get("base_branch")
@@ -1400,11 +1477,17 @@ async fn fetch_brief_profile(
     brief: &Brief,
     cfg: &crate::Config,
 ) -> Option<orchestrator_types::Profile> {
-    let target_repo = brief
-        .payload
-        .get("target_repo")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let target_repo = match brief.target_repo() {
+        Some(t) => t,
+        None => {
+            tracing::warn!(
+                brief = %brief.id,
+                "profile fetch skipped: brief target_repo absent or rejected by strict validation",
+            );
+            return None;
+        }
+    };
+    let target_repo_str = target_repo.to_string();
     let base_branch = brief
         .payload
         .get("base_branch")
@@ -1413,19 +1496,19 @@ async fn fetch_brief_profile(
     let forge_host = cfg.forge.default_host.as_deref().unwrap_or("");
     let gitea_token = std::env::var("GITEA_TOKEN").unwrap_or_default();
 
-    if target_repo.is_empty() || forge_host.is_empty() || gitea_token.is_empty() {
+    if forge_host.is_empty() || gitea_token.is_empty() {
         tracing::info!(
             brief = %brief.id,
-            target_repo = %target_repo,
+            target_repo = %target_repo_str,
             forge_host = %forge_host,
             has_token = !gitea_token.is_empty(),
-            "profile fetch skipped: missing target_repo/forge_host/GITEA_TOKEN"
+            "profile fetch skipped: missing forge_host/GITEA_TOKEN"
         );
         return None;
     }
 
     match redis_io::fetch_profile(
-        target_repo,
+        &target_repo_str,
         base_branch,
         forge_host,
         &gitea_token,
@@ -1436,7 +1519,7 @@ async fn fetch_brief_profile(
         Ok(Some(p)) => {
             tracing::info!(
                 brief = %brief.id,
-                target_repo = %target_repo,
+                target_repo = %target_repo_str,
                 tool_packs_coder = ?p.coder.tool_packs,
                 tool_packs_reviewer = ?p.reviewer.tool_packs,
                 acceptance_default = ?p.acceptance.default,
@@ -1448,7 +1531,7 @@ async fn fetch_brief_profile(
         Ok(None) => {
             tracing::info!(
                 brief = %brief.id,
-                target_repo = %target_repo,
+                target_repo = %target_repo_str,
                 "no .agentry/profile.toml in target_repo; using defaults"
             );
             None
@@ -1456,7 +1539,7 @@ async fn fetch_brief_profile(
         Err(e) => {
             tracing::warn!(
                 brief = %brief.id,
-                target_repo = %target_repo,
+                target_repo = %target_repo_str,
                 error = %e,
                 "profile fetch failed; using defaults"
             );
@@ -1467,12 +1550,21 @@ async fn fetch_brief_profile(
 
 /// Build a token-bearing forge URL for the FIRST bare clone. Subsequent
 /// worktree operations against the bare clone do not need to carry auth.
-fn forge_url(target_repo: &str, forge_host: &str) -> Result<String> {
+///
+/// Brief 1b: the path component is composed via [`TargetRepo::clone_url`]
+/// from the validated `(owner, repo)` fields rather than from the raw
+/// payload string — this closes the URL-fragment injection vector G3.
+/// The token-bearing `oauth2:<token>@host` form is preserved by
+/// rewriting the scheme of the typed builder's output.
+fn forge_url(target_repo: &TargetRepo, forge_host: &str) -> Result<String> {
     let token = std::env::var("GITEA_TOKEN")
         .map_err(|_| Error::Config("GITEA_TOKEN not in daemon env".into()))?;
-    Ok(format!(
-        "https://oauth2:{token}@{forge_host}/{target_repo}.git"
-    ))
+    let typed = target_repo.clone_url(forge_host);
+    let path = typed
+        .strip_prefix("https://")
+        .and_then(|rest| rest.strip_prefix(forge_host))
+        .ok_or_else(|| Error::Config("clone_url did not start with https://<forge_host>".into()))?;
+    Ok(format!("https://oauth2:{token}@{forge_host}{path}"))
 }
 
 #[allow(dead_code)]

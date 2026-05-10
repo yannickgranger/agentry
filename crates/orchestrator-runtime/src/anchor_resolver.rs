@@ -43,28 +43,16 @@ impl ResolverContext {
     }
 }
 
-/// Transitional bridge during brief 1a — delegates to [`TargetRepo::slug`]
-/// for valid inputs, falls back to the legacy inline byte-map for inputs
-/// the new strict validator rejects. Brief 1b removes the fallback.
-///
-/// Replaces `/` and any non-alphanumeric/underscore character with `_`. The
-/// empty string and slugs with leading/trailing underscores are returned
-/// as-is — daemon callers pre-validate before reaching here.
+/// Strict slug derivation: delegates to [`TargetRepo::slug`] for inputs
+/// that parse, returns the empty-string sentinel otherwise. Daemon
+/// callers pre-validate the typed accessor and treat the sentinel as a
+/// hard error — no permissive byte-map fallback remains.
 #[must_use]
 pub fn sanitize_target_repo_slug(target_repo: &str) -> String {
-    if let Ok(parsed) = TargetRepo::from_str(target_repo) {
-        return parsed.slug();
+    match TargetRepo::from_str(target_repo) {
+        Ok(parsed) => parsed.slug(),
+        Err(_) => String::new(),
     }
-    target_repo
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
 }
 
 /// Outcome of resolving a single assertion anchor.
