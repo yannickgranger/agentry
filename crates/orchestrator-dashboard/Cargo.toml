@@ -16,7 +16,7 @@ path = "src/main.rs"
 
 [dependencies]
 orchestrator-types = { path = "../orchestrator-types" }
-orchestrator-runtime = { path = "../orchestrator-runtime" }
+orchestrator-infra = { path = "../orchestrator-infra" }
 trace-query = { path = "../trace-query" }
 serde.workspace = true
 serde_json.workspace = true

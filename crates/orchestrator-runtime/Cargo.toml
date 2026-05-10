@@ -24,6 +24,7 @@ path = "src/bin/captain.rs"
 
 [dependencies]
 orchestrator-types = { path = "../orchestrator-types" }
+orchestrator-infra = { path = "../orchestrator-infra" }
 schemars = { workspace = true }
 serde.workspace = true
 serde_json.workspace = true
@@ -43,9 +44,9 @@ hex.workspace = true
 figment.workspace = true
 reqwest.workspace = true
 anyhow = "1.0.102"
-rusqlite = { version = "0.32", features = ["bundled", "chrono"] }
+rusqlite = { workspace = true }
 humantime = "2"
-base64 = "0.22"
+base64 = { workspace = true }
 toml = { workspace = true }
 tempfile = "3.14"
 
