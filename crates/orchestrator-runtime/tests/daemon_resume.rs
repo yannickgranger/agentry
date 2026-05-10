@@ -15,7 +15,7 @@ use orchestrator_runtime::lifecycle::{
     EventSource, EventSourceError, StateProjector, StateProjectorError,
 };
 use orchestrator_types::lifecycle::{
-    BriefEvent, BriefState, BriefStateRecord, Reason, RetryBudget,
+    BriefEvent, BriefState, BriefStateRecord, DisagreementSummary, Reason, RetryBudget,
 };
 use orchestrator_types::{now, Brief, BriefId, Budget, EscalationMode, VersionedRef};
 use redis::aio::ConnectionManager;
@@ -595,5 +595,94 @@ async fn reattach_failure_falls_through_to_failed() {
 
     cleanup(&mut conn, &[id]).await;
     kill_sleep_container(agent_id).await;
+    result.expect("test body");
+}
+
+/// 487a: a brief in `AwaitingCaptainDecision` reattaches on boot
+/// regardless of any container being alive — the brief is operator-gated
+/// and the projector_task is spawned to consume the eventual
+/// `CaptainAccepted` / `CaptainRejected` event the operator pushes via
+/// `captain decide`. The `:state` record is left untouched (no event has
+/// arrived yet) and `kept_alive` is bumped.
+#[tokio::test]
+#[ignore = "requires live Redis (AGENTRY_TEST_REDIS_URL)"]
+async fn resume_reattaches_awaiting_captain_decision_brief() {
+    let Some(url) = test_redis_url() else {
+        return;
+    };
+    let mut conn = open_conn(&url).await;
+    let id = "test_awaiting_001";
+    let team_name = "agentry-awaiting-test-team";
+    let team_version: u32 = 1;
+    let topology = VersionedRef::new(team_name, team_version);
+
+    cleanup(&mut conn, &[id]).await;
+    cleanup_team(&mut conn, team_name, team_version).await;
+
+    let result = async {
+        let disagreements = vec![DisagreementSummary {
+            verb: "X".into(),
+            applied_form: "Y".into(),
+            rationale: "Z".into(),
+        }];
+        seed_state(
+            &mut conn,
+            id,
+            BriefState::AwaitingCaptainDecision {
+                disagreements,
+                retry: fresh_retry(),
+            },
+        )
+        .await;
+        seed_body(&mut conn, id, &topology).await;
+        seed_team(&mut conn, team_name, team_version).await;
+
+        let before = read_state(&mut conn, id).await;
+
+        let (event_factory, projector_factory, event_calls, projector_calls) = noop_factories();
+        let cfg = Config::default();
+        let report = resume_orphans(&mut conn, &event_factory, &projector_factory, &cfg)
+            .await
+            .expect("resume");
+
+        assert_eq!(
+            report,
+            ResumeReport {
+                scanned: 1,
+                failed_dead: 0,
+                kept_alive: 1,
+                reattach_failed: 0,
+            },
+            "AwaitingCaptainDecision record must reattach without a container probe",
+        );
+        assert_eq!(
+            event_calls.load(Ordering::SeqCst),
+            1,
+            "event_source_factory must be invoked exactly once for the reattached brief",
+        );
+        assert_eq!(
+            projector_calls.load(Ordering::SeqCst),
+            1,
+            "state_projector_factory must be invoked exactly once for the reattached brief",
+        );
+
+        let after = read_state(&mut conn, id).await;
+        assert_eq!(
+            before.state, after.state,
+            "reattach must not rewrite the :state record (no captain event yet)",
+        );
+
+        let log = read_log_records(&mut conn, id).await;
+        assert!(
+            log.is_empty(),
+            "reattach must not append to :state_log; got {log:?}",
+        );
+
+        Ok::<(), String>(())
+    }
+    .await;
+
+    cleanup(&mut conn, &[id]).await;
+    cleanup_team(&mut conn, team_name, team_version).await;
     result.expect("test body");
 }

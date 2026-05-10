@@ -106,17 +106,29 @@ pub async fn resume_orphans(
         let brief_id = record.brief_id.clone();
         let agent_id = brief_state_agent_id(&record.state);
 
-        // Without an agent_id we cannot probe a container — treat as
-        // dead and fail conservatively. Past-Authoring states (Verifying,
-        // Reviewing, Reworking, Shipping, Watching, Extension) fall in
-        // this bucket today; a future brief can refine once a per-role
-        // agent inventory is queryable here.
-        let alive = match agent_id {
-            Some(id) => container_alive(id).await,
-            None => false,
+        // Decide whether to attempt a reattach.
+        //
+        // - `Authoring` reattaches when its recorded container is still
+        //   alive (471b path). Without a live container we cannot resume
+        //   in-flight work, so it falls through to failed_dead.
+        // - `AwaitingCaptainDecision` reattaches unconditionally (487a):
+        //   the brief is operator-gated, no agent container is in
+        //   flight, and the projector_task only needs to consume the
+        //   eventual `CaptainAccepted` / `CaptainRejected` event the
+        //   operator pushes via `captain decide` — at which point the
+        //   FSM transitions normally.
+        // - All other non-terminal states (Verifying, Reviewing,
+        //   Reworking, Shipping, Watching, Extension) currently fall
+        //   through to failed_dead. Reattach for those requires the
+        //   role-chain re-spawn story which lives in a future brief
+        //   (#487b).
+        let should_reattach = match &record.state {
+            BriefState::Authoring { agent_id, .. } => container_alive(agent_id).await,
+            BriefState::AwaitingCaptainDecision { .. } => true,
+            _ => false,
         };
 
-        if alive {
+        if should_reattach {
             match reattach_brief(
                 &brief_id,
                 event_source_factory,
@@ -130,7 +142,8 @@ pub async fn resume_orphans(
                     tracing::info!(
                         brief = %brief_id.0,
                         agent = ?agent_id,
-                        "resume: reattached lifecycle driver to live container",
+                        state = ?record.state,
+                        "resume: reattached lifecycle driver",
                     );
                     report.kept_alive += 1;
                     continue;
