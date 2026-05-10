@@ -146,6 +146,8 @@ pub enum BriefState {
 pub enum BriefEvent {
     CoderStarted {
         agent_id: String,
+        #[serde(default = "crate::now")]
+        started_at: Ts,
     },
     CoderDone {
         verdict: EventVerdict,
@@ -298,16 +300,20 @@ pub fn handle(
 
     match (state, event) {
         // ---- Submitted ----
-        (BriefState::Submitted, BriefEvent::CoderStarted { agent_id }) => {
-            Ok(BriefState::Authoring {
-                agent_id: agent_id.clone(),
-                started_at: Ts::default(),
-                retry: RetryBudget {
-                    attempt: 1,
-                    max: DEFAULT_ATTEMPT_CAP,
-                },
-            })
-        }
+        (
+            BriefState::Submitted,
+            BriefEvent::CoderStarted {
+                agent_id,
+                started_at,
+            },
+        ) => Ok(BriefState::Authoring {
+            agent_id: agent_id.clone(),
+            started_at: *started_at,
+            retry: RetryBudget {
+                attempt: 1,
+                max: DEFAULT_ATTEMPT_CAP,
+            },
+        }),
 
         // ---- Authoring ----
         // Preflight smell: preflight-criterion-agentry detected an
@@ -495,13 +501,17 @@ pub fn handle(
         }
 
         // ---- Reworking ----
-        (BriefState::Reworking { retry, .. }, BriefEvent::CoderStarted { agent_id }) => {
-            Ok(BriefState::Authoring {
-                agent_id: agent_id.clone(),
-                started_at: Ts::default(),
-                retry: *retry,
-            })
-        }
+        (
+            BriefState::Reworking { retry, .. },
+            BriefEvent::CoderStarted {
+                agent_id,
+                started_at,
+            },
+        ) => Ok(BriefState::Authoring {
+            agent_id: agent_id.clone(),
+            started_at: *started_at,
+            retry: *retry,
+        }),
 
         // ---- Shipping ----
         (

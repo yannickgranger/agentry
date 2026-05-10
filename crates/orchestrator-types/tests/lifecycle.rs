@@ -42,6 +42,7 @@ fn fresh_retry() -> RetryBudget {
 fn coder_started() -> BriefEvent {
     BriefEvent::CoderStarted {
         agent_id: "coder-1".to_owned(),
+        started_at: now(),
     }
 }
 
@@ -299,6 +300,42 @@ fn reworking_coder_started_returns_to_authoring_with_same_retry() {
         }
         other => panic!("expected Authoring, got {other:?}"),
     }
+}
+
+// --- brief 472: CoderStarted carries a real wall-clock started_at ---
+
+/// Fix verification for issue #472: pre-fix the FSM populated
+/// `Authoring.started_at` with `Ts::default()` (1970-01-01T00:00:00Z)
+/// because `handle` is pure and could not call `now()`. Post-fix the
+/// timestamp rides on the `BriefEvent::CoderStarted` payload and the
+/// FSM copies it through, so the resulting `Authoring` state carries
+/// a real wall-clock stamp inside the (`before`, `after`) window
+/// captured around the transition.
+#[test]
+fn coder_started_carries_real_timestamp() {
+    let before = now();
+    let event = BriefEvent::CoderStarted {
+        agent_id: "agt_test".into(),
+        started_at: now(),
+    };
+    let next = handle(&BriefState::Submitted, &event, &no_gates()).expect("ok");
+    let started_at = match next {
+        BriefState::Authoring { started_at, .. } => started_at,
+        other => panic!("expected Authoring, got {other:?}"),
+    };
+    let after = now();
+    assert!(
+        started_at != Ts::default(),
+        "started_at must not be the epoch-zero sentinel"
+    );
+    assert!(
+        started_at >= before,
+        "started_at {started_at} must be at or after the pre-event capture {before}"
+    );
+    assert!(
+        started_at <= after,
+        "started_at {started_at} must be at or before the post-event capture {after}"
+    );
 }
 
 // --- watching: rebase + ci_pending stay in Watching ---
