@@ -1,6 +1,6 @@
 use orchestrator_types::lifecycle::{
-    handle, BriefEvent, BriefState, BriefStateRecord, CiState, InvalidTransition, Reason,
-    RetryBudget, ReworkTarget, DEFAULT_ATTEMPT_CAP, MAXIMUM_ATTEMPT_CAP,
+    handle, BriefEvent, BriefState, BriefStateRecord, CiState, DisagreementSummary,
+    InvalidTransition, Reason, RetryBudget, ReworkTarget, DEFAULT_ATTEMPT_CAP, MAXIMUM_ATTEMPT_CAP,
 };
 use orchestrator_types::{now, BriefId, EventVerdict, ReviewFinding, Ts};
 
@@ -1443,6 +1443,137 @@ fn authoring_to_verifying_no_skip_when_verifying_has_expected() {
         }
         other => panic!("expected Verifying (no auto-skip), got {other:?}"),
     }
+}
+
+// --- 449a: captain-mediated disagreement resolution ---
+
+fn sample_disagreements() -> Vec<DisagreementSummary> {
+    vec![DisagreementSummary {
+        verb: "REPLACE crates/foo/src/bar.rs:42 with `let x = 1;`".to_owned(),
+        applied_form: "REPLACE crates/foo/src/bar.rs:42 with `let x = 1u32;`".to_owned(),
+        rationale: "the literal verb produces a type-inference error; coerce to u32".to_owned(),
+    }]
+}
+
+#[test]
+fn authoring_disagreed_transitions_to_awaiting_captain() {
+    let retry = RetryBudget { attempt: 1, max: 3 };
+    let s = BriefState::Authoring {
+        agent_id: "c".into(),
+        started_at: Ts::default(),
+        retry,
+    };
+    let disagreements = sample_disagreements();
+    let next = handle(
+        &s,
+        &BriefEvent::CoderDisagreed {
+            disagreements: disagreements.clone(),
+        },
+        &no_gates(),
+    )
+    .expect("authoring + coder_disagreed");
+    match next {
+        BriefState::AwaitingCaptainDecision {
+            disagreements: d,
+            retry: r,
+        } => {
+            assert_eq!(r, retry);
+            assert_eq!(d, disagreements);
+        }
+        other => panic!("expected AwaitingCaptainDecision, got {other:?}"),
+    }
+}
+
+#[test]
+fn reworking_disagreed_transitions_to_awaiting_captain() {
+    let retry = RetryBudget { attempt: 2, max: 4 };
+    let s = BriefState::Reworking {
+        target: ReworkTarget::Coder,
+        retry,
+    };
+    let disagreements = sample_disagreements();
+    let next = handle(
+        &s,
+        &BriefEvent::CoderDisagreed {
+            disagreements: disagreements.clone(),
+        },
+        &no_gates(),
+    )
+    .expect("reworking + coder_disagreed");
+    match next {
+        BriefState::AwaitingCaptainDecision {
+            disagreements: d,
+            retry: r,
+        } => {
+            assert_eq!(r, retry);
+            assert_eq!(d, disagreements);
+        }
+        other => panic!("expected AwaitingCaptainDecision, got {other:?}"),
+    }
+}
+
+#[test]
+fn verifying_disagreed_is_invalid_transition() {
+    let s = BriefState::Verifying {
+        retry: fresh_retry(),
+        received: std::collections::BTreeMap::new(),
+        expected: vec![],
+        policy: orchestrator_types::lifecycle::GatePolicy::AllMustPass,
+    };
+    let event = BriefEvent::CoderDisagreed {
+        disagreements: sample_disagreements(),
+    };
+    let err = handle(&s, &event, &no_gates())
+        .expect_err("CoderDisagreed is phase-specific to coder phase");
+    assert_eq!(err.from, s);
+    assert_eq!(err.event, event);
+}
+
+#[test]
+fn captain_accepted_transitions_through_post_coder_chain() {
+    let retry = RetryBudget { attempt: 1, max: 3 };
+    let s = BriefState::AwaitingCaptainDecision {
+        disagreements: sample_disagreements(),
+        retry,
+    };
+    let gates = single_role_gates();
+    let next = handle(&s, &BriefEvent::CaptainAccepted, &gates)
+        .expect("awaiting_captain_decision + captain_accepted");
+    // single_role_gates() has a non-empty verifying gate, so post_coder_shipped
+    // should land in Verifying — same as the existing Authoring +
+    // CoderDone{Shipped} happy-path test.
+    match next {
+        BriefState::Verifying { retry: r, .. }
+        | BriefState::Reviewing { retry: r, .. }
+        | BriefState::Shipping { retry: r, .. } => {
+            assert_eq!(r, retry, "retry budget must be preserved through accept");
+        }
+        other => panic!("expected one of Verifying/Reviewing/Shipping, got {other:?}"),
+    }
+}
+
+#[test]
+fn captain_rejected_transitions_to_failed() {
+    let s = BriefState::AwaitingCaptainDecision {
+        disagreements: sample_disagreements(),
+        retry: fresh_retry(),
+    };
+    let next = handle(
+        &s,
+        &BriefEvent::CaptainRejected {
+            reason: "captain prefers literal verb".into(),
+        },
+        &no_gates(),
+    )
+    .expect("awaiting_captain_decision + captain_rejected");
+    assert_eq!(
+        next,
+        BriefState::Failed {
+            reason: Reason::CaptainRejectedDisagreement {
+                reason: "captain prefers literal verb".into(),
+            },
+        }
+    );
 }
 
 #[test]
