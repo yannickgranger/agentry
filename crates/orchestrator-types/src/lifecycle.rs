@@ -66,6 +66,9 @@ pub enum Reason {
     DaemonError {
         detail: String,
     },
+    /// Fires when the daemon's boot-time resume scan finds a brief in a
+    /// non-terminal `:state` whose named container is no longer alive.
+    DaemonRestartedDuringExecution,
 }
 
 /// CI status carried by a `BriefEvent::CiResult`.

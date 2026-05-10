@@ -15,6 +15,7 @@ pub mod cli_agents;
 pub mod cli_roles;
 pub mod cli_teams;
 pub mod daemon;
+pub mod daemon_resume;
 pub mod delivery;
 pub mod intake_validation;
 pub mod lifecycle;
