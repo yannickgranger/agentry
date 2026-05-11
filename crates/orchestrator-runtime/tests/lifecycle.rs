@@ -636,3 +636,166 @@ async fn late_reviewer_done_in_reworking_is_dropped_not_failed() {
         );
     }
 }
+
+// --- zombie :state regression suite ---
+//
+// These pin the brief: `fix(daemon): zombie :state — terminal
+// disposition must atomically write BriefState::Failed`. Two paths
+// converge on the same root cause (terminal :state never written):
+//
+// 1. `handle_brief`'s team-failure disposition returned `VerdictKind::Failed`
+//    without touching `:state`, so the reaper kept firing
+//    BudgetExhausted forever on a brief whose container was long gone.
+// 2. `projector_task` was parked at `Reworking{..}` because the
+//    late-reviewer-in-reworking branch demoted the only event the FSM
+//    would have accepted; the reaper's BudgetExhausted then had no
+//    pathway to drive the FSM to terminal.
+
+/// `handle_brief`'s team-failure disposition path must atomically write
+/// `BriefState::Failed { reason: AcceptanceFailed { detail } }` through
+/// the projector before returning. Drives the helper
+/// (`write_team_terminal_state`) with an in-memory projector and
+/// asserts the post-write record is terminal Failed with a
+/// non-default reason naming the failing role.
+#[tokio::test]
+async fn team_failed_disposition_writes_terminal_state_atomically() {
+    let bid = BriefId("brf_team_failed_zombie".into());
+    let written: Arc<Mutex<Vec<(BriefStateRecord, String)>>> = Arc::new(Mutex::new(Vec::new()));
+    let mut projector = MemStateProjector {
+        written: written.clone(),
+    };
+
+    let detail = "reviewer-claude-agentry verdict=Failed".to_string();
+    orchestrator_runtime::daemon::write_team_terminal_state(
+        &mut projector,
+        &bid,
+        BriefState::Failed {
+            reason: Reason::AcceptanceFailed {
+                detail: detail.clone(),
+            },
+        },
+        "team-orchestration-failed",
+    )
+    .await;
+
+    let log = written.lock().expect("mutex").clone();
+    assert_eq!(
+        log.len(),
+        1,
+        "the team-failure disposition must produce exactly one :state write"
+    );
+    let (record, cursor) = &log[0];
+    assert_eq!(record.brief_id, bid);
+    assert_eq!(cursor, "team-orchestration-failed");
+    match &record.state {
+        BriefState::Failed {
+            reason: Reason::AcceptanceFailed { detail: got },
+        } => {
+            assert_eq!(got, &detail, "reason must carry the failing-role detail");
+            assert!(
+                !got.is_empty(),
+                "reason detail must be non-default — operators read :state without the trace stream",
+            );
+        }
+        other => panic!("expected Failed{{AcceptanceFailed}}, got {other:?}"),
+    }
+}
+
+/// `handle_brief`'s shipped path must also atomically write
+/// `BriefState::Shipped` to `:state` before returning, so the reaper
+/// stops firing on a brief whose PR has merged.
+#[tokio::test]
+async fn team_shipped_disposition_writes_terminal_state_atomically() {
+    let bid = BriefId("brf_team_shipped_zombie".into());
+    let written: Arc<Mutex<Vec<(BriefStateRecord, String)>>> = Arc::new(Mutex::new(Vec::new()));
+    let mut projector = MemStateProjector {
+        written: written.clone(),
+    };
+
+    orchestrator_runtime::daemon::write_team_terminal_state(
+        &mut projector,
+        &bid,
+        BriefState::Shipped,
+        "team-orchestration-shipped",
+    )
+    .await;
+
+    let log = written.lock().expect("mutex").clone();
+    assert_eq!(log.len(), 1);
+    assert!(matches!(log[0].0.state, BriefState::Shipped));
+    assert_eq!(log[0].1, "team-orchestration-shipped");
+}
+
+/// Seed `projector_task` to land in `Reworking { target: Coder }` via
+/// the canonical Reviewing-rework path, then push `BudgetExhausted`
+/// (the event the reaper synthesises on over-budget briefs) and assert
+/// the FSM driver writes a terminal `Failed { BudgetExhausted }`
+/// record. Pre-fix the late-reviewer-in-reworking branch parked the
+/// FSM in Reworking and the reaper's BudgetExhausted had no pathway to
+/// drive the FSM to terminal.
+#[tokio::test]
+async fn reaper_budget_exhausted_drives_fsm_to_failed() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    std::env::set_var("AGENTRY_WORKSPACE_ROOT", tmp.path());
+
+    let bid = BriefId("brf_reaper_budget_exhausted_zombie".into());
+    let written: Arc<Mutex<Vec<(BriefStateRecord, String)>>> = Arc::new(Mutex::new(Vec::new()));
+    let source: Box<dyn EventSource + Send> = Box::new(MemEventSource {
+        events: VecDeque::from(vec![
+            BriefEvent::CoderStarted {
+                agent_id: "agent-1".into(),
+                started_at: now(),
+            },
+            BriefEvent::CoderDone {
+                verdict: EventVerdict::Shipped,
+            },
+            BriefEvent::AcVerifierDone {
+                verdict: EventVerdict::Shipped,
+                role_name: "ac-verifier-test".to_owned(),
+            },
+            BriefEvent::ReviewerDone {
+                verdict: EventVerdict::ReworkNeeded,
+                findings: vec![],
+                role_name: "reviewer-test".to_owned(),
+            },
+            // FSM is now in Reworking{Coder, 2/3}. The reaper observes
+            // the brief past its wall-clock budget and pushes this:
+            BriefEvent::BudgetExhausted,
+        ]),
+    });
+    let projector: Box<dyn StateProjector + Send> = Box::new(MemStateProjector {
+        written: written.clone(),
+    });
+
+    let result = projector_task(
+        bid.clone(),
+        source,
+        projector,
+        None,
+        std::sync::Arc::new(no_gates()),
+    )
+    .await;
+    assert!(
+        result.is_ok(),
+        "projector_task must return Ok after honoring BudgetExhausted: {result:?}"
+    );
+
+    let log = written.lock().expect("mutex").clone();
+    let last = &log.last().expect("at least one record").0.state;
+    match last {
+        BriefState::Failed {
+            reason: Reason::BudgetExhausted,
+        } => {}
+        other => panic!("expected Failed{{BudgetExhausted}}, got {other:?}"),
+    }
+    // The Reworking record must have been written BEFORE the terminal
+    // Failed — pre-fix the FSM was parked in Reworking with no terminal
+    // write ever following.
+    assert!(
+        log.iter()
+            .any(|(r, _)| matches!(r.state, BriefState::Reworking { .. })),
+        "FSM must pass through Reworking before terminating",
+    );
+
+    std::env::remove_var("AGENTRY_WORKSPACE_ROOT");
+}
