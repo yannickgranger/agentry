@@ -15,7 +15,7 @@ use crate::lifecycle::{
 use crate::redis_io;
 use crate::workspace::{self, BriefWorkspace, TerminationDisposition};
 use crate::{Error, Result};
-use orchestrator_types::lifecycle::{handle, BriefEvent, BriefState, BriefStateRecord};
+use orchestrator_types::lifecycle::{handle, BriefEvent, BriefState, BriefStateRecord, Reason};
 use orchestrator_types::{now, BriefId, Event, EventKind, Verdict, VerdictKind};
 use redis::aio::ConnectionManager;
 use std::path::Path;
@@ -74,6 +74,56 @@ pub async fn projector_task(
         }
         step = step.saturating_add(1);
         let cursor = format!("step-{step}");
+
+        // Sibling pathway: terminating events arriving while the FSM
+        // is parked in Reworking must be honored — the reaper pushes
+        // `BudgetExhausted` on over-budget briefs, an operator may
+        // push `AbortRequested`, and either must transition
+        // `Reworking{..} → Failed{..}` and write terminal :state.
+        // The universal abort handler in `handle()` covers the
+        // transition arithmetically, but pre-fix zombies (brf_495_v2
+        // and friends) showed briefs parked in Reworking after the
+        // outer team-orchestration loop returned, with the reaper
+        // firing forever because no terminal `:state` was ever
+        // written. Re-checking explicitly here makes the FSM driver
+        // observably responsible for the transition and gives the
+        // regression a direct test target.
+        if matches!(state, BriefState::Reworking { .. }) {
+            let terminal_reason = match &event {
+                BriefEvent::BudgetExhausted => Some(Reason::BudgetExhausted),
+                BriefEvent::AbortRequested { actor, message } => Some(Reason::AbortRequested {
+                    actor: actor.clone(),
+                    message: message.clone(),
+                }),
+                _ => None,
+            };
+            if let Some(reason) = terminal_reason {
+                let failed_state = BriefState::Failed { reason };
+                let record = BriefStateRecord {
+                    brief_id: brief_id.clone(),
+                    state: failed_state.clone(),
+                    parent_brief_id: None,
+                    composition_role: None,
+                    at: now(),
+                };
+                projector
+                    .write(&record, &cursor)
+                    .await
+                    .map_err(|e| Error::Config(format!("state projector: {e}")))?;
+                state = failed_state;
+                if let Some(ref mut conn) = verdict_conn {
+                    emit_terminal_verdict(conn, &brief_id, &state, no_op_reason.as_deref()).await?;
+                }
+                cleanup_failed_brief(&brief_id, verdict_conn.as_mut()).await;
+                tracing::info!(
+                    brief = %brief_id.0,
+                    event = ?event,
+                    "FSM driver: terminating event in Reworking drove terminal Failed",
+                );
+                break;
+            }
+        }
+
         match handle(&state, &event, &phase_gates) {
             Ok(new_state) => {
                 let record = BriefStateRecord {

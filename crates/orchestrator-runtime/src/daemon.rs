@@ -11,7 +11,7 @@
 use crate::intake_validation::{self, IntakeError};
 use crate::{
     daemon_resume,
-    lifecycle::{EventSource, StateProjector},
+    lifecycle::{EventSource, RedisStateProjector, StateProjector},
     lifecycle_driver, permit as permit_mod, projector, reaper, redis_io,
     spawner::{PodmanSpawner, RoutedMessage, RunAgentCtx, Spawner, TeamContext},
     state,
@@ -20,6 +20,7 @@ use crate::{
 };
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use futures::future::join_all;
+use orchestrator_types::lifecycle::{BriefState, BriefStateRecord, Reason};
 use orchestrator_types::{
     apply_overrides, now, AgentRole, Brief, BriefId, Budget, EventKind, PermitOverrides,
     PermitScope, RoleRef, TargetRepo, TeamTopology, ToolAllowlist, Verdict, VerdictKind,
@@ -560,6 +561,11 @@ async fn handle_brief(
     let mut workspace: Option<BriefWorkspace> = None;
     // Track the final team-level outcome.
     let mut team_shipped = true;
+    // Captured at each `team_shipped = false` break so the terminal
+    // `:state` write below can name the failing role (e.g.
+    // `"reviewer-claude-agentry verdict=Failed"`). Operators reading the
+    // `:state` key see WHY without grepping the trace stream.
+    let mut team_failure_detail: Option<String> = None;
     // Per-brief rework budget.
     let mut reworks_used: u32 = 0;
     // Roles whose Shipped outcome has appeared in the trace stream so
@@ -773,6 +779,10 @@ async fn handle_brief(
                         "rework requested but retry budget exhausted"
                     );
                     team_shipped = false;
+                    team_failure_detail = Some(format!(
+                        "{} rework budget exhausted ({}/{})",
+                        from_ref.name, reworks_used, team.max_retries
+                    ));
                     break 'outer;
                 }
                 None => {
@@ -782,6 +792,10 @@ async fn handle_brief(
                         "rework requested but role has no upstream — treating as failed"
                     );
                     team_shipped = false;
+                    team_failure_detail = Some(format!(
+                        "{} requested rework with no upstream",
+                        from_ref.name
+                    ));
                     break 'outer;
                 }
             }
@@ -793,6 +807,7 @@ async fn handle_brief(
         for failed in &failures {
             if !rewound_subdags.contains(failed) {
                 team_shipped = false;
+                team_failure_detail = Some(format!("{} verdict=Failed", failed.name));
                 break 'outer;
             }
         }
@@ -801,6 +816,10 @@ async fn handle_brief(
     // Success requires the terminal role to have shipped.
     if team_shipped && !shipped_roles.contains(&team.terminal_role) {
         team_shipped = false;
+        team_failure_detail = Some(format!(
+            "terminal role {} did not ship",
+            team.terminal_role.name
+        ));
     }
 
     // Bail early on team failure — no chain-trigger. The workspace is
@@ -812,14 +831,54 @@ async fn handle_brief(
     // names that handoff so an operator grepping the log still finds a
     // pointer to where cleanup actually runs.
     if !team_shipped {
+        // Atomically write `BriefState::Failed { AcceptanceFailed }` to
+        // `:state` BEFORE returning. Without this, the FSM driver's
+        // projector path may never observe a terminating event (the
+        // outer loop returns first and the late-reviewer-in-Reworking
+        // branch parks the FSM), leaving the reaper firing
+        // BudgetExhausted forever on a brief whose container is long
+        // gone. See brief: zombie :state — terminal disposition must
+        // atomically write Failed.
+        let detail = team_failure_detail.clone().unwrap_or_else(|| {
+            "team-orchestration declared failure without per-role detail".to_string()
+        });
+        let mut projector = RedisStateProjector::new(conn.clone(), brief.id.clone());
+        write_team_terminal_state(
+            &mut projector,
+            &brief.id,
+            BriefState::Failed {
+                reason: Reason::AcceptanceFailed {
+                    detail: detail.clone(),
+                },
+            },
+            "team-orchestration-failed",
+        )
+        .await;
         if let Some(ws) = workspace.take() {
             tracing::info!(
                 brief = %brief.id,
                 path = %ws.host_path.display(),
+                detail = %detail,
                 "workspace handoff: lifecycle FSM driver cleans up on terminal Failed"
             );
         }
         return Ok(VerdictKind::Failed);
+    }
+
+    // Atomically write `BriefState::Shipped` to `:state` BEFORE
+    // returning. Without this, the FSM driver may still be parked on
+    // `source.next().await` when the team-orchestration outer loop
+    // declares team_shipped=true and tears down the workspace, leaving
+    // the reaper firing BudgetExhausted on a brief that has shipped.
+    {
+        let mut projector = RedisStateProjector::new(conn.clone(), brief.id.clone());
+        write_team_terminal_state(
+            &mut projector,
+            &brief.id,
+            BriefState::Shipped,
+            "team-orchestration-shipped",
+        )
+        .await;
     }
 
     // Chain-trigger BEFORE workspace destruction: chain paths often live
@@ -830,6 +889,38 @@ async fn handle_brief(
     finalize_shipped_team(conn, brief, workspace.take(), &all_messages).await?;
 
     Ok(VerdictKind::Shipped)
+}
+
+/// Atomically write a terminal `BriefStateRecord` through the supplied
+/// projector. The projector is responsible for the underlying
+/// three-key Lua atomic write (state_log XADD, state SET, cursor SET).
+/// Errors are logged at WARN — the team-orchestration outer loop's
+/// terminal-disposition path must not propagate Redis hiccups, since
+/// the brief's verdict is already decided and surfacing an error here
+/// would mask a Shipped/Failed outcome with a generic handler error.
+/// Public so `tests/lifecycle.rs` can drive the helper with the
+/// in-memory projector and pin the terminal-record shape.
+pub async fn write_team_terminal_state(
+    projector: &mut (dyn StateProjector + Send),
+    brief_id: &BriefId,
+    state: BriefState,
+    cursor: &str,
+) {
+    let record = BriefStateRecord {
+        brief_id: brief_id.clone(),
+        state,
+        parent_brief_id: None,
+        composition_role: None,
+        at: now(),
+    };
+    if let Err(e) = projector.write(&record, cursor).await {
+        tracing::warn!(
+            brief = %brief_id.0,
+            error = %e,
+            cursor = %cursor,
+            "team-orchestration: terminal :state atomic write failed",
+        );
+    }
 }
 
 /// Post-shipping finalize: read every chain-trigger brief into memory and
