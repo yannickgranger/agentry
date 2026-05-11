@@ -238,6 +238,28 @@ impl Spawner for PodmanSpawner {
                 .arg("SCCACHE_REDIS_ENDPOINT=redis://agentry-sccache-redis:6379");
             cmd.arg("--env").arg("SCCACHE_REDIS_KEY_PREFIX=agentry");
         }
+        // Issue #506 Option B: when the brief's target_repo lives on the
+        // agency.lab forge (self-signed TLS), every role needs git/cargo to
+        // bypass cert verification or fetching git deps fails inside the
+        // container. Injected BEFORE `role.passthru_env` so a role-declared
+        // override of these vars can still win. Option C (`profile.toml`
+        // `container_env`) is the planned long-term replacement.
+        let ssl_bypass = agency_lab_ssl_bypass_env_args(brief);
+        if !ssl_bypass.is_empty() {
+            let target_repo_str = brief
+                .payload
+                .get("target_repo")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            tracing::info!(
+                target_repo = %target_repo_str,
+                role = %role.name,
+                "injected GIT_SSL_NO_VERIFY+CARGO_NET_GIT_FETCH_WITH_CLI for agency.lab forge"
+            );
+            for kv in &ssl_bypass {
+                cmd.arg("--env").arg(kv);
+            }
+        }
         // Pass through declared env vars from orchestratord's own env.
         // Missing vars are logged and skipped — role doesn't get what it wanted.
         for var_name in &role.passthru_env {
@@ -665,6 +687,53 @@ fn brief_env_args(brief: &Brief) -> Vec<String> {
         format!("AGENTRY_BRIEF_KIND={kind_str}"),
         format!("AGENTRY_BASE_BRANCH={base}"),
     ]
+}
+
+/// True when `forge_host` identifies the agency.lab forge (with or without a
+/// `:PORT` suffix). The agency.lab forge serves a self-signed TLS cert, so
+/// every role container spawned against a brief whose `target_repo` lives on
+/// it needs `GIT_SSL_NO_VERIFY=1` and `CARGO_NET_GIT_FETCH_WITH_CLI=true` or
+/// cargo's git-fetch step fails on cert verification (issue #506).
+///
+/// Option-B-default mechanism per issue #506: the spawner injects the bypass
+/// env unconditionally for every role on every agency.lab brief. Option C
+/// (per-target `container_env` in `.agentry/profile.toml`) is the planned
+/// long-term replacement and lands in a follow-up brief.
+///
+/// `pub` so the peer test in `tests/spawner_test.rs` can drive it directly
+/// (matching the visibility-promotion pattern of `augment_role_with_profile`
+/// and `resolve_role_with_packs`); the arch ban on inline `#[cfg(test)]`
+/// items in `src/` forbids the embedded-tests alternative.
+#[must_use]
+pub fn forge_host_is_agency_lab(forge_host: &str) -> bool {
+    let host_only = forge_host.split(':').next().unwrap_or(forge_host);
+    host_only == "agency.lab"
+}
+
+/// Compute the `KEY=VALUE` env strings the spawner must inject ahead of
+/// `role.passthru_env` when the brief targets the agency.lab forge.
+///
+/// Reads `brief.payload.forge_host` (the field the daemon's intake-time forge
+/// resolver populates from `cfg.forge.default_host` cascade). Returns an empty
+/// vec for any non-agency forge, so a brief targeting `github.com` or any
+/// other forge gets nothing injected. Kept as a free function so the peer
+/// test in `tests/spawner_test.rs` can drive it without standing up a
+/// `RunAgentCtx` or podman.
+#[must_use]
+pub fn agency_lab_ssl_bypass_env_args(brief: &Brief) -> Vec<String> {
+    let forge_host = brief
+        .payload
+        .get("forge_host")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if forge_host_is_agency_lab(forge_host) {
+        vec![
+            "GIT_SSL_NO_VERIFY=1".into(),
+            "CARGO_NET_GIT_FETCH_WITH_CLI=true".into(),
+        ]
+    } else {
+        Vec::new()
+    }
 }
 
 /// Roles whose coder-tooling bind-mounts (ra-query, dead-pub-check, ship) may
