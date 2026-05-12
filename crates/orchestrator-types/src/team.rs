@@ -29,6 +29,15 @@ impl fmt::Display for TeamName {
 #[serde(transparent)]
 pub struct NodeClass(pub String);
 
+/// Stable identifier for a node in the lifecycle DAG. PartialOrd/Ord are
+/// derived so NodeId can key a BTreeMap (the evidence map carried by
+/// BriefState::Walking).
+#[derive(
+    Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(transparent)]
+pub struct NodeId(pub String);
+
 /// A directed edge in the message graph: "from's outbox messages routed to to's inbox".
 /// The optional `permit_overrides_from` names a contract-field set that `to` inherits.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

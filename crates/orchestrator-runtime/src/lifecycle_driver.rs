@@ -503,3 +503,71 @@ pub fn build_phase_gates(
         },
     }
 }
+
+/// Project a team's topology into the per-node `WalkConfig` consumed by
+/// the lifecycle DAG walker. Beta-a (#495 part 1) introduces the helper
+/// alongside the legacy `build_phase_gates`; beta-b deletes the legacy
+/// helper and routes the FSM through the walker built from this output.
+///
+/// Adjacency: walks `team.message_graph` and groups each `MessageEdge` by
+/// `from`, with the `to` collected as `NodeId(to.name.0)`.
+///
+/// Per-node configs: walks `team.roles`, then for each role
+///   - `class` is `team.node_classes.get(role.name)`, falling back to
+///     `NodeClass("container_bound")` when the role is not pinned in
+///     `node_classes` (legacy topologies and operator-gated vertices);
+///   - `expected_inbound` is the deduplicated upstream role list from
+///     `team.inbound_roles`, mapped to `NodeId`;
+///   - `policy` is the first inbound edge's `gate_policy` if any are
+///     pinned, falling back to `GatePolicy::AllMustPass` (the legacy
+///     hardcoded default that beta-a's `build_phase_gates` already
+///     applies for both phases).
+#[must_use]
+pub fn build_walk_config(
+    team: &orchestrator_types::TeamTopology,
+) -> orchestrator_types::lifecycle::WalkConfig {
+    use orchestrator_types::lifecycle::{GatePolicy, NodeConfig, WalkConfig};
+    use orchestrator_types::team::NodeClass;
+    use orchestrator_types::NodeId;
+    use std::collections::HashMap;
+
+    let mut adjacency: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+    for edge in &team.message_graph {
+        let from = NodeId(edge.from.name.0.clone());
+        let to = NodeId(edge.to.name.0.clone());
+        adjacency.entry(from).or_default().push(to);
+    }
+
+    let default_class = NodeClass("container_bound".to_string());
+    let mut node_configs: HashMap<NodeId, NodeConfig> = HashMap::new();
+    for role in &team.roles {
+        let class = team
+            .node_classes
+            .get(&role.name)
+            .cloned()
+            .unwrap_or_else(|| default_class.clone());
+        let expected_inbound: Vec<NodeId> = team
+            .inbound_roles(role)
+            .into_iter()
+            .map(|r| NodeId(r.name.0.clone()))
+            .collect();
+        let policy = team
+            .incoming(role)
+            .iter()
+            .find_map(|e| e.gate_policy.clone())
+            .unwrap_or(GatePolicy::AllMustPass);
+        node_configs.insert(
+            NodeId(role.name.0.clone()),
+            NodeConfig {
+                class,
+                expected_inbound,
+                policy,
+            },
+        );
+    }
+
+    WalkConfig {
+        adjacency,
+        node_configs,
+    }
+}

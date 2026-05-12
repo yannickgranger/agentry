@@ -186,6 +186,49 @@ the unchanged diff (used when only the review-side judgement was the
 problem, not the code itself). The rework loop dispatched by the daemon
 reads this field to pick which role to fire next.
 
+## NodeConfig
+
+Beta-a (#495 part 1) precursor: per-node walker config carrying the
+node's `NodeClass`, the deduplicated upstream `NodeId`s that must
+report before the node is considered ready (`expected_inbound`), and
+the `GatePolicy` used to fold inbound verdicts. Lands alongside the
+legacy `PhaseGates` shape so reviewers see the new per-node form next
+to the legacy per-phase form. Beta-b (#495 part 2) deletes
+`PhaseGates` and routes the FSM through the walker built from these
+configs.
+
+- depends on: NodeClass
+- depends on: NodeId
+- depends on: GatePolicy
+
+## WalkConfig
+
+Beta-a precursor: adjacency map plus per-node configs for the
+lifecycle DAG walker. Built from `TeamTopology` by the runtime helper
+`build_walk_config`, which groups `MessageEdge`s by `from` to populate
+adjacency and walks `roles` cross-referenced against `node_classes` to
+populate `node_configs`. Nothing in the FSM consumes this in beta-a;
+beta-b's walker reads it.
+
+- depends on: NodeId
+- depends on: NodeConfig
+
+## RunData
+
+Beta-a precursor: per-node run-data carried through the lifecycle DAG
+walker. Five variants tagged by `kind`: `none` (no per-node state),
+`coder { agent_id }` (coder-spawn handle), `pr_tracking { pr_number,
+head_sha }` (post-shipper PR locator), `operator_decision {
+disagreements }` (captain-decision payload mirroring the legacy
+`AwaitingCaptainDecision`), and `extension { data }` (free-form JSON
+escape hatch for downstream-extension nodes). `Eq` is intentionally
+not derived: the `extension` variant carries `serde_json::Value`,
+which blocks structural equality. Carried by `BriefState::Walking`
+(beta-a parks the variant unreachable from `handle()`) and by
+`BriefEvent::RoleDone`.
+
+- depends on: DisagreementSummary
+
 ## InvalidTransition
 
 Returned by `handle` when an event is not legal in the current state.

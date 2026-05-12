@@ -799,3 +799,42 @@ async fn reaper_budget_exhausted_drives_fsm_to_failed() {
 
     std::env::remove_var("AGENTRY_WORKSPACE_ROOT");
 }
+
+#[test]
+fn build_walk_config_from_self_host_topology() {
+    use orchestrator_runtime::lifecycle_driver::build_walk_config;
+    use orchestrator_types::team::{NodeClass, NodeId};
+    use orchestrator_types::TeamTopology;
+
+    let raw = std::fs::read_to_string("../../seed/topologies/agentry-self-host-v0.json")
+        .expect("read agentry-self-host-v0 fixture");
+    let team: TeamTopology = serde_json::from_str(&raw).expect("parse self-host topology");
+    assert_eq!(team.roles.len(), 8, "fixture invariant: 8 roles");
+    assert_eq!(team.message_graph.len(), 14, "fixture invariant: 14 edges");
+
+    let cfg = build_walk_config(&team);
+
+    let coder = NodeId("coder-claude-agentry".to_string());
+    let downstream = cfg
+        .adjacency
+        .get(&coder)
+        .expect("coder must have an adjacency entry");
+    let mut got: Vec<String> = downstream.iter().map(|n| n.0.clone()).collect();
+    got.sort();
+    let mut want = vec![
+        "ac-verifier-claude-agentry".to_string(),
+        "ac-verifier-gemini-agentry".to_string(),
+        "ac-verifier-grok-agentry".to_string(),
+        "reviewer-claude-agentry".to_string(),
+        "reviewer-mechanical-agentry".to_string(),
+    ];
+    want.sort();
+    assert_eq!(got, want, "coder fans out to 3 ac-verifiers + 2 reviewers");
+
+    let ci_watcher = NodeId("ci-watcher-agentry".to_string());
+    let nc = cfg
+        .node_configs
+        .get(&ci_watcher)
+        .expect("ci-watcher node config");
+    assert_eq!(nc.class, NodeClass("container_bound".to_string()));
+}

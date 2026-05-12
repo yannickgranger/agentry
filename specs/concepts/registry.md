@@ -112,6 +112,17 @@ reference check and from the single-terminal accounting — operator-gated
 nodes are pure topology vertices that do not spawn containers. Read-only
 in alpha (#494); beta (#495) wires it into per-node reattach policy.
 
+## NodeId
+
+Stable identifier for a node in the lifecycle DAG. Wire-form is a bare
+string (a newtype, not a Rust enum) keyed off the role name so
+`NodeId("coder-claude-agentry")` resolves directly to the
+`coder-claude-agentry` topology vertex. Derives `PartialOrd`/`Ord` so
+it can key a `BTreeMap` — the evidence multiset carried by
+`BriefState::Walking` is keyed by `NodeId` and traversed in stable
+iteration order. Beta-a (#495 part 1) introduces it alongside the
+legacy phase enum; beta-b's walker consumes it.
+
 ## MessageEdge
 
 A directed routing edge in a team's message graph: from one role to another,

@@ -1609,3 +1609,115 @@ fn verifying_to_reviewing_auto_skips_empty_reviewing() {
         other => panic!("expected Shipping (auto-skipped empty Reviewing), got {other:?}"),
     }
 }
+
+// --- beta-a (#495 part 1) precursor-types coverage ---
+
+#[test]
+fn walking_state_roundtrips_through_serde() {
+    use orchestrator_types::lifecycle::{NodeConfig, WalkConfig};
+    use orchestrator_types::run_data::RunData;
+    use orchestrator_types::team::NodeId;
+
+    let _unused: Option<NodeConfig> = None;
+    let _unused2: Option<WalkConfig> = None;
+
+    let state = BriefState::Walking {
+        node_id: NodeId("coder-claude-agentry".to_string()),
+        evidence: std::collections::BTreeMap::new(),
+        run_data: RunData::Coder {
+            agent_id: "agt_test_123".to_string(),
+        },
+        retry: fresh_retry(),
+    };
+    let json = serde_json::to_string(&state).expect("serialize Walking");
+    let back: BriefState = serde_json::from_str(&json).expect("deserialize Walking");
+    assert_eq!(state, back);
+}
+
+#[test]
+fn run_data_accessors_match_variants() {
+    use orchestrator_types::run_data::RunData;
+
+    let none = RunData::None;
+    let coder = RunData::Coder {
+        agent_id: "agt_test".to_string(),
+    };
+    let pr = RunData::PrTracking {
+        pr_number: 42,
+        head_sha: "deadbeef".to_string(),
+    };
+    let op = RunData::OperatorDecision {
+        disagreements: vec![DisagreementSummary {
+            verb: "UPDATE".to_string(),
+            applied_form: "REPLACE".to_string(),
+            rationale: "verb mismatch".to_string(),
+        }],
+    };
+    let ext = RunData::Extension {
+        data: serde_json::json!({"k": "v"}),
+    };
+
+    assert_eq!(coder.agent_id(), Some("agt_test"));
+    assert_eq!(none.agent_id(), None);
+    assert_eq!(pr.agent_id(), None);
+    assert_eq!(op.agent_id(), None);
+    assert_eq!(ext.agent_id(), None);
+
+    assert_eq!(pr.pr_number(), Some(42));
+    assert_eq!(none.pr_number(), None);
+    assert_eq!(coder.pr_number(), None);
+    assert_eq!(op.pr_number(), None);
+    assert_eq!(ext.pr_number(), None);
+
+    assert_eq!(pr.head_sha(), Some("deadbeef"));
+    assert_eq!(none.head_sha(), None);
+    assert_eq!(coder.head_sha(), None);
+    assert_eq!(op.head_sha(), None);
+    assert_eq!(ext.head_sha(), None);
+
+    assert_eq!(op.disagreements().map(<[_]>::len), Some(1));
+    assert_eq!(none.disagreements(), None);
+    assert_eq!(coder.disagreements(), None);
+    assert_eq!(pr.disagreements(), None);
+    assert_eq!(ext.disagreements(), None);
+}
+
+#[test]
+fn walk_config_round_trips() {
+    use orchestrator_types::lifecycle::{GatePolicy, NodeConfig, WalkConfig};
+    use orchestrator_types::team::{NodeClass, NodeId};
+    use std::collections::HashMap;
+
+    let a = NodeId("node-a".to_string());
+    let b = NodeId("node-b".to_string());
+
+    let mut adjacency: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+    adjacency.insert(a.clone(), vec![b.clone()]);
+    adjacency.insert(b.clone(), vec![]);
+
+    let mut node_configs: HashMap<NodeId, NodeConfig> = HashMap::new();
+    node_configs.insert(
+        a.clone(),
+        NodeConfig {
+            class: NodeClass("container_bound".to_string()),
+            expected_inbound: vec![],
+            policy: GatePolicy::AllMustPass,
+        },
+    );
+    node_configs.insert(
+        b.clone(),
+        NodeConfig {
+            class: NodeClass("container_bound".to_string()),
+            expected_inbound: vec![a.clone()],
+            policy: GatePolicy::AllMustPass,
+        },
+    );
+
+    let cfg = WalkConfig {
+        adjacency,
+        node_configs,
+    };
+    let json = serde_json::to_string(&cfg).expect("serialize WalkConfig");
+    let back: WalkConfig = serde_json::from_str(&json).expect("deserialize WalkConfig");
+    assert_eq!(cfg, back);
+}
