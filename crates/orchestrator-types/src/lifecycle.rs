@@ -6,10 +6,12 @@
 //! `handle` is a pure function of `(state, event)`. Wall-clock time and
 //! brief-id wrapping are layered by the daemon caller (see L.2).
 
+use crate::run_data::RunData;
+use crate::team::NodeId;
 use crate::{BriefId, EventVerdict, ReviewFinding, Ts};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// Compile-time default for `RetryBudget.max` when a topology does not
 /// specify `max_retries`.
@@ -21,7 +23,7 @@ pub const MAXIMUM_ATTEMPT_CAP: u32 = 10;
 
 /// Persisted projection of a brief's current lifecycle position. The daemon
 /// writes one of these per FSM step; the projector replays them on resume.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BriefStateRecord {
     pub brief_id: BriefId,
     pub state: BriefState,
@@ -102,7 +104,7 @@ pub enum ReworkTarget {
 /// them into orchestrator-types so the FSM can carry disagreements
 /// across phases without a role-runtime dependency. Wire-equivalent
 /// to UnappliedVerb at the JSON level.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DisagreementSummary {
     pub verb: String,
@@ -115,7 +117,7 @@ pub struct DisagreementSummary {
 /// The position a brief occupies inside the lifecycle FSM. Non-terminal
 /// variants carry their `RetryBudget`; the two terminals (`Shipped`,
 /// `Failed`) carry only the outcome.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BriefState {
     Submitted,
@@ -162,6 +164,19 @@ pub enum BriefState {
     /// the captain chooses to reject and the operator resubmits.
     AwaitingCaptainDecision {
         disagreements: Vec<DisagreementSummary>,
+        retry: RetryBudget,
+    },
+    /// Beta-a (#495) precursor variant: per-node lifecycle position used
+    /// by the DAG walker that beta-b will wire in. Carries the active
+    /// node id, the per-node evidence multiset, the variant-specific
+    /// run data, and the retry budget. Tagged `walking` to match the
+    /// `kind` + snake_case convention of the other variants. Not
+    /// reachable from `handle()` in beta-a — `handle()` stubs the arm
+    /// with `InvalidTransition` so the compiler stays exhaustive.
+    Walking {
+        node_id: NodeId,
+        evidence: BTreeMap<NodeId, EventVerdict>,
+        run_data: RunData,
         retry: RetryBudget,
     },
     Shipped,
@@ -252,6 +267,20 @@ pub enum BriefEvent {
         smell_id: String,
         criterion: String,
         baseline: String,
+    },
+    /// Beta-a (#495) precursor variant: per-node done signal that
+    /// beta-b's walker consumes. Carries the source node id, the
+    /// node's verdict, any review findings, and an optional
+    /// `RunData` payload (None for nodes that don't carry per-node
+    /// state). Tagged `role_done` to match the `kind` + snake_case
+    /// convention. Not consumed by the FSM in beta-a — legacy
+    /// CoderDone / AcVerifierDone / ReviewerDone / ShipperDone
+    /// variants stay until beta-b.
+    RoleDone {
+        node_id: NodeId,
+        verdict: EventVerdict,
+        findings: Vec<ReviewFinding>,
+        run_data: Option<RunData>,
     },
 }
 
@@ -612,6 +641,16 @@ pub fn handle(
         // ---- Failed (terminal except for human-driven retry) ----
         (BriefState::Failed { .. }, BriefEvent::RetryRequested { .. }) => Ok(BriefState::Submitted),
 
+        // ---- Walking (beta-a precursor — not yet wired) ----
+        // Beta-a lands the variant alongside the legacy phase enum so
+        // beta-b's walker can replace the phase chain in place. The
+        // FSM does not yet route any event into Walking, but match
+        // exhaustivity requires an explicit arm here once the variant
+        // exists. Reject every event landing on a Walking state with
+        // InvalidTransition; beta-b rewrites this with the real
+        // walker semantics.
+        (BriefState::Walking { .. }, _) => invalid(),
+
         // ---- Everything else: not allowed in this state. ----
         _ => invalid(),
     }
@@ -721,6 +760,27 @@ pub struct GateConfig {
 pub struct PhaseGates {
     pub verifying: GateConfig,
     pub reviewing: GateConfig,
+}
+
+/// Per-node walker config: the node's class, the inbound edges that must
+/// fire before the node is considered ready, and the gate policy used to
+/// fold inbound verdicts. Beta-a precursor — beta-b's walker consumes
+/// this; nothing in the FSM reads it yet.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct NodeConfig {
+    pub class: crate::team::NodeClass,
+    pub expected_inbound: Vec<NodeId>,
+    pub policy: GatePolicy,
+}
+
+/// Adjacency + per-node config for the lifecycle DAG walker. Built from
+/// `TeamTopology` by the runtime helper `build_walk_config`. Beta-a
+/// precursor — beta-b's walker consumes this; nothing in the FSM
+/// reads it yet.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct WalkConfig {
+    pub adjacency: HashMap<NodeId, Vec<NodeId>>,
+    pub node_configs: HashMap<NodeId, NodeConfig>,
 }
 
 /// Return value of the pure `decide` function. Transient — not persisted,
