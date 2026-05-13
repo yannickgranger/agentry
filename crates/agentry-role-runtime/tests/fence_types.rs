@@ -17,9 +17,21 @@ fn fence_matrix_covers_every_kind() {
 }
 
 #[test]
-fn fence_matrix_all_blocker() {
-    for (_, _, sev) in FENCE_MATRIX {
-        assert_eq!(*sev, Severity::Blocker);
+fn fence_matrix_severity_layout() {
+    // Metric fences (clones/complexity/unwraps) scan whole CHANGED FILES,
+    // not new-lines-only — demoted to Warn until scope-by-diff lands so
+    // they don't tank briefs that touch functions in files carrying
+    // legacy debt. CallersZero stays Blocker — it is a new-pub-zero-callers
+    // split-brain signal on NEW code, not a metric on pre-existing code.
+    for (kind, _, sev) in FENCE_MATRIX {
+        let expected = match kind {
+            FenceKind::CallersZero => Severity::Blocker,
+            FenceKind::ClonesInLoop
+            | FenceKind::CloneProd
+            | FenceKind::Complexity
+            | FenceKind::Unwraps => Severity::Warn,
+        };
+        assert_eq!(*sev, expected, "unexpected severity for {kind:?}");
     }
 }
 
