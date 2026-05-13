@@ -202,6 +202,7 @@ pub async fn resume_orphans(
 /// work but do NOT auto-progress to the next role. A v2 reattach can
 /// re-spawn the role chain via a follow-up brief; for v0 this is the
 /// acceptable cost for not losing all in-flight work on every redeploy.
+#[tracing::instrument(skip_all, fields(brief = %brief_id.0))]
 async fn reattach_brief(
     brief_id: &BriefId,
     event_source_factory: &Arc<dyn Fn(BriefId) -> Box<dyn EventSource + Send> + Send + Sync>,
@@ -253,6 +254,7 @@ async fn reattach_brief(
 /// flip the return value, mirroring 471a behaviour). Returns `false`
 /// only on serialization or SET failure, in which case nothing was
 /// written and the caller should NOT bump any counter for this record.
+#[tracing::instrument(skip_all, fields(brief = %record.brief_id.0))]
 async fn mark_failed(conn: &mut ConnectionManager, record: &BriefStateRecord) -> bool {
     let brief_id = record.brief_id.clone();
     let new_record = BriefStateRecord {
