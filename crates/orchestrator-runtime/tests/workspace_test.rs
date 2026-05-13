@@ -548,3 +548,43 @@ async fn preserve_no_error_on_missing_dir() {
         .await
         .expect("Preserve must return Ok even when detach fails");
 }
+
+/// Regression guard for the extract-git-helpers refactor (brf_debt_008):
+/// the four inline git steps (clone --local, remote set-url, checkout -b,
+/// rev-parse HEAD) were pulled into private helpers, leaving only the
+/// two `fs` ops (pre-clean + parent mkdir) plus the legacy-path mkdir
+/// using the inline `.await.map_err(` shape. If someone re-inlines a
+/// git step in the compact one-line form, the count climbs above 3 and
+/// this test fires.
+#[test]
+fn allocate_at_complexity_under_15() {
+    let src = std::fs::read_to_string("src/workspace.rs").expect("read workspace.rs");
+    let marker = "pub async fn allocate_at";
+    let start = src.find(marker).expect("allocate_at signature present");
+    let after = &src[start..];
+    // Body ends at the first column-0 `}`/`pub `/`fn `/`async fn ` AFTER the
+    // signature line — the function's own closing brace (or, defensively,
+    // the next sibling item).
+    let mut offset: usize = 0;
+    let mut end: Option<usize> = None;
+    for (i, line) in after.split_inclusive('\n').enumerate() {
+        if i > 0
+            && (line.starts_with('}')
+                || line.starts_with("pub ")
+                || line.starts_with("fn ")
+                || line.starts_with("async fn "))
+        {
+            end = Some(offset + line.len());
+            break;
+        }
+        offset += line.len();
+    }
+    let body = &after[..end.expect("allocate_at body has a closing brace")];
+    let count = body.matches(".await.map_err(").count();
+    assert!(
+        count <= 3,
+        "allocate_at body must contain at most 3 `.await.map_err(` occurrences \
+         (the two repo-path fs ops + the legacy-path mkdir); found {count}. \
+         A re-inlined git step is the most likely cause."
+    );
+}
