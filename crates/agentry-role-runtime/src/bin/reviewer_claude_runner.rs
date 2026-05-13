@@ -65,8 +65,8 @@ use std::process::{Command, Stdio};
 use agentry_role_runtime::{
     build_review_prompt_with_mechanical_findings, drop_empty_blocker_findings, emit_done,
     emit_event, emit_finding, format_mechanical_findings_summary, parse_allowed_tools,
-    parse_findings, pointer_str, ra_query_pre_pass, read_bundle_value, run_fence, stream_claude,
-    tail_lines, workspace_is_git_repo, DoneGuard, StreamErr,
+    parse_findings, pointer_str, ra_query_pre_pass, read_bundle_value, run_fence,
+    stream_claude_via_stdin, tail_lines, workspace_is_git_repo, DoneGuard, StreamErr,
 };
 use orchestrator_types::{DoneReason, EventVerdict, Severity};
 use serde_json::json;
@@ -190,7 +190,7 @@ fn main() {
         &mech_summary,
     );
 
-    let response = match stream_claude(&brief_id, ".reviewer", &prompt) {
+    let response = match stream_claude_via_stdin(&brief_id, ".reviewer", &prompt) {
         Ok(r) => r,
         Err(StreamErr::ClaudeFailed { exit_code, detail }) => {
             emit_event(json!({

@@ -30,7 +30,7 @@ pub mod planner;
 pub mod pr_rebaser;
 pub mod precommit_gate;
 pub mod shipper_runner;
-pub use claude::{stream_claude, StreamErr};
+pub use claude::{stream_claude, stream_claude_via_stdin, StreamErr};
 pub use precommit_gate::{
     decide_gate, derive_fqn, is_orphan_pub_item, orphan_pub_item_finding, parse_allowlist_toml,
     parse_new_pub_items, GateDecision, NewPubItem, PublicApiAllowlist, GATE_CATEGORY, GATE_SOURCE,
@@ -617,26 +617,38 @@ pub enum Threshold {
 
 /// The fence policy table. Adding a sixth fence is one row addition.
 pub const FENCE_MATRIX: &[(FenceKind, Threshold, Severity)] = &[
+    // Metric fences (clones / complexity / unwraps) run on whole CHANGED
+    // FILES, not new lines only. Without a diff-scope filter they flag
+    // pre-existing code in any file the brief touches — guaranteed to
+    // block briefs that edit functions inside files with legacy debt
+    // (e.g. handle() with 29 prod clones, projector_task with complexity
+    // 39). Demoted to Warn until the fence learns scope-by-diff
+    // (separate brief / cfdb-rule). The LLM reviewer's design-feedback
+    // path still surfaces real defects in new code with proper scope.
     (
         FenceKind::ClonesInLoop,
         Threshold::GreaterThan(0),
-        Severity::Blocker,
+        Severity::Warn,
     ),
     (
         FenceKind::CloneProd,
         Threshold::GreaterThan(0),
-        Severity::Blocker,
+        Severity::Warn,
     ),
     (
         FenceKind::Complexity,
         Threshold::GreaterThan(15),
-        Severity::Blocker,
+        Severity::Warn,
     ),
     (
         FenceKind::Unwraps,
         Threshold::SeverityAtLeast(UnwrapSeverity::High),
-        Severity::Blocker,
+        Severity::Warn,
     ),
+    // CallersZero stays Blocker — it's a new-pub-with-zero-callers
+    // split-brain signal, NOT a metric on pre-existing code. Only
+    // fires when ra-query's worktree pre-pass succeeded (already
+    // demoted to Warn-on-ROFS earlier in this file).
     (
         FenceKind::CallersZero,
         Threshold::EqualTo(0),
@@ -721,12 +733,38 @@ pub fn run_fence(workspace: &Path, base_branch: &str) -> Vec<ReviewFinding> {
 
     // Callers fence (Y.4): for each new pub item introduced by the diff,
     // ask ra-query who calls it. Zero callers in workspace is a Blocker
-    // (split-brain candidate). Pre-diff worktree creation failure and any
-    // ra-query failure inside the fence are fail-closed (Y.5). Cleanup
-    // after the fence is best-effort and does not override findings.
+    // (split-brain candidate). Pre-diff worktree creation failure is a
+    // SUBSTRATE issue (the reviewer-claude container mounts the workspace
+    // read-only by design, so `.git/worktrees/` writes fail with ROFS) —
+    // emit a single Warn and skip the callers fence rather than tanking
+    // the whole brief with a Blocker. ra-query call failures inside the
+    // fence still fail-closed (those indicate ra-query is genuinely
+    // broken, not a substrate-by-design issue). Cleanup after the fence
+    // is best-effort and does not override findings.
     let pre = match create_pre_diff_worktree(workspace, base_branch) {
         Ok(p) => p,
-        Err(e) => return fail_closed("git_worktree_failed", &format!("git worktree add: {e}")),
+        Err(e) => {
+            findings.push(ReviewFinding {
+                file: None,
+                line: None,
+                severity: Severity::Warn,
+                origin: FindingOrigin::Mechanical {
+                    tool: "ra-query".into(),
+                    rule: Some("callers_fence_skipped".into()),
+                },
+                category: "fence".into(),
+                message: format!(
+                    "callers fence skipped: pre-diff worktree creation failed (git worktree add: {e}). \
+                     Likely a read-only workspace mount; clones/complexity/unwraps fences still ran. \
+                     Restore writability of `.git/worktrees/` in the reviewer container to re-enable \
+                     the callers-zero check."
+                ),
+                suggested_fix: None,
+                prohibitions: Vec::new(),
+                requirements: Vec::new(),
+            });
+            return findings;
+        }
     };
     let callers_result: Result<Vec<ReviewFinding>, (&'static str, String)> = (|| {
         let mut out = Vec::new();

@@ -60,6 +60,29 @@ pub enum StreamErr {
 /// concatenation of `assistant.message.content[].text` segments if no
 /// `result` line is present.
 pub fn stream_claude(brief_id: &str, suffix: &str, prompt: &str) -> Result<String, StreamErr> {
+    stream_claude_inner(brief_id, suffix, prompt, false)
+}
+
+/// Variant for single-turn, large-prompt callers (reviewer-claude).
+/// Writes the prompt to a temp file and uses `Stdio::from(File)` so
+/// claude reads stdin from the file descriptor instead of receiving
+/// the prompt as a CLI positional. Avoids E2BIG on large diffs
+/// without breaking multi-turn agentic-loop semantics that the
+/// positional path preserves for the coder runner.
+pub fn stream_claude_via_stdin(
+    brief_id: &str,
+    suffix: &str,
+    prompt: &str,
+) -> Result<String, StreamErr> {
+    stream_claude_inner(brief_id, suffix, prompt, true)
+}
+
+fn stream_claude_inner(
+    brief_id: &str,
+    suffix: &str,
+    prompt: &str,
+    via_stdin: bool,
+) -> Result<String, StreamErr> {
     let _ = fs::create_dir_all(TRANSCRIPTS_DIR);
     let transcript_path = format!("{TRANSCRIPTS_DIR}/{brief_id}{suffix}.jsonl");
 
@@ -78,24 +101,65 @@ pub fn stream_claude(brief_id: &str, suffix: &str, prompt: &str) -> Result<Strin
         }
     };
 
-    let timeout_secs = std::env::var("CLAUDE_P_TIMEOUT").unwrap_or_else(|_| "1200".into());
+    let timeout_secs = std::env::var("CLAUDE_P_TIMEOUT").unwrap_or_else(|_| "3600".into());
 
-    // bash: `HOME=/root timeout "$CLAUDE_P_TIMEOUT" claude -p --output-format stream-json --verbose "$_prompt" 2>&1`
+    // If via_stdin: write the prompt to a temp file and feed claude's
+    // stdin from that file. Big diffs (#495 beta-b reviewer prompt
+    // ~241KB) push ARG_MAX on positional, so file-backed stdin is the
+    // escape hatch. File-backed stdin (Stdio::from(File)) matches
+    // shell `claude -p < file.txt` semantics — the OS handles the
+    // close on full read, no premature EOF on a pipe buffer.
+    //
+    // Positional is preserved for multi-turn agentic-loop callers
+    // (coder-claude-runner): with positional, claude treats the arg
+    // as "the whole task, work autonomously"; with stdin, claude
+    // appears to read once and exit the agentic loop earlier
+    // (observed empirically in beta-a v5/v6).
+    let prompt_file_path = if via_stdin {
+        // Use a stable suffix-derived path so it appears in the
+        // brief's transcript layout, but stays small enough to
+        // tolerate prompts under /tmp's tmpfs quota.
+        let path = format!("/tmp/claude-prompt-{brief_id}{suffix}.txt");
+        if let Err(e) = fs::write(&path, prompt) {
+            return Err(StreamErr::ClaudeFailed {
+                exit_code: -1,
+                detail: format!("write prompt file {path}: {e}"),
+            });
+        }
+        Some(path)
+    } else {
+        None
+    };
+
     let mut cmd = Command::new("timeout");
     cmd.arg(&timeout_secs)
         .arg("claude")
         .arg("-p")
         .arg("--output-format")
         .arg("stream-json")
-        .arg("--verbose")
-        .arg(prompt)
-        .env("HOME", "/root")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        // Bash redirected 2>&1 so stderr ends up in the same stream the
-        // tee/while-read pipeline consumes. Mirror by merging stderr into
-        // a sibling-thread drain so an emit-event consumer can see it.
-        .stderr(Stdio::piped());
+        .arg("--verbose");
+    if !via_stdin {
+        cmd.arg(prompt);
+    }
+    cmd.env("HOME", "/root");
+
+    if let Some(ref path) = prompt_file_path {
+        match fs::File::open(path) {
+            Ok(file) => {
+                cmd.stdin(Stdio::from(file));
+            }
+            Err(e) => {
+                return Err(StreamErr::ClaudeFailed {
+                    exit_code: -1,
+                    detail: format!("open prompt file {path}: {e}"),
+                });
+            }
+        }
+    } else {
+        cmd.stdin(Stdio::null());
+    }
+
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,

@@ -265,19 +265,32 @@ fn exitpoint_phase(ctx: &BriefContext) -> Result<(), RunErr> {
     }
     emit_event(json!({"msg": "acceptance passed (self-check)"}));
 
-    // 3b. No-op short-circuit: acceptance passed, but the worktree
-    //     diff against the base branch is empty (the work was already
-    //     on base — typically a duplicate or stale brief). Emit
-    //     `done shipped` with the `no_op_short_circuit` cause so the
-    //     daemon's lifecycle driver folds this into a terminal Shipped
-    //     verdict and skips the downstream reviewer / shipper /
-    //     ci-watcher fan-out. The `cause:no_changes` failed-emission
-    //     path below is preserved for the non-acceptance-passed cases
-    //     (acceptance bypassed, or the diff probe itself failed I/O).
+    // 3b. Stage everything (incl. untracked NEW files) so the no-op
+    //     short-circuit and the subsequent has-staged check see the
+    //     same set of changes claude actually made. Previously this
+    //     ran AFTER the no-op check, but the no-op check compared
+    //     HEAD vs origin/<base> — which is identical when claude has
+    //     only uncommitted edits, so EVERY brief tripped the no-op
+    //     short-circuit even when claude did real work. See #495 beta
+    //     v5/v6 failures.
+    git_add_all().map_err(|e| RunErr {
+        event_msg: "git add -A failed",
+        detail: e,
+        cause: "git_add_failed",
+        exit_code: None,
+    })?;
+
+    // 3c. No-op short-circuit: acceptance passed, but the staged diff
+    //     against origin/<base> is empty (the work was already on base
+    //     — typically a duplicate or stale brief). Emit `done shipped`
+    //     with the `no_op_short_circuit` cause so the daemon's
+    //     lifecycle driver folds this into a terminal Shipped verdict
+    //     and skips the downstream reviewer / shipper / ci-watcher
+    //     fan-out.
     match git_diff_empty_against_base(&ctx.base_branch) {
         Ok(true) => {
             emit_event(json!({
-                "msg": "no-op brief — acceptance passed but diff against base is empty",
+                "msg": "no-op brief — acceptance passed but staged diff against base is empty",
                 "base_branch": ctx.base_branch,
                 "reason": "coder analysis: work already on base branch (acceptance passed but produced no changes)",
             }));
@@ -294,7 +307,7 @@ fn exitpoint_phase(ctx: &BriefContext) -> Result<(), RunErr> {
         Ok(false) => {}
         Err(detail) => {
             // Diff probe failed for I/O reasons — fall through to the
-            // existing `git add -A` path so the regular `cause:no_changes`
+            // has-staged check below so the regular `cause:no_changes`
             // failed-emission can still fire if there are no staged
             // changes there either.
             emit_event(json!({
@@ -304,13 +317,8 @@ fn exitpoint_phase(ctx: &BriefContext) -> Result<(), RunErr> {
         }
     }
 
-    // 4. git add -A + has-staged check
-    git_add_all().map_err(|e| RunErr {
-        event_msg: "git add -A failed",
-        detail: e,
-        cause: "git_add_failed",
-        exit_code: None,
-    })?;
+    // 4. has-staged check (defensive — should be identical to no-op
+    //    Ok(false) above unless the diff probe itself errored).
     if !git_has_staged_changes().map_err(|e| RunErr {
         event_msg: "git diff --cached check failed",
         detail: e,
@@ -493,18 +501,27 @@ fn git_add_all() -> Result<(), String> {
     Ok(())
 }
 
-/// Probe whether the worktree diff against `origin/<base_branch>` is
+/// Probe whether the STAGED diff against `origin/<base_branch>` is
 /// empty. `Ok(true)` ⇒ no changes produced (no-op short-circuit
 /// candidate); `Ok(false)` ⇒ real changes present; `Err(_)` on I/O
 /// failure (caller falls back to the regular has-staged check).
+///
+/// Uses `--cached origin/<base>` (not `origin/<base>...HEAD`) so the
+/// probe catches the coder's uncommitted-but-staged edits AND new
+/// untracked files claude added via Write. Caller must run
+/// `git_add_all()` before this so claude's working-tree edits are in
+/// the index. Comparing `...HEAD` was a latent bug — HEAD == base
+/// when claude has only uncommitted edits, so every real-work brief
+/// tripped the no-op short-circuit (#495 beta v5/v6 failures).
 fn git_diff_empty_against_base(base_branch: &str) -> Result<bool, String> {
     let out = Command::new("git")
         .arg("diff")
+        .arg("--cached")
         .arg("--quiet")
-        .arg(format!("origin/{base_branch}...HEAD"))
+        .arg(format!("origin/{base_branch}"))
         .current_dir(WORKSPACE_DIR)
         .output()
-        .map_err(|e| format!("spawn git diff --quiet: {e}"))?;
+        .map_err(|e| format!("spawn git diff --cached --quiet: {e}"))?;
     match out.status.code() {
         // `--quiet` is exit 0 when there is no diff, exit 1 when there
         // is one. Anything else is a probe failure (bad ref, repo
