@@ -64,8 +64,9 @@ enum Cmd {
         /// Optional PR body. Default: a one-line placeholder.
         #[arg(long)]
         pr_body: Option<String>,
-        /// Optional acceptance command. Default: the agentry self-host
-        /// acceptance.
+        /// Acceptance command. Required when --target-repo is not yg/agentry;
+        /// the agentry self-host default is only applied when --target-repo
+        /// points at agentry's own repo.
         #[arg(long)]
         acceptance: Option<String>,
         /// Optional base branch. Default: `develop`.
@@ -204,6 +205,7 @@ const DEFAULT_PLACEHOLDER_BODY: &str =
 const DEFAULT_ACCEPTANCE: &str =
     "cargo run -p quality-fast --bin quality-mech --release --quiet && bash scripts/arch-check.sh";
 const DEFAULT_BASE_BRANCH: &str = "develop";
+const AGENTRY_SELF_HOST_TARGET_REPO: &str = "yg/agentry";
 const DEFAULT_SUBMITTED_BY: &str = "captain-cli";
 const TODO_QNAME: &str = "TODO::replace_with_real_qname";
 
@@ -269,6 +271,12 @@ fn build_brief(
     let kind = parse_kind(kind_str)?;
     let topology = parse_topology(topology_str)?;
     let id = id.map_or_else(BriefId::fresh, BriefId);
+
+    if target_repo != AGENTRY_SELF_HOST_TARGET_REPO && acceptance.is_none() {
+        return Err(anyhow!(
+            "--acceptance is required when target_repo ({target_repo}) is not {AGENTRY_SELF_HOST_TARGET_REPO}. The default acceptance command `{DEFAULT_ACCEPTANCE}` references agentry-specific binaries (quality-fast, scripts/arch-check.sh) that do not exist in other target repos. Either pass --acceptance with a command appropriate for the target, or dispatch through a topology whose role defaults already encode the target-specific acceptance."
+        ));
+    }
 
     let payload = json!({
         "issue_number": Value::Null,
