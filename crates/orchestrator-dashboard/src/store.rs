@@ -309,11 +309,10 @@ impl DashboardStore {
     /// spawning the tail loop on first call. The mutex is held only for
     /// the HashMap lookup/insert — never across `.await`.
     fn subscribe_stream(&self, stream: String, field: &'static str) -> broadcast::Receiver<String> {
-        let mut map = self
-            .inner
-            .fanouts
-            .lock()
-            .expect("fanout map mutex poisoned");
+        let mut map = self.inner.fanouts.lock().unwrap_or_else(|poison| {
+            tracing::warn!(lock = "dashboard_fanout", "recovering from poisoned mutex");
+            poison.into_inner()
+        });
         if let Some(tx) = map.get(&stream) {
             return tx.subscribe();
         }
@@ -471,7 +470,10 @@ async fn tail_stream(
         } else {
             let started = *idle_since.get_or_insert_with(Instant::now);
             if started.elapsed() >= inner.eviction_grace {
-                let mut map = inner.fanouts.lock().expect("fanout map mutex poisoned");
+                let mut map = inner.fanouts.lock().unwrap_or_else(|poison| {
+                    tracing::warn!(lock = "dashboard_fanout", "recovering from poisoned mutex");
+                    poison.into_inner()
+                });
                 // Re-check under the lock — a subscriber could have
                 // arrived in the gap between `elapsed()` and the lock
                 // acquisition. If so, leave the entry, clear the timer,
