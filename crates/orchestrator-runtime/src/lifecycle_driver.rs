@@ -363,6 +363,7 @@ pub async fn cleanup_shipped_no_op_brief_at(
 /// field of the Redis trace event — the workspace dir teardown,
 /// idempotency, and error-swallowing behavior are identical across
 /// dispositions.
+#[tracing::instrument(skip_all, fields(brief = %brief_id.0, disposition = %disposition.label()))]
 async fn cleanup_brief_at(
     brief_id: &BriefId,
     root: &Path,
@@ -426,6 +427,7 @@ pub const TERMINAL_BRIEF_TTL_SECONDS: usize = 30 * 24 * 60 * 60;
 /// [`TERMINAL_BRIEF_TTL_SECONDS`]. Failures (key already gone, transient
 /// Redis blip) are logged at DEBUG and skipped — TTL is best-effort and
 /// must not block the FSM driver's terminal step.
+#[tracing::instrument(skip_all, fields(brief = %brief_id.0))]
 async fn apply_terminal_ttl(conn: &mut ConnectionManager, brief_id: &BriefId) {
     let pattern = format!("agentry:brief:{}:*", brief_id.0);
     let mut cursor: u64 = 0;
