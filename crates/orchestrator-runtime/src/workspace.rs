@@ -239,6 +239,100 @@ pub async fn allocate(brief_id: &BriefId, repo: Option<(&str, &str)>) -> Result<
     allocate_at(brief_id, repo, &BriefWorkspace::root()).await
 }
 
+/// `git clone --local --no-hardlinks <bare> <host_path>` with `http.sslVerify=false`.
+/// Gives the brief its own independent .git database (no shared object files,
+/// no worktree linkage).
+async fn git_local_clone(bare: &Path, host_path: &Path) -> Result<()> {
+    let clone = tokio::process::Command::new("git")
+        .arg("-c")
+        .arg("http.sslVerify=false")
+        .arg("clone")
+        .arg("--local")
+        .arg("--no-hardlinks")
+        .arg(bare)
+        .arg(host_path)
+        .output()
+        .await
+        .map_err(|e| Error::Config(format!("git clone --local: {e}")))?;
+    if !clone.status.success() {
+        return Err(Error::Config(format!(
+            "git clone --local failed: {}",
+            String::from_utf8_lossy(&clone.stderr)
+        )));
+    }
+    Ok(())
+}
+
+/// `git -C <host_path> remote set-url origin <repo_url>`. Repoints origin from
+/// the local bare to the actual forge URL so push goes to the forge, not back
+/// to the host bare.
+async fn git_set_origin_url(host_path: &Path, repo_url: &str) -> Result<()> {
+    let set_url = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(host_path)
+        .args(["remote", "set-url", "origin", repo_url])
+        .output()
+        .await
+        .map_err(|e| Error::Config(format!("git remote set-url: {e}")))?;
+    if !set_url.status.success() {
+        return Err(Error::Config(format!(
+            "git remote set-url failed: {}",
+            String::from_utf8_lossy(&set_url.stderr)
+        )));
+    }
+    Ok(())
+}
+
+/// `git -C <host_path> checkout -b <branch> origin/<base_branch>`. The
+/// full base ref string is constructed inside the helper.
+async fn git_checkout_branch(host_path: &Path, branch: &str, base_branch: &str) -> Result<()> {
+    let checkout = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(host_path)
+        .args(["checkout", "-b", branch, &format!("origin/{base_branch}")])
+        .output()
+        .await
+        .map_err(|e| Error::Config(format!("git checkout -b: {e}")))?;
+    if !checkout.status.success() {
+        return Err(Error::Config(format!(
+            "git checkout -b {branch} from origin/{base_branch} failed: {}",
+            String::from_utf8_lossy(&checkout.stderr)
+        )));
+    }
+    Ok(())
+}
+
+/// Defense-in-depth: verify HEAD points at a real commit. If the checkout
+/// silently produced an unborn HEAD (base_branch misspelled or unreachable
+/// in the cloned base), reject the allocation here rather than letting the
+/// coder commit an orphan that fails to merge later. On failure, removes
+/// the cloned `host_path` before returning.
+async fn git_verify_born_head(host_path: &Path, bare: &Path, base_branch: &str) -> Result<()> {
+    let head_check = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(host_path)
+        .arg("rev-parse")
+        .arg("--verify")
+        .arg("HEAD")
+        .output()
+        .await
+        .map_err(|e| Error::Config(format!("git rev-parse HEAD: {e}")))?;
+    if !head_check.status.success()
+        || String::from_utf8_lossy(&head_check.stdout)
+            .trim()
+            .is_empty()
+    {
+        // No worktree linkage to clean up — just remove the cloned dir.
+        let _ = tokio::fs::remove_dir_all(host_path).await;
+        return Err(Error::Config(format!(
+            "HEAD is unborn after checkout (base_branch={base_branch} \
+             likely unreachable in bare clone {}); refusing to allocate",
+            bare.display()
+        )));
+    }
+    Ok(())
+}
+
 /// Allocate under an explicit root. Useful for tests that must not share the
 /// process-wide env var.
 pub async fn allocate_at(
@@ -271,86 +365,11 @@ pub async fn allocate_at(
                 Error::Config(format!("workspace parent {}: {e}", parent.display()))
             })?;
         }
-        // Clone from the local bare into the brief's host_path. --local + --no-hardlinks
-        // gives the brief its own independent .git database (no shared object files,
-        // no worktree linkage). Branch-lock impossible because nothing in the bare
-        // ever knows about auto/<brief_id>.
-        let clone = tokio::process::Command::new("git")
-            .arg("-c")
-            .arg("http.sslVerify=false")
-            .arg("clone")
-            .arg("--local")
-            .arg("--no-hardlinks")
-            .arg(&bare)
-            .arg(&host_path)
-            .output()
-            .await
-            .map_err(|e| Error::Config(format!("git clone --local: {e}")))?;
-        if !clone.status.success() {
-            return Err(Error::Config(format!(
-                "git clone --local failed: {}",
-                String::from_utf8_lossy(&clone.stderr)
-            )));
-        }
-
-        // Repoint origin from the local bare to the actual forge URL so push goes
-        // to the forge, not back to the host bare.
-        let set_url = tokio::process::Command::new("git")
-            .arg("-C")
-            .arg(&host_path)
-            .args(["remote", "set-url", "origin", repo_url])
-            .output()
-            .await
-            .map_err(|e| Error::Config(format!("git remote set-url: {e}")))?;
-        if !set_url.status.success() {
-            return Err(Error::Config(format!(
-                "git remote set-url failed: {}",
-                String::from_utf8_lossy(&set_url.stderr)
-            )));
-        }
-
-        // Create the brief's branch from the cloned base_branch tip.
+        git_local_clone(&bare, &host_path).await?;
+        git_set_origin_url(&host_path, repo_url).await?;
         let branch = format!("auto/{}", brief_id.0);
-        let checkout = tokio::process::Command::new("git")
-            .arg("-C")
-            .arg(&host_path)
-            .args(["checkout", "-b", &branch, &format!("origin/{base_branch}")])
-            .output()
-            .await
-            .map_err(|e| Error::Config(format!("git checkout -b: {e}")))?;
-        if !checkout.status.success() {
-            return Err(Error::Config(format!(
-                "git checkout -b {branch} from origin/{base_branch} failed: {}",
-                String::from_utf8_lossy(&checkout.stderr)
-            )));
-        }
-
-        // Defense-in-depth: verify HEAD points at a real commit. If the
-        // checkout silently produced an unborn HEAD (base_branch misspelled or
-        // unreachable in the cloned base), reject the allocation here rather
-        // than letting the coder commit an orphan that fails to merge later.
-        let head_check = tokio::process::Command::new("git")
-            .arg("-C")
-            .arg(&host_path)
-            .arg("rev-parse")
-            .arg("--verify")
-            .arg("HEAD")
-            .output()
-            .await
-            .map_err(|e| Error::Config(format!("git rev-parse HEAD: {e}")))?;
-        if !head_check.status.success()
-            || String::from_utf8_lossy(&head_check.stdout)
-                .trim()
-                .is_empty()
-        {
-            // No worktree linkage to clean up — just remove the cloned dir.
-            let _ = tokio::fs::remove_dir_all(&host_path).await;
-            return Err(Error::Config(format!(
-                "HEAD is unborn after checkout (base_branch={base_branch} \
-                 likely unreachable in bare clone {}); refusing to allocate",
-                bare.display()
-            )));
-        }
+        git_checkout_branch(&host_path, &branch, base_branch).await?;
+        git_verify_born_head(&host_path, &bare, base_branch).await?;
     } else {
         // Legacy path: empty scratch dir. Preserves probe roles that don't
         // name a repo.
