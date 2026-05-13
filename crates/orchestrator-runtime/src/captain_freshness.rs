@@ -15,6 +15,87 @@ use base64::Engine;
 use regex::Regex;
 use std::collections::HashSet;
 
+/// Classification of a single file:line ref against the target repo.
+///
+/// Variant names mirror the operator-facing stdout column values
+/// (`OK` / `MISSING` / `LINE_OUT_OF_RANGE`). `pub` because integration
+/// tests under `tests/` need to construct/match it — `pub(crate)` would
+/// not be visible across the crate boundary, and inline `#[cfg(test)]`
+/// modules in `src/` are banned by `arch-ban-inline-cfg-test-in-src.cypher`.
+#[derive(Debug, PartialEq)]
+pub enum RefStatus {
+    Ok,
+    Missing,
+    OutOfRange { actual_lines: u64 },
+}
+
+/// Pure line-count comparison: classify already-fetched content against
+/// an optional expected line number.
+///
+/// Returns `OutOfRange { actual_lines }` when `expected_line` is `Some(n)`
+/// and `n` exceeds the newline-delimited line count of `content`;
+/// otherwise `Ok`. `pub` so unit tests can exercise the comparison
+/// without HTTP mocking (see [[classify_ref]] for the HTTP-fronted wrapper).
+pub fn classify_against_content(content: &str, expected_line: Option<u64>) -> RefStatus {
+    let line_count = content.lines().count() as u64;
+    match expected_line {
+        Some(n) if n > line_count => RefStatus::OutOfRange {
+            actual_lines: line_count,
+        },
+        _ => RefStatus::Ok,
+    }
+}
+
+/// Probe a single file ref against the forge contents endpoint and
+/// classify the result.
+///
+/// Returns `Ok(RefStatus::Missing)` on HTTP 404, propagates `Err` on any
+/// other non-2xx, otherwise base64-decodes the response and delegates
+/// the line-count comparison to [`classify_against_content`]. `pub` so
+/// integration tests can drive it directly (the inline-`cfg(test)` ban
+/// rules out the alternative).
+pub fn classify_ref(
+    client: &reqwest::blocking::Client,
+    token: &str,
+    forge_host: &str,
+    target_repo: &str,
+    base_branch: &str,
+    path: &str,
+    expected_line: Option<u64>,
+) -> Result<RefStatus> {
+    let contents_url = format!(
+        "https://{forge_host}/api/v1/repos/{target_repo}/contents/{path}?ref={base_branch}"
+    );
+    let resp = client
+        .get(&contents_url)
+        .header("Authorization", format!("token {token}"))
+        .send()
+        .with_context(|| format!("GET {contents_url}"))?;
+    let status = resp.status();
+    if status.as_u16() == 404 {
+        return Ok(RefStatus::Missing);
+    }
+    if !status.is_success() {
+        let detail = resp.text().unwrap_or_default();
+        return Err(anyhow!(
+            "gitea contents fetch failed for {path}: {status} — {detail}"
+        ));
+    }
+    let body_json: serde_json::Value = resp
+        .json()
+        .with_context(|| format!("parse contents JSON for {path}"))?;
+    let encoded = body_json
+        .get("content")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let cleaned: String = encoded.chars().filter(|c| !c.is_whitespace()).collect();
+    let decoded_bytes = base64::engine::general_purpose::STANDARD
+        .decode(cleaned.as_bytes())
+        .with_context(|| format!("decode base64 content for {path}"))?;
+    let content = String::from_utf8_lossy(&decoded_bytes);
+    Ok(classify_against_content(&content, expected_line))
+}
+
 /// Extract file/line refs cited in a forge issue body.
 ///
 /// Returns each distinct `(path, Option<line>)` pair in source order, with
@@ -92,47 +173,26 @@ pub fn run_freshness(
             Some(n) => format!("{path}:{n}"),
             None => path.clone(),
         };
-        let contents_url = format!(
-            "https://{forge_host}/api/v1/repos/{target_repo}/contents/{path}?ref={base_branch}"
-        );
-        let resp = client
-            .get(&contents_url)
-            .header("Authorization", format!("token {token}"))
-            .send()
-            .with_context(|| format!("GET {contents_url}"))?;
-        let status = resp.status();
-        if status.as_u16() == 404 {
-            missing += 1;
-            println!("{display}\tMISSING\t{path}");
-            continue;
-        }
-        if !status.is_success() {
-            let detail = resp.text().unwrap_or_default();
-            return Err(anyhow!(
-                "gitea contents fetch failed for {path}: {status} — {detail}"
-            ));
-        }
-        let body_json: serde_json::Value = resp
-            .json()
-            .with_context(|| format!("parse contents JSON for {path}"))?;
-        let encoded = body_json
-            .get("content")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let cleaned: String = encoded.chars().filter(|c| !c.is_whitespace()).collect();
-        let decoded_bytes = base64::engine::general_purpose::STANDARD
-            .decode(cleaned.as_bytes())
-            .with_context(|| format!("decode base64 content for {path}"))?;
-        let content = String::from_utf8_lossy(&decoded_bytes);
-        let line_count = content.lines().count() as u64;
-        match line {
-            Some(n) if *n > line_count => {
-                oor += 1;
-                println!("{display}\tLINE_OUT_OF_RANGE\tactual {line_count} lines");
-            }
-            _ => {
+        match classify_ref(
+            &client,
+            &token,
+            forge_host,
+            target_repo,
+            base_branch,
+            path,
+            *line,
+        )? {
+            RefStatus::Ok => {
                 ok += 1;
                 println!("{display}\tOK\t");
+            }
+            RefStatus::Missing => {
+                missing += 1;
+                println!("{display}\tMISSING\t{path}");
+            }
+            RefStatus::OutOfRange { actual_lines } => {
+                oor += 1;
+                println!("{display}\tLINE_OUT_OF_RANGE\tactual {actual_lines} lines");
             }
         }
     }
