@@ -11,6 +11,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
+use orchestrator_runtime::captain_dispatch_env::populate_env_from_disk;
 use orchestrator_runtime::captain_ground::{render_grounding_sheet, CfdbItem, SpecMatch};
 use orchestrator_runtime::captain_ground_cache::captain_ground_cache_dir;
 use orchestrator_runtime::{cli_decide, Config};
@@ -20,6 +21,7 @@ use orchestrator_types::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::io;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
@@ -124,6 +126,19 @@ enum Cmd {
     /// Validate a brief file against the Brief schema and shell out to
     /// `orchestrator submit`. The dispatch summary is emitted on stderr to
     /// keep stdout clean for downstream pipe consumers.
+    ///
+    /// Required configuration is resolved in this order — the operator
+    /// sees every missing piece in one block, not one error at a time:
+    ///
+    /// 1. `AGENTRY_REDIS_PASSWORD` — env, falling back to
+    ///    `~/.config/agentry/redis.password`.
+    /// 2. `AGENTRY_REDIS__URL` — env, falling back to
+    ///    `redis://:<password>@127.0.0.1:6380` built from the resolved
+    ///    password.
+    /// 3. `AGENTRY_SIGNING__KEY_PATH` — env, falling back to
+    ///    `~/.config/agentry/signing.key`.
+    /// 4. `orchestrator` binary — `$PATH`, falling back to
+    ///    `/var/mnt/workspaces/agentry/target/release/orchestrator`.
     Dispatch {
         /// Path to the brief JSON file to validate and dispatch.
         brief_file: PathBuf,
@@ -541,6 +556,7 @@ fn cmd_ground(
 // arch-ban-process-exit-outside-bin rule (only the bin entry point's `main`
 // may terminate the process; library/non-main code propagates via Result).
 fn cmd_dispatch(brief_file: PathBuf, dry_run: bool) -> Result<i32> {
+    populate_env_from_disk()?;
     let raw = std::fs::read_to_string(&brief_file)
         .with_context(|| format!("failed to read brief file {}", brief_file.display()))?;
     let brief: Brief = serde_json::from_str(&raw)
@@ -577,15 +593,36 @@ fn cmd_dispatch(brief_file: PathBuf, dry_run: bool) -> Result<i32> {
     }
 
     let brief_file_str = brief_file.display().to_string();
-    let status = Command::new("orchestrator")
-        .args(["submit", &brief_file_str])
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .with_context(|| {
-            "failed to spawn `orchestrator`; the orchestrator binary must be on PATH (canonical local build path: /var/mnt/workspaces/agentry/target/release/orchestrator)".to_string()
-        })?;
+    let canonical_orchestrator = "/var/mnt/workspaces/agentry/target/release/orchestrator";
+    let spawn = |bin: &str| -> std::io::Result<std::process::ExitStatus> {
+        Command::new(bin)
+            .args(["submit", &brief_file_str])
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+    };
+    let status = match spawn("orchestrator") {
+        Ok(s) => {
+            eprintln!("// dispatch: spawned `orchestrator` from PATH");
+            s
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            eprintln!(
+                "// dispatch: `orchestrator` not on PATH; falling back to canonical local build at {canonical_orchestrator}"
+            );
+            spawn(canonical_orchestrator).with_context(|| {
+                format!(
+                    "failed to spawn `orchestrator`; the orchestrator binary must be on PATH (canonical local build path: {canonical_orchestrator})"
+                )
+            })?
+        }
+        Err(e) => {
+            return Err(anyhow::Error::from(e).context(format!(
+                "failed to spawn `orchestrator`; the orchestrator binary must be on PATH (canonical local build path: {canonical_orchestrator})"
+            )));
+        }
+    };
     Ok(status.code().unwrap_or(1))
 }
 

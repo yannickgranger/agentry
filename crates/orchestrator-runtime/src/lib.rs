@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 
 pub mod anchor_resolver;
+pub mod captain_dispatch_env;
 pub mod captain_ground;
 pub mod captain_ground_cache;
 pub mod captain_new_spec;
