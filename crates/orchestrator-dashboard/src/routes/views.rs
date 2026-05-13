@@ -556,12 +556,10 @@ pub async fn role_create(
     State(state): State<AppState>,
     Form(f): Form<RoleForm>,
 ) -> Result<Redirect, AppError> {
-    let substrate_class: SubstrateClass =
-        serde_json::from_value(Value::String(f.substrate_class.clone()))
-            .map_err(|e| anyhow::anyhow!("invalid substrate_class: {e}"))?;
-    let package_manager: PackageManager =
-        serde_json::from_value(Value::String(f.package_manager.clone()))
-            .map_err(|e| anyhow::anyhow!("invalid package_manager: {e}"))?;
+    let substrate_class: SubstrateClass = serde_json::from_value(Value::String(f.substrate_class))
+        .map_err(|e| anyhow::anyhow!("invalid substrate_class: {e}"))?;
+    let package_manager: PackageManager = serde_json::from_value(Value::String(f.package_manager))
+        .map_err(|e| anyhow::anyhow!("invalid package_manager: {e}"))?;
 
     if f.entrypoint_script.trim().is_empty() {
         return Err(anyhow::anyhow!("entrypoint_script is required").into());
@@ -579,7 +577,7 @@ pub async fn role_create(
 
     let version = state.store.next_version("role", &f.name).await?;
     let role = AgentRole {
-        name: RoleName(f.name.clone()),
+        name: RoleName(f.name),
         version,
         model,
         system_prompt,
@@ -736,7 +734,7 @@ pub async fn team_create(
 
     let version = state.store.next_version("team", &f.name).await?;
     let team = TeamTopology {
-        name: TeamName(f.name.clone()),
+        name: TeamName(f.name),
         version,
         roles,
         message_graph: edges,
@@ -848,11 +846,11 @@ pub async fn project_create(
     Form(f): Form<ProjectForm>,
 ) -> Result<Redirect, AppError> {
     let default_escalation: EscalationMode =
-        serde_json::from_value(Value::String(f.default_escalation.clone()))
+        serde_json::from_value(Value::String(f.default_escalation))
             .map_err(|e| anyhow::anyhow!("invalid default_escalation: {e}"))?;
 
     let project = Project {
-        slug: ProjectSlug(f.slug.clone()),
+        slug: ProjectSlug(f.slug),
         name: f.name,
         forges: split_lines(&f.forges_lines),
         default_topology: match f.default_topology.trim() {
