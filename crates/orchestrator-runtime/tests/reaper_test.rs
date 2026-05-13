@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use chrono::TimeZone;
 use orchestrator_runtime::lifecycle::EventSourceError;
 use orchestrator_runtime::reaper::{
-    self, is_orphan, BriefInventory, ReaperSink, DEFAULT_WALL_CLOCK_SECONDS,
+    self, is_orphan, is_trace_orphan, BriefInventory, ReaperSink, DEFAULT_WALL_CLOCK_SECONDS,
 };
 use orchestrator_types::lifecycle::{
     handle, BriefEvent, BriefState, BriefStateRecord, Reason, RetryBudget, DEFAULT_ATTEMPT_CAP,
@@ -152,6 +152,7 @@ fn is_orphan_clock_skew_into_future_is_false() {
 struct MockInventory {
     records: Vec<BriefStateRecord>,
     budgets: HashMap<String, u64>,
+    trace_ages: HashMap<String, u64>,
 }
 
 #[async_trait]
@@ -165,6 +166,14 @@ impl BriefInventory for MockInventory {
         brief_id: &BriefId,
     ) -> Result<Option<u64>, EventSourceError> {
         Ok(self.budgets.get(&brief_id.0).copied())
+    }
+
+    async fn last_trace_event_age(
+        &mut self,
+        brief_id: &BriefId,
+        _now: Ts,
+    ) -> Result<Option<u64>, EventSourceError> {
+        Ok(self.trace_ages.get(&brief_id.0).copied())
     }
 }
 
@@ -231,6 +240,7 @@ async fn tick_emits_one_abort_for_one_expired_non_terminal_brief() {
             ("brf_expired".into(), 1800),
             ("brf_done".into(), 1800),
         ]),
+        trace_ages: HashMap::new(),
     };
     let mut sink = MockSink::default();
 
@@ -273,6 +283,7 @@ async fn tick_uses_default_budget_when_brief_body_absent() {
             0,
         )],
         budgets: HashMap::new(),
+        trace_ages: HashMap::new(),
     };
     let mut sink = MockSink::default();
 
@@ -360,4 +371,99 @@ fn handle_maps_budget_exhausted_to_failed_with_budget_reason_from_every_non_term
             "from {s:?}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// is_trace_orphan — stale-trace probe boundary table
+// ---------------------------------------------------------------------------
+
+#[test]
+fn is_trace_orphan_fires_when_above_threshold() {
+    let r = record(
+        "brf_quiet",
+        BriefState::Authoring {
+            agent_id: "c".into(),
+            started_at: ts(0),
+            retry: fresh_retry(),
+        },
+        0,
+    );
+    assert!(is_trace_orphan(&r, 700, 600));
+}
+
+#[test]
+fn is_trace_orphan_skips_terminal() {
+    let shipped = record("brf_shipped", BriefState::Shipped, 0);
+    assert!(!is_trace_orphan(&shipped, 999, 600));
+
+    let failed = record(
+        "brf_failed",
+        BriefState::Failed {
+            reason: Reason::BudgetExhausted,
+        },
+        0,
+    );
+    assert!(!is_trace_orphan(&failed, 999, 600));
+}
+
+#[test]
+fn is_trace_orphan_skips_awaiting_captain_decision() {
+    let r = record(
+        "brf_awaiting",
+        BriefState::AwaitingCaptainDecision {
+            disagreements: vec![],
+            retry: fresh_retry(),
+        },
+        0,
+    );
+    assert!(!is_trace_orphan(&r, 999, 600));
+}
+
+// ---------------------------------------------------------------------------
+// reaper::tick — stale-trace path distinct from wall-clock path
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn tick_reaps_stale_trace_orphan_distinctly_from_wall_clock() {
+    // Brief is Authoring, only 60s old (well within the 1800s wall-clock
+    // budget), but its trace stream has been silent 700s — past the
+    // 600s STALE_TRACE_THRESHOLD_SECONDS. The stale-trace probe must
+    // fire, push BudgetExhausted, and kill containers — same effects
+    // as the wall-clock path.
+    let now_secs: i64 = 10_000;
+    let mut inv = MockInventory {
+        records: vec![record(
+            "brf_quiet",
+            BriefState::Authoring {
+                agent_id: "c".into(),
+                started_at: ts(now_secs - 60),
+                retry: fresh_retry(),
+            },
+            now_secs - 60,
+        )],
+        budgets: HashMap::from([("brf_quiet".into(), 1800)]),
+        trace_ages: HashMap::from([("brf_quiet".into(), 700)]),
+    };
+    let mut sink = MockSink::default();
+
+    let reaped = reaper::tick(
+        &mut inv,
+        &mut sink,
+        DEFAULT_WALL_CLOCK_SECONDS,
+        ts(now_secs),
+    )
+    .await
+    .expect("tick");
+    assert_eq!(reaped, 1, "one stale-trace orphan reaped");
+
+    let pushed = sink.pushed.lock().await.clone();
+    assert_eq!(pushed.len(), 1, "exactly one event pushed");
+    assert_eq!(pushed[0].0, BriefId("brf_quiet".into()));
+    assert!(
+        matches!(pushed[0].1, BriefEvent::BudgetExhausted),
+        "stale-trace path reuses BudgetExhausted"
+    );
+
+    let killed = sink.killed.lock().await.clone();
+    assert_eq!(killed, vec![BriefId("brf_quiet".into())]);
 }

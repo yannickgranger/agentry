@@ -7,7 +7,7 @@ use crate::lifecycle_ports::EventSourceError;
 use crate::reaper_ports::{BriefInventory, ReaperSink, REAPER_AGENT_ID};
 use async_trait::async_trait;
 use orchestrator_types::lifecycle::{BriefEvent, BriefStateRecord};
-use orchestrator_types::{BriefId, Event, EventKind};
+use orchestrator_types::{BriefId, Event, EventKind, Ts};
 use redis::aio::ConnectionManager;
 use redis::AsyncCommands;
 use serde_json::Value as JsonValue;
@@ -100,6 +100,82 @@ impl BriefInventory for RedisInventory {
             .get("budget")
             .and_then(|b| b.get("max_wall_seconds"))
             .and_then(JsonValue::as_u64))
+    }
+
+    async fn last_trace_event_age(
+        &mut self,
+        brief_id: &BriefId,
+        now: Ts,
+    ) -> Result<Option<u64>, EventSourceError> {
+        let stream = format!("agentry:brief:{}:trace", brief_id.0);
+        let reply: redis::Value = match redis::cmd("XINFO")
+            .arg("STREAM")
+            .arg(&stream)
+            .query_async(&mut self.conn)
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                // Stream missing → ERR no such key; treat as not-orphan.
+                if e.kind() == redis::ErrorKind::ResponseError
+                    && e.to_string().to_lowercase().contains("no such key")
+                {
+                    return Ok(None);
+                }
+                return Err(EventSourceError::Backend {
+                    detail: e.to_string(),
+                });
+            }
+        };
+        let mut length: Option<i64> = None;
+        let mut last_id: Option<String> = None;
+        if let redis::Value::Array(items) = reply {
+            let mut iter = items.into_iter();
+            while let (Some(k), Some(v)) = (iter.next(), iter.next()) {
+                let key = match k {
+                    redis::Value::BulkString(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+                    redis::Value::SimpleString(s) => s,
+                    _ => continue,
+                };
+                match key.as_str() {
+                    "length" => {
+                        if let redis::Value::Int(n) = v {
+                            length = Some(n);
+                        }
+                    }
+                    "last-generated-id" => match v {
+                        redis::Value::BulkString(bytes) => {
+                            last_id = Some(String::from_utf8_lossy(&bytes).into_owned());
+                        }
+                        redis::Value::SimpleString(s) => last_id = Some(s),
+                        _ => {}
+                    },
+                    _ => {}
+                }
+            }
+        }
+        if matches!(length, Some(0)) {
+            return Ok(None);
+        }
+        let Some(id) = last_id else { return Ok(None) };
+        let Some((ms_str, _)) = id.split_once('-') else {
+            tracing::warn!(brief = %brief_id.0, last_id = %id, "reaper: malformed XID");
+            return Ok(None);
+        };
+        let Ok(ms) = ms_str.parse::<i64>() else {
+            tracing::warn!(brief = %brief_id.0, last_id = %id, "reaper: unparsable XID ms prefix");
+            return Ok(None);
+        };
+        if ms == 0 {
+            return Ok(None);
+        }
+        let last_secs = ms / 1000;
+        let now_secs = now.timestamp();
+        let delta = now_secs - last_secs;
+        if delta < 0 {
+            return Ok(None);
+        }
+        Ok(Some(delta as u64))
     }
 }
 
