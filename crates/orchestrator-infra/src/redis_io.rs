@@ -340,11 +340,7 @@ pub async fn read_next_brief(
     for k in r.keys {
         for entry in k.ids {
             let sid = entry.id;
-            let body: Option<String> = entry.map.get("brief").and_then(|v| match v {
-                redis::Value::BulkString(b) => std::str::from_utf8(b).ok().map(String::from),
-                redis::Value::SimpleString(s) => Some(s.clone()),
-                _ => None,
-            });
+            let body: Option<String> = entry.map.get("brief").and_then(redis_value_as_str);
             if let Some(b) = body {
                 let brief: Brief = serde_json::from_str(&b)?;
                 return Ok(Some((sid, brief)));
@@ -352,6 +348,19 @@ pub async fn read_next_brief(
         }
     }
     Ok(None)
+}
+
+/// Decode a redis::Value into Option<String>. Handles BulkString and
+/// SimpleString; everything else maps to None. Pre-existing private
+/// copies in lifecycle_redis.rs / projector.rs / watchdog.rs /
+/// cli_agents.rs (orchestrator-runtime) and store.rs (orchestrator-
+/// dashboard) all delegate here.
+pub fn redis_value_as_str(v: &redis::Value) -> Option<String> {
+    match v {
+        redis::Value::BulkString(b) => std::str::from_utf8(b).ok().map(String::from),
+        redis::Value::SimpleString(s) => Some(s.clone()),
+        _ => None,
+    }
 }
 
 /// Hint that we're skipping fields (silences dead-code warnings on unused helper types).

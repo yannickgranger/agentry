@@ -18,6 +18,7 @@
 //! daemon does not spawn the watchdog at all — see `daemon.rs`.
 
 use crate::state::State;
+use orchestrator_infra::redis_io::redis_value_as_str;
 use orchestrator_types::{Event, EventKind};
 use redis::aio::ConnectionManager;
 use redis::AsyncCommands;
@@ -279,14 +280,6 @@ async fn scan_evidence(
 /// always include `"type":"status"` per the EventKind serde tag.
 fn is_status_event_body(body: &str) -> bool {
     body.contains("\"type\":\"status\"") || body.contains("\"type\": \"status\"")
-}
-
-fn redis_value_as_str(v: &redis::Value) -> Option<String> {
-    match v {
-        redis::Value::BulkString(b) => std::str::from_utf8(b).ok().map(String::from),
-        redis::Value::SimpleString(s) => Some(s.clone()),
-        _ => None,
-    }
 }
 
 async fn call_grok(

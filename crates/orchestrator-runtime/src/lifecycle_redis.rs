@@ -7,6 +7,7 @@ use crate::lifecycle_ports::{
     translate_trace_entry, EventSource, EventSourceError, StateProjector, StateProjectorError,
 };
 use async_trait::async_trait;
+use orchestrator_infra::redis_io::redis_value_as_str;
 use orchestrator_types::lifecycle::{BriefEvent, BriefStateRecord};
 use orchestrator_types::{BriefId, Event};
 use redis::aio::ConnectionManager;
@@ -190,13 +191,5 @@ impl StateProjector for RedisStateProjector {
                 detail: e.to_string(),
             })?;
         Ok(())
-    }
-}
-
-fn redis_value_as_str(v: &redis::Value) -> Option<String> {
-    match v {
-        redis::Value::BulkString(b) => std::str::from_utf8(b).ok().map(String::from),
-        redis::Value::SimpleString(s) => Some(s.clone()),
-        _ => None,
     }
 }

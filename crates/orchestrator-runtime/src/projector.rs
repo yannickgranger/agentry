@@ -18,6 +18,7 @@
 
 use crate::state::{AgentRow, State};
 use chrono::{DateTime, Utc};
+use orchestrator_infra::redis_io::redis_value_as_str;
 use orchestrator_types::{Event, EventKind};
 use redis::aio::ConnectionManager;
 use redis::streams::{StreamReadOptions, StreamReadReply};
@@ -203,12 +204,4 @@ fn build_agent_row(
         exit_code: None,
         cohort_labels,
     })
-}
-
-fn redis_value_as_str(v: &redis::Value) -> Option<String> {
-    match v {
-        redis::Value::BulkString(b) => std::str::from_utf8(b).ok().map(String::from),
-        redis::Value::SimpleString(s) => Some(s.clone()),
-        _ => None,
-    }
 }
