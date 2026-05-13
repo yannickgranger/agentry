@@ -290,7 +290,17 @@ fn split_target_repo(target_repo: &str) -> (String, String) {
 fn http_get_json(url: &str, token: &str) -> Result<Value, String> {
     let auth = format!("Authorization: token {token}");
     let out = Command::new("curl")
-        .args(["-sS", "-k", "-H", &auth, url])
+        .args([
+            "-sS",
+            "--connect-timeout",
+            "10",
+            "--max-time",
+            "30",
+            "-k",
+            "-H",
+            &auth,
+            url,
+        ])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -315,6 +325,10 @@ fn http_post(url: &str, token: &str, body: &str) -> Result<(String, String), Str
     let out = Command::new("curl")
         .args([
             "-sS",
+            "--connect-timeout",
+            "10",
+            "--max-time",
+            "30",
             "-k",
             "-X",
             "POST",

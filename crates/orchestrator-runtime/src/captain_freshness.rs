@@ -57,6 +57,7 @@ pub fn run_freshness(
         .context("GITEA_TOKEN env var required for forge issue fetch")?;
     let client = reqwest::blocking::Client::builder()
         .danger_accept_invalid_certs(true)
+        .timeout(std::time::Duration::from_secs(30))
         .build()
         .context("build blocking reqwest client")?;
 

@@ -234,6 +234,7 @@ pub async fn open_pull_request(
 ) -> Result<PrOpened> {
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
+        .timeout(std::time::Duration::from_secs(30))
         .build()?;
     let url = format!("https://{forge_host}/api/v1/repos/{target_repo}/pulls");
     let payload = serde_json::json!({

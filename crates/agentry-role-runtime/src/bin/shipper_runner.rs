@@ -420,6 +420,10 @@ fn http_post_json(url: &str, token: &str, body: &str) -> Result<String, String> 
     let out = Command::new("curl")
         .args([
             "-sS",
+            "--connect-timeout",
+            "10",
+            "--max-time",
+            "30",
             "-k",
             "-X",
             "POST",
