@@ -256,9 +256,8 @@ async fn reattach_brief(
 /// written and the caller should NOT bump any counter for this record.
 #[tracing::instrument(skip_all, fields(brief = %record.brief_id.0))]
 async fn mark_failed(conn: &mut ConnectionManager, record: &BriefStateRecord) -> bool {
-    let brief_id = record.brief_id.clone();
     let new_record = BriefStateRecord {
-        brief_id: brief_id.clone(),
+        brief_id: record.brief_id.clone(),
         state: BriefState::Failed {
             reason: Reason::DaemonRestartedDuringExecution,
         },
@@ -270,27 +269,27 @@ async fn mark_failed(conn: &mut ConnectionManager, record: &BriefStateRecord) ->
     let json = match serde_json::to_string(&new_record) {
         Ok(j) => j,
         Err(e) => {
-            tracing::warn!(brief = %brief_id.0, error = %e, "resume: serialize failed, skipping");
+            tracing::warn!(brief = %record.brief_id.0, error = %e, "resume: serialize failed, skipping");
             return false;
         }
     };
 
-    let state_key = format!("agentry:brief:{}:state", brief_id.0);
-    let log_key = format!("agentry:brief:{}:state_log", brief_id.0);
+    let state_key = format!("agentry:brief:{}:state", record.brief_id.0);
+    let log_key = format!("agentry:brief:{}:state_log", record.brief_id.0);
 
     if let Err(e) = conn.set::<_, _, ()>(&state_key, json.as_str()).await {
-        tracing::warn!(brief = %brief_id.0, error = %e, "resume: SET state failed, skipping");
+        tracing::warn!(brief = %record.brief_id.0, error = %e, "resume: SET state failed, skipping");
         return false;
     }
     if let Err(e) = conn
         .xadd::<_, _, _, _, String>(&log_key, "*", &[("record", json.as_str())])
         .await
     {
-        tracing::warn!(brief = %brief_id.0, error = %e, "resume: XADD state_log failed (state already updated)");
+        tracing::warn!(brief = %record.brief_id.0, error = %e, "resume: XADD state_log failed (state already updated)");
     }
 
     tracing::info!(
-        brief = %brief_id.0,
+        brief = %record.brief_id.0,
         "resume: marked Failed {{ DaemonRestartedDuringExecution }}",
     );
     true
