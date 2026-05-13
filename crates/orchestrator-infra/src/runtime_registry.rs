@@ -15,6 +15,7 @@ use orchestrator_types::BriefId;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{OnceLock, RwLock};
+use tracing;
 
 #[derive(Debug, Clone)]
 pub struct ContainerHandle {
@@ -28,16 +29,24 @@ fn registry() -> &'static RwLock<HashMap<BriefId, ContainerHandle>> {
 }
 
 fn register_running(brief_id: &BriefId, handle: ContainerHandle) {
-    let mut g = registry()
-        .write()
-        .expect("running-container registry poisoned");
+    let mut g = registry().write().unwrap_or_else(|poison| {
+        tracing::warn!(
+            lock = "runtime_registry",
+            "recovering from poisoned write-lock"
+        );
+        poison.into_inner()
+    });
     g.insert(brief_id.clone(), handle);
 }
 
 fn unregister_running(brief_id: &BriefId) {
-    let mut g = registry()
-        .write()
-        .expect("running-container registry poisoned");
+    let mut g = registry().write().unwrap_or_else(|poison| {
+        tracing::warn!(
+            lock = "runtime_registry",
+            "recovering from poisoned write-lock"
+        );
+        poison.into_inner()
+    });
     g.remove(brief_id);
 }
 
@@ -69,9 +78,13 @@ pub fn register_running_with_guard(brief_id: BriefId, handle: ContainerHandle) -
 /// script (when configured) runs.
 pub async fn kill(brief_id: &BriefId) -> Result<()> {
     let name = {
-        let g = registry()
-            .read()
-            .expect("running-container registry poisoned");
+        let g = registry().read().unwrap_or_else(|poison| {
+            tracing::warn!(
+                lock = "runtime_registry",
+                "recovering from poisoned read-lock"
+            );
+            poison.into_inner()
+        });
         g.get(brief_id).map(|h| h.container_name.clone())
     };
     let name = name.ok_or_else(|| Error::NotFound {
@@ -97,8 +110,23 @@ pub async fn kill(brief_id: &BriefId) -> Result<()> {
 /// runs without a workspace mount.
 #[must_use]
 pub fn workspace_path(brief_id: &BriefId) -> Option<PathBuf> {
-    let g = registry()
-        .read()
-        .expect("running-container registry poisoned");
+    let g = registry().read().unwrap_or_else(|poison| {
+        tracing::warn!(
+            lock = "runtime_registry",
+            "recovering from poisoned read-lock"
+        );
+        poison.into_inner()
+    });
     g.get(brief_id).and_then(|h| h.workspace_path.clone())
+}
+
+// Test-only accessor so `tests/runtime_registry_poison_test.rs` can drive the
+// poisoning deterministically. The static lock is private by design (callers
+// must go through `register_running_with_guard` / `workspace_path` /
+// `kill`); this hook exists solely so the recovery contract can be
+// black-box verified from an integration test, since inline `#[cfg(test)]`
+// in `src/` is banned by `arch-ban-inline-cfg-test-in-src`.
+#[doc(hidden)]
+pub fn __registry_for_test() -> &'static RwLock<HashMap<BriefId, ContainerHandle>> {
+    registry()
 }
