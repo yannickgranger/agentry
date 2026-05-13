@@ -54,9 +54,10 @@ fn bare_clone_locks() -> &'static StdMutex<HashMap<PathBuf, Arc<TokioMutex<()>>>
 }
 
 fn lock_for_bare(bare: &Path) -> Arc<TokioMutex<()>> {
-    let mut guard = bare_clone_locks()
-        .lock()
-        .expect("bare-clone lock registry poisoned");
+    let mut guard = bare_clone_locks().lock().unwrap_or_else(|poison| {
+        tracing::warn!(lock = "bare_clone_locks", "recovering from poisoned mutex");
+        poison.into_inner()
+    });
     guard
         .entry(bare.to_path_buf())
         .or_insert_with(|| Arc::new(TokioMutex::new(())))
@@ -686,4 +687,23 @@ async fn sweep_one_bare(bare: &Path, briefs_dir: &Path) -> usize {
         }
     }
     deleted
+}
+
+/// Test-only hook on the private `bare_clone_locks` static. The lock
+/// registry is otherwise process-private; the integration test for the
+/// `unwrap_or_else(|poison| poison.into_inner())` recovery pattern
+/// (mirroring PR #522 on `runtime_registry`) needs to poison the lock
+/// from a panicking thread and then assert `lock_for_bare` survives.
+/// Inline `#[cfg(test)] mod tests` in src/ is banned by
+/// `arch-ban-inline-cfg-test-in-src`.
+#[doc(hidden)]
+pub fn __bare_clone_locks_for_test() -> &'static StdMutex<HashMap<PathBuf, Arc<TokioMutex<()>>>> {
+    bare_clone_locks()
+}
+
+/// Test-only hook on the private `lock_for_bare` helper. See
+/// [`__bare_clone_locks_for_test`] for rationale.
+#[doc(hidden)]
+pub fn __lock_for_bare_for_test(bare: &Path) -> Arc<TokioMutex<()>> {
+    lock_for_bare(bare)
 }
