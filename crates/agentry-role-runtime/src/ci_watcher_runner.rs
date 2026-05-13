@@ -36,6 +36,24 @@ pub fn first_failing_context(statuses: &[Value]) -> Option<String> {
         .and_then(|s| s.get("context").and_then(Value::as_str).map(str::to_string))
 }
 
+/// Return EVERY failing context — same predicate as
+/// [`first_failing_context`] but collected into a `Vec` in source order.
+/// Entries without a `context` string are skipped. The rework coder needs
+/// the full set because non-trivial CI configs run multiple parallel
+/// checks and any one of them can be the actionable failure.
+pub fn all_failing_contexts(statuses: &[Value]) -> Vec<String> {
+    statuses
+        .iter()
+        .filter(|s| {
+            matches!(
+                s.get("state").and_then(Value::as_str),
+                Some("failure") | Some("error")
+            )
+        })
+        .filter_map(|s| s.get("context").and_then(Value::as_str).map(str::to_string))
+        .collect()
+}
+
 /// Return a non-cryptographic jitter in `0..=9`, replacing bash's
 /// `RANDOM % 10`. Used by the merge-retry backoff loop to avoid the
 /// thundering-herd pattern when several CI-green children attempt to

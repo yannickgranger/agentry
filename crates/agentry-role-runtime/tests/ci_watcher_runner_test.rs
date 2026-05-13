@@ -4,8 +4,8 @@
 //! a separate test-crate file (mirrors `coder_helpers_test.rs`).
 
 use agentry_role_runtime::ci_watcher_runner::{
-    find_shipper_message, first_failing_context, rand_jitter, run_merge_retry_loop, AttemptResult,
-    MergeRetryOutcome,
+    all_failing_contexts, find_shipper_message, first_failing_context, rand_jitter,
+    run_merge_retry_loop, AttemptResult, MergeRetryOutcome,
 };
 use serde_json::json;
 
@@ -81,6 +81,35 @@ fn first_failing_context_returns_none_when_all_green() {
 fn first_failing_context_returns_none_when_context_missing() {
     let statuses = [json!({"state": "failure"})];
     assert!(first_failing_context(&statuses).is_none());
+}
+
+#[test]
+fn all_failing_contexts_collects_failure_and_error_in_order() {
+    let statuses = [
+        json!({"state": "success", "context": "fmt"}),
+        json!({"state": "failure", "context": "Public API Freeze"}),
+        json!({"state": "error", "context": "clippy"}),
+    ];
+    assert_eq!(
+        all_failing_contexts(&statuses),
+        vec!["Public API Freeze".to_string(), "clippy".to_string()],
+    );
+}
+
+#[test]
+fn all_failing_contexts_returns_empty_on_empty_input() {
+    let statuses: Vec<serde_json::Value> = Vec::new();
+    assert!(all_failing_contexts(&statuses).is_empty());
+}
+
+#[test]
+fn all_failing_contexts_returns_empty_when_all_green() {
+    let statuses = [
+        json!({"state": "success", "context": "fmt"}),
+        json!({"state": "success", "context": "build"}),
+        json!({"state": "success", "context": "clippy"}),
+    ];
+    assert!(all_failing_contexts(&statuses).is_empty());
 }
 
 #[test]
