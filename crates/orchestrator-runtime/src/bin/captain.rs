@@ -157,6 +157,23 @@ enum Cmd {
         #[arg(long)]
         target_repo: String,
     },
+    /// Probe file:line refs cited in a forge issue body against
+    /// target_repo@base_branch. Reports each ref as OK / MISSING /
+    /// LINE_OUT_OF_RANGE. Exit 0 when all OK; exit 1 when any non-OK.
+    Freshness {
+        /// Forge shorthand for the target repo whose develop branch to probe, e.g. `yg/agentry`.
+        #[arg(long)]
+        target_repo: String,
+        /// Issue number on the forge.
+        #[arg(long)]
+        issue: u64,
+        /// Branch to probe against. Defaults to `develop`.
+        #[arg(long)]
+        base_branch: Option<String>,
+        /// Forge host. Defaults to value of AGENTRY_FORGE_HOST env or `agency.lab:3000` from forge_host_from_env().
+        #[arg(long)]
+        forge_host: Option<String>,
+    },
     /// Rebuild release binaries listed by a brief's `redeploy_required`.
     Redeploy {
         /// Comma-separated list of targets to rebuild. Accepted values
@@ -692,6 +709,20 @@ fn cmd_redeploy(target: &str, dry_run: bool) -> Result<()> {
     Ok(())
 }
 
+fn cmd_freshness(
+    target_repo: String,
+    issue: u64,
+    base_branch: String,
+    forge_host: String,
+) -> Result<i32> {
+    orchestrator_runtime::captain_freshness::run_freshness(
+        &target_repo,
+        issue,
+        &base_branch,
+        &forge_host,
+    )
+}
+
 fn cmd_decide(action: DecideAction) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -808,6 +839,20 @@ fn main() -> Result<()> {
                 "Use CamelCase concept names. Level-4 (####) headings are local subsections and do not"
             );
             eprintln!("need to match code Items. The graph-specs check enforces this at PR time.");
+        }
+        Cmd::Freshness {
+            target_repo,
+            issue,
+            base_branch,
+            forge_host,
+        } => {
+            let code = cmd_freshness(
+                target_repo,
+                issue,
+                base_branch.unwrap_or_else(|| DEFAULT_BASE_BRANCH.to_string()),
+                forge_host.unwrap_or_else(forge_host_from_env),
+            )?;
+            std::process::exit(code);
         }
         Cmd::Redeploy { target, dry_run } => cmd_redeploy(&target, dry_run)?,
         Cmd::Decide { action } => cmd_decide(action)?,

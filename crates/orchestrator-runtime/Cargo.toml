@@ -42,13 +42,14 @@ ed25519-dalek.workspace = true
 rand_core.workspace = true
 hex.workspace = true
 figment.workspace = true
-reqwest.workspace = true
+reqwest = { workspace = true, features = ["blocking"] }
 anyhow = "1.0.102"
 rusqlite = { workspace = true }
 humantime = "2"
 base64 = { workspace = true }
 toml = { workspace = true }
 tempfile = "3.14"
+regex = "1"
 
 [dev-dependencies]
 filetime = "0.2"
