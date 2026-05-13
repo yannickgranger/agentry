@@ -432,7 +432,9 @@ pub async fn fetch_profile_url(
     if tls_insecure {
         builder = builder.danger_accept_invalid_certs(true);
     }
-    let client = builder.build()?;
+    let client = builder
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
     let resp = client
         .get(url)
         .header("Authorization", format!("token {forge_token}"))
