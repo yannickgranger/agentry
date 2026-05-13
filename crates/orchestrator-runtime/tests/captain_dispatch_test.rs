@@ -5,6 +5,7 @@
 //! `orchestrator submit` path is not exercised here — that path is exercised
 //! at acceptance time when this brief itself is dispatched.
 
+use orchestrator_runtime::captain_dispatch_env::populate_env_from_disk;
 use orchestrator_types::{
     now, Assertion, AssertionAnchor, AssertionId, Brief, BriefId, Budget, Contract, EscalationMode,
     TaskShape, VersionedRef,
@@ -12,7 +13,49 @@ use orchestrator_types::{
 use serde_json::Value;
 use std::io::Write;
 use std::process::Command;
+use std::sync::Mutex;
 use tempfile::NamedTempFile;
+
+/// Serialises the in-process env-mutating tests below. Subprocess tests
+/// don't share env with the parent so they don't need this guard; the
+/// `populate_env_from_disk` tests do, because they read $HOME and write
+/// AGENTRY_* in the parent process.
+static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+/// RAII helper: snapshot a fixed set of env vars, clear them, restore on
+/// drop. Lets each populate_env_from_disk test start from a known-empty
+/// state and leaves the process env unchanged for subsequent tests.
+struct EnvSnapshot {
+    saved: Vec<(&'static str, Option<String>)>,
+}
+
+impl EnvSnapshot {
+    fn capture(keys: &[&'static str]) -> Self {
+        let saved = keys.iter().map(|k| (*k, std::env::var(k).ok())).collect();
+        for k in keys {
+            std::env::remove_var(k);
+        }
+        Self { saved }
+    }
+}
+
+impl Drop for EnvSnapshot {
+    fn drop(&mut self) {
+        for (k, v) in &self.saved {
+            match v {
+                Some(val) => std::env::set_var(k, val),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+}
+
+const TRACKED_ENV: &[&str] = &[
+    "HOME",
+    "AGENTRY_REDIS_PASSWORD",
+    "AGENTRY_REDIS__URL",
+    "AGENTRY_SIGNING__KEY_PATH",
+];
 
 fn captain_bin() -> &'static str {
     env!("CARGO_BIN_EXE_captain")
@@ -54,6 +97,14 @@ fn build_brief(kind: Option<TaskShape>, contract: Option<Contract>) -> Brief {
 
 fn run_dispatch(args: &[&str]) -> std::process::Output {
     let mut cmd = Command::new(captain_bin());
+    // Supply the three env vars `captain dispatch` now resolves up-front so
+    // the disk-probe fallback (`populate_env_from_disk`) is a no-op for
+    // these integration tests. Without this, the tests would depend on the
+    // host having `~/.config/agentry/{redis.password,signing.key}` set up,
+    // which is not portable to fresh CI containers.
+    cmd.env("AGENTRY_REDIS_PASSWORD", "test-redis-password")
+        .env("AGENTRY_REDIS__URL", "redis://:test@127.0.0.1:6380")
+        .env("AGENTRY_SIGNING__KEY_PATH", "/tmp/test-signing.key");
     cmd.arg("dispatch");
     cmd.args(args);
     cmd.output().expect("spawn captain dispatch")
@@ -176,6 +227,92 @@ fn captain_dispatch_rejects_invalid_brief_json() {
     assert!(
         stderr.contains("parse") || stderr.contains("Brief"),
         "expected stderr to describe a parse error; got:\n{stderr}"
+    );
+}
+
+#[test]
+fn populate_env_from_disk_reads_redis_password_and_constructs_url() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _env = EnvSnapshot::capture(TRACKED_ENV);
+
+    let home = tempfile::tempdir().expect("create tempdir for HOME");
+    let cfg = home.path().join(".config").join("agentry");
+    std::fs::create_dir_all(&cfg).expect("create config dir");
+    std::fs::write(cfg.join("redis.password"), "s3cret-pw\n").expect("write redis.password");
+    std::fs::write(cfg.join("signing.key"), b"key-bytes").expect("write signing.key");
+    std::env::set_var("HOME", home.path());
+
+    populate_env_from_disk().expect("populate_env_from_disk should succeed");
+
+    assert_eq!(
+        std::env::var("AGENTRY_REDIS_PASSWORD").ok().as_deref(),
+        Some("s3cret-pw"),
+        "redis password should be loaded from disk and trimmed"
+    );
+    assert_eq!(
+        std::env::var("AGENTRY_REDIS__URL").ok().as_deref(),
+        Some("redis://:s3cret-pw@127.0.0.1:6380"),
+        "redis url should be derived from the loaded password"
+    );
+    let signing = std::env::var("AGENTRY_SIGNING__KEY_PATH").expect("signing key path set");
+    assert_eq!(
+        std::path::PathBuf::from(signing),
+        cfg.join("signing.key"),
+        "signing key path should default under $HOME/.config/agentry/"
+    );
+}
+
+#[test]
+fn populate_env_from_disk_reports_all_three_when_config_dir_missing() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _env = EnvSnapshot::capture(TRACKED_ENV);
+
+    let home = tempfile::tempdir().expect("create tempdir for HOME");
+    std::env::set_var("HOME", home.path());
+
+    let err = populate_env_from_disk()
+        .expect_err("populate_env_from_disk should fail with no config dir");
+    let msg = format!("{err:#}");
+
+    assert!(
+        msg.contains("3 missing configuration"),
+        "expected three missing items in error:\n{msg}"
+    );
+}
+
+#[test]
+fn populate_env_from_disk_reports_only_signing_key_when_password_present() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _env = EnvSnapshot::capture(TRACKED_ENV);
+
+    let home = tempfile::tempdir().expect("create tempdir for HOME");
+    let cfg = home.path().join(".config").join("agentry");
+    std::fs::create_dir_all(&cfg).expect("create config dir");
+    std::fs::write(cfg.join("redis.password"), "pw\n").expect("write redis.password");
+    std::env::set_var("HOME", home.path());
+
+    let err = populate_env_from_disk()
+        .expect_err("populate_env_from_disk should fail without signing.key");
+    let msg = format!("{err:#}");
+
+    assert!(
+        msg.contains("1 missing configuration"),
+        "expected exactly one missing item:\n{msg}"
+    );
+    assert_eq!(
+        std::env::var("AGENTRY_REDIS_PASSWORD").ok().as_deref(),
+        Some("pw"),
+        "redis password should still be resolved from disk"
+    );
+    assert!(
+        std::env::var("AGENTRY_REDIS__URL").is_ok(),
+        "redis url should be derived from the resolved password"
+    );
+    let signing = std::env::var("AGENTRY_SIGNING__KEY_PATH").expect("signing key path set");
+    assert_eq!(
+        std::path::PathBuf::from(signing),
+        cfg.join("signing.key"),
+        "signing key env should default to canonical path even when file is missing"
     );
 }
 
