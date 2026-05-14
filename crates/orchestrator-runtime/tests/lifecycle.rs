@@ -18,10 +18,10 @@ use orchestrator_runtime::lifecycle::{
 };
 use orchestrator_runtime::lifecycle_driver::projector_task;
 use orchestrator_types::lifecycle::{
-    handle, role_kind, BriefEvent, BriefState, BriefStateRecord, CiState, Reason, RetryBudget,
-    DEFAULT_ATTEMPT_CAP,
+    handle, role_kind, BriefEvent, BriefState, BriefStateRecord, CiState, DisagreementSummary,
+    Reason, RetryBudget, DEFAULT_ATTEMPT_CAP,
 };
-use orchestrator_types::{now, BriefId, Event, EventKind, EventVerdict};
+use orchestrator_types::{event::DoneReason, now, BriefId, Event, EventKind, EventVerdict};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
@@ -524,6 +524,51 @@ fn translate_done_from_coder_emits_role_done() {
             assert_eq!(node_id.0, "coder-claude-agentry");
         }
         other => panic!("expected RoleDone for coder, got {other:?}"),
+    }
+}
+
+/// #529 regression fence — when a coder's `Done` event carries
+/// `reason.cause == "self_review_disagreed"` plus a non-empty
+/// `disagreements` vec, the translator MUST yield
+/// `BriefEvent::CoderDisagreed { disagreements }`, not the generic
+/// `RoleDone` arm. This is the canonical-FSM entry into the F6
+/// captain-decide park (`Walking{Coder}` → `Walking{OperatorDecision}`).
+/// If the translator silently downgraded the disagreement to `RoleDone`,
+/// the brief would route through ordinary post-coder gates and the
+/// daemon's mini-FSM would terminal-fail it on the embedded `Failed`
+/// verdict — exactly the regression #529 documents.
+#[test]
+fn translate_done_from_coder_with_self_review_disagreed_emits_coder_disagreed() {
+    let mut memo: HashMap<String, String> = HashMap::new();
+    let _ = translate_trace_entry(
+        &mut memo,
+        "agent-c".to_string(),
+        spawned_event("coder-claude-agentry"),
+    )
+    .expect("memoize coder spawn");
+    let disagreements = vec![DisagreementSummary {
+        verb: "UPDATE crates/foo/src/bar.rs:42".into(),
+        applied_form: "extracted into a helper".into(),
+        rationale: "callers need to mock the helper in unit tests".into(),
+    }];
+    let event = Event::new(EventKind::Done {
+        verdict: EventVerdict::Failed,
+        refusal_count: 0,
+        reason: Some(DoneReason {
+            cause: "self_review_disagreed".into(),
+            exit_code: None,
+            disagreements: disagreements.clone(),
+        }),
+    });
+    let out = translate_trace_entry(&mut memo, "agent-c".to_string(), event)
+        .expect("translate coder disagreed done");
+    match out {
+        Some(BriefEvent::CoderDisagreed {
+            disagreements: emitted,
+        }) => {
+            assert_eq!(emitted, disagreements);
+        }
+        other => panic!("expected CoderDisagreed, got {other:?}"),
     }
 }
 
