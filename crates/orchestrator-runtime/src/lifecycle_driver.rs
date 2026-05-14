@@ -15,7 +15,7 @@ use crate::lifecycle::{
 use crate::redis_io;
 use crate::workspace::{self, BriefWorkspace, TerminationDisposition};
 use crate::{Error, Result};
-use orchestrator_types::lifecycle::{handle, BriefEvent, BriefState, BriefStateRecord, Reason};
+use orchestrator_types::lifecycle::{handle, BriefEvent, BriefState, BriefStateRecord};
 use orchestrator_types::{now, BriefId, Event, EventKind, Verdict, VerdictKind};
 use redis::aio::ConnectionManager;
 use std::path::Path;
@@ -52,7 +52,8 @@ pub async fn projector_task(
     mut source: Box<dyn EventSource + Send>,
     mut projector: Box<dyn StateProjector + Send>,
     mut verdict_conn: Option<ConnectionManager>,
-    phase_gates: std::sync::Arc<orchestrator_types::lifecycle::PhaseGates>,
+    walk_config: std::sync::Arc<orchestrator_types::lifecycle::WalkConfig>,
+    entry_node: std::sync::Arc<orchestrator_types::NodeId>,
 ) -> Result<()> {
     let mut state = BriefState::Submitted;
     let mut step: u64 = 0;
@@ -75,56 +76,7 @@ pub async fn projector_task(
         step = step.saturating_add(1);
         let cursor = format!("step-{step}");
 
-        // Sibling pathway: terminating events arriving while the FSM
-        // is parked in Reworking must be honored — the reaper pushes
-        // `BudgetExhausted` on over-budget briefs, an operator may
-        // push `AbortRequested`, and either must transition
-        // `Reworking{..} → Failed{..}` and write terminal :state.
-        // The universal abort handler in `handle()` covers the
-        // transition arithmetically, but pre-fix zombies (brf_495_v2
-        // and friends) showed briefs parked in Reworking after the
-        // outer team-orchestration loop returned, with the reaper
-        // firing forever because no terminal `:state` was ever
-        // written. Re-checking explicitly here makes the FSM driver
-        // observably responsible for the transition and gives the
-        // regression a direct test target.
-        if matches!(state, BriefState::Reworking { .. }) {
-            let terminal_reason = match &event {
-                BriefEvent::BudgetExhausted => Some(Reason::BudgetExhausted),
-                BriefEvent::AbortRequested { actor, message } => Some(Reason::AbortRequested {
-                    actor: actor.clone(),
-                    message: message.clone(),
-                }),
-                _ => None,
-            };
-            if let Some(reason) = terminal_reason {
-                let failed_state = BriefState::Failed { reason };
-                let record = BriefStateRecord {
-                    brief_id: brief_id.clone(),
-                    state: failed_state.clone(),
-                    parent_brief_id: None,
-                    composition_role: None,
-                    at: now(),
-                };
-                projector
-                    .write(&record, &cursor)
-                    .await
-                    .map_err(|e| Error::Config(format!("state projector: {e}")))?;
-                state = failed_state;
-                if let Some(ref mut conn) = verdict_conn {
-                    emit_terminal_verdict(conn, &brief_id, &state, no_op_reason.as_deref()).await?;
-                }
-                cleanup_failed_brief(&brief_id, verdict_conn.as_mut()).await;
-                tracing::info!(
-                    brief = %brief_id.0,
-                    event = ?event,
-                    "FSM driver: terminating event in Reworking drove terminal Failed",
-                );
-                break;
-            }
-        }
-
-        match handle(&state, &event, &phase_gates) {
+        match handle(&state, &event, &walk_config, &entry_node) {
             Ok(new_state) => {
                 let record = BriefStateRecord {
                     brief_id: brief_id.clone(),
@@ -161,16 +113,23 @@ pub async fn projector_task(
                 }
             }
             Err(invalid) => {
-                let is_late_reviewer_in_reworking =
-                    matches!(invalid.event, BriefEvent::ReviewerDone { .. })
-                        && matches!(invalid.from, BriefState::Reworking { .. });
-                if is_late_reviewer_in_reworking {
+                // Late-event fence: a RoleDone for a node that was
+                // already passed by the walker is silently dropped at
+                // the FSM layer (handle() returns state unchanged via
+                // is_late_event). If the FSM rejects a RoleDone with
+                // InvalidTransition, that's a genuinely-late event
+                // arriving when the walker has progressed past its
+                // dependent gate — warn and continue rather than fail.
+                let is_late_role_done =
+                    matches!(invalid.event, BriefEvent::RoleDone { .. })
+                        && matches!(invalid.from, BriefState::Walking { .. });
+                if is_late_role_done {
                     tracing::warn!(
                         brief = %brief_id.0,
                         from = ?invalid.from,
                         event = ?invalid.event,
-                        outcome = "dropped_late_reviewer_in_reworking",
-                        "FSM rejected late ReviewerDone in Reworking; dropping event without state transition"
+                        outcome = "dropped_late_role_done_in_walking",
+                        "FSM rejected late RoleDone in Walking; dropping event without state transition"
                     );
                     continue;
                 }
@@ -473,42 +432,8 @@ async fn apply_terminal_ttl(conn: &mut ConnectionManager, brief_id: &BriefId) {
     }
 }
 
-/// Project a team's role list into the per-phase `PhaseGates` the FSM
-/// driver threads through `handle()`. Walks `team.roles` and partitions
-/// by `orchestrator_types::lifecycle::role_kind`: `ac-verifier` / `verifier` roles
-/// feed the verifying gate's `expected_roles`, `reviewer` roles feed the
-/// reviewing gate's. Policy is hardcoded `AllMustPass` for both phases —
-/// Pattern 3 (#397) lifts policy to per-edge config in topology JSON.
-#[must_use]
-pub fn build_phase_gates(
-    team: &orchestrator_types::TeamTopology,
-) -> orchestrator_types::lifecycle::PhaseGates {
-    use orchestrator_types::lifecycle::{GateConfig, GatePolicy, PhaseGates};
-    let mut verifying_roles: Vec<String> = Vec::new();
-    let mut reviewing_roles: Vec<String> = Vec::new();
-    for r in &team.roles {
-        let role_name = &r.name.0;
-        match orchestrator_types::lifecycle::role_kind(role_name) {
-            Some("ac-verifier") | Some("verifier") => verifying_roles.push(role_name.clone()),
-            Some("reviewer") => reviewing_roles.push(role_name.clone()),
-            _ => {}
-        }
-    }
-    PhaseGates {
-        verifying: GateConfig {
-            expected_roles: verifying_roles,
-            policy: GatePolicy::AllMustPass,
-        },
-        reviewing: GateConfig {
-            expected_roles: reviewing_roles,
-            policy: GatePolicy::AllMustPass,
-        },
-    }
-}
-
 /// Project a team's topology into the per-node `WalkConfig` consumed by
-/// the lifecycle DAG walker. Beta-a (#495 part 1) introduces the helper
-/// alongside the legacy `build_phase_gates`; beta-b deletes the legacy
+/// the lifecycle DAG walker. Beta-b deleted the legacy `build_phase_gates`
 /// helper and routes the FSM through the walker built from this output.
 ///
 /// Adjacency: walks `team.message_graph` and groups each `MessageEdge` by
@@ -571,5 +496,30 @@ pub fn build_walk_config(
     WalkConfig {
         adjacency,
         node_configs,
+    }
+}
+
+/// Derive the topology root from a `WalkConfig` — the unique node whose
+/// `expected_inbound` is empty. Returns `Err(Reason::TopologyInvalid)`
+/// when no such node exists or when more than one does (a topology-data
+/// bug that the projector flags by failing the brief rather than
+/// silently routing through an arbitrary node).
+pub fn derive_entry_node(
+    walk_config: &orchestrator_types::lifecycle::WalkConfig,
+) -> std::result::Result<orchestrator_types::NodeId, orchestrator_types::lifecycle::Reason> {
+    let mut roots: Vec<&orchestrator_types::NodeId> = walk_config
+        .node_configs
+        .iter()
+        .filter(|(_, cfg)| cfg.expected_inbound.is_empty())
+        .map(|(id, _)| id)
+        .collect();
+    match roots.len() {
+        0 => Err(orchestrator_types::lifecycle::Reason::TopologyInvalid {
+            detail: "no entry vertex (every node has at least one expected_inbound)".to_string(),
+        }),
+        1 => Ok(roots.pop().expect("len==1 just checked").clone()),
+        n => Err(orchestrator_types::lifecycle::Reason::TopologyInvalid {
+            detail: format!("expected exactly one entry vertex, found {n}"),
+        }),
     }
 }

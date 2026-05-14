@@ -156,20 +156,19 @@ fn terminal_reason(state: &BriefState) -> Option<&'static str> {
     }
 }
 
-fn state_kind_str(state: &BriefState) -> &'static str {
+/// Post-collapse: there's no longer a coarse "kind" enum projection on
+/// `BriefState` — for the universal `Walking` variant, the node_id is
+/// the kind in the topology-driven shape. We return the node_id's
+/// underlying string for `Walking`, and the literal lowercase variant
+/// name for the three terminal-or-initial variants. Returning `String`
+/// (not `&'static str`) is the cost of moving from a closed-kind enum
+/// to a topology-driven node namespace.
+fn state_kind_str(state: &BriefState) -> String {
     match state {
-        BriefState::Submitted => "submitted",
-        BriefState::Authoring { .. } => "authoring",
-        BriefState::Verifying { .. } => "verifying",
-        BriefState::Reviewing { .. } => "reviewing",
-        BriefState::Reworking { .. } => "reworking",
-        BriefState::Shipping { .. } => "shipping",
-        BriefState::Watching { .. } => "watching",
-        BriefState::Extension { .. } => "extension",
-        BriefState::AwaitingCaptainDecision { .. } => "awaiting_captain_decision",
-        BriefState::Walking { .. } => "walking",
-        BriefState::Shipped => "shipped",
-        BriefState::Failed { .. } => "failed",
+        BriefState::Submitted => "submitted".to_string(),
+        BriefState::Walking { node_id, .. } => node_id.0.clone(),
+        BriefState::Shipped => "shipped".to_string(),
+        BriefState::Failed { .. } => "failed".to_string(),
     }
 }
 

@@ -15,6 +15,7 @@ use crate::lifecycle::{EventSource, StateProjector};
 use crate::{lifecycle_driver, Config, Error, Result};
 use orchestrator_infra::redis_io;
 use orchestrator_types::lifecycle::{BriefState, BriefStateRecord, Reason};
+use orchestrator_types::RunData;
 use orchestrator_types::{now, Brief, BriefId};
 use redis::aio::ConnectionManager;
 use redis::AsyncCommands;
@@ -117,14 +118,30 @@ pub async fn resume_orphans(
         //   eventual `CaptainAccepted` / `CaptainRejected` event the
         //   operator pushes via `captain decide` — at which point the
         //   FSM transitions normally.
-        // - All other non-terminal states (Verifying, Reviewing,
-        //   Reworking, Shipping, Watching, Extension) currently fall
-        //   through to failed_dead. Reattach for those requires the
-        //   role-chain re-spawn story which lives in a future brief
-        //   (#487b).
+        // Post-#495-beta-b: all non-terminal states are `Walking`. The
+        // reattach decision keys off `run_data`:
+        //
+        //  - `Coder { agent_id }` — probe `container_alive(agent_id)`;
+        //    reattach iff the container is still up.
+        //  - `OperatorDecision { .. }` — always reattach (operator-gated
+        //    parking; container is dead by design, FSM driver consumes
+        //    `CaptainAccepted` / `CaptainRejected` events from the
+        //    operator's `captain decide` invocation). Pinned fix for
+        //    v4 reviewer-claude blocker B8.
+        //  - `PrTracking { .. }` — always reattach (the ci-watcher node
+        //    is daemon-poll-driven, not container-bound after the
+        //    initial spawn).
+        //  - `None` / `Extension { .. }` — fall back to the node's
+        //    declared class via the topology (container_bound nodes
+        //    require a live container; operator_gated nodes always
+        //    reattach).
         let should_reattach = match &record.state {
-            BriefState::Authoring { agent_id, .. } => container_alive(agent_id).await,
-            BriefState::AwaitingCaptainDecision { .. } => true,
+            BriefState::Walking { run_data, .. } => match run_data {
+                RunData::Coder { agent_id } => container_alive(agent_id).await,
+                RunData::OperatorDecision { .. } => true,
+                RunData::PrTracking { .. } => true,
+                RunData::None | RunData::Extension { .. } => true,
+            },
             _ => false,
         };
 
@@ -231,7 +248,14 @@ async fn reattach_brief(
     let team = redis_io::fetch_team(conn, &brief.topology)
         .await
         .map_err(|e| Error::Config(format!("reattach: fetch_team: {e}")))?;
-    let phase_gates = Arc::new(lifecycle_driver::build_phase_gates(&team));
+    let walk_config = lifecycle_driver::build_walk_config(&team);
+    let entry_node = lifecycle_driver::derive_entry_node(&walk_config).map_err(|reason| {
+        Error::Config(format!(
+            "reattach: topology has no unique entry vertex: {reason:?}"
+        ))
+    })?;
+    let walk_config = Arc::new(walk_config);
+    let entry_node = Arc::new(entry_node);
 
     let event_source = (event_source_factory)(brief_id.clone());
     let state_projector = (state_projector_factory)(brief_id.clone());
@@ -242,7 +266,8 @@ async fn reattach_brief(
         event_source,
         state_projector,
         Some(verdict_conn),
-        phase_gates,
+        walk_config,
+        entry_node,
     ));
 
     Ok(())
@@ -322,9 +347,10 @@ async fn scan_state_keys(conn: &mut ConnectionManager) -> Result<Vec<String>> {
 }
 
 /// Extract the `agent_id` named on a brief's current `BriefState`, when the
-/// state variant pins one. Today only `Authoring` carries an `agent_id`;
-/// past-Authoring phases (Verifying, Reviewing, Reworking, Shipping,
-/// Watching, Extension) return `None` and the caller decides what to do
+/// state variant pins one. Post-#495-beta-b only
+/// `Walking { run_data: RunData::Coder { agent_id }, .. }` carries an
+/// agent_id; every other Walking variant (PrTracking, OperatorDecision,
+/// None, Extension) returns `None` and the caller decides what to do
 /// with the missing target.
 ///
 /// Public so `crate::cli_abort` can reuse the same accessor when the
@@ -333,7 +359,10 @@ async fn scan_state_keys(conn: &mut ConnectionManager) -> Result<Vec<String>> {
 #[must_use]
 pub fn brief_state_agent_id(state: &BriefState) -> Option<&str> {
     match state {
-        BriefState::Authoring { agent_id, .. } => Some(agent_id.as_str()),
+        BriefState::Walking {
+            run_data: RunData::Coder { agent_id },
+            ..
+        } => Some(agent_id.as_str()),
         _ => None,
     }
 }

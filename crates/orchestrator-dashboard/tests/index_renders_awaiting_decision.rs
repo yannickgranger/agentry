@@ -1,6 +1,7 @@
 //! Index-handler coverage for the brief-449c surface: per-row state badges
 //! on every active brief and the disagreements section + captain-decide hint
-//! on briefs parked in `AwaitingCaptainDecision`.
+//! on briefs parked awaiting captain decision (post-#495b: encoded as
+//! `Walking { run_data: RunData::OperatorDecision { .. }, .. }`).
 //!
 //! Drives the live `/` route through `tower::ServiceExt::oneshot` against a
 //! real `DashboardStore`. Gated on `AGENTRY_TEST_REDIS_URL` so the
@@ -16,9 +17,12 @@ use orchestrator_dashboard::AppState;
 use orchestrator_types::lifecycle::{
     BriefState, BriefStateRecord, DisagreementSummary, RetryBudget,
 };
-use orchestrator_types::BriefId;
+use orchestrator_types::run_data::RunData;
+use orchestrator_types::team::NodeId;
+use orchestrator_types::{BriefId, EventVerdict};
 use redis::AsyncCommands;
 use serde_json::json;
+use std::collections::BTreeMap;
 use tower::ServiceExt;
 
 fn redis_url_or_skip() -> Option<String> {
@@ -110,12 +114,18 @@ async fn index_includes_state_badges_for_active_briefs() {
         .await
         .expect("conn");
     let brief_id = fresh_id("authoring");
+    // Post-#495b: the coder-running state is `Walking { run_data:
+    // RunData::Coder { agent_id }, node_id: <coder role>, .. }`.
+    // The dashboard badge surfaces `node_id.0` as the role label.
     seed_brief(
         &mut conn,
         &brief_id,
-        BriefState::Authoring {
-            agent_id: "agent-1".into(),
-            started_at: chrono::Utc::now(),
+        BriefState::Walking {
+            node_id: NodeId("coder-claude-agentry".to_string()),
+            evidence: BTreeMap::<NodeId, EventVerdict>::new(),
+            run_data: RunData::Coder {
+                agent_id: "agent-1".into(),
+            },
             retry: RetryBudget { attempt: 1, max: 3 },
         },
     )
@@ -135,8 +145,8 @@ async fn index_includes_state_badges_for_active_briefs() {
         "index should list the seeded brief id"
     );
     assert!(
-        body.contains("authoring"),
-        "index must render the state badge text 'authoring' for an active brief"
+        body.contains("coder-claude-agentry"),
+        "index must render the state badge text matching the current Walking node_id"
     );
 }
 
@@ -152,22 +162,28 @@ async fn index_renders_disagreements_for_awaiting_captain() {
         .await
         .expect("conn");
     let brief_id = fresh_id("awaiting");
+    // Post-#495b: AwaitingCaptainDecision collapsed into
+    // `Walking { run_data: RunData::OperatorDecision { disagreements }, .. }`.
     seed_brief(
         &mut conn,
         &brief_id,
-        BriefState::AwaitingCaptainDecision {
-            disagreements: vec![
-                DisagreementSummary {
-                    verb: "REPLACE-X".into(),
-                    applied_form: "EDIT".into(),
-                    rationale: "literal verb conflicted with surrounding context".into(),
-                },
-                DisagreementSummary {
-                    verb: "DELETE-Y".into(),
-                    applied_form: "RETAIN".into(),
-                    rationale: "removing would break the export surface".into(),
-                },
-            ],
+        BriefState::Walking {
+            node_id: NodeId("coder-claude-agentry".to_string()),
+            evidence: BTreeMap::<NodeId, EventVerdict>::new(),
+            run_data: RunData::OperatorDecision {
+                disagreements: vec![
+                    DisagreementSummary {
+                        verb: "REPLACE-X".into(),
+                        applied_form: "EDIT".into(),
+                        rationale: "literal verb conflicted with surrounding context".into(),
+                    },
+                    DisagreementSummary {
+                        verb: "DELETE-Y".into(),
+                        applied_form: "RETAIN".into(),
+                        rationale: "removing would break the export surface".into(),
+                    },
+                ],
+            },
             retry: RetryBudget { attempt: 1, max: 3 },
         },
     )

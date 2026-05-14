@@ -77,6 +77,14 @@ pub enum Reason {
     CaptainRejectedDisagreement {
         reason: String,
     },
+    /// `build_walk_config` could not derive a unique entry vertex from the
+    /// topology (zero or more than one node with empty `expected_inbound`).
+    /// A topology-data bug — the brief fails with this so the operator
+    /// fixes the topology rather than silently routing through an
+    /// arbitrary node.
+    TopologyInvalid {
+        detail: String,
+    },
 }
 
 /// CI status carried by a `BriefEvent::CiResult`.
@@ -114,65 +122,42 @@ pub struct DisagreementSummary {
     pub rationale: String,
 }
 
-/// The position a brief occupies inside the lifecycle FSM. Non-terminal
-/// variants carry their `RetryBudget`; the two terminals (`Shipped`,
-/// `Failed`) carry only the outcome.
+/// The position a brief occupies inside the lifecycle FSM.
+///
+/// Post-#495-beta-b: collapsed to 4 variants. `Walking` carries the
+/// brief's position inside the team-topology DAG — the node whose role
+/// just reported (`node_id`), the accumulated multiset of per-node
+/// verdicts (`evidence`), per-node run data (`run_data` — coder agent
+/// id, PR tracking, or operator-decision park payload), and the retry
+/// budget. `Submitted` is the pre-walk state before any role spawns;
+/// `Shipped` and `Failed` are the two terminals.
+///
+/// The legacy phase-specific variants (`Authoring`, `Verifying`,
+/// `Reviewing`, `Reworking`, `Shipping`, `Watching`, `Extension`,
+/// `AwaitingCaptainDecision`) were deleted in beta-b — phase names are
+/// now metadata on the topology, not enum variants. See
+/// `specs/concepts/brief_lifecycle.md` for the post-collapse doctrine.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BriefState {
     Submitted,
-    Authoring {
-        agent_id: String,
-        started_at: Ts,
-        retry: RetryBudget,
-    },
-    Verifying {
-        retry: RetryBudget,
-        received: BTreeMap<String, EventVerdict>,
-        expected: Vec<String>,
-        policy: GatePolicy,
-    },
-    Reviewing {
-        retry: RetryBudget,
-        received: BTreeMap<String, EventVerdict>,
-        expected: Vec<String>,
-        policy: GatePolicy,
-    },
-    Reworking {
-        target: ReworkTarget,
-        retry: RetryBudget,
-    },
-    Shipping {
-        pr_number: u32,
-        head_sha: String,
-        retry: RetryBudget,
-    },
-    Watching {
-        pr_number: u32,
-        head_sha: String,
-        retry: RetryBudget,
-    },
-    Extension {
-        name: String,
-        data: serde_json::Value,
-        retry: RetryBudget,
-    },
-    /// Coder reported all-applied=false but every miss carries applied_form+rationale
-    /// (deliberate disagreement, not failure). Brief is parked until the captain
-    /// accepts or rejects via CaptainAccepted / CaptainRejected events. Carries
-    /// the original Authoring retry budget so retry semantics are preserved if
-    /// the captain chooses to reject and the operator resubmits.
-    AwaitingCaptainDecision {
-        disagreements: Vec<DisagreementSummary>,
-        retry: RetryBudget,
-    },
-    /// Beta-a (#495) precursor variant: per-node lifecycle position used
-    /// by the DAG walker that beta-b will wire in. Carries the active
-    /// node id, the per-node evidence multiset, the variant-specific
-    /// run data, and the retry budget. Tagged `walking` to match the
-    /// `kind` + snake_case convention of the other variants. Not
-    /// reachable from `handle()` in beta-a — `handle()` stubs the arm
-    /// with `InvalidTransition` so the compiler stays exhaustive.
+    /// Per-node lifecycle position. `node_id` is the role-name of the
+    /// node whose most recent `RoleDone` shaped the current state — also
+    /// used by the projector as the late-event fence reference (events
+    /// for nodes already passed by the walker are dropped with a
+    /// tracing warn, not propagated as `InvalidTransition`).
+    ///
+    /// `evidence` accumulates `(NodeId → EventVerdict)` across the
+    /// whole walk; the projector consults it on every `RoleDone` to
+    /// decide whether each downstream node's gate (per `WalkConfig`)
+    /// is satisfied.
+    ///
+    /// `run_data` carries the per-node variant: `Coder { agent_id }`
+    /// while a coder container is alive, `PrTracking { pr_number,
+    /// head_sha }` from the shipper onward, `OperatorDecision
+    /// { disagreements }` when a coder reported a deliberate
+    /// disagreement and the brief is parked for captain decide, or
+    /// `None` for stateless nodes.
     Walking {
         node_id: NodeId,
         evidence: BTreeMap<NodeId, EventVerdict>,
@@ -193,40 +178,33 @@ pub enum BriefState {
 pub enum BriefEvent {
     CoderStarted {
         agent_id: String,
+        /// The full role name as emitted by the spawner (e.g.
+        /// `"coder-claude-agentry"`, `"coder-codex-agentry"`). Carried so
+        /// the FSM can construct `BriefState::Walking { node_id }` keyed
+        /// off the topology-declared role name rather than a hardcoded
+        /// literal. The translator copies this from the `spawned` event's
+        /// `role_name` payload at `lifecycle_ports.rs`'s coder dispatch.
+        #[serde(default)]
+        role_name: String,
         #[serde(default = "crate::now")]
         started_at: Ts,
     },
-    CoderDone {
-        verdict: EventVerdict,
-    },
     /// Coder reported terminal Shipped but produced no diff against base
     /// (acceptance passed against work that was already on the base
-    /// branch). Short-circuits the FSM Authoring → Shipped, bypassing
-    /// the Verifying / Reviewing / Shipping / Watching trail since
-    /// there is nothing for downstream roles to act on. The free-text
-    /// reason carries the coder's diagnosis for the operator-visible
-    /// terminal verdict.
+    /// branch). Short-circuits the FSM `Walking{coder} → Shipped`,
+    /// bypassing every downstream node since there is nothing for them
+    /// to operate on. The free-text reason carries the coder's diagnosis
+    /// for the operator-visible terminal verdict.
     CoderDoneNoOp {
         reason: String,
     },
     /// Self-review found unapplied verbs but every miss has applied_form+rationale
     /// set. Coder is flagging a deliberate disagreement, not a failure. The FSM
-    /// transitions Authoring (or Reworking) to AwaitingCaptainDecision.
+    /// flips the coder's `Walking{run_data: Coder{..}}` to
+    /// `Walking{run_data: OperatorDecision{disagreements}}` and the brief is
+    /// parked until CaptainAccepted / CaptainRejected fires.
     CoderDisagreed {
         disagreements: Vec<DisagreementSummary>,
-    },
-    AcVerifierDone {
-        verdict: EventVerdict,
-        role_name: String,
-    },
-    ReviewerDone {
-        verdict: EventVerdict,
-        findings: Vec<ReviewFinding>,
-        role_name: String,
-    },
-    ShipperDone {
-        pr_number: u32,
-        head_sha: String,
     },
     CiResult {
         state: CiState,
@@ -244,10 +222,12 @@ pub enum BriefEvent {
         actor: String,
         message: String,
     },
-    /// Captain endorses the disagreed-form output. The FSM treats the brief as
-    /// if the coder had shipped normally — proceeds to the post-coder phase
-    /// chain (Verifying → Reviewing → Shipping → Watching) using the work
-    /// that's already in the brief workspace.
+    /// Captain endorses the disagreed-form output. The FSM treats the brief
+    /// as if the coder had shipped normally — advances the walker from
+    /// the coder node to its downstream node(s) using the work that's
+    /// already in the brief workspace. The current `Walking.evidence`
+    /// records the coder's contribution as `EventVerdict::Shipped` so
+    /// the next gate sees a clean inbound.
     CaptainAccepted,
     /// Captain explicitly rejects the disagreement. The FSM transitions to
     /// `Failed{CaptainRejectedDisagreement{reason}}`.
@@ -268,14 +248,15 @@ pub enum BriefEvent {
         criterion: String,
         baseline: String,
     },
-    /// Beta-a (#495) precursor variant: per-node done signal that
-    /// beta-b's walker consumes. Carries the source node id, the
-    /// node's verdict, any review findings, and an optional
-    /// `RunData` payload (None for nodes that don't carry per-node
-    /// state). Tagged `role_done` to match the `kind` + snake_case
-    /// convention. Not consumed by the FSM in beta-a — legacy
-    /// CoderDone / AcVerifierDone / ReviewerDone / ShipperDone
-    /// variants stay until beta-b.
+    /// Per-node done signal — the single generic role-completion event
+    /// after beta-b's collapse. The translator emits this for every
+    /// `EventKind::Done` regardless of role (coder, ac-verifier,
+    /// reviewer, shipper, ci-watcher). Carries the source node id, the
+    /// node's verdict, any review findings the role produced, and an
+    /// optional `RunData` payload. The shipper's emit carries
+    /// `Some(RunData::PrTracking { pr_number, head_sha })` so the
+    /// walker's next state (ci-watcher node) inherits PR identifiers;
+    /// other roles emit `run_data: None`.
     RoleDone {
         node_id: NodeId,
         verdict: EventVerdict,
@@ -330,14 +311,16 @@ pub fn role_kind(role_name: &str) -> Option<&'static str> {
 /// or `InvalidTransition` for an event that is not allowed in the current
 /// state. Never panics, never awaits, never performs I/O.
 ///
-/// Retry-budget contract: when a transition would push `attempt > max` on
-/// a non-terminal state, the function returns `Failed{BudgetExhausted}`
-/// instead of the proposed next state.
+/// Post-#495-beta-b shape: drives a generic topology-walker. Inputs are
+/// the current `BriefState`, the next `BriefEvent`, the precomputed
+/// `WalkConfig` for the brief's team topology (adjacency + per-node
+/// gate config), and `entry_node` (the unique topology root — the node
+/// whose `expected_inbound` is empty; the projector computes it once
+/// from `WalkConfig` and threads it here on every call).
 ///
-/// Time contract: variants whose shape carries a `Ts` (`Authoring.started_at`)
-/// are populated with `Ts::default()`; the daemon caller overlays the real
-/// wall-clock when wrapping into a `BriefStateRecord`. Keeping `handle`
-/// time-free is what makes the transition table testable as a pure table.
+/// Retry-budget contract: when a transition would push `attempt > max`
+/// on a non-terminal state, the function returns `Failed{BudgetExhausted}`
+/// instead of the proposed next state.
 ///
 /// Error type is boxed because [`InvalidTransition`] embeds `BriefState +
 /// BriefEvent`, both of which grow whenever a new variant lands; clippy's
@@ -346,7 +329,8 @@ pub fn role_kind(role_name: &str) -> Option<&'static str> {
 pub fn handle(
     state: &BriefState,
     event: &BriefEvent,
-    gates: &PhaseGates,
+    walk_config: &WalkConfig,
+    entry_node: &NodeId,
 ) -> Result<BriefState, Box<InvalidTransition>> {
     let invalid = || {
         Err(Box::new(InvalidTransition {
@@ -371,285 +355,245 @@ pub fn handle(
                     reason: Reason::BudgetExhausted,
                 });
             }
-            BriefEvent::CoderDisagreed { disagreements } => {
-                // Phase-specific signal: only valid from the coder phase
-                // (Authoring or Reworking). The universal handler's
-                // "always-applies on non-terminal" semantics don't apply
-                // here — from any other state this is an InvalidTransition.
-                return match state {
-                    BriefState::Authoring { retry, .. } => {
-                        Ok(BriefState::AwaitingCaptainDecision {
-                            disagreements: disagreements.clone(),
-                            retry: *retry,
-                        })
-                    }
-                    BriefState::Reworking { retry, .. } => {
-                        Ok(BriefState::AwaitingCaptainDecision {
-                            disagreements: disagreements.clone(),
-                            retry: *retry,
-                        })
-                    }
-                    _ => Err(Box::new(InvalidTransition {
-                        from: state.clone(),
-                        event: event.clone(),
-                    })),
-                };
-            }
             _ => {}
         }
     }
 
     match (state, event) {
         // ---- Submitted ----
+        // First coder spawn: enter Walking at the entry node. The
+        // node_id comes from the event's role_name (the spawner-emitted
+        // role identifier) — DO NOT hardcode any coder role name here.
+        // The entry_node arg is the topology root (computed by the
+        // projector from WalkConfig.adjacency) and must equal
+        // NodeId(role_name) for a well-formed dispatch; if it doesn't,
+        // that's a topology-vs-spawn mismatch and we trust the event
+        // since it reflects the actually-spawned role.
         (
             BriefState::Submitted,
             BriefEvent::CoderStarted {
                 agent_id,
-                started_at,
+                role_name,
+                ..
             },
-        ) => Ok(BriefState::Authoring {
-            agent_id: agent_id.clone(),
-            started_at: *started_at,
+        ) => Ok(BriefState::Walking {
+            node_id: NodeId(role_name.clone()),
+            evidence: BTreeMap::new(),
+            run_data: RunData::Coder {
+                agent_id: agent_id.clone(),
+            },
             retry: RetryBudget {
                 attempt: 1,
                 max: DEFAULT_ATTEMPT_CAP,
             },
         }),
 
-        // ---- Authoring ----
-        // Preflight smell: preflight-criterion-agentry detected an
-        // operator-authored criterion that triggers one of the smell
-        // heuristics. Per Q1/Q3 of the brief 84b grill-me transcript,
-        // smell is a terminal block (no warn-and-continue, no
-        // operator-override): the criterion itself is the contract and
-        // refining the heuristics is a code-level PR. Routes through
-        // Authoring because preflight currently has no state of its
-        // own; 84b-2 will revisit the FSM if a dedicated `Preflight`
-        // state turns out to be worth the variant.
-        (BriefState::Authoring { .. }, BriefEvent::PreflightSmellDetected { .. }) => {
-            Ok(BriefState::Failed {
-                reason: Reason::PreflightSmell,
-            })
-        }
-
-        // No-op short-circuit: acceptance passed against work that was
-        // already on the base branch. Skip Verifying / Reviewing /
-        // Shipping / Watching — there is no diff for downstream roles
-        // to operate on. The lifecycle driver overrides the terminal
-        // verdict's reason with the carried free-text so the operator
-        // sees "no-op brief — ..." on `agentry:verdicts`.
-        (BriefState::Authoring { .. }, BriefEvent::CoderDoneNoOp { .. }) => Ok(BriefState::Shipped),
-
-        (BriefState::Authoring { retry, .. }, BriefEvent::CoderDone { verdict }) => match verdict {
-            EventVerdict::Shipped => Ok(post_coder_shipped(*retry, gates)),
-            EventVerdict::Failed => Ok(BriefState::Failed {
-                reason: Reason::AcceptanceFailed {
-                    detail: "coder reported failed".to_owned(),
-                },
-            }),
-            EventVerdict::Escalated => Ok(BriefState::Failed {
-                reason: Reason::AcceptanceFailed {
-                    detail: "coder escalated".to_owned(),
-                },
-            }),
-            EventVerdict::Rejected => Ok(BriefState::Failed {
-                reason: Reason::AcceptanceFailed {
-                    detail: "coder rejected".to_owned(),
-                },
-            }),
-            EventVerdict::ReworkNeeded => invalid(),
-        },
-
-        // ---- Verifying ----
+        // ---- Walking + preflight smell (only at the entry coder node) ----
         (
-            BriefState::Verifying {
-                retry,
-                received,
-                expected,
-                policy,
+            BriefState::Walking {
+                node_id,
+                run_data: RunData::Coder { .. },
+                ..
             },
-            BriefEvent::AcVerifierDone { verdict, role_name },
+            BriefEvent::PreflightSmellDetected { .. },
+        ) if node_id == entry_node => Ok(BriefState::Failed {
+            reason: Reason::PreflightSmell,
+        }),
+
+        // ---- Walking + no-op short-circuit (only at the entry coder node) ----
+        // Acceptance passed against work already on base; skip every
+        // downstream node since there's nothing to operate on.
+        (
+            BriefState::Walking {
+                node_id,
+                run_data: RunData::Coder { .. },
+                ..
+            },
+            BriefEvent::CoderDoneNoOp { .. },
+        ) if node_id == entry_node => Ok(BriefState::Shipped),
+
+        // ---- Walking + CoderDisagreed (only at coder node with Coder run_data) ----
+        // Flip the run_data to OperatorDecision; keep the node_id and
+        // evidence intact. The brief is now parked awaiting captain decide.
+        (
+            BriefState::Walking {
+                node_id,
+                evidence,
+                run_data: RunData::Coder { .. },
+                retry,
+            },
+            BriefEvent::CoderDisagreed { disagreements },
+        ) => Ok(BriefState::Walking {
+            node_id: node_id.clone(),
+            evidence: evidence.clone(),
+            run_data: RunData::OperatorDecision {
+                disagreements: disagreements.clone(),
+            },
+            retry: *retry,
+        }),
+
+        // ---- Walking + CaptainAccepted (only with OperatorDecision run_data) ----
+        // Treat as if the coder had shipped: record Shipped in evidence
+        // and advance the walker. The agent_id is no longer known
+        // (operator-decision park is post-coder-exit), so run_data resets
+        // to None on the next node.
+        (
+            BriefState::Walking {
+                node_id,
+                evidence,
+                run_data: RunData::OperatorDecision { .. },
+                retry,
+            },
+            BriefEvent::CaptainAccepted,
         ) => {
-            let mut new_received = received.clone();
-            new_received.insert(role_name.clone(), *verdict);
-            let gate_config = GateConfig {
-                expected_roles: expected.clone(),
-                policy: policy.clone(),
-            };
-            match decide(&new_received, &gate_config) {
-                Decide::Wait => Ok(BriefState::Verifying {
-                    retry: *retry,
-                    received: new_received,
-                    expected: expected.clone(),
-                    policy: policy.clone(),
-                }),
-                Decide::Pass => {
-                    // Empty-phase auto-skip: if reviewing has no expected
-                    // roles, decide() Passes vacuously and we short-circuit
-                    // straight to Shipping rather than stalling in Reviewing.
-                    let received_r = BTreeMap::new();
-                    let gate_r = GateConfig {
-                        expected_roles: gates.reviewing.expected_roles.clone(),
-                        policy: gates.reviewing.policy.clone(),
-                    };
-                    match decide(&received_r, &gate_r) {
-                        Decide::Pass => Ok(BriefState::Shipping {
-                            pr_number: 0,
-                            head_sha: String::new(),
-                            retry: *retry,
-                        }),
-                        _ => Ok(BriefState::Reviewing {
-                            retry: *retry,
-                            received: received_r,
-                            expected: gate_r.expected_roles,
-                            policy: gate_r.policy,
-                        }),
-                    }
-                }
-                Decide::Rework { detail: _ } => {
-                    Ok(increment_or_fail(*retry, |next| BriefState::Reworking {
-                        target: ReworkTarget::Coder,
-                        retry: next,
-                    }))
-                }
-                Decide::Reject { detail } => Ok(BriefState::Failed {
-                    reason: Reason::AcceptanceFailed { detail },
-                }),
-            }
+            let mut new_evidence = evidence.clone();
+            new_evidence.insert(node_id.clone(), EventVerdict::Shipped);
+            advance_walker(node_id, new_evidence, RunData::None, *retry, walk_config, entry_node)
         }
 
-        // ---- Reviewing ----
+        // ---- Walking + CaptainRejected ----
         (
-            BriefState::Reviewing {
-                retry,
-                received,
-                expected,
-                policy,
+            BriefState::Walking {
+                run_data: RunData::OperatorDecision { .. },
+                ..
             },
-            BriefEvent::ReviewerDone {
+            BriefEvent::CaptainRejected { reason },
+        ) => Ok(BriefState::Failed {
+            reason: Reason::CaptainRejectedDisagreement {
+                reason: reason.clone(),
+            },
+        }),
+
+        // ---- Walking + RoleDone (the universal node-completion event) ----
+        // Update evidence with the just-reported node's verdict, then
+        // advance the walker based on adjacency + per-node gates.
+        // Late-event check: if the reporting node is upstream of the
+        // current walker position (i.e., already passed), drop silently
+        // (return state unchanged). The lifecycle_driver caller is
+        // expected to emit a tracing::warn for the dropped event but
+        // does so by detecting state == new_state with event = RoleDone.
+        (
+            BriefState::Walking {
+                node_id,
+                evidence,
+                run_data,
+                retry,
+            },
+            BriefEvent::RoleDone {
+                node_id: reporter,
                 verdict,
                 findings: _,
-                role_name,
+                run_data: rd_payload,
             },
         ) => {
-            let mut new_received = received.clone();
-            new_received.insert(role_name.clone(), *verdict);
-            let gate_config = GateConfig {
-                expected_roles: expected.clone(),
-                policy: policy.clone(),
-            };
-            match decide(&new_received, &gate_config) {
-                Decide::Wait => Ok(BriefState::Reviewing {
+            if is_late_event(reporter, node_id, walk_config) {
+                return Ok(BriefState::Walking {
+                    node_id: node_id.clone(),
+                    evidence: evidence.clone(),
+                    run_data: run_data.clone(),
                     retry: *retry,
-                    received: new_received,
-                    expected: expected.clone(),
-                    policy: policy.clone(),
-                }),
-                Decide::Pass => Ok(BriefState::Shipping {
-                    pr_number: 0,
-                    head_sha: String::new(),
-                    retry: *retry,
-                }),
-                Decide::Rework { detail: _ } => {
-                    Ok(increment_or_fail(*retry, |next| BriefState::Reworking {
-                        target: ReworkTarget::Coder,
+                });
+            }
+            let mut new_evidence = evidence.clone();
+            new_evidence.insert(reporter.clone(), *verdict);
+            let inherited_run_data = rd_payload.clone().unwrap_or(RunData::None);
+            match verdict {
+                EventVerdict::Shipped => advance_walker(
+                    reporter,
+                    new_evidence,
+                    inherited_run_data,
+                    *retry,
+                    walk_config,
+                    entry_node,
+                ),
+                EventVerdict::ReworkNeeded | EventVerdict::Failed => {
+                    Ok(increment_or_fail(*retry, |next| BriefState::Walking {
+                        node_id: entry_node.clone(),
+                        evidence: BTreeMap::new(),
+                        run_data: RunData::None,
                         retry: next,
                     }))
                 }
-                Decide::Reject { detail } => Ok(BriefState::Failed {
-                    reason: Reason::AcceptanceFailed { detail },
+                EventVerdict::Escalated => Ok(BriefState::Failed {
+                    reason: Reason::AcceptanceFailed {
+                        detail: format!("{} escalated", reporter.0),
+                    },
+                }),
+                EventVerdict::Rejected => Ok(BriefState::Failed {
+                    reason: Reason::AcceptanceFailed {
+                        detail: format!("{} rejected", reporter.0),
+                    },
                 }),
             }
         }
 
-        // ---- Reworking ----
+        // ---- Walking + CoderStarted (rework re-spawn at entry node) ----
         (
-            BriefState::Reworking { retry, .. },
+            BriefState::Walking { retry, .. },
             BriefEvent::CoderStarted {
                 agent_id,
-                started_at,
+                role_name,
+                ..
             },
-        ) => Ok(BriefState::Authoring {
-            agent_id: agent_id.clone(),
-            started_at: *started_at,
+        ) if NodeId(role_name.clone()) == *entry_node => Ok(BriefState::Walking {
+            node_id: entry_node.clone(),
+            evidence: BTreeMap::new(),
+            run_data: RunData::Coder {
+                agent_id: agent_id.clone(),
+            },
             retry: *retry,
         }),
 
-        // ---- AwaitingCaptainDecision ----
-        // Captain endorses the disagreed-form output: treat it as if the
-        // coder had emitted CoderDone{Shipped} from Authoring. Use the
-        // shared post_coder_shipped helper so the empty-phase auto-skip
-        // and gate-evaluation logic stays in one place.
-        (BriefState::AwaitingCaptainDecision { retry, .. }, BriefEvent::CaptainAccepted) => {
-            Ok(post_coder_shipped(*retry, gates))
-        }
-        (BriefState::AwaitingCaptainDecision { .. }, BriefEvent::CaptainRejected { reason }) => {
-            Ok(BriefState::Failed {
-                reason: Reason::CaptainRejectedDisagreement {
-                    reason: reason.clone(),
-                },
-            })
-        }
-
-        // ---- Shipping ----
-        (
-            BriefState::Shipping { retry, .. },
-            BriefEvent::ShipperDone {
-                pr_number,
-                head_sha,
-            },
-        ) => Ok(BriefState::Watching {
-            pr_number: *pr_number,
-            head_sha: head_sha.clone(),
-            retry: *retry,
-        }),
-
-        // ---- Watching ----
-        (
-            BriefState::Watching {
-                pr_number,
-                head_sha,
-                retry,
-            },
-            event,
-        ) => match event {
-            BriefEvent::CiResult { state: ci, .. } => match ci {
-                CiState::Success => Ok(BriefState::Shipped),
-                CiState::Failed => Ok(increment_or_fail(*retry, |next| BriefState::Reworking {
-                    target: ReworkTarget::Coder,
-                    retry: next,
-                })),
-                CiState::Pending => Ok(BriefState::Watching {
-                    pr_number: *pr_number,
-                    head_sha: head_sha.clone(),
-                    retry: *retry,
-                }),
-            },
-            BriefEvent::RebaseStarted => Ok(BriefState::Watching {
-                pr_number: *pr_number,
-                head_sha: head_sha.clone(),
-                retry: *retry,
-            }),
-            BriefEvent::Rebased { new_head_sha } => Ok(BriefState::Watching {
-                pr_number: *pr_number,
-                head_sha: new_head_sha.clone(),
-                retry: *retry,
-            }),
-            _ => invalid(),
+        // ---- Walking + CiResult ----
+        // CI watcher reports success/failure/pending. Success → terminal
+        // Shipped; failed → rewind to entry (or BudgetExhausted);
+        // pending → stay. We accept any run_data shape — when PrTracking
+        // is plumbed end-to-end (B7 follow-up), the run_data carries
+        // the head_sha and the daemon's rebase plumbing uses it; until
+        // then we ignore the run_data variant on the CiResult arm.
+        (BriefState::Walking { retry, .. }, BriefEvent::CiResult { state: ci, .. }) => match ci {
+            CiState::Success => Ok(BriefState::Shipped),
+            CiState::Failed => Ok(increment_or_fail(*retry, |next| BriefState::Walking {
+                node_id: entry_node.clone(),
+                evidence: BTreeMap::new(),
+                run_data: RunData::None,
+                retry: next,
+            })),
+            CiState::Pending => Ok(state.clone()),
         },
 
-        // ---- Failed (terminal except for human-driven retry) ----
-        (BriefState::Failed { .. }, BriefEvent::RetryRequested { .. }) => Ok(BriefState::Submitted),
+        // ---- Walking + RebaseStarted (no state change) ----
+        (BriefState::Walking { .. }, BriefEvent::RebaseStarted) => Ok(state.clone()),
 
-        // ---- Walking (beta-a precursor — not yet wired) ----
-        // Beta-a lands the variant alongside the legacy phase enum so
-        // beta-b's walker can replace the phase chain in place. The
-        // FSM does not yet route any event into Walking, but match
-        // exhaustivity requires an explicit arm here once the variant
-        // exists. Reject every event landing on a Walking state with
-        // InvalidTransition; beta-b rewrites this with the real
-        // walker semantics.
-        (BriefState::Walking { .. }, _) => invalid(),
+        // ---- Walking + Rebased: update head_sha when run_data carries
+        // PrTracking; otherwise no-op stay.
+        (
+            BriefState::Walking {
+                node_id,
+                evidence,
+                run_data:
+                    RunData::PrTracking {
+                        pr_number,
+                        head_sha: _,
+                    },
+                retry,
+            },
+            BriefEvent::Rebased { new_head_sha },
+        ) => Ok(BriefState::Walking {
+            node_id: node_id.clone(),
+            evidence: evidence.clone(),
+            run_data: RunData::PrTracking {
+                pr_number: *pr_number,
+                head_sha: new_head_sha.clone(),
+            },
+            retry: *retry,
+        }),
+        (BriefState::Walking { .. }, BriefEvent::Rebased { .. }) => Ok(state.clone()),
+
+        // ---- Failed + RetryRequested (operator-driven retry) ----
+        (BriefState::Failed { .. }, BriefEvent::RetryRequested { .. }) => {
+            Ok(BriefState::Submitted)
+        }
 
         // ---- Everything else: not allowed in this state. ----
         _ => invalid(),
@@ -676,46 +620,131 @@ fn increment_or_fail(
     }
 }
 
-/// Post-coder-Shipped phase routing: evaluate verifying then reviewing
-/// gates against an empty received multiset, applying the empty-phase
-/// auto-skip rule (decide() returns Pass vacuously when expected_roles
-/// is empty). Shared by the `Authoring + CoderDone{Shipped}` arm and the
-/// `AwaitingCaptainDecision + CaptainAccepted` arm so both call sites
-/// stay byte-equivalent.
-fn post_coder_shipped(retry: RetryBudget, gates: &PhaseGates) -> BriefState {
-    let received_v = BTreeMap::new();
-    let gate_v = GateConfig {
-        expected_roles: gates.verifying.expected_roles.clone(),
-        policy: gates.verifying.policy.clone(),
-    };
-    match decide(&received_v, &gate_v) {
-        Decide::Pass => {
-            let received_r = BTreeMap::new();
-            let gate_r = GateConfig {
-                expected_roles: gates.reviewing.expected_roles.clone(),
-                policy: gates.reviewing.policy.clone(),
-            };
-            match decide(&received_r, &gate_r) {
-                Decide::Pass => BriefState::Shipping {
-                    pr_number: 0,
-                    head_sha: String::new(),
+/// Walker advance: called after `evidence[reporter] = verdict` was
+/// recorded. For each downstream of `reporter` in the adjacency, check
+/// whether that downstream's gate (expected_inbound + policy) is
+/// satisfied by the new evidence. Advance to the first downstream
+/// whose gate Passes; on Wait/Reject/Rework, apply the canonical
+/// response without advancing.
+///
+/// `inherited_run_data` is the `run_data` payload the reporter's
+/// `RoleDone` event carried (e.g. `Some(PrTracking{..})` from the
+/// shipper). It is propagated to the next node's `Walking` state only
+/// when the next node's `class` opts in (here we treat any non-None
+/// inherited payload as opt-in; the runtime convention is that
+/// shippers and shipper-like roles emit non-None payloads and only
+/// PrTracking-consumer nodes should be downstream of them).
+///
+/// If the reporter has no downstreams in adjacency, the walk has
+/// reached a sink — terminal `Shipped`.
+fn advance_walker(
+    reporter: &NodeId,
+    new_evidence: BTreeMap<NodeId, EventVerdict>,
+    inherited_run_data: RunData,
+    retry: RetryBudget,
+    walk_config: &WalkConfig,
+    entry_node: &NodeId,
+) -> Result<BriefState, Box<InvalidTransition>> {
+    let downstreams = walk_config
+        .adjacency
+        .get(reporter)
+        .cloned()
+        .unwrap_or_default();
+
+    if downstreams.is_empty() {
+        return Ok(BriefState::Shipped);
+    }
+
+    for d in &downstreams {
+        let Some(node_cfg) = walk_config.node_configs.get(d) else {
+            continue;
+        };
+        let gate = GateConfig {
+            expected_roles: node_cfg
+                .expected_inbound
+                .iter()
+                .map(|n| n.0.clone())
+                .collect(),
+            policy: node_cfg.policy.clone(),
+        };
+        let received_for_d: BTreeMap<String, EventVerdict> = new_evidence
+            .iter()
+            .filter(|(k, _)| node_cfg.expected_inbound.contains(k))
+            .map(|(k, v)| (k.0.clone(), *v))
+            .collect();
+        match decide(&received_for_d, &gate) {
+            Decide::Pass => {
+                let next_run_data = match &inherited_run_data {
+                    RunData::PrTracking { .. } => inherited_run_data.clone(),
+                    _ => RunData::None,
+                };
+                return Ok(BriefState::Walking {
+                    node_id: d.clone(),
+                    evidence: new_evidence,
+                    run_data: next_run_data,
                     retry,
-                },
-                _ => BriefState::Reviewing {
-                    retry,
-                    received: received_r,
-                    expected: gate_r.expected_roles,
-                    policy: gate_r.policy,
-                },
+                });
+            }
+            Decide::Wait => continue,
+            Decide::Rework { detail: _ } => {
+                return Ok(increment_or_fail(retry, |next| BriefState::Walking {
+                    node_id: entry_node.clone(),
+                    evidence: BTreeMap::new(),
+                    run_data: RunData::None,
+                    retry: next,
+                }));
+            }
+            Decide::Reject { detail } => {
+                return Ok(BriefState::Failed {
+                    reason: Reason::AcceptanceFailed { detail },
+                });
             }
         }
-        _ => BriefState::Verifying {
-            retry,
-            received: received_v,
-            expected: gate_v.expected_roles,
-            policy: gate_v.policy,
-        },
     }
+
+    // No downstream advanced — stay at reporter with the updated
+    // evidence and inherited run_data so a future RoleDone for one of
+    // reporter's siblings can complete the gate.
+    Ok(BriefState::Walking {
+        node_id: reporter.clone(),
+        evidence: new_evidence,
+        run_data: inherited_run_data,
+        retry,
+    })
+}
+
+/// Late-event fence: a `RoleDone` for `reporter` while the walker's
+/// current position is `current` is a "late event" when `reporter` is
+/// strictly upstream of `current` in the adjacency (i.e., the walker
+/// has already moved past it). In that case `handle()` returns the
+/// state unchanged and the lifecycle_driver logs a warn.
+///
+/// Implementation: reachability from `reporter` to `current` in the
+/// adjacency-forward direction. If `current` is reachable from
+/// `reporter` (and they're not equal), `reporter` is upstream → late.
+fn is_late_event(reporter: &NodeId, current: &NodeId, walk_config: &WalkConfig) -> bool {
+    if reporter == current {
+        return false;
+    }
+    // BFS forward from reporter; if we reach current, reporter is upstream.
+    let mut frontier: Vec<NodeId> = walk_config
+        .adjacency
+        .get(reporter)
+        .cloned()
+        .unwrap_or_default();
+    let mut visited: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
+    while let Some(n) = frontier.pop() {
+        if &n == current {
+            return true;
+        }
+        if !visited.insert(n.clone()) {
+            continue;
+        }
+        if let Some(adj) = walk_config.adjacency.get(&n) {
+            frontier.extend(adj.iter().cloned());
+        }
+    }
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -751,15 +780,6 @@ pub enum GatePolicy {
 pub struct GateConfig {
     pub expected_roles: Vec<String>,
     pub policy: GatePolicy,
-}
-
-/// Per-brief container for the verifying-phase and reviewing-phase
-/// `GateConfig` values. 396b will populate this from team topology at
-/// brief dispatch time and thread it through `handle()`.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PhaseGates {
-    pub verifying: GateConfig,
-    pub reviewing: GateConfig,
 }
 
 /// Per-node walker config: the node's class, the inbound edges that must

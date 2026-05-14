@@ -68,17 +68,21 @@ pub fn is_orphan(record: &BriefStateRecord, now: Ts, budget_seconds: u64) -> boo
     (elapsed as u64) > budget_seconds
 }
 
-/// True iff `record` is non-terminal, NOT
-/// [`BriefState::AwaitingCaptainDecision`] (operator-gated; expected
-/// to be quiet), AND the brief's trace stream has been silent longer
-/// than `threshold`. Terminal states (`Shipped`, `Failed`) return
-/// false. Companion probe to [`is_orphan`] — wall-clock budget elapse
-/// vs. trace-quiet are the two orphan signals the reaper acts on.
+/// True iff `record` is non-terminal, NOT a `Walking` with
+/// `RunData::OperatorDecision` (operator-gated; expected to be quiet
+/// while awaiting captain decide), AND the brief's trace stream has
+/// been silent longer than `threshold`. Terminal states (`Shipped`,
+/// `Failed`) return false. Companion probe to [`is_orphan`] —
+/// wall-clock budget elapse vs. trace-quiet are the two orphan
+/// signals the reaper acts on.
 #[must_use]
 pub fn is_trace_orphan(record: &BriefStateRecord, trace_age_seconds: u64, threshold: u64) -> bool {
-    match record.state {
+    match &record.state {
         BriefState::Shipped | BriefState::Failed { .. } => false,
-        BriefState::AwaitingCaptainDecision { .. } => false,
+        BriefState::Walking {
+            run_data: orchestrator_types::run_data::RunData::OperatorDecision { .. },
+            ..
+        } => false,
         _ => trace_age_seconds > threshold,
     }
 }

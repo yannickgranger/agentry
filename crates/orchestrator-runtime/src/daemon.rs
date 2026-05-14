@@ -385,14 +385,28 @@ pub async fn run(
                     // every `handle()` call so Verifying/Reviewing
                     // construct with the gate config available;
                     // 396b-3 will swap the serial transitions for
-                    // evidence-based gating using these fields.
-                    let phase_gates = match redis_io::fetch_team(
+                    // walk_config: built from team topology, threaded to
+                    // the FSM projector for every handle() call. entry_node
+                    // is the unique topology root (verified once per
+                    // brief); if the topology is malformed the brief
+                    // fails terminally with Reason::TopologyInvalid
+                    // before any role spawns.
+                    let (walk_config, entry_node) = match redis_io::fetch_team(
                         &mut conn_for_brief,
                         &brief.topology,
                     )
                     .await
                     {
-                        Ok(team) => Arc::new(lifecycle_driver::build_phase_gates(&team)),
+                        Ok(team) => {
+                            let wc = lifecycle_driver::build_walk_config(&team);
+                            match lifecycle_driver::derive_entry_node(&wc) {
+                                Ok(en) => (Arc::new(wc), Arc::new(en)),
+                                Err(reason) => {
+                                    tracing::error!(brief = %brief_id, ?reason, "topology missing unique entry vertex; skipping brief");
+                                    return;
+                                }
+                            }
+                        },
                         Err(e) => {
                             tracing::error!(brief = %brief_id, error = %e, "fetch_team failed; skipping brief");
                             return;
@@ -410,7 +424,8 @@ pub async fn run(
                         event_source,
                         state_projector,
                         Some(conn_for_verdict_emit),
-                        phase_gates,
+                        walk_config,
+                        entry_node,
                     ));
 
                     let outcome = handle_brief(
