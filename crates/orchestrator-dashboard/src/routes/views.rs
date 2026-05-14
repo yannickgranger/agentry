@@ -91,13 +91,13 @@ pub(crate) async fn derive_active_briefs(store: &DashboardStore) -> anyhow::Resu
             // Surface the disagreements payload so the index renderer
             // can emit the amber "awaiting captain decision" affordance
             // and the disagreements detail block.
-            if let BriefState::Walking { run_data, .. } = &record.state {
-                if let orchestrator_types::run_data::RunData::OperatorDecision { disagreements } =
-                    run_data
-                {
-                    if let Ok(d) = serde_json::to_value(disagreements) {
-                        map.insert("_dashboard_disagreements".into(), d);
-                    }
+            if let BriefState::Walking {
+                run_data: orchestrator_types::run_data::RunData::OperatorDecision { disagreements },
+                ..
+            } = &record.state
+            {
+                if let Ok(d) = serde_json::to_value(disagreements) {
+                    map.insert("_dashboard_disagreements".into(), d);
                 }
             }
         }
