@@ -13,8 +13,8 @@
 use async_trait::async_trait;
 use chrono::Utc;
 use orchestrator_runtime::lifecycle::{
-    translate_trace_entry, EventSource, EventSourceError, RedisEventSource, RedisStateProjector,
-    StateProjector, StateProjectorError,
+    read_brief_state, translate_trace_entry, EventSource, EventSourceError, RedisEventSource,
+    RedisStateProjector, StateProjector, StateProjectorError,
 };
 use orchestrator_runtime::lifecycle_driver::projector_task;
 use orchestrator_types::lifecycle::{
@@ -375,6 +375,18 @@ async fn redis_round_trip_writes_three_keys_atomically() {
     let cursor: Option<String> = conn.get(&cursor_key).await.expect("get cursor");
     assert_eq!(cursor.as_deref(), Some("fixture-trace-id"));
 
+    // `read_brief_state` is the symmetric reader for the same key the
+    // projector wrote. The team-orchestration loop (#539) calls this on
+    // each iteration to observe FSM-side state instead of carrying
+    // parallel in-process accumulators.
+    let read_back = read_brief_state(&mut conn, &brief_id)
+        .await
+        .expect("read_brief_state ok");
+    assert!(read_back.is_some(), "round-trip recovers the record");
+    let read_back = read_back.expect("round-trip not none");
+    assert_eq!(read_back.brief_id, record.brief_id);
+    assert!(matches!(read_back.state, BriefState::Submitted));
+
     // Crash recovery: build a fresh source from a captured cursor.
     let resumed = RedisEventSource::resume_from(conn.clone(), brief_id.clone(), "0-0".to_string());
     let _ = resumed; // construction-only smoke test; fixture stream already drained.
@@ -383,6 +395,28 @@ async fn redis_round_trip_writes_three_keys_atomically() {
     let _: () = conn.del(&state_log_key).await.expect("cleanup state_log");
     let _: () = conn.del(&state_key).await.expect("cleanup state");
     let _: () = conn.del(&cursor_key).await.expect("cleanup cursor");
+}
+
+/// `read_brief_state` returns `Ok(None)` when the `:state` key is
+/// absent — the brief has been dispatched but no FSM transition has
+/// fired yet, or the brief id never existed. The team-orchestration
+/// loop must treat None as "FSM hasn't observed this brief yet" and
+/// fall back to topology-driven ready-set computation.
+#[tokio::test]
+#[ignore = "requires live Redis (AGENTRY_TEST_REDIS_URL)"]
+async fn read_brief_state_returns_none_when_state_key_absent() {
+    let Some(url) = test_redis_url() else {
+        return;
+    };
+    let client = redis::Client::open(url).expect("client");
+    let mut conn = redis::aio::ConnectionManager::new(client)
+        .await
+        .expect("conn");
+    let brief_id = BriefId(brief_slug("absent"));
+    let out = read_brief_state(&mut conn, &brief_id)
+        .await
+        .expect("read_brief_state ok on absent key");
+    assert!(out.is_none(), "absent key surfaces as Ok(None)");
 }
 
 /// Live-Redis: a trace-stream entry of the shape

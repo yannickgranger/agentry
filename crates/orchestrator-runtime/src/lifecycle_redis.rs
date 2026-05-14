@@ -193,3 +193,45 @@ impl StateProjector for RedisStateProjector {
         Ok(())
     }
 }
+
+/// Read the latest `BriefStateRecord` for a brief from Redis.
+///
+/// The FSM writes records through [`RedisStateProjector`] to the
+/// `agentry:brief:{id}:state` key (atomic three-key write at
+/// [`LUA_PROJECTOR_WRITE`]). This function is the symmetric reader —
+/// returns `Ok(None)` when the key is missing (brief dispatched but no
+/// state transition has fired yet, or the brief never existed), and
+/// `Ok(Some(record))` when the projector has written.
+///
+/// Required by the v2-finale daemon-collapse work (#539): the team-
+/// orchestration loop in `daemon::handle_brief` must observe FSM state
+/// each iteration instead of carrying parallel in-process accumulators
+/// (`shipped_roles`, `reworks_used`). The synthesis pure-projection
+/// invariant — "a brief's progression at any moment is fully derivable
+/// from `(BriefState, TeamTopology, trace stream)`" — depends on this
+/// read path being available outside the daemon-resume boot scan.
+///
+/// Malformed JSON returns `Err(StateProjectorError::LuaFailed)` — the
+/// error variant is reused for any payload-shape failure since this
+/// signals projector-side corruption (the writer is the only producer
+/// of this key).
+pub async fn read_brief_state(
+    conn: &mut ConnectionManager,
+    brief_id: &BriefId,
+) -> Result<Option<BriefStateRecord>, StateProjectorError> {
+    let state_key = format!("agentry:brief:{}:state", brief_id.0);
+    let raw: Option<String> =
+        conn.get(&state_key)
+            .await
+            .map_err(|e| StateProjectorError::Backend {
+                detail: e.to_string(),
+            })?;
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let record: BriefStateRecord =
+        serde_json::from_str(&raw).map_err(|e| StateProjectorError::LuaFailed {
+            detail: format!("malformed state record at {state_key}: {e}"),
+        })?;
+    Ok(Some(record))
+}
