@@ -58,10 +58,7 @@ fn synthetic_self_host_walk_config() -> (WalkConfig, NodeId) {
     let ciw = NodeId("ci-watcher-agentry".to_owned());
 
     let mut adjacency: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
-    adjacency.insert(
-        entry.clone(),
-        vec![ac1.clone(), ac2.clone(), ac3.clone()],
-    );
+    adjacency.insert(entry.clone(), vec![ac1.clone(), ac2.clone(), ac3.clone()]);
     for ac in [&ac1, &ac2, &ac3] {
         adjacency.insert(ac.clone(), vec![rm.clone(), rc.clone()]);
     }
@@ -211,7 +208,8 @@ fn happy_path_submitted_to_shipped_through_self_host_topology() {
     let s0 = BriefState::Submitted;
 
     // Submitted -> Walking{coder}
-    let s1 = handle(&s0, &coder_started_default(), &cfg, &entry).expect("submitted + coder_started");
+    let s1 =
+        handle(&s0, &coder_started_default(), &cfg, &entry).expect("submitted + coder_started");
     let retry = match &s1 {
         BriefState::Walking {
             node_id,
@@ -229,8 +227,13 @@ fn happy_path_submitted_to_shipped_through_self_host_topology() {
     };
 
     // Coder done -> Walking{ac-verifier} (advance to first downstream)
-    let s2 = handle(&s1, &role_done_shipped("coder-claude-agentry"), &cfg, &entry)
-        .expect("coder shipped advances to ac-verifier");
+    let s2 = handle(
+        &s1,
+        &role_done_shipped("coder-claude-agentry"),
+        &cfg,
+        &entry,
+    )
+    .expect("coder shipped advances to ac-verifier");
     match &s2 {
         BriefState::Walking { node_id, .. } => {
             // Walker advances to the first downstream that passes its gate;
@@ -360,7 +363,13 @@ fn coder_role_done_failed_rewinds_to_entry_and_increments_retry() {
             assert_eq!(node_id, entry);
             assert!(evidence.is_empty());
             assert_eq!(run_data, RunData::None);
-            assert_eq!(retry, RetryBudget { attempt: 2, max: DEFAULT_ATTEMPT_CAP });
+            assert_eq!(
+                retry,
+                RetryBudget {
+                    attempt: 2,
+                    max: DEFAULT_ATTEMPT_CAP
+                }
+            );
         }
         other => panic!("expected Walking(entry, fresh, attempt=2), got {other:?}"),
     }
@@ -437,18 +446,13 @@ fn reviewer_rework_needed_rewinds_to_entry_and_increments_retry() {
     };
     let next = handle(
         &s,
-        &role_done(
-            "reviewer-claude-agentry",
-            EventVerdict::ReworkNeeded,
-        ),
+        &role_done("reviewer-claude-agentry", EventVerdict::ReworkNeeded),
         &cfg,
         &entry,
     )
     .expect("reviewer rework");
     match next {
-        BriefState::Walking {
-            node_id, retry, ..
-        } => {
+        BriefState::Walking { node_id, retry, .. } => {
             assert_eq!(node_id, entry);
             assert_eq!(retry, RetryBudget { attempt: 2, max: 3 });
         }
@@ -662,9 +666,7 @@ fn ci_failed_rewinds_to_entry() {
     )
     .expect("ci failed");
     match next {
-        BriefState::Walking {
-            node_id, retry, ..
-        } => {
+        BriefState::Walking { node_id, retry, .. } => {
             assert_eq!(node_id, entry);
             assert_eq!(retry, RetryBudget { attempt: 2, max: 2 });
         }
@@ -687,10 +689,7 @@ fn rework_at_cap_short_circuits_to_budget_exhausted() {
     };
     let next = handle(
         &s,
-        &role_done(
-            "reviewer-claude-agentry",
-            EventVerdict::ReworkNeeded,
-        ),
+        &role_done("reviewer-claude-agentry", EventVerdict::ReworkNeeded),
         &cfg,
         &entry,
     )
@@ -1360,10 +1359,7 @@ fn preflight_smell_detected_at_entry_coder_fails_brief() {
 /// CoderStarted, NOT a hardcoded "coder-claude-agentry".
 #[test]
 fn submitted_with_coder_started_role_name_drives_walking_node_id() {
-    let (cfg, entry) = synthetic_linear_walk_config(&[
-        "coder-mythic-agentry",
-        "shipper-agentry",
-    ]);
+    let (cfg, entry) = synthetic_linear_walk_config(&["coder-mythic-agentry", "shipper-agentry"]);
     let s0 = BriefState::Submitted;
     let event = BriefEvent::CoderStarted {
         agent_id: "agt_42".to_owned(),
@@ -1398,10 +1394,7 @@ fn coder_disagreed_preserves_node_id_evidence_and_retry() {
     let (cfg, entry) = synthetic_self_host_walk_config();
     let retry = RetryBudget { attempt: 2, max: 5 };
     let mut evidence = BTreeMap::new();
-    evidence.insert(
-        NodeId("prior-marker".to_owned()),
-        EventVerdict::Shipped,
-    );
+    evidence.insert(NodeId("prior-marker".to_owned()), EventVerdict::Shipped);
     let s = BriefState::Walking {
         node_id: coder_node(),
         evidence: evidence.clone(),

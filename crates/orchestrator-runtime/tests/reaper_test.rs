@@ -118,11 +118,7 @@ fn is_orphan_exactly_at_budget_is_false() {
 
 #[test]
 fn is_orphan_one_second_over_budget_is_true() {
-    let r = record(
-        "brf_over",
-        walking_stateless("reviewer-claude-agentry"),
-        0,
-    );
+    let r = record("brf_over", walking_stateless("reviewer-claude-agentry"), 0);
     assert!(is_orphan(&r, ts(1801), 1800));
 }
 

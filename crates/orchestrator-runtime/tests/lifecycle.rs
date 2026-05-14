@@ -276,9 +276,7 @@ async fn mem_adapters_carry_retry_budget_through_rework() {
                 "rework loop bumps the attempt counter"
             );
         }
-        other => panic!(
-            "expected Walking{{coder, Coder}} after rework loop, got {other:?}"
-        ),
+        other => panic!("expected Walking{{coder, Coder}} after rework loop, got {other:?}"),
     }
 }
 

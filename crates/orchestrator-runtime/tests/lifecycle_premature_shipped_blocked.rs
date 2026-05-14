@@ -150,16 +150,9 @@ async fn run_to_completion(
         written: written.clone(),
     });
     let (walk_config, entry_node) = chain_walk();
-    projector_task(
-        brief_id,
-        source,
-        projector,
-        None,
-        walk_config,
-        entry_node,
-    )
-    .await
-    .expect("projector_task");
+    projector_task(brief_id, source, projector, None, walk_config, entry_node)
+        .await
+        .expect("projector_task");
     let log = written.lock().expect("mutex").clone();
     log
 }

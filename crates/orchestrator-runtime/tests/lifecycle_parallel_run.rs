@@ -272,16 +272,9 @@ async fn projector_task_fails_brief_on_invalid_transition() {
     });
 
     let (walk_config, entry_node) = chain_walk();
-    projector_task(
-        brief_id,
-        source,
-        projector,
-        None,
-        walk_config,
-        entry_node,
-    )
-    .await
-    .expect("projector_task fences on invalid transition without erroring");
+    projector_task(brief_id, source, projector, None, walk_config, entry_node)
+        .await
+        .expect("projector_task fences on invalid transition without erroring");
 
     let log = written.lock().expect("mutex").clone();
     assert_eq!(
@@ -316,16 +309,9 @@ async fn projector_task_handles_empty_stream() {
     });
 
     let (walk_config, entry_node) = chain_walk();
-    projector_task(
-        brief_id,
-        source,
-        projector,
-        None,
-        walk_config,
-        entry_node,
-    )
-    .await
-    .expect("empty stream terminates cleanly");
+    projector_task(brief_id, source, projector, None, walk_config, entry_node)
+        .await
+        .expect("empty stream terminates cleanly");
 
     assert!(
         written.lock().expect("mutex").is_empty(),

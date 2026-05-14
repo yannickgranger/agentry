@@ -448,7 +448,14 @@ pub fn handle(
         ) => {
             let mut new_evidence = evidence.clone();
             new_evidence.insert(node_id.clone(), EventVerdict::Shipped);
-            advance_walker(node_id, new_evidence, RunData::None, *retry, walk_config, entry_node)
+            advance_walker(
+                node_id,
+                new_evidence,
+                RunData::None,
+                *retry,
+                walk_config,
+                entry_node,
+            )
         }
 
         // ---- Walking + CaptainRejected ----
@@ -591,9 +598,7 @@ pub fn handle(
         (BriefState::Walking { .. }, BriefEvent::Rebased { .. }) => Ok(state.clone()),
 
         // ---- Failed + RetryRequested (operator-driven retry) ----
-        (BriefState::Failed { .. }, BriefEvent::RetryRequested { .. }) => {
-            Ok(BriefState::Submitted)
-        }
+        (BriefState::Failed { .. }, BriefEvent::RetryRequested { .. }) => Ok(BriefState::Submitted),
 
         // ---- Everything else: not allowed in this state. ----
         _ => invalid(),

@@ -406,7 +406,7 @@ pub async fn run(
                                     return;
                                 }
                             }
-                        },
+                        }
                         Err(e) => {
                             tracing::error!(brief = %brief_id, error = %e, "fetch_team failed; skipping brief");
                             return;

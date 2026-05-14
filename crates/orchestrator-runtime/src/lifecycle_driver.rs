@@ -120,9 +120,8 @@ pub async fn projector_task(
                 // InvalidTransition, that's a genuinely-late event
                 // arriving when the walker has progressed past its
                 // dependent gate — warn and continue rather than fail.
-                let is_late_role_done =
-                    matches!(invalid.event, BriefEvent::RoleDone { .. })
-                        && matches!(invalid.from, BriefState::Walking { .. });
+                let is_late_role_done = matches!(invalid.event, BriefEvent::RoleDone { .. })
+                    && matches!(invalid.from, BriefState::Walking { .. });
                 if is_late_role_done {
                     tracing::warn!(
                         brief = %brief_id.0,
