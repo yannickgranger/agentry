@@ -511,6 +511,85 @@ struct RoleRun {
     team_ctx: TeamContext,
 }
 
+/// Scan a brief's trace stream and group routed messages by their
+/// destination role. The trace is the canonical source of routed
+/// messages — `spawner::run_agent` appends every `EventKind::Message`
+/// to `agentry:brief:{id}:trace` (spawner.rs:489). The in-process
+/// `all_messages` accumulator in `handle_brief` is a redundant copy
+/// that this helper can rebuild.
+///
+/// Role-name memoization mirrors `lifecycle_ports::translate_trace_entry`
+/// (lifecycle_ports.rs:90+): every `spawned` event payload carries
+/// `role_name`; subsequent events from the same `agent_id` inherit
+/// that mapping. The returned `RoutedMessage.from` is the source
+/// role's name, matching the in-process write at spawner.rs:478-484.
+///
+/// v2 finale (#539 phase 4) probe helper — at this commit, called
+/// once per outer-loop iteration and used to log divergence vs the
+/// in-process `all_messages` slice. Later phase switches the
+/// authoritative source to this helper and deletes `all_messages`.
+///
+/// Trace read errors return an empty map with a WARN log — a
+/// transient Redis hiccup must not crash a brief in flight; the
+/// caller falls back to the in-process slice. The XRANGE count is
+/// bounded at 4096 entries per scan, which exceeds any current
+/// brief's trace length by an order of magnitude.
+async fn messages_by_role_from_trace(
+    conn: &mut ConnectionManager,
+    brief_id: &BriefId,
+) -> HashMap<String, Vec<RoutedMessage>> {
+    let stream = format!("agentry:brief:{}:trace", brief_id.0);
+    let reply: redis::streams::StreamRangeReply =
+        match conn.xrange_count(&stream, "-", "+", 4096_usize).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(
+                    brief = %brief_id,
+                    error = %e,
+                    "messages_by_role_from_trace xrange failed; returning empty map"
+                );
+                return HashMap::new();
+            }
+        };
+    let mut role_by_agent: HashMap<String, String> = HashMap::new();
+    let mut out: HashMap<String, Vec<RoutedMessage>> = HashMap::new();
+    for entry in reply.ids {
+        let agent_id = entry
+            .map
+            .get("agent")
+            .and_then(orchestrator_infra::redis_io::redis_value_as_str)
+            .unwrap_or_default();
+        let body = entry
+            .map
+            .get("event")
+            .and_then(orchestrator_infra::redis_io::redis_value_as_str)
+            .unwrap_or_default();
+        let Ok(ev) = serde_json::from_str::<orchestrator_types::Event>(&body) else {
+            continue;
+        };
+        match &ev.kind {
+            EventKind::Event { payload } => {
+                if payload.get("agent_event").and_then(|v| v.as_str()) == Some("spawned") {
+                    if let Some(rn) = payload.get("role_name").and_then(|v| v.as_str()) {
+                        role_by_agent.insert(agent_id.clone(), rn.to_string());
+                    }
+                }
+            }
+            EventKind::Message { to, payload } => {
+                let from = role_by_agent.get(&agent_id).cloned().unwrap_or_default();
+                out.entry(to.clone()).or_default().push(RoutedMessage {
+                    from,
+                    to: to.clone(),
+                    payload: payload.clone(),
+                    at: ev.at,
+                });
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 /// FSM-side view of a brief's progression at iteration top of the
 /// team-orchestration loop in `handle_brief`. Returns
 /// `(shipped_set, fsm_retry_attempt)`:
@@ -700,6 +779,16 @@ async fn handle_brief(
             break;
         }
 
+        // v2 finale (#539 phase 4): trace-derived inbox probe. Scan
+        // the trace stream once per iteration and group routed
+        // messages by destination role; below at TeamContext
+        // construction, log divergence between this trace-derived
+        // slice and the in-process `all_messages` slice. Behavior is
+        // unchanged this commit — in-process slice remains the
+        // authoritative source. Later phase swaps the authoritative
+        // source and deletes `all_messages`.
+        let trace_msgs_by_role = messages_by_role_from_trace(conn, &brief.id).await;
+
         // Setup phase (serial): fetch role records, allocate workspace if
         // needed, mint+narrow+sign permits, build per-role TeamContexts.
         let mut runs: Vec<RoleRun> = Vec::with_capacity(ready.len());
@@ -741,6 +830,27 @@ async fn handle_brief(
                     .cloned()
                     .collect(),
             };
+            // v2 finale (#539 phase 4): probe trace-derived inbox vs
+            // the in-process slice above. Empty `trace_msgs_by_role`
+            // means the scan returned no Message events for any role
+            // — expected on the first iteration of any brief. Counts
+            // diverging mid-flight indicates the trace and the
+            // accumulator are out of sync; later phase swaps the
+            // authoritative source after a sync barrier guarantees
+            // they cannot drift.
+            let trace_slice = trace_msgs_by_role
+                .get(&role.name.0)
+                .cloned()
+                .unwrap_or_default();
+            if trace_slice.len() != team_ctx.messages.len() {
+                tracing::debug!(
+                    brief = %brief.id,
+                    role = %role.name,
+                    trace_count = trace_slice.len(),
+                    local_count = team_ctx.messages.len(),
+                    "trace-derived inbox diverges from in-process all_messages slice (acceptable while in-process is authoritative)"
+                );
+            }
 
             runs.push(RoleRun {
                 role_ref: role_ref.clone(),
