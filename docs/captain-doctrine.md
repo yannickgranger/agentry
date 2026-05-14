@@ -72,6 +72,31 @@ install -m 0755 target/release/<runner-name> ~/.local/bin/<runner-name>
 
 The bind-mount in the role's JSON config (source: `${HOME}/.local/bin/<runner-name>`) means the next container spawn picks up the new binary; no daemon restart needed. This step is operator-mediated outside the modeled redeploy_required field; F8d will extend RedeployTarget and captain redeploy to cover role runners.
 
+## Topology-only changes (no redeploy)
+
+Some changes are pure topology JSON edits — adding a node, removing a node, changing fan-in policy, adding an operator-gate, renaming an edge, raising `max_retries`. These do NOT require `redeploy_required`. The runtime is a generic walker; topology data IS the methodology, and the daemon reads each brief's `(team, version)` topology at dispatch time.
+
+### Operator workflow
+
+1. Edit the topology JSON in `seed/topologies/<team>.json`. **Bump `version`** — topologies are `(name, version)`-keyed and the registry is strict (`orchestrator team register` rejects re-registration of an existing `(name, version)`).
+2. Validate locally: `orchestrator team validate seed/topologies/<team>.json` — catches schema drift, unknown roles, malformed gate-config, and node-class typos without touching Redis.
+3. Dispatch the change as a brief whose verbs include the JSON edit:
+   ```
+   UPDATE seed/topologies/<team>.json: bump version <N> → <N+1>
+   UPDATE seed/topologies/<team>.json: <the topology change>
+   ```
+   `redeploy_required: []` — the daemon binary is unaffected.
+4. After merge: `orchestrator team register seed/topologies/<team>.json` (NOT `captain redeploy`) — pushes the new `(name, version+1)` topology body to Redis atomically.
+5. New briefs dispatched after the register step pin `topology.version: <N+1>` and execute against the new shape. Any in-flight brief pinned to `<N>` continues against the old shape — version pinning is the migration mechanism.
+
+### Border case — binary change is needed
+
+If the topology change requires a new `RunData` variant or a new `BriefEvent` variant (e.g. introducing a node-class whose runtime needs a new data carrier), that IS a binary change and MUST set `redeploy_required: ["daemon"]`. The cfdb fence `arch-ban-rundata-phase-names` prevents methodology-named additions; legitimate new `RunData` variants (data-shape-named, e.g. `WebhookGated { url, headers }`) are doctrinally rare but they do happen. When in doubt: if any verb in the brief edits a `.rs` file under `crates/orchestrator-runtime/` or `crates/orchestrator-types/`, set `redeploy_required: ["daemon"]`.
+
+### Why this matters
+
+The v2 finale (#397, council synthesis `council/v2-finale-fsm-collapse/synthesis.md`) collapsed the FSM's hardcoded phase enum into a generic topology walker precisely to make this no-redeploy path viable. Treating every topology shape change as a daemon-redeploy is the old (pre-#532) methodology-in-Rust pattern. Once a topology JSON edit lands and is registered, the dispatch path is the only thing left to update — no compile, no swap, no downtime.
+
 ## Spec authoring
 
 Briefs that create or modify `specs/concepts/*.md` should start from a compliant skeleton emitted by `captain new-spec --concept <CamelCaseName> --target-repo <forge/repo>`. The skeleton enforces graph-specs equivalence: the H1 and the level-2 heading must be the same CamelCase token, matching a Rust type, function, or trait of that name in the target_repo's source tree. Level-4 headings (`####`) are local subsections and are not concepts; they are not subject to the equivalence check. Prose-style headings like `## Stage A — size catalog` will be rejected by graph-specs and by the coder self-review (this caused the G2 v1 wasted re-roll cited in #436).
