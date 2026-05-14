@@ -14,6 +14,8 @@ use orchestrator_runtime::cli_abort::{run_per_brief_abort, ABORT_AGENT_ID};
 use orchestrator_types::lifecycle::{
     BriefEvent, BriefState, BriefStateRecord, Reason, RetryBudget,
 };
+use orchestrator_types::run_data::RunData;
+use orchestrator_types::team::NodeId;
 use orchestrator_types::{now, BriefId, Event, EventKind};
 use redis::aio::ConnectionManager;
 use redis::AsyncCommands;
@@ -127,9 +129,12 @@ async fn abort_pushes_event_for_active_brief() {
         seed_state(
             &mut conn,
             id,
-            BriefState::Authoring {
-                agent_id: "agt_does_not_exist_001".into(),
-                started_at: now(),
+            BriefState::Walking {
+                node_id: NodeId("coder-claude-agentry".into()),
+                evidence: std::collections::BTreeMap::new(),
+                run_data: RunData::Coder {
+                    agent_id: "agt_does_not_exist_001".into(),
+                },
                 retry: fresh_retry(),
             },
         )

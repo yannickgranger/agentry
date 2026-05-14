@@ -18,10 +18,58 @@ use orchestrator_runtime::reaper::{
     self, is_orphan, is_trace_orphan, BriefInventory, ReaperSink, DEFAULT_WALL_CLOCK_SECONDS,
 };
 use orchestrator_types::lifecycle::{
-    handle, BriefEvent, BriefState, BriefStateRecord, Reason, RetryBudget, DEFAULT_ATTEMPT_CAP,
+    handle, BriefEvent, BriefState, BriefStateRecord, GatePolicy, NodeConfig, Reason, RetryBudget,
+    WalkConfig, DEFAULT_ATTEMPT_CAP,
 };
+use orchestrator_types::run_data::RunData;
+use orchestrator_types::team::{NodeClass, NodeId};
 use orchestrator_types::{BriefId, Ts};
 use tokio::sync::Mutex;
+
+/// Build the canonical (`WalkConfig`, entry-`NodeId`) pair used by every
+/// reaper FSM test: a single-node topology rooted at the canonical coder
+/// role. The reaper tests only push universal-arm events (BudgetExhausted)
+/// — adjacency / per-node gate config never participates, so a one-node
+/// graph is sufficient.
+fn no_gates() -> (WalkConfig, NodeId) {
+    let entry = NodeId("coder-claude-agentry".into());
+    let mut node_configs = std::collections::HashMap::new();
+    node_configs.insert(
+        entry.clone(),
+        NodeConfig {
+            class: NodeClass("container_bound".into()),
+            expected_inbound: vec![],
+            policy: GatePolicy::AllMustPass,
+        },
+    );
+    (
+        WalkConfig {
+            adjacency: std::collections::HashMap::new(),
+            node_configs,
+        },
+        entry,
+    )
+}
+
+fn walking_coder(agent: &str) -> BriefState {
+    BriefState::Walking {
+        node_id: NodeId("coder-claude-agentry".into()),
+        evidence: std::collections::BTreeMap::new(),
+        run_data: RunData::Coder {
+            agent_id: agent.into(),
+        },
+        retry: fresh_retry(),
+    }
+}
+
+fn walking_stateless(node: &str) -> BriefState {
+    BriefState::Walking {
+        node_id: NodeId(node.into()),
+        evidence: std::collections::BTreeMap::new(),
+        run_data: RunData::None,
+        retry: fresh_retry(),
+    }
+}
 
 fn ts(secs: i64) -> Ts {
     chrono::Utc.timestamp_opt(secs, 0).single().expect("ts")
@@ -31,20 +79,6 @@ fn fresh_retry() -> RetryBudget {
     RetryBudget {
         attempt: 1,
         max: DEFAULT_ATTEMPT_CAP,
-    }
-}
-
-fn no_gates() -> orchestrator_types::lifecycle::PhaseGates {
-    use orchestrator_types::lifecycle::{GateConfig, GatePolicy, PhaseGates};
-    PhaseGates {
-        verifying: GateConfig {
-            expected_roles: vec![],
-            policy: GatePolicy::AllMustPass,
-        },
-        reviewing: GateConfig {
-            expected_roles: vec![],
-            policy: GatePolicy::AllMustPass,
-        },
     }
 }
 
@@ -65,15 +99,7 @@ fn record(id: &str, state: BriefState, at_secs: i64) -> BriefStateRecord {
 #[test]
 fn is_orphan_just_under_budget_is_false() {
     // 1799s elapsed against a 1800s budget — NOT orphan.
-    let r = record(
-        "brf_under",
-        BriefState::Authoring {
-            agent_id: "c".into(),
-            started_at: ts(0),
-            retry: fresh_retry(),
-        },
-        1,
-    );
+    let r = record("brf_under", walking_coder("c"), 1);
     assert!(!is_orphan(&r, ts(1800), 1800));
 }
 
@@ -84,12 +110,7 @@ fn is_orphan_exactly_at_budget_is_false() {
     // record whose clock matches the budget exactly.
     let r = record(
         "brf_boundary",
-        BriefState::Verifying {
-            retry: fresh_retry(),
-            received: std::collections::BTreeMap::new(),
-            expected: vec![],
-            policy: orchestrator_types::lifecycle::GatePolicy::AllMustPass,
-        },
+        walking_stateless("ac-verifier-claude-agentry"),
         0,
     );
     assert!(!is_orphan(&r, ts(1800), 1800));
@@ -99,12 +120,7 @@ fn is_orphan_exactly_at_budget_is_false() {
 fn is_orphan_one_second_over_budget_is_true() {
     let r = record(
         "brf_over",
-        BriefState::Reviewing {
-            retry: fresh_retry(),
-            received: std::collections::BTreeMap::new(),
-            expected: vec![],
-            policy: orchestrator_types::lifecycle::GatePolicy::AllMustPass,
-        },
+        walking_stateless("reviewer-claude-agentry"),
         0,
     );
     assert!(is_orphan(&r, ts(1801), 1800));
@@ -132,15 +148,7 @@ fn is_orphan_terminal_failed_is_false_regardless_of_elapsed() {
 #[test]
 fn is_orphan_clock_skew_into_future_is_false() {
     // record.at > now (host clock skew). Defensive: don't reap.
-    let r = record(
-        "brf_future",
-        BriefState::Authoring {
-            agent_id: "c".into(),
-            started_at: ts(10_000),
-            retry: fresh_retry(),
-        },
-        10_000,
-    );
+    let r = record("brf_future", walking_coder("c"), 10_000);
     assert!(!is_orphan(&r, ts(0), 1800));
 }
 
@@ -214,23 +222,10 @@ async fn tick_emits_one_abort_for_one_expired_non_terminal_brief() {
     //   - brf_done: terminal Shipped, ancient — NOT reaped.
     let mut inv = MockInventory {
         records: vec![
-            record(
-                "brf_fresh",
-                BriefState::Authoring {
-                    agent_id: "c".into(),
-                    started_at: ts(9_900),
-                    retry: fresh_retry(),
-                },
-                9_900,
-            ),
+            record("brf_fresh", walking_coder("c"), 9_900),
             record(
                 "brf_expired",
-                BriefState::Verifying {
-                    retry: fresh_retry(),
-                    received: std::collections::BTreeMap::new(),
-                    expected: vec![],
-                    policy: orchestrator_types::lifecycle::GatePolicy::AllMustPass,
-                },
+                walking_stateless("ac-verifier-claude-agentry"),
                 0,
             ),
             record("brf_done", BriefState::Shipped, 0),
@@ -273,15 +268,7 @@ async fn tick_uses_default_budget_when_brief_body_absent() {
     // Authoring for 2 hours — well past the 30 min default — so
     // it is reaped.
     let mut inv = MockInventory {
-        records: vec![record(
-            "brf_no_body",
-            BriefState::Authoring {
-                agent_id: "c".into(),
-                started_at: ts(0),
-                retry: fresh_retry(),
-            },
-            0,
-        )],
+        records: vec![record("brf_no_body", walking_coder("c"), 0)],
         budgets: HashMap::new(),
         trace_ages: HashMap::new(),
     };
@@ -321,47 +308,70 @@ fn handle_maps_budget_exhausted_to_failed_with_budget_reason_from_every_non_term
     // expiry path to land in terminal Failed{BudgetExhausted}, every
     // non-terminal state must accept the event and yield that exact
     // terminal. This pins the contract the reaper relies on.
+    // Post-#495-beta-b: the only non-terminal states are `Submitted` and
+    // `Walking { run_data: ... }`. The reaper's BudgetExhausted contract
+    // must fire from each `RunData` variant a real brief can sit in
+    // (Coder, PrTracking, OperatorDecision, Extension, None).
     let states = [
         BriefState::Submitted,
-        BriefState::Authoring {
-            agent_id: "c".into(),
-            started_at: ts(0),
+        BriefState::Walking {
+            node_id: NodeId("coder-claude-agentry".into()),
+            evidence: std::collections::BTreeMap::new(),
+            run_data: RunData::Coder {
+                agent_id: "c".into(),
+            },
             retry: fresh_retry(),
         },
-        BriefState::Verifying {
-            retry: fresh_retry(),
-            received: std::collections::BTreeMap::new(),
-            expected: vec![],
-            policy: orchestrator_types::lifecycle::GatePolicy::AllMustPass,
-        },
-        BriefState::Reviewing {
-            retry: fresh_retry(),
-            received: std::collections::BTreeMap::new(),
-            expected: vec![],
-            policy: orchestrator_types::lifecycle::GatePolicy::AllMustPass,
-        },
-        BriefState::Reworking {
-            target: orchestrator_types::lifecycle::ReworkTarget::Coder,
+        BriefState::Walking {
+            node_id: NodeId("ac-verifier-claude-agentry".into()),
+            evidence: std::collections::BTreeMap::new(),
+            run_data: RunData::None,
             retry: fresh_retry(),
         },
-        BriefState::Shipping {
-            pr_number: 1,
-            head_sha: "h".into(),
+        BriefState::Walking {
+            node_id: NodeId("reviewer-claude-agentry".into()),
+            evidence: std::collections::BTreeMap::new(),
+            run_data: RunData::None,
             retry: fresh_retry(),
         },
-        BriefState::Watching {
-            pr_number: 1,
-            head_sha: "h".into(),
+        BriefState::Walking {
+            node_id: NodeId("shipper-agentry".into()),
+            evidence: std::collections::BTreeMap::new(),
+            run_data: RunData::PrTracking {
+                pr_number: 1,
+                head_sha: "h".into(),
+            },
             retry: fresh_retry(),
         },
-        BriefState::Extension {
-            name: "ext".into(),
-            data: serde_json::json!({}),
+        BriefState::Walking {
+            node_id: NodeId("ci-watcher-agentry".into()),
+            evidence: std::collections::BTreeMap::new(),
+            run_data: RunData::PrTracking {
+                pr_number: 1,
+                head_sha: "h".into(),
+            },
+            retry: fresh_retry(),
+        },
+        BriefState::Walking {
+            node_id: NodeId("coder-claude-agentry".into()),
+            evidence: std::collections::BTreeMap::new(),
+            run_data: RunData::OperatorDecision {
+                disagreements: vec![],
+            },
+            retry: fresh_retry(),
+        },
+        BriefState::Walking {
+            node_id: NodeId("ext-agentry".into()),
+            evidence: std::collections::BTreeMap::new(),
+            run_data: RunData::Extension {
+                data: serde_json::json!({}),
+            },
             retry: fresh_retry(),
         },
     ];
+    let (walk_config, entry_node) = no_gates();
     for s in states {
-        let next = handle(&s, &BriefEvent::BudgetExhausted, &no_gates())
+        let next = handle(&s, &BriefEvent::BudgetExhausted, &walk_config, &entry_node)
             .unwrap_or_else(|_| panic!("BudgetExhausted denied from {s:?}"));
         assert_eq!(
             next,
@@ -379,15 +389,7 @@ fn handle_maps_budget_exhausted_to_failed_with_budget_reason_from_every_non_term
 
 #[test]
 fn is_trace_orphan_fires_when_above_threshold() {
-    let r = record(
-        "brf_quiet",
-        BriefState::Authoring {
-            agent_id: "c".into(),
-            started_at: ts(0),
-            retry: fresh_retry(),
-        },
-        0,
-    );
+    let r = record("brf_quiet", walking_coder("c"), 0);
     assert!(is_trace_orphan(&r, 700, 600));
 }
 
@@ -410,8 +412,12 @@ fn is_trace_orphan_skips_terminal() {
 fn is_trace_orphan_skips_awaiting_captain_decision() {
     let r = record(
         "brf_awaiting",
-        BriefState::AwaitingCaptainDecision {
-            disagreements: vec![],
+        BriefState::Walking {
+            node_id: NodeId("coder-claude-agentry".into()),
+            evidence: std::collections::BTreeMap::new(),
+            run_data: RunData::OperatorDecision {
+                disagreements: vec![],
+            },
             retry: fresh_retry(),
         },
         0,
@@ -432,15 +438,7 @@ async fn tick_reaps_stale_trace_orphan_distinctly_from_wall_clock() {
     // as the wall-clock path.
     let now_secs: i64 = 10_000;
     let mut inv = MockInventory {
-        records: vec![record(
-            "brf_quiet",
-            BriefState::Authoring {
-                agent_id: "c".into(),
-                started_at: ts(now_secs - 60),
-                retry: fresh_retry(),
-            },
-            now_secs - 60,
-        )],
+        records: vec![record("brf_quiet", walking_coder("c"), now_secs - 60)],
         budgets: HashMap::from([("brf_quiet".into(), 1800)]),
         trace_ages: HashMap::from([("brf_quiet".into(), 700)]),
     };
