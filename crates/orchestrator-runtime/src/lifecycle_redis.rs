@@ -220,12 +220,12 @@ pub async fn read_brief_state(
     brief_id: &BriefId,
 ) -> Result<Option<BriefStateRecord>, StateProjectorError> {
     let state_key = format!("agentry:brief:{}:state", brief_id.0);
-    let raw: Option<String> = conn
-        .get(&state_key)
-        .await
-        .map_err(|e| StateProjectorError::Backend {
-            detail: e.to_string(),
-        })?;
+    let raw: Option<String> =
+        conn.get(&state_key)
+            .await
+            .map_err(|e| StateProjectorError::Backend {
+                detail: e.to_string(),
+            })?;
     let Some(raw) = raw else {
         return Ok(None);
     };
