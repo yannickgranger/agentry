@@ -615,8 +615,13 @@ async fn handle_brief(
                 None
             }
         };
-        let shipped_set: HashSet<RoleRef> = match fsm_state.as_ref().map(|r| &r.state) {
-            Some(BriefState::Walking { evidence, .. }) => {
+        let (shipped_set, fsm_retry_attempt): (HashSet<RoleRef>, Option<u32>) = match fsm_state
+            .as_ref()
+            .map(|r| &r.state)
+        {
+            Some(BriefState::Walking {
+                evidence, retry, ..
+            }) => {
                 // NodeId in `Walking.evidence` is constructed from
                 // `role.name.0` by the translator (lifecycle_ports.rs:165
                 // and the `Some(_)` arm at :185); the inverse lookup is
@@ -638,32 +643,33 @@ async fn handle_brief(
                         brief = %brief.id,
                         fsm_count = fsm.len(),
                         local_count = local.len(),
-                        "FSM shipped_set diverges from in-process accumulator (acceptable during transition between batches; phase 2 deletes the in-process side)"
+                        "FSM shipped_set diverges from in-process accumulator (acceptable during transition between batches; later phase deletes the in-process side)"
                     );
                 }
-                // Union for safety: if either source has the role marked
-                // shipped, treat it as shipped. The in-process accumulator
-                // can be ahead within a batch (we wrote to it before the
-                // FSM driver consumed the trace); the FSM can be ahead on
-                // reattach. Phase 2 introduces a sync barrier and drops
-                // the local side.
-                fsm.union(&local).cloned().collect()
+                // Union for safety: if either source has the role
+                // marked shipped, treat it as shipped. The in-process
+                // accumulator can be ahead within a batch (we wrote
+                // to it before the FSM driver consumed the trace);
+                // the FSM can be ahead on reattach. Later phase
+                // introduces a sync barrier and drops the local side.
+                (fsm.union(&local).cloned().collect(), Some(retry.attempt))
             }
             // Terminal state on read: the FSM has decided the brief.
-            // Don't early-break here — let the existing terminal-disposition
-            // path at end-of-function reconcile against the FSM's verdict.
-            // The path is idempotent at the LUA-write boundary, so a
-            // second write of the same terminal state is harmless. A
-            // future commit will short-circuit this loop on terminal FSM
-            // state once the terminal-write path is FSM-aware.
+            // Don't early-break here — let the existing terminal-
+            // disposition path at end-of-function reconcile against
+            // the FSM's verdict. The path is idempotent at the LUA-
+            // write boundary, so a second write of the same terminal
+            // state is harmless. A future commit will short-circuit
+            // this loop on terminal FSM state once the terminal-write
+            // path is FSM-aware.
             Some(BriefState::Shipped) | Some(BriefState::Failed { .. }) => {
                 tracing::debug!(
                     brief = %brief.id,
                     "FSM reports terminal state during team-orchestration loop; continuing to in-process terminal disposition"
                 );
-                shipped_roles.iter().cloned().collect()
+                (shipped_roles.iter().cloned().collect(), None)
             }
-            _ => shipped_roles.iter().cloned().collect(),
+            _ => (shipped_roles.iter().cloned().collect(), None),
         };
         let ready: Vec<RoleRef> = team
             .roles
@@ -841,11 +847,31 @@ async fn handle_brief(
         // Reworks: each rewinds to its single upstream and resets that
         // upstream + its downstream sub-DAG so the slice re-fires once
         // the upstream re-ships.
+        // v2 finale (#539 phase 2): the FSM's `Walking.retry.attempt`
+        // (mirror of `team.max_retries` via `RetryBudget`) is the
+        // canonical rework counter. Take the max of FSM-observed and
+        // in-process counts so neither source can race ahead of the
+        // threshold. The local `reworks_used` still increments below
+        // for the in-batch increment that the FSM driver will catch up
+        // on async. Subsequent phase deletes `reworks_used` once an
+        // FSM-cursor sync barrier is in place.
+        let effective_reworks_used = reworks_used.max(fsm_retry_attempt.unwrap_or(0));
+        if fsm_retry_attempt
+            .map(|f| f != reworks_used)
+            .unwrap_or(false)
+        {
+            tracing::debug!(
+                brief = %brief.id,
+                fsm_attempt = ?fsm_retry_attempt,
+                local = reworks_used,
+                "FSM retry.attempt diverges from in-process reworks_used (acceptable during batch transition)"
+            );
+        }
         let mut rewound_subdags: HashSet<RoleRef> = HashSet::new();
         for (from_ref, findings) in reworks {
             let upstream = resolve_rework_target(&from_ref, &team);
             match upstream {
-                Some(up) if reworks_used < team.max_retries => {
+                Some(up) if effective_reworks_used < team.max_retries => {
                     all_messages.push(RoutedMessage {
                         from: from_ref.name.0.clone(),
                         to: up.name.0.clone(),
@@ -867,7 +893,9 @@ async fn handle_brief(
                         from = %from_ref.name,
                         to = %up.name,
                         findings_count = findings.len(),
+                        effective_reworks_used,
                         reworks_used,
+                        fsm_attempt = ?fsm_retry_attempt,
                         max_retries = team.max_retries,
                         route_kind = %route_kind,
                         "rework requested — resetting upstream sub-DAG"
@@ -884,14 +912,20 @@ async fn handle_brief(
                         brief = %brief.id,
                         role = %from_ref.name,
                         upstream = %up.name,
+                        effective_reworks_used,
                         reworks_used,
+                        fsm_attempt = ?fsm_retry_attempt,
                         max_retries = team.max_retries,
                         "rework requested but retry budget exhausted"
                     );
                     team_shipped = false;
                     team_failure_detail = Some(format!(
-                        "{} rework budget exhausted ({}/{})",
-                        from_ref.name, reworks_used, team.max_retries
+                        "{} rework budget exhausted (effective={}, local={}, fsm={:?}, max={})",
+                        from_ref.name,
+                        effective_reworks_used,
+                        reworks_used,
+                        fsm_retry_attempt,
+                        team.max_retries
                     ));
                     break 'outer;
                 }
