@@ -729,6 +729,31 @@ async fn handle_brief(
             }
             all_messages.extend(outcome.outbox);
 
+            // F6 escalation: when the coder reports verdict=Failed with
+            // cause=self_review_disagreed, the translator has emitted
+            // BriefEvent::CoderDisagreed and the FSM has flipped
+            // Walking{Coder} → Walking{OperatorDecision}. The daemon
+            // must NOT mark this as a team failure — that would
+            // atomically overwrite the FSM's parked state with terminal
+            // Failed, breaking captain decide. Dissolves #529 (the F6
+            // routing regression caused by the daemon's mini-FSM
+            // pre-empting the canonical lifecycle FSM). The spawner
+            // propagates `cause:` prefixed reason onto the verdict, see
+            // `spawner::compute_verdict`.
+            if matches!(outcome.verdict.kind, VerdictKind::Failed)
+                && outcome.verdict.reason.as_deref() == Some("cause:self_review_disagreed")
+            {
+                tracing::info!(
+                    brief = %brief.id,
+                    role = %run.role_ref.name,
+                    "coder reported self_review_disagreed; team-orchestration yields to FSM (Walking{{OperatorDecision}}) for captain decide"
+                );
+                // Detach the workspace handle without tearing it down —
+                // the FSM driver's cleanup fires on the eventual
+                // terminal CaptainAccepted/CaptainRejected transition.
+                let _ = workspace.take();
+                return Ok(VerdictKind::Failed);
+            }
             match outcome.verdict.kind {
                 VerdictKind::Shipped => shipped_in_batch.push(run.role_ref.clone()),
                 VerdictKind::ReworkNeeded { findings } => {
