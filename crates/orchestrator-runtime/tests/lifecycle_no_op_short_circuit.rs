@@ -43,18 +43,35 @@ use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-fn no_gates() -> std::sync::Arc<orchestrator_types::lifecycle::PhaseGates> {
-    use orchestrator_types::lifecycle::{GateConfig, GatePolicy, PhaseGates};
-    std::sync::Arc::new(PhaseGates {
-        verifying: GateConfig {
-            expected_roles: vec![],
+/// Build the canonical (`WalkConfig`, entry-`NodeId`) Arc pair for the
+/// no-op tests. The no-op short-circuit fires from `Walking { node_id ==
+/// entry_node, run_data: Coder { .. } }` and lands directly on `Shipped`,
+/// so the topology only needs a single coder vertex.
+fn no_gates() -> (
+    std::sync::Arc<orchestrator_types::lifecycle::WalkConfig>,
+    std::sync::Arc<orchestrator_types::team::NodeId>,
+) {
+    use orchestrator_types::lifecycle::{GatePolicy, NodeConfig, WalkConfig};
+    use orchestrator_types::team::{NodeClass, NodeId};
+    use std::collections::HashMap;
+
+    let entry = NodeId("coder-claude-agentry".into());
+    let mut node_configs = HashMap::new();
+    node_configs.insert(
+        entry.clone(),
+        NodeConfig {
+            class: NodeClass("container_bound".into()),
+            expected_inbound: vec![],
             policy: GatePolicy::AllMustPass,
         },
-        reviewing: GateConfig {
-            expected_roles: vec![],
-            policy: GatePolicy::AllMustPass,
-        },
-    })
+    );
+    (
+        std::sync::Arc::new(WalkConfig {
+            adjacency: HashMap::new(),
+            node_configs,
+        }),
+        std::sync::Arc::new(entry),
+    )
 }
 
 struct MemEventSource {
@@ -98,7 +115,8 @@ async fn run_to_completion(
     let projector: Box<dyn StateProjector + Send> = Box::new(MemStateProjector {
         written: written.clone(),
     });
-    projector_task(brief_id, source, projector, None, no_gates())
+    let (walk_config, entry_node) = no_gates();
+    projector_task(brief_id, source, projector, None, walk_config, entry_node)
         .await
         .expect("projector_task");
     let log = written.lock().expect("mutex").clone();
@@ -117,6 +135,7 @@ async fn coder_done_no_op_short_circuits_authoring_to_shipped() {
     let events = vec![
         BriefEvent::CoderStarted {
             agent_id: "agent-1".into(),
+            role_name: "coder-claude-agentry".into(),
             started_at: now(),
         },
         BriefEvent::CoderDoneNoOp {
@@ -131,27 +150,21 @@ async fn coder_done_no_op_short_circuits_authoring_to_shipped() {
         2,
         "no-op short-circuit writes exactly two records: Authoring then Shipped"
     );
+    use orchestrator_types::run_data::RunData;
     assert!(
-        matches!(log[0].0.state, BriefState::Authoring { .. }),
-        "first record is Authoring (CoderStarted transition)"
+        matches!(
+            log[0].0.state,
+            BriefState::Walking {
+                run_data: RunData::Coder { .. },
+                ..
+            }
+        ),
+        "first record is Walking at the coder entry node (CoderStarted transition)"
     );
     assert!(
         matches!(log[1].0.state, BriefState::Shipped),
-        "second record is the terminal Shipped — no intermediate Verifying / Reviewing / Shipping / Watching"
+        "second record is the terminal Shipped — no intermediate Walking transitions for downstream gates"
     );
-
-    for (record, _) in &log {
-        assert!(
-            !matches!(
-                record.state,
-                BriefState::Verifying { .. }
-                    | BriefState::Reviewing { .. }
-                    | BriefState::Shipping { .. }
-                    | BriefState::Watching { .. }
-            ),
-            "no intermediate downstream states are written for a no-op brief"
-        );
-    }
 }
 
 /// Scenario 2: events appended AFTER a no-op `CoderDoneNoOp` are not
@@ -165,6 +178,7 @@ async fn projector_stops_at_no_op_terminal_and_does_not_consume_tail_events() {
     let events = vec![
         BriefEvent::CoderStarted {
             agent_id: "agent-1".into(),
+            role_name: "coder-claude-agentry".into(),
             started_at: now(),
         },
         BriefEvent::CoderDoneNoOp {
@@ -173,18 +187,26 @@ async fn projector_stops_at_no_op_terminal_and_does_not_consume_tail_events() {
         // Tail events that would normally drive the FSM forward —
         // must not be processed because the projector already saw
         // terminal Shipped.
-        BriefEvent::AcVerifierDone {
-            verdict: EventVerdict::Shipped,
-            role_name: "ac-verifier-test".to_owned(),
-        },
-        BriefEvent::ReviewerDone {
+        BriefEvent::RoleDone {
+            node_id: orchestrator_types::team::NodeId("ac-verifier-test".into()),
             verdict: EventVerdict::Shipped,
             findings: vec![],
-            role_name: "reviewer-test".to_owned(),
+            run_data: None,
         },
-        BriefEvent::ShipperDone {
-            pr_number: 1,
-            head_sha: "should-not-be-read".into(),
+        BriefEvent::RoleDone {
+            node_id: orchestrator_types::team::NodeId("reviewer-test".into()),
+            verdict: EventVerdict::Shipped,
+            findings: vec![],
+            run_data: None,
+        },
+        BriefEvent::RoleDone {
+            node_id: orchestrator_types::team::NodeId("shipper-agentry".into()),
+            verdict: EventVerdict::Shipped,
+            findings: vec![],
+            run_data: Some(orchestrator_types::run_data::RunData::PrTracking {
+                pr_number: 1,
+                head_sha: "should-not-be-read".into(),
+            }),
         },
     ];
 
@@ -303,11 +325,12 @@ async fn translator_decodes_no_op_cause_to_coder_done_no_op() {
     assert!(
         matches!(
             plain_decoded,
-            Some(BriefEvent::CoderDone {
-                verdict: EventVerdict::Shipped
+            Some(BriefEvent::RoleDone {
+                verdict: EventVerdict::Shipped,
+                ..
             })
         ),
-        "plain Shipped done (no cause sentinel) decodes to vanilla CoderDone"
+        "plain Shipped done (no cause sentinel) decodes to vanilla RoleDone"
     );
 
     let _: () = conn.del(&trace_key).await.expect("cleanup trace");

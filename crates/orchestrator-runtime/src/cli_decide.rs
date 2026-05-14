@@ -1,12 +1,14 @@
 //! Captain `decide` CLI helpers — accept / reject / list briefs parked in
-//! `BriefState::AwaitingCaptainDecision`.
+//! `BriefState::Walking { run_data: RunData::OperatorDecision { .. }, .. }`.
 //!
 //! When the coder runner emits `BriefEvent::CoderDisagreed` (via a Done event
-//! whose `DoneReason.cause == "self_review_disagreed"`), the FSM parks the
-//! brief in `AwaitingCaptainDecision`. The operator resolves it by pushing
-//! one of `BriefEvent::CaptainAccepted` / `BriefEvent::CaptainRejected` onto
-//! the brief's trace stream, where the per-brief lifecycle driver consumes
-//! it and applies the matching FSM transition.
+//! whose `DoneReason.cause == "self_review_disagreed"`), the FSM flips the
+//! coder's `Walking{run_data: Coder{..}}` to
+//! `Walking{run_data: OperatorDecision{disagreements}}` and parks the brief
+//! until captain decide. The operator resolves it by pushing one of
+//! `BriefEvent::CaptainAccepted` / `BriefEvent::CaptainRejected` onto the
+//! brief's trace stream, where the per-brief lifecycle driver consumes it
+//! and applies the matching FSM transition.
 //!
 //! Each helper is one round-trip against Redis: GET `:state`, validate, push
 //! the FSM event with the same envelope shape used by `RedisReaperSink::push_event`
@@ -15,7 +17,7 @@
 
 use crate::{redis_io, Config, Error, Result};
 use orchestrator_types::lifecycle::{BriefEvent, BriefState, BriefStateRecord};
-use orchestrator_types::{Event, EventKind};
+use orchestrator_types::{Event, EventKind, RunData};
 use redis::aio::ConnectionManager;
 use redis::AsyncCommands;
 
@@ -26,16 +28,16 @@ use redis::AsyncCommands;
 pub const DECIDE_AGENT_ID: &str = "captain-cli";
 
 /// Accept a parked disagreement: push `BriefEvent::CaptainAccepted` so the
-/// FSM transitions through the post-coder phase chain (Verifying → Reviewing
-/// → Shipping → Watching) on the work already in the brief workspace.
+/// FSM advances the walker from the coder node to its downstream node(s)
+/// on the work already in the brief workspace.
 ///
 /// # Errors
 ///
 /// Returns `Err(Error::NotFound { kind: "brief", .. })` when no `:state` key
 /// exists for `brief_id`. Returns `Err(Error::Config(..))` when the brief is
-/// not in `AwaitingCaptainDecision` (the captain CLI mis-targeted a live or
-/// terminal brief). Backend / serde failures propagate as `Error::Redis` /
-/// `Error::Json`.
+/// not parked in `Walking { run_data: RunData::OperatorDecision { .. }, .. }`
+/// (the captain CLI mis-targeted a live or terminal brief). Backend / serde
+/// failures propagate as `Error::Redis` / `Error::Json`.
 pub async fn run_accept(cfg: &Config, brief_id: &str) -> Result<()> {
     let mut conn = redis_io::connect(&cfg.redis.url).await?;
     require_parked(&mut conn, brief_id).await?;
@@ -64,9 +66,11 @@ pub async fn run_reject(cfg: &Config, brief_id: &str, reason: &str) -> Result<()
     Ok(())
 }
 
-/// List every brief currently in `AwaitingCaptainDecision`. Emits one JSON
-/// object per line on stdout: `{"brief_id":"…","disagreements":N,"parked_at":"…"}`.
-/// Empty stream when nothing is parked.
+/// List every brief currently parked in
+/// `Walking { run_data: RunData::OperatorDecision { .. }, .. }`. Emits one
+/// JSON object per line on stdout:
+/// `{"brief_id":"…","disagreements":N,"parked_at":"…"}`. Empty stream when
+/// nothing is parked.
 ///
 /// # Errors
 ///
@@ -102,7 +106,13 @@ async fn require_parked(conn: &mut ConnectionManager, brief_id: &str) -> Result<
         });
     };
     let record: BriefStateRecord = serde_json::from_str(&raw)?;
-    if !matches!(record.state, BriefState::AwaitingCaptainDecision { .. }) {
+    if !matches!(
+        record.state,
+        BriefState::Walking {
+            run_data: RunData::OperatorDecision { .. },
+            ..
+        }
+    ) {
         return Err(Error::Config(format!(
             "brief is not parked (state.kind = {})",
             state_kind_label(&record.state)
@@ -156,7 +166,11 @@ async fn list_parked(conn: &mut ConnectionManager) -> Result<Vec<ParkedEntry>> {
         let Ok(record) = serde_json::from_str::<BriefStateRecord>(&raw) else {
             continue;
         };
-        if let BriefState::AwaitingCaptainDecision { disagreements, .. } = &record.state {
+        if let BriefState::Walking {
+            run_data: RunData::OperatorDecision { disagreements },
+            ..
+        } = &record.state
+        {
             out.push(ParkedEntry {
                 brief_id: record.brief_id.0.clone(),
                 disagreements: disagreements.len(),
@@ -167,20 +181,18 @@ async fn list_parked(conn: &mut ConnectionManager) -> Result<Vec<ParkedEntry>> {
     Ok(out)
 }
 
-fn state_kind_label(state: &BriefState) -> &'static str {
+/// Post-collapse: there's no longer a coarse "kind" enum projection on
+/// `BriefState` — for the universal `Walking` variant, the node_id is the
+/// kind in the topology-driven shape. Returns the node_id's underlying
+/// string for `Walking`, and the literal lowercase variant name for the
+/// three terminal-or-initial variants. Returns `String` (not `&'static
+/// str`) because `node_id.0` is an owned string from the topology.
+fn state_kind_label(state: &BriefState) -> String {
     match state {
-        BriefState::Submitted => "submitted",
-        BriefState::Authoring { .. } => "authoring",
-        BriefState::Verifying { .. } => "verifying",
-        BriefState::Reviewing { .. } => "reviewing",
-        BriefState::Reworking { .. } => "reworking",
-        BriefState::Shipping { .. } => "shipping",
-        BriefState::Watching { .. } => "watching",
-        BriefState::Extension { .. } => "extension",
-        BriefState::AwaitingCaptainDecision { .. } => "awaiting_captain_decision",
-        BriefState::Walking { .. } => "walking",
-        BriefState::Shipped => "shipped",
-        BriefState::Failed { .. } => "failed",
+        BriefState::Submitted => "submitted".to_string(),
+        BriefState::Walking { node_id, .. } => node_id.0.clone(),
+        BriefState::Shipped => "shipped".to_string(),
+        BriefState::Failed { .. } => "failed".to_string(),
     }
 }
 

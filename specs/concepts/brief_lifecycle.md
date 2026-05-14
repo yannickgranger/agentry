@@ -1,28 +1,35 @@
 # Brief lifecycle
 
-> Status: **ratified**. Code landing PR: L.1 (EPIC #246). The pure FSM
-> types and `handle` transition function live in
-> `crates/orchestrator-types/src/lifecycle.rs`. Daemon wiring,
+> Status: **ratified, post-#495-beta-b**. The phase-enum FSM has been
+> collapsed to a generic topology walker. The pure FSM types and
+> `handle` transition function live in
+> `crates/orchestrator-types/src/lifecycle.rs`. Daemon wiring, the
 > projection on Redis streams, and the persisted state-stream substrate
-> land in L.2 under `specs/concepts/brief_state_stream.md`.
+> live alongside this spec in `specs/concepts/brief_state_stream.md`.
 
 The bounded context that owns *the position of a brief inside its
 end-to-end shipping pipeline*. A brief is a single record that travels
-from submission, through coding, acceptance verification, review,
-shipping, CI watch, and finally to one of two terminals. The lifecycle
-captures only what is *observable about the brief itself* — agent
-identities, retry counters, the PR number once one exists, the head
-SHA being watched. Per-agent execution detail (token usage, transcript
-paths, watchdog signals) is not part of this concept; it lives in the
-agent contract and event streams.
+from submission, through whatever per-team topology the operator
+dispatched it into, to one of two terminals. The lifecycle captures
+only what is *observable about the brief itself* — the topology node
+whose role most recently reported, the accumulated multiset of
+sibling verdicts that drives gate decisions, the retry counter, the
+per-node run-data payload (a coder's agent id while it runs, the
+PR number/head SHA once a shipper produces one, a coder-flagged
+disagreement payload when a brief is parked for captain decide).
+Per-agent execution detail (token usage, transcript paths, watchdog
+signals) is not part of this concept; it lives in the agent contract
+and event streams.
 
-The FSM is a pure transition table: `handle(state, event) -> new
-state`. Wall-clock time, persistence, agent dispatch, and human
-notification are layered by the daemon caller. Keeping the table free
-of I/O is what makes the entire flow replayable: the same event log
-projected against the same starting state will always produce the
-same sequence of `BriefStateRecord`s. The L.2 brief introduces an
-`EventSource` and `StateProjector` that consume this FSM.
+The FSM is a pure transition table: `handle(state, event,
+walk_config, entry_node) -> new_state`. Wall-clock time, persistence,
+agent dispatch, and human notification are layered by the daemon
+caller. Keeping the table free of I/O is what makes the entire flow
+replayable: the same event log projected against the same starting
+state, the same `WalkConfig`, and the same `entry_node` will always
+produce the same sequence of `BriefStateRecord`s. The L.2 brief
+introduces an `EventSource` and `StateProjector` that consume this
+FSM.
 
 ## BriefStateRecord
 
@@ -37,73 +44,182 @@ in-memory state.
 
 ## BriefState
 
-The position a brief occupies in the lifecycle. Sum type with ten
-variants: one entry state (`Submitted`), seven non-terminal working
-states (`Authoring`, `Verifying`, `Reviewing`, `Reworking`,
-`Shipping`, `Watching`, `Extension`), and two terminals (`Shipped`,
-`Failed`). Non-terminal variants carry their `RetryBudget`; the two
-terminals carry only the outcome. `Authoring` additionally pins the
-`agent_id` that started the run and the `started_at` timestamp; the
-shipping/watching states carry the gitea `pr_number` and the `head_sha`
-CI is being polled against. `Extension` is a forward-compat slot for
-team-specific intermediate states the core FSM does not need to know
-about (e.g. a planner's child-fanout phase) — only the universal
-aborts apply to it; all other events return `InvalidTransition`.
+The position a brief occupies in the lifecycle. Sum type with **four**
+variants: one entry state (`Submitted`), one workhorse non-terminal
+state (`Walking`), and two terminals (`Shipped`, `Failed`).
 
-`Verifying` and `Reviewing` additionally carry three evidence-shape
-fields landed in 396b-2: `received` (a `BTreeMap<String, EventVerdict>`
-of `role_name` → verdict, accumulating sibling reports as they arrive),
-`expected` (the list of `role_name` strings the gate waits on,
-populated from the team topology at phase entry by
-`build_phase_gates`), and `policy` (a `GatePolicy` variant indicating
-the fan-in rule). Per 396b-3 `handle()` transitions out of the phase
-only when the gate's policy declares Pass over the accumulated
-`received` multiset; transitions to Reworking on soft fails
-(Failed/ReworkNeeded), to Failed{AcceptanceFailed} on hard fails
-(Rejected/Escalated). Each new sibling verdict is folded into
-`received` and `handle()` calls
-`decide(received, &GateConfig{expected, policy})` to pick Wait /
-Pass / Rework / Reject — the FSM is now parallel-aware and no
-sibling's report is silently dropped.
+`Walking` is the only non-terminal state after the collapse. It carries:
+
+- `node_id: NodeId` — the role-name of the topology node whose most
+  recent `RoleDone` shaped the current state. This doubles as the
+  late-event fence reference: the lifecycle driver detects late
+  events (a `RoleDone` for a node that is strictly upstream of
+  `node_id` in the topology) by comparing the reporter to this field
+  via `is_late_event`.
+- `evidence: BTreeMap<NodeId, EventVerdict>` — the accumulated
+  multiset of per-node verdicts across the entire walk. Every
+  `RoleDone` folds its verdict into this map; `advance_walker`
+  consults it on each step to decide whether each downstream node's
+  gate (per `WalkConfig.node_configs[d]`) is satisfied by the
+  evidence collected so far.
+- `run_data: RunData` — the per-node variant payload. See `RunData`
+  below for the variants and their lifetimes.
+- `retry: RetryBudget` — the brief's retry counter. Rework-class
+  outcomes (soft fails, CI failure) call `increment_or_fail` to
+  bump `attempt` and either rebuild a fresh `Walking` at the entry
+  node or short-circuit to `Failed{BudgetExhausted}`.
+
+`Shipped` and `Failed` are the two terminals. `Shipped` carries no
+payload — every shipped brief is a shipped brief. `Failed` carries a
+`Reason` so dashboards can render a typed badge per failure mode
+without parsing prose.
+
+The legacy phase-specific variants (`Authoring`, `Verifying`,
+`Reviewing`, `Reworking`, `Shipping`, `Watching`, `Extension`,
+`AwaitingCaptainDecision`) were deleted in beta-b. Phase names are
+now metadata on the topology (the role-name itself), not enum
+variants. See the migration appendix at the bottom of this document.
+
+## RunData
+
+Per-node run-data carried by `BriefState::Walking` and (optionally)
+by `BriefEvent::RoleDone`. Five variants tagged `kind` + snake_case:
+
+- `none` — stateless node (verifier, reviewer, ci-watcher mid-poll).
+- `coder { agent_id }` — coder container is alive at the current
+  node. Set on `Submitted + CoderStarted` (entry to `Walking`) and
+  on rework re-spawn (`Walking + CoderStarted` at the entry node).
+- `pr_tracking { pr_number, head_sha }` — set by the shipper's
+  `RoleDone` payload; the walker propagates it forward across the
+  ci-watcher node so rebase plumbing can update `head_sha` via
+  `Rebased { new_head_sha }`.
+- `operator_decision { disagreements }` — coder reported a
+  deliberate disagreement (`self_review_disagreed`) and the brief
+  is parked waiting for `CaptainAccepted` or `CaptainRejected`. This
+  is the post-collapse home of what the legacy FSM called the
+  `AwaitingCaptainDecision` BriefState variant — it's a RunData
+  discriminant now, not a top-level state.
+- `extension { data: serde_json::Value }` — free-form JSON escape
+  hatch for downstream-extension nodes. `Eq` is intentionally not
+  derived on `RunData` because the `Extension` variant carries
+  `serde_json::Value`, which blocks structural equality.
+
+Helper accessors on `RunData` (`agent_id`, `pr_number`, `head_sha`,
+`disagreements`) yield `Option<&T>` for the relevant variant so call
+sites stay type-safe without matching exhaustively.
+
+- depends on: DisagreementSummary
 
 ## BriefEvent
 
-The discrete inputs the FSM accepts. One variant per externally
-observable signal: agent-emitted (`CoderStarted`, `CoderDone`,
-`AcVerifierDone`, `ReviewerDone`, `ShipperDone`), gitea-poller-emitted
-(`CiResult`, `RebaseStarted`, `Rebased`), and human/operator-emitted
-(`RetryRequested`, `AbortRequested`). `BudgetExhausted` is a
-self-emitted event the daemon raises when external bookkeeping (token
-spend, wall-clock) crosses a `Budget` cap; the FSM treats it as just
-another input so the budget enforcement layer stays decoupled. Each
-variant carries the minimal data needed to compute the next state —
-verdicts, PR numbers, head SHAs, actor identities.
+The discrete inputs the FSM accepts. Tagged `kind` + snake_case.
+Each variant carries the minimal data needed to compute the next
+state.
 
-`AcVerifierDone` and `ReviewerDone` additionally carry the originating
-`role_name` (the full role name like `"ac-verifier-claude-agentry"` or
-`"reviewer-mechanical-agentry"`) so the planned evidence multiset
-(396b-2) can key by sibling and distinguish reports from a fan-out (e.g.
-the three `ac-verifier-*` roles or the two `reviewer-*` roles under
-`agentry-self-host-v0`). Other variants are unchanged. The `role_name`
-field is populated by `translate_trace_entry` in the runtime adapter at
-the projector boundary — the same site that already maps each agent's
-spawned role onto an `EventKind`-shaped `BriefEvent`.
+The events split into three groups:
+
+**Specialised events** that the FSM still routes through dedicated
+arms in `handle()`:
+
+- `CoderStarted { agent_id, role_name, started_at }` — coder
+  container spawned. From `Submitted` it transitions the brief into
+  `Walking` at the entry node (`NodeId(role_name)`) with
+  `RunData::Coder { agent_id }`; from `Walking` at the entry node
+  it is the rework re-spawn (reset evidence + run_data, preserve
+  retry).
+- `CoderDoneNoOp { reason }` — coder reported terminal `Shipped`
+  but produced no diff against base (acceptance passed against work
+  already on the base branch). Short-circuits `Walking{coder} →
+  Shipped`, bypassing every downstream node. Only legal at the
+  entry coder node.
+- `CoderDisagreed { disagreements }` — coder's self-review found
+  unapplied verbs but every miss carries `applied_form` +
+  `rationale` (deliberate disagreement, not failure). Flips the
+  coder's `Walking{run_data: Coder{..}}` to
+  `Walking{run_data: OperatorDecision{disagreements}}`; `node_id`,
+  `evidence`, and `retry` are preserved. The brief is parked until
+  `CaptainAccepted` / `CaptainRejected` fires.
+- `CiResult { state: CiState, head_sha }` — CI watcher reports
+  success / failure / pending. Routed through its own arm in
+  `handle()` because the rebase/CI loop has a distinct retry
+  policy (failure rewinds to the entry node and bumps `retry`;
+  pending stays).
+- `RebaseStarted` — no-op stay (observability marker for the
+  state log).
+- `Rebased { new_head_sha }` — when the current `run_data` is
+  `PrTracking`, updates `head_sha`; otherwise no-op.
+- `CaptainAccepted` — operator endorses the disagreed-form output.
+  Treats the coder's contribution as `EventVerdict::Shipped` in
+  `evidence` and calls `advance_walker` so the brief continues
+  downstream as if the coder had shipped normally.
+- `CaptainRejected { reason }` — operator rejects. Fails the brief
+  with `Reason::CaptainRejectedDisagreement { reason }`.
+- `PreflightSmellDetected { smell_id, criterion, baseline }` —
+  preflight-criterion-agentry detected a blocking smell heuristic
+  on the brief's `success_criteria`. Only legal at the entry coder
+  node; fails the brief with `Reason::PreflightSmell`.
+
+**Universal events** that are handled at the top of `handle()`
+against every non-terminal state:
+
+- `AbortRequested { actor, message }` — fails the brief with
+  `Reason::AbortRequested { actor, message }` from any non-terminal
+  state.
+- `BudgetExhausted` — fails the brief with
+  `Reason::BudgetExhausted` from any non-terminal state. Emitted
+  by the wall-clock reaper and by `increment_or_fail` callers.
+
+**The generic per-node completion event**:
+
+- `RoleDone { node_id, verdict, findings, run_data }` — the single
+  generic role-completion event after the collapse. The translator
+  emits this for every `EventKind::Done` regardless of role family
+  (coder, ac-verifier, reviewer, shipper, ci-watcher). Carries the
+  reporter node id, its verdict, any review findings the role
+  produced, and an optional `RunData` payload. The shipper's emit
+  carries `Some(RunData::PrTracking { pr_number, head_sha })` so
+  the walker's next state (the ci-watcher node) inherits PR
+  identifiers; other roles emit `run_data: None`.
+
+The coder's `self_review_disagreed` cause path now flows through
+`CoderDisagreed → Walking { run_data: OperatorDecision }`. Pre-collapse
+this routed through `Authoring → AwaitingCaptainDecision`.
+
+`RetryRequested { actor, reason }` is handled on the terminal
+`Failed` state and transitions back to `Submitted` (operator-driven
+retry of a failed brief, re-running the whole walk).
 
 ## Reason
 
-Why a brief landed in `BriefState::Failed`. Tagged enum with five
-variants: `BudgetExhausted` (retry counter exceeded `RetryBudget.max`,
-or the daemon raised `BudgetExhausted` from a token/wall-clock cap),
-`AbortRequested` (a human or supervising agent issued an abort —
-carries `actor` and `message` so the dashboard surfaces who and why),
-`AcceptanceFailed` (a quality gate — coder, ac-verifier, or reviewer —
-returned a non-rework failure verdict that does not warrant retry),
-`PreflightSmell` (preflight-criterion-agentry's smell heuristics fired
-on the brief's `success_criteria` — see below), and `DaemonError` (an
-internal substrate failure with a free-text `detail` field; reserved
-for the daemon's own bookkeeping mistakes, not for agent-side
-problems). The discriminator is `kind` so dashboards can render a
-typed badge per failure mode without parsing prose.
+Why a brief landed in `BriefState::Failed`. Tagged enum (discriminator
+`kind`). Variants:
+
+- `BudgetExhausted` — retry counter exceeded `RetryBudget.max`, or
+  the daemon raised `BudgetExhausted` from a token / wall-clock cap.
+- `AbortRequested { actor, message }` — a human or supervising
+  agent issued an abort.
+- `AcceptanceFailed { detail }` — a gate (per `WalkConfig` per-node
+  `policy`) returned a non-rework hard failure verdict
+  (`Rejected` / `Escalated`). Details carry the reporting node and
+  the verdict family.
+- `PreflightSmell` — `preflight-criterion-agentry`'s smell
+  heuristics fired on the brief's `success_criteria`; see below.
+- `DaemonError { detail }` — an internal substrate failure. The
+  lifecycle driver also synthesises this on `InvalidTransition`
+  (every (state, event) pair either transitions or fails the brief
+  — silent drops are forbidden).
+- `DaemonRestartedDuringExecution` — the daemon's boot-time resume
+  scan found a brief in a non-terminal `:state` whose container is
+  gone (or whose reattach setup failed).
+- `CaptainRejectedDisagreement { reason }` — captain explicitly
+  rejected a coder-flagged disagreement via `captain decide reject`.
+  The reason carries the captain's prose explanation.
+- `TopologyInvalid { detail }` — **NEW in beta-b.** Fires when
+  `lifecycle_driver::derive_entry_node` cannot identify a unique
+  topology root (zero or more than one node has empty
+  `expected_inbound`). A topology-data bug — the brief fails with
+  this so the operator fixes the topology rather than the daemon
+  silently routing through an arbitrary node.
 
 `PreflightSmell` fires when preflight-criterion-agentry detects that
 the operator-authored `success_criteria` matches one of the blocking
@@ -126,76 +242,76 @@ surface a typed badge per smell-class without re-parsing prose.
 
 ## GatePolicy
 
-The rule applied at a phase fan-in to fold a multiset of role verdicts
-into a single decision. Three variants: `AllMustPass` — every role-kind
-in `expected_roles` must report `Shipped`; any other verdict triggers
-`Rework` (soft fails) or `Reject` (hard fails). `FailFast` — the same
-short-circuit verdicts but evaluated as evidence arrives, without
-waiting for siblings; the first non-`Shipped` verdict transitions the
-brief immediately. `Majority { threshold_pct }` — the `Shipped` count
-must reach the threshold percentage of expected roles to `Pass`; soft
-fails after the threshold is unreachable trigger `Rework`; hard fails
-always `Reject`.
+The rule applied at a node fan-in to fold a multiset of inbound
+verdicts into a single `Decide` outcome. Three variants:
+
+- `AllMustPass` — every entry in `expected_roles` must report
+  `Shipped`; any other verdict triggers `Rework` (soft fails:
+  `Failed` / `ReworkNeeded`) or `Reject` (hard fails: `Rejected` /
+  `Escalated`).
+- `FailFast` — same short-circuit verdicts but evaluated as
+  evidence arrives, without waiting for siblings; the first
+  non-`Shipped` verdict transitions the brief immediately.
+- `Majority { threshold_pct }` — the `Shipped` count must reach
+  the threshold percentage of expected roles to `Pass`; soft fails
+  after the threshold is unreachable trigger `Rework`; hard fails
+  always `Reject`.
 
 ## GateConfig
 
-Pairs a `GatePolicy` with the list of role-kinds the gate waits on.
-`expected_roles` enumerates the role-kinds (the output of
-`lifecycle::role_kind`) that must appear in the received verdict
-multiset for the gate to reach a terminal `Pass` outcome. The shape is
-generic — the verifier phase under `agentry-self-host-v0` carries the
-three `ac-verifier-*` kinds, but `GateConfig` accepts any list.
+Pairs a `GatePolicy` with the list of role-names the gate waits on.
+`expected_roles` enumerates the role-name strings (the `.0` of each
+`NodeId` in the per-node `expected_inbound`) that must appear in the
+evidence multiset for the gate to reach a terminal `Pass` outcome.
+The shape is generic — `agentry-self-host-v0`'s verifier fan-in
+carries three `ac-verifier-*` names, but `GateConfig` accepts any
+list. Constructed on the fly by `advance_walker` from each downstream
+node's `NodeConfig` (it projects the per-node `expected_inbound: Vec<NodeId>`
+into `expected_roles: Vec<String>`).
 
 - depends on: GatePolicy
 
-## PhaseGates
-
-Per-brief container for the verifying-phase and reviewing-phase
-`GateConfig` values. The daemon will populate this from team topology
-at brief dispatch time (landed in 396b) so each brief carries the gate
-shape its topology fans out — three verifiers and two reviewers under
-`agentry-self-host-v0`, different counts and policies under other
-topologies.
-
-- depends on: GateConfig
-
 ## Decide
 
-The return value of the pure `decide` function that folds a phase's
+The return value of the pure `decide` function that folds a node's
 collected verdicts against its `GateConfig`. Four variants: `Wait`
-(collect more evidence), `Pass` (gate satisfied — advance), `Rework`
-(soft failure — re-author the brief), `Reject` (hard failure —
-terminate the brief). `Decide` is a transient return value; it is not
-persisted, not serialized, and does not appear in `BriefStateRecord`.
+(collect more evidence), `Pass` (gate satisfied — advance to this
+downstream), `Rework { detail }` (soft failure — rewind to the
+entry node and bump retry), `Reject { detail }` (hard failure —
+fail the brief with `Reason::AcceptanceFailed`). `Decide` is a
+transient return value; it is not persisted, not serialized, and
+does not appear in `BriefStateRecord`.
+
+## ReworkTarget
+
+Pre-collapse: enum signalling which role re-runs when the FSM enters
+`Reworking` (`Coder` re-spawns; `Reviewer` re-runs the deterministic
+fences against the unchanged diff). Post-collapse the rework loop is
+implicit in `WalkConfig.adjacency` — soft-fail outcomes rewind the
+walker to the entry node and bump `retry`, so the topology root is
+the only rework target. The enum is retained in
+`crates/orchestrator-types/src/lifecycle.rs` as a no-longer-consumed
+type pending follow-up cleanup; nothing in `handle()` reads it.
 
 ## CiState
 
 The CI status carried by a `BriefEvent::CiResult`. Three variants —
 `Pending`, `Success`, `Failed` — matching the gitea poller's coarse
-view. `Success` transitions a watching brief to `Shipped`; `Failed`
-kicks off a rework loop or short-circuits to `BudgetExhausted`;
-`Pending` is a no-op that keeps the brief in `Watching` so the
-projector still records the poll for observability.
-
-## ReworkTarget
-
-Which role re-runs when the FSM enters `Reworking`. `Coder` re-spawns
-the coder against the same brief with the latest blocker findings
-attached; `Reviewer` re-runs the deterministic review fences against
-the unchanged diff (used when only the review-side judgement was the
-problem, not the code itself). The rework loop dispatched by the daemon
-reads this field to pick which role to fire next.
+view. `Success` transitions a `Walking` brief to terminal `Shipped`;
+`Failed` rewinds to the entry node and bumps `retry` (or
+short-circuits to `BudgetExhausted` when the bump would breach the
+cap); `Pending` is a no-op that keeps the brief at its current
+`Walking` state so the projector still records the poll for
+observability.
 
 ## NodeConfig
 
-Beta-a (#495 part 1) precursor: per-node walker config carrying the
-node's `NodeClass`, the deduplicated upstream `NodeId`s that must
-report before the node is considered ready (`expected_inbound`), and
-the `GatePolicy` used to fold inbound verdicts. Lands alongside the
-legacy `PhaseGates` shape so reviewers see the new per-node form next
-to the legacy per-phase form. Beta-b (#495 part 2) deletes
-`PhaseGates` and routes the FSM through the walker built from these
-configs.
+Per-node walker config carrying the node's `NodeClass`, the
+deduplicated upstream `NodeId`s that must report before the node is
+considered ready (`expected_inbound`), and the `GatePolicy` used to
+fold inbound verdicts. Loaded-bearing post-collapse: the walker reads
+this on every advance step to construct the per-node `GateConfig`
+fed to `decide()`.
 
 - depends on: NodeClass
 - depends on: NodeId
@@ -203,31 +319,26 @@ configs.
 
 ## WalkConfig
 
-Beta-a precursor: adjacency map plus per-node configs for the
-lifecycle DAG walker. Built from `TeamTopology` by the runtime helper
-`build_walk_config`, which groups `MessageEdge`s by `from` to populate
-adjacency and walks `roles` cross-referenced against `node_classes` to
-populate `node_configs`. Nothing in the FSM consumes this in beta-a;
-beta-b's walker reads it.
+Adjacency map plus per-node configs for the lifecycle DAG walker.
+Built from `TeamTopology` by the runtime helper `build_walk_config`
+(in `crates/orchestrator-runtime/src/lifecycle_driver.rs`), which
+groups `MessageEdge`s by `from` to populate adjacency and walks
+`team.roles` cross-referenced against `team.node_classes` to populate
+`node_configs`. The per-edge `GatePolicy` (`MessageEdge.gate_policy`)
+overrides the default `AllMustPass` when the topology declares one.
+
+Load-bearing post-collapse: every `handle()` call consumes a
+`&WalkConfig`. The projector builds it once per brief at dispatch
+(or reattach) time and threads it on every step.
+
+`derive_entry_node(walk_config) -> Result<NodeId, Reason>` computes
+the topology root — the unique node whose `expected_inbound` is
+empty. Zero roots or more than one are surfaced as
+`Reason::TopologyInvalid` so the brief fails cleanly rather than
+routing through an arbitrary node.
 
 - depends on: NodeId
 - depends on: NodeConfig
-
-## RunData
-
-Beta-a precursor: per-node run-data carried through the lifecycle DAG
-walker. Five variants tagged by `kind`: `none` (no per-node state),
-`coder { agent_id }` (coder-spawn handle), `pr_tracking { pr_number,
-head_sha }` (post-shipper PR locator), `operator_decision {
-disagreements }` (captain-decision payload mirroring the legacy
-`AwaitingCaptainDecision`), and `extension { data }` (free-form JSON
-escape hatch for downstream-extension nodes). `Eq` is intentionally
-not derived: the `extension` variant carries `serde_json::Value`,
-which blocks structural equality. Carried by `BriefState::Walking`
-(beta-a parks the variant unreachable from `handle()`) and by
-`BriefEvent::RoleDone`.
-
-- depends on: DisagreementSummary
 
 ## InvalidTransition
 
@@ -236,7 +347,8 @@ Carries an owned snapshot of both the offending state and the event
 that triggered the rejection so the daemon can log the pair without
 re-borrowing the originals. Marked `Clone + PartialEq` so tests can
 compare the rejection shape and the daemon can attach the value to a
-trace event.
+trace event. Boxed at the `Result` boundary because `BriefState +
+BriefEvent` cross clippy's `result_large_err` threshold.
 
 ## BriefInventory
 
@@ -284,18 +396,32 @@ shells out via `tokio::process::Command`.
   out roles in parallel. The structural fence is: every (state, event)
   pair either transitions or fails the brief; there is no third path.
 
-- **Empty-phase auto-skip.** When a phase's `expected_roles` is empty
-  (the topology has no role of that kind, e.g. agentry-bugfix-v0 with
-  no ac-verifier), the FSM transitions straight through that phase
-  rather than stalling on a never-arriving event. The Authoring →
-  Verifying transition consults `decide()` on the proposed Verifying
-  state's evidence (empty received, gate config from gates.verifying)
-  and short-circuits to Reviewing if Pass; same chained logic from
-  Verifying → Reviewing skips to Shipping. **WHY:** the FSM phase enum
-  is denser than the topology DAG — without auto-skip, leaner
-  topologies fail with `DaemonError` because the phase has no event
-  source. Pattern 3 (#397) collapses the phase enum entirely; this
-  auto-skip is the tactical bridge.
+- **Late-event fence.** A `RoleDone` for a node that is strictly
+  upstream of the walker's current `node_id` (in the
+  `WalkConfig.adjacency` forward direction) is a "late event". The
+  FSM returns the state unchanged on these; the lifecycle driver
+  detects the no-op transition via `is_late_event` and emits a
+  `tracing::warn` rather than propagating an `InvalidTransition`.
+  Replaces the legacy "first matching event wins" silent-drop
+  behaviour with explicit observability.
+
+- **Topology root is derived, not configured.** The unique
+  entry-vertex `NodeId` is computed once by
+  `lifecycle_driver::derive_entry_node` from `WalkConfig` at
+  dispatch/reattach time and threaded into every `handle()` call.
+  Topologies with zero or multiple roots fail the brief with
+  `Reason::TopologyInvalid` — there is no "first node by hash order"
+  fallback.
+
+- **Empty-downstream sink.** A node with no entries in
+  `WalkConfig.adjacency` is a terminal sink: when a `RoleDone` for
+  it folds into `evidence` and `advance_walker` finds no
+  downstreams, the brief transitions to terminal `Shipped`. This
+  replaces the per-phase auto-skip that the legacy FSM used to
+  bridge leaner topologies (e.g. `agentry-bugfix-v0` with no
+  verifier); now leaner topologies just have fewer DAG nodes, and
+  the walker reaches the sink correctly without any phase-enum-
+  specific short-circuit.
 
 #### Wall-clock reaper transition (not enforced by graph-specs)
 
@@ -331,15 +457,15 @@ The spawner emits the full role name on each agent's spawn event
 translator's `role_by_agent` memo must store the SHORT kind that the
 `Done`-branch match arms compare against — otherwise the lookup
 returns the full name, no arm fires, and the FSM never advances out
-of `Authoring`. The mapping table:
+of the entry node. The mapping table:
 
 | Spawned role-name shape           | Short kind     | Done-branch BriefEvent                              |
 |-----------------------------------|----------------|-----------------------------------------------------|
-| `coder-*`                         | `coder`        | `CoderStarted` (on spawn), `CoderDone` (on done)    |
-| `ac-verifier-*`                   | `ac-verifier`  | `AcVerifierDone`                                    |
-| `verifier-*`                      | `verifier`     | `AcVerifierDone`                                    |
-| `reviewer-*`                      | `reviewer`     | `ReviewerDone { findings: [] }`                     |
-| `shipper-agentry` (exact)         | `shipper`      | `ShipperDone`                                       |
+| `coder-*`                         | `coder`        | `CoderStarted` (on spawn), `RoleDone` (on done)     |
+| `ac-verifier-*`                   | `ac-verifier`  | `RoleDone`                                          |
+| `verifier-*`                      | `verifier`     | `RoleDone`                                          |
+| `reviewer-*`                      | `reviewer`     | `RoleDone { findings: [...] }`                      |
+| `shipper-agentry` (exact)         | `shipper`      | `RoleDone { run_data: Some(PrTracking{..}) }`       |
 | `ci-watcher-agentry` (exact)      | `ci-watcher`   | `CiResult { state: <verdict→CiState> }`             |
 | `preflight-criterion-*`           | `preflight`    | (none — preflight emits its own typed BriefEvent)   |
 
@@ -347,7 +473,8 @@ CI-watcher verdict mapping: `EventVerdict::Shipped → CiState::Success`,
 `EventVerdict::Failed → CiState::Failed`, all other verdicts (`Escalated`,
 `ReworkNeeded`, `Rejected`) → `CiState::Pending`. The watcher does not
 normally emit the latter three on its happy path; the Pending fallback
-keeps the brief in `Watching` so the next poll tick can advance it.
+keeps the brief at the ci-watcher `Walking` node so the next poll tick
+can advance it.
 
 Unrecognised role names are NOT memoized — the `Done` lookup falls
 through to the catch-all (no `BriefEvent` emitted), preserving the
@@ -356,78 +483,89 @@ mis-classifying a future role family.
 
 #### FSM transition flow (not enforced by graph-specs)
 
+After the collapse the FSM is no longer a fixed phase chain. The
+shape of the walk is whatever the brief's `WalkConfig` adjacency
+declares. The illustrative `agentry-self-host-v0` happy path:
+
 ```
 Submitted
-  → Authoring   (CoderStarted)
-  → Verifying   (CoderDone Shipped)
-  → Reviewing   (AcVerifierDone Shipped)
-  → Shipping    (ReviewerDone Shipped)
-  → Watching    (ShipperDone)
-  → Shipped     (CiResult Success)
+  → Walking{coder, run_data: Coder}          (CoderStarted)
+  → Walking{verifier_n, run_data: None}      (RoleDone Shipped from coder, AllMustPass on ac-verifier-*)
+  → Walking{reviewer_n, run_data: None}      (RoleDone Shipped from each ac-verifier, gate Pass)
+  → Walking{shipper, run_data: PrTracking}   (RoleDone Shipped from reviewer-*, gate Pass — shipper's RoleDone carries PrTracking)
+  → Walking{ci-watcher, run_data: PrTracking}(advance_walker forwards PrTracking)
+  → Shipped                                  (CiResult Success)
 ```
 
-`Watching` is a self-loop on `CiResult Pending` (the gitea poller
-is still waiting on green). `Watching → Reworking` triggers on
-`CiResult Failed`, bumping the retry budget. `Authoring → Shipped`
-short-circuits via `CoderDoneNoOp` when the coder's acceptance check
-passes against an empty diff (no work to verify, review, or ship).
+`Walking{ci-watcher}` is a self-loop on `CiResult Pending`.
+`Walking{ci-watcher} + CiResult Failed` rewinds to the entry coder
+node and bumps `retry` (or short-circuits to `BudgetExhausted`).
+`Walking{coder, run_data: Coder} + CoderDoneNoOp` short-circuits
+straight to terminal `Shipped`.
 
-#### Gate policy and evidence accumulation (planned — #396)
+The "phases" the legacy FSM hard-coded (`Authoring`, `Verifying`,
+`Reviewing`, `Shipping`, `Watching`) survive only as role-name
+prefixes inside `WalkConfig.node_configs` keys. A topology that
+declares no `verifier-*` role simply has no verifier nodes in its
+adjacency, and the walker advances coder → reviewer directly.
 
-The current FSM transitions on the first matching event for each phase:
-the first `AcVerifierDone` advances `Verifying → Reviewing`, the first
-`ReviewerDone` advances `Reviewing → Shipping`. Under the
-`agentry-self-host-v0` topology — which fans out three `ac-verifier-*`
-roles in the verifier phase and two `reviewer-*` roles in the reviewer
-phase — this silently drops the 2nd and 3rd verifiers' reports and the
-2nd reviewer's report. It looks like an observability bug (the
-verdicts never reach the dashboard) but it is a correctness bug: a
-brief that the first verifier waved through can have a hard `Rejected`
-sitting in a sibling verifier's stdout that the FSM never sees.
+#### F6 escalation — coder disagreement → captain decide
 
-#396a (this brief) lands the additive precursor: the `GatePolicy`,
-`GateConfig`, `PhaseGates`, and `Decide` types plus the pure
-`decide(received, gate) -> Decide` function. No behavior change yet —
-`handle()` and `BriefState` are untouched, the new types are not
-threaded anywhere, the existing tests in `crates/orchestrator-types/
-tests/lifecycle.rs` continue to pass without edits.
+When the coder's self-review reports `all_applied=false` but every
+miss carries `applied_form` + `rationale` (deliberate disagreement,
+not failure), the daemon's trace translator detects the
+`cause = "self_review_disagreed"` payload on the coder's `Done`
+event and emits `BriefEvent::CoderDisagreed { disagreements }`.
 
-#396b will migrate `BriefState::Verifying` and `BriefState::Reviewing`
-to carry the received-verdict multiset (`BTreeMap<String, EventVerdict>`)
-and the per-phase `GateConfig`. `handle()` will fold each new
-`AcVerifierDone` / `ReviewerDone` into the multiset and call `decide`;
-the FSM only transitions out of the phase when `decide` returns
-`Pass`, `Rework`, or `Reject`. The lifecycle driver will fail the
-brief on `InvalidTransition` rather than silently swallowing
-out-of-state events — closing the silent-drop bug at both layers.
+`handle()`'s CoderDisagreed arm flips the coder node's `run_data`:
 
-396b-1 has landed the `BriefEvent::AcVerifierDone` /
-`BriefEvent::ReviewerDone` `role_name` field as the multiset-key
-prerequisite — `handle()` still uses the existing serial-first-event
-semantics and pattern-matches the new field with `..` so behavior is
-unchanged. 396b-2 will land the `BriefState` evidence shape and the
-3-arg `handle()` that consumes `role_name` to key the multiset.
+```text
+Walking { node_id: coder_node,
+          evidence,
+          run_data: RunData::Coder { agent_id },
+          retry }
+    + CoderDisagreed { disagreements }
+=>
+Walking { node_id: coder_node,
+          evidence,                      // preserved
+          run_data: RunData::OperatorDecision { disagreements },
+          retry }                        // preserved
+```
 
-396b-2 has landed the `BriefState` evidence shape (`received` /
-`expected` / `policy` on `Verifying` and `Reviewing`), the third
-`&PhaseGates` argument to `handle()`, and the daemon's
-`build_phase_gates(team)` projection that walks `team.roles` to derive
-each phase's `expected_roles` list (verifier-kind roles → verifying
-gate, reviewer-kind roles → reviewing gate). Policy is currently
-hardcoded to `AllMustPass` for both phases — Pattern 3 (#397) will
-lift this to per-edge config in topology JSON. The transition logic in
-`handle()` is still serial-first-event; 396b-3 swaps that for
-evidence-based gating via `decide()`.
+The brief is now parked indefinitely — no timeout, no automatic
+retry — waiting for an explicit captain decision. `node_id`,
+`evidence`, and `retry` are all preserved so when the captain
+accepts, the walk can resume from where the coder left off.
 
-396b-3 lands the behavior change: `handle()` Verifying and Reviewing
-arms accumulate `received` verdicts and call `decide()` to determine
-Wait/Pass/Rework/Reject; `lifecycle_driver` fails the brief on
-`InvalidTransition`. With this slice merged, the
-`agentry-self-host-v0` ensemble (3 ac-verifiers + 2 reviewers under
-`AllMustPass`) is correct: every sibling's verdict is captured, no
-Failed report is silently dropped. Pattern 3 (#397) lifts the
-hardcoded `AllMustPass` policy to per-edge config in the topology
-JSON.
+`captain decide accept <brief_id>` pushes `BriefEvent::CaptainAccepted`
+onto the brief's trace stream; the FSM's CaptainAccepted arm
+records the coder's contribution as `EventVerdict::Shipped` in
+`evidence` and calls `advance_walker` so the brief proceeds to the
+post-coder downstream nodes using the work already in the brief
+workspace, exactly as if the coder had emitted the literal verb.
+The `run_data` resets to `None` on the next node (the agent_id is
+no longer known — the operator-decision park is post-coder-exit).
+
+`captain decide reject <brief_id> --reason '...'` pushes
+`BriefEvent::CaptainRejected { reason }`; the FSM fails the brief
+with `Reason::CaptainRejectedDisagreement { reason }`.
+
+`captain decide list` shows currently parked briefs as one JSON
+object per line, `{"brief_id":"…","disagreements":N,"parked_at":"…"}`.
+The captain CLI identifies parked briefs by scanning `:state` records
+for the `Walking{run_data: OperatorDecision{..}}` shape — the
+post-collapse home of what was previously the
+`BriefState::AwaitingCaptainDecision` variant.
+
+All three subcommands push their event onto
+`agentry:brief:<id>:trace` with `agent` set to `captain-cli`, where
+the per-brief lifecycle driver consumes it like any other FSM event.
+
+The dashboard surfaces parked briefs in the standard in-flight list
+with a prominent AWAITING CAPTAIN DECISION badge and the
+disagreements rendered inline (verb, what the coder did instead,
+rationale). The badge derives from the `run_data: OperatorDecision`
+shape, not from a dedicated BriefState variant.
 
 #### Operator abort (not enforced by graph-specs)
 
@@ -480,20 +618,23 @@ exposed on `ResumeReport`:
 - **Live container, reattach OK** → `kept_alive`. The daemon re-spawns
   `lifecycle_driver::projector_task` for the brief: it reads the brief
   body from `agentry:brief:{id}:body`, fetches the team topology via
-  `redis_io::fetch_team`, builds the per-phase gates with
-  `lifecycle_driver::build_phase_gates`, and hands the resulting
+  `redis_io::fetch_team`, builds the `WalkConfig` with
+  `lifecycle_driver::build_walk_config`, derives the entry node with
+  `lifecycle_driver::derive_entry_node`, and hands the resulting
   `EventSource` / `StateProjector` (constructed via the same factories
   the original dispatch used) to a fresh `projector_task`. The
   projector resumes reading the brief's trace stream and observes any
   subsequent terminal event the agent container produces. The `:state`
   record is left untouched — the brief is genuinely still in flight.
 - **Live container, reattach setup failed** → `reattach_failed`. The
-  body GET, body deserialization, team fetch, or phase-gate build
-  failed (most commonly: the body key was evicted or never written).
-  The brief is marked `Failed { DaemonRestartedDuringExecution }`
-  exactly as if the container were dead, so the FSM lands cleanly
-  terminal and the operator can resubmit. The container itself is
-  intentionally NOT killed — operator may want to inspect.
+  body GET, body deserialization, team fetch, `WalkConfig` build, or
+  entry-node derivation failed (most commonly: the body key was
+  evicted or never written; or the topology was malformed and
+  `derive_entry_node` returned `Reason::TopologyInvalid`). The brief
+  is marked `Failed { DaemonRestartedDuringExecution }` exactly as
+  if the container were dead, so the FSM lands cleanly terminal and
+  the operator can resubmit. The container itself is intentionally
+  NOT killed — operator may want to inspect.
 - **Dead container** → `failed_dead`. The named container is gone (or
   the record's state has no `agent_id` to probe). The resume path
   writes a fresh
@@ -552,24 +693,25 @@ emits the verdict and exits. So the worst-case behaviour is "projector
 waits up to one wall-clock budget interval before terminating," not
 "projector loops forever."
 
-The pre-471a behaviour — the FSM staying in
-`Authoring`/`Verifying`/etc forever and the dashboard showing phantom
-"running" briefs indefinitely — is closed by the failed-bucket paths.
-The pre-471b behaviour — every operator-initiated daemon redeploy
-killing all in-flight work even when the containers were still
-running — is closed by the reattach (kept_alive) path. If the
-operator needs orphaned work redone, they can resubmit with the same
-brief id; the new run will be a fresh trip through the FSM.
+The pre-471a behaviour — the FSM staying in a non-terminal state
+forever and the dashboard showing phantom "running" briefs
+indefinitely — is closed by the failed-bucket paths. The pre-471b
+behaviour — every operator-initiated daemon redeploy killing all
+in-flight work even when the containers were still running — is
+closed by the reattach (kept_alive) path. If the operator needs
+orphaned work redone, they can resubmit with the same brief id; the
+new run will be a fresh trip through the FSM.
 
-Briefs in AwaitingCaptainDecision state also reattach on boot —
-projector_task is re-spawned to consume the eventual CaptainAccepted
-or CaptainRejected event the operator will push via captain decide
-CLI. No agent container check is needed for this state; the brief is
-operator-gated, not container-gated. Other non-Authoring non-terminal
-states (Verifying, Reviewing, Shipping, Watching, Extension) continue
-to be marked Failed{DaemonRestartedDuringExecution} on boot — closing
-that gap requires the role-chain re-spawn story which lives in a
-future brief.
+Briefs whose `Walking.run_data` is `OperatorDecision{..}` (the
+post-collapse home of the legacy `AwaitingCaptainDecision` state)
+also reattach on boot — `projector_task` is re-spawned to consume
+the eventual `CaptainAccepted` or `CaptainRejected` event the
+operator will push via captain decide CLI. No agent-container check
+is needed for this shape; the brief is operator-gated, not
+container-gated. Other non-entry-coder `Walking` records (verifier,
+reviewer, shipper, ci-watcher nodes) continue to be marked
+`Failed{DaemonRestartedDuringExecution}` on boot — closing that gap
+requires the role-chain re-spawn story which lives in a future brief.
 
 ## DisagreementSummary
 
@@ -577,31 +719,33 @@ One coder-flagged disagreement with a brief verb. The struct carries
 `verb` (the literal verb the coder did not apply), `applied_form`
 (the variant the coder emitted instead), and `rationale` (the coder's
 reason for the substitution). F6a (PR #443) added these fields to the
-role-runtime `UnappliedVerb` shape; F6b (this brief + 449b) lifts them
-into orchestrator-types so the FSM can carry disagreements across
-phases without a role-runtime dependency. Wire-equivalent to
+role-runtime `UnappliedVerb` shape; F6b (this brief + 449b) lifted
+them into orchestrator-types so the FSM can carry disagreements
+without a role-runtime dependency. Wire-equivalent to
 `UnappliedVerb` at the JSON level; `serde(deny_unknown_fields)` so
 extra keys are a hard error rather than silently dropped.
 
-`DisagreementSummary` rides on the `BriefEvent::CoderDisagreed`
-payload and is then carried in the `BriefState::AwaitingCaptainDecision`
-state until the captain decides. The flow is captain-mediated: when
-the coder's self-review reports `all_applied=false` but every miss
-carries `applied_form` + `rationale` (deliberate disagreement, not
-failure), the FSM transitions from `Authoring` (or `Reworking`) to
-`AwaitingCaptainDecision`. The brief is parked indefinitely — no
-timeout, no automatic retry — waiting for an explicit captain
-decision. The state carries the disagreements vector and the original
-retry budget so retry semantics are preserved if the captain rejects
-and the operator resubmits.
+Post-collapse, `DisagreementSummary` rides on the
+`BriefEvent::CoderDisagreed` payload and is then carried in
+`BriefState::Walking { run_data: RunData::OperatorDecision
+{ disagreements } }` until the captain decides. The flow is
+captain-mediated: when the coder's self-review reports
+`all_applied=false` but every miss carries `applied_form` +
+`rationale` (deliberate disagreement, not failure), the FSM transitions
+from `Walking { run_data: Coder { .. } }` to `Walking { run_data:
+OperatorDecision { disagreements } }` with `node_id`, `evidence`, and
+`retry` preserved. The brief is parked indefinitely — no timeout, no
+automatic retry — waiting for an explicit captain decision. The
+preserved retry budget means semantics are preserved if the captain
+rejects and the operator resubmits.
 
 `CaptainAccepted` treats the disagreed-form output as morally
-equivalent to `CoderDone{Shipped}`. The brief proceeds through
-`Verifying → Reviewing → Shipping → Watching` using the work already
-in the brief workspace, exactly as if the coder had emitted the
-literal verb. The same empty-phase auto-skip rules apply, so a
-topology with no verifier or reviewer roles short-circuits straight
-to `Shipping` just like the regular coder-shipped path.
+equivalent to `RoleDone { verdict: Shipped }` from the coder node.
+The brief proceeds through the downstream nodes using the work
+already in the brief workspace, exactly as if the coder had emitted
+the literal verb. Topologies with no downstreams (or whose walker
+reaches a sink) terminate cleanly at `Shipped` just like the regular
+coder-shipped path.
 
 `CaptainRejected` fails the brief with reason
 `CaptainRejectedDisagreement` carrying the captain's prose
@@ -609,29 +753,45 @@ explanation. The operator can resubmit a fresh brief id with a
 corrected verb after seeing the captain's reason on the terminal
 verdict.
 
-This brief (449a) lands the FSM types only. The daemon-side
-translator that detects the disagreement pattern and emits
-`CoderDisagreed` lives in 449b. The `captain decide` CLI subcommand
-that pushes `CaptainAccepted` / `CaptainRejected` lives in 449b. The
-dashboard surface that lists parked briefs lives in 449c.
+#### Migration appendix — beta-b collapse (post-#495b)
 
-The daemon's trace translator detects the deliberate-disagreement
-pattern from the coder's `Done` event (`cause = "self_review_disagreed"`
-with `disagreements` populated). When matched, it emits
-`BriefEvent::CoderDisagreed` which routes through the universal handler
-to `AwaitingCaptainDecision`. The operator resolves the brief via
-`captain decide accept <brief_id>` (proceeds through the post-coder
-phase chain) or `captain decide reject <brief_id> --reason '...'`
-(transitions to `Failed{CaptainRejectedDisagreement}`). `captain decide
-list` shows currently parked briefs as one JSON object per line,
-`{"brief_id":"…","disagreements":N,"parked_at":"…"}`. All three
-subcommands push their event onto `agentry:brief:<id>:trace` with
-`agent` set to `captain-cli`, where the per-brief lifecycle driver
-consumes it like any other FSM event.
+The 11-variant phase-enum FSM was collapsed to 4 variants in
+#495 beta-b. The mapping from the pre-collapse vocabulary to the
+post-collapse vocabulary:
 
-The dashboard surfaces parked briefs in the standard in-flight list
-with a prominent AWAITING CAPTAIN DECISION badge and the disagreements
-rendered inline (verb, what the coder did instead, rationale). The
-operator resolves via the `captain decide accept <brief_id>` or
-`captain decide reject <brief_id> --reason '...'` CLI. Form-based
-resolution from the dashboard is a future enhancement.
+| Pre-collapse                                       | Post-collapse                                                                 |
+|----------------------------------------------------|-------------------------------------------------------------------------------|
+| `BriefState::Authoring { agent_id, started_at, .. }` | `BriefState::Walking { node_id: coder_node, run_data: Coder { agent_id }, .. }` |
+| `BriefState::Verifying { received, expected, .. }` | `BriefState::Walking { node_id: ac_verifier_n, evidence, .. }`                |
+| `BriefState::Reviewing { received, expected, .. }` | `BriefState::Walking { node_id: reviewer_n, evidence, .. }`                   |
+| `BriefState::Reworking { .. }`                     | `BriefState::Walking { node_id: <entry coder>, retry: bumped, .. }`           |
+| `BriefState::Shipping { pr_number, head_sha, .. }` | `BriefState::Walking { node_id: shipper_node, run_data: PrTracking, .. }`     |
+| `BriefState::Watching { pr_number, head_sha, .. }` | `BriefState::Walking { node_id: ci_watcher_node, run_data: PrTracking, .. }`  |
+| `BriefState::Extension { .. }`                     | `BriefState::Walking { node_id: <topology-declared>, run_data: Extension, .. }` |
+| `BriefState::AwaitingCaptainDecision { .. }`       | `BriefState::Walking { run_data: OperatorDecision { .. }, .. }`               |
+| `BriefEvent::CoderDone { verdict }`                | `BriefEvent::RoleDone { node_id: coder_node, verdict, .. }`                   |
+| `BriefEvent::AcVerifierDone { role_name, verdict }`| `BriefEvent::RoleDone { node_id, verdict, .. }`                               |
+| `BriefEvent::ReviewerDone { role_name, .. }`       | `BriefEvent::RoleDone { node_id, verdict, findings, .. }`                     |
+| `BriefEvent::ShipperDone { pr_number, head_sha }`  | `BriefEvent::RoleDone { node_id, run_data: Some(PrTracking{..}), .. }`        |
+| `PhaseGates { verifying: GateConfig, reviewing: GateConfig }` | `WalkConfig.node_configs[node_id].policy / .expected_inbound` (per-node) |
+| `ReworkTarget` enum                                | Implicit in `WalkConfig.adjacency` (rework rewinds to entry node)             |
+| `lifecycle::role_kind(role)` lookup                | Still present — translator memoizes the short kind; the FSM keys on `NodeId(role_name)` directly |
+
+Pre-beta-b briefs in the legacy `BriefState` shape will fail to
+deserialize after this lands (the persisted JSON variant tags
+`authoring` / `verifying` / etc. are gone). The migration brief
+**#497** drained in-flight briefs before the cutover; see
+`docs/captain-doctrine.md` for the redeploy + drain protocol.
+
+`PhaseGates` was deleted in this collapse; per-node gate config now
+lives on `WalkConfig.node_configs[n].policy` and
+`WalkConfig.node_configs[n].expected_inbound`. The runtime helper
+`build_walk_config` populates this from `TeamTopology.message_graph`
++ `TeamTopology.roles` + `TeamTopology.node_classes` +
+`MessageEdge.gate_policy`.
+
+The `lifecycle::role_kind` helper is still in
+`crates/orchestrator-types/src/lifecycle.rs` — the translator uses
+it to map a spawn event's full role name to the short kind for the
+`Done`-branch lookup, but the FSM itself no longer keys on the short
+kind; it keys on `NodeId(role_name)` (the full role name).

@@ -593,13 +593,18 @@ fn compute_verdict(
     exit_code: Option<i32>,
     accumulated_findings: Vec<orchestrator_types::ReviewFinding>,
 ) -> Verdict {
-    let (event_verdict, refusal_count) = match terminal_event.map(|e| &e.kind) {
+    let (event_verdict, refusal_count, event_cause) = match terminal_event.map(|e| &e.kind) {
         Some(EventKind::Done {
             verdict,
             refusal_count,
+            reason,
             ..
-        }) => (Some(*verdict), *refusal_count),
-        _ => (None, 0),
+        }) => (
+            Some(*verdict),
+            *refusal_count,
+            reason.as_ref().map(|r| r.cause.clone()),
+        ),
+        _ => (None, 0, None),
     };
     let (kind, reason) = if timed_out {
         (
@@ -616,7 +621,20 @@ fn compute_verdict(
                 },
                 None,
             ),
-            Some(v) => (VerdictKind::from(v), None),
+            // Propagate the Done event's reason.cause (when present) onto
+            // the Verdict.reason free-text field, prefixed with `cause:`
+            // for unambiguous parsing by downstream consumers. This is
+            // how the daemon detects the coder's `self_review_disagreed`
+            // outcome — without the propagation, the cause string is
+            // dropped here and the daemon classifies the verdict as a
+            // generic team failure (pre-empting the FSM's
+            // CoderDisagreed → Walking{OperatorDecision} transition).
+            Some(v) => (
+                VerdictKind::from(v),
+                event_cause
+                    .filter(|c| !c.is_empty())
+                    .map(|c| format!("cause:{c}")),
+            ),
             None => (
                 VerdictKind::Failed,
                 Some(format!(

@@ -36,21 +36,63 @@ use orchestrator_types::{now, BriefId, EventVerdict};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
-fn no_gates() -> std::sync::Arc<orchestrator_types::lifecycle::PhaseGates> {
-    use orchestrator_types::lifecycle::{GateConfig, GatePolicy, PhaseGates};
-    // Non-empty expected roles: with the E/1 empty-phase auto-skip,
-    // empty/empty would short-circuit Authoring → Shipping and the
-    // happy-path trail asserted below would be unreachable.
-    std::sync::Arc::new(PhaseGates {
-        verifying: GateConfig {
-            expected_roles: vec!["ac-verifier-test".to_owned()],
+/// Build a `coder → ac-verifier → reviewer → shipper → ci-watcher` chain
+/// `WalkConfig` and the entry NodeId. Mirrors the production happy-path
+/// shape closely enough for the parallel-run trail assertions to remain
+/// meaningful after the FSM collapsed phase variants into Walking.
+fn chain_walk() -> (
+    std::sync::Arc<orchestrator_types::lifecycle::WalkConfig>,
+    std::sync::Arc<orchestrator_types::team::NodeId>,
+) {
+    use orchestrator_types::lifecycle::{GatePolicy, NodeConfig, WalkConfig};
+    use orchestrator_types::team::{NodeClass, NodeId};
+    use std::collections::HashMap;
+
+    let coder = NodeId("coder-claude-agentry".into());
+    let acv = NodeId("ac-verifier-test".into());
+    let reviewer = NodeId("reviewer-test".into());
+    let shipper = NodeId("shipper-agentry".into());
+    let ci = NodeId("ci-watcher-agentry".into());
+
+    let mut adjacency: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+    adjacency.insert(coder.clone(), vec![acv.clone()]);
+    adjacency.insert(acv.clone(), vec![reviewer.clone()]);
+    adjacency.insert(reviewer.clone(), vec![shipper.clone()]);
+    adjacency.insert(shipper.clone(), vec![ci.clone()]);
+
+    let class = NodeClass("container_bound".into());
+    let mut node_configs: HashMap<NodeId, NodeConfig> = HashMap::new();
+    node_configs.insert(
+        coder.clone(),
+        NodeConfig {
+            class: class.clone(),
+            expected_inbound: vec![],
             policy: GatePolicy::AllMustPass,
         },
-        reviewing: GateConfig {
-            expected_roles: vec!["reviewer-test".to_owned()],
-            policy: GatePolicy::AllMustPass,
-        },
-    })
+    );
+    for (n, upstream) in [
+        (&acv, &coder),
+        (&reviewer, &acv),
+        (&shipper, &reviewer),
+        (&ci, &shipper),
+    ] {
+        node_configs.insert(
+            n.clone(),
+            NodeConfig {
+                class: class.clone(),
+                expected_inbound: vec![upstream.clone()],
+                policy: GatePolicy::AllMustPass,
+            },
+        );
+    }
+
+    (
+        std::sync::Arc::new(WalkConfig {
+            adjacency,
+            node_configs,
+        }),
+        std::sync::Arc::new(coder),
+    )
 }
 
 struct MemEventSource {
@@ -90,26 +132,40 @@ impl StateProjector for MemStateProjector {
 #[tokio::test]
 async fn projector_task_walks_happy_path_to_shipped() {
     let brief_id = BriefId("brf_parallel_run_happy".into());
+    use orchestrator_types::run_data::RunData;
+    use orchestrator_types::team::NodeId;
     let events = VecDeque::from(vec![
         BriefEvent::CoderStarted {
             agent_id: "agent-1".into(),
+            role_name: "coder-claude-agentry".into(),
             started_at: now(),
         },
-        BriefEvent::CoderDone {
-            verdict: EventVerdict::Shipped,
-        },
-        BriefEvent::AcVerifierDone {
-            verdict: EventVerdict::Shipped,
-            role_name: "ac-verifier-test".to_owned(),
-        },
-        BriefEvent::ReviewerDone {
+        BriefEvent::RoleDone {
+            node_id: NodeId("coder-claude-agentry".into()),
             verdict: EventVerdict::Shipped,
             findings: vec![],
-            role_name: "reviewer-test".to_owned(),
+            run_data: None,
         },
-        BriefEvent::ShipperDone {
-            pr_number: 42,
-            head_sha: "abc1234".into(),
+        BriefEvent::RoleDone {
+            node_id: NodeId("ac-verifier-test".into()),
+            verdict: EventVerdict::Shipped,
+            findings: vec![],
+            run_data: None,
+        },
+        BriefEvent::RoleDone {
+            node_id: NodeId("reviewer-test".into()),
+            verdict: EventVerdict::Shipped,
+            findings: vec![],
+            run_data: None,
+        },
+        BriefEvent::RoleDone {
+            node_id: NodeId("shipper-agentry".into()),
+            verdict: EventVerdict::Shipped,
+            findings: vec![],
+            run_data: Some(RunData::PrTracking {
+                pr_number: 42,
+                head_sha: "abc1234".into(),
+            }),
         },
         BriefEvent::CiResult {
             state: CiState::Success,
@@ -128,9 +184,17 @@ async fn projector_task_walks_happy_path_to_shipped() {
         written: written.clone(),
     });
 
-    projector_task(brief_id.clone(), source, projector, None, no_gates())
-        .await
-        .expect("projector_task happy path");
+    let (walk_config, entry_node) = chain_walk();
+    projector_task(
+        brief_id.clone(),
+        source,
+        projector,
+        None,
+        walk_config,
+        entry_node,
+    )
+    .await
+    .expect("projector_task happy path");
 
     let log = written.lock().expect("mutex").clone();
     assert_eq!(
@@ -139,11 +203,19 @@ async fn projector_task_walks_happy_path_to_shipped() {
         "one record per processed event up to and including terminal Shipped"
     );
 
-    assert!(matches!(log[0].0.state, BriefState::Authoring { .. }));
-    assert!(matches!(log[1].0.state, BriefState::Verifying { .. }));
-    assert!(matches!(log[2].0.state, BriefState::Reviewing { .. }));
-    assert!(matches!(log[3].0.state, BriefState::Shipping { .. }));
-    assert!(matches!(log[4].0.state, BriefState::Watching { .. }));
+    let assert_walking_at = |i: usize, name: &str| match &log[i].0.state {
+        BriefState::Walking { node_id, .. } => assert_eq!(
+            node_id.0, name,
+            "record {i} must be Walking at {name}, got {:?}",
+            node_id.0
+        ),
+        other => panic!("record {i} must be Walking, got {other:?}"),
+    };
+    assert_walking_at(0, "coder-claude-agentry");
+    assert_walking_at(1, "ac-verifier-test");
+    assert_walking_at(2, "reviewer-test");
+    assert_walking_at(3, "shipper-agentry");
+    assert_walking_at(4, "ci-watcher-agentry");
     assert!(matches!(log[5].0.state, BriefState::Shipped));
 
     // Cursor advances per processed event.
@@ -169,20 +241,27 @@ async fn projector_task_walks_happy_path_to_shipped() {
 #[tokio::test]
 async fn projector_task_fails_brief_on_invalid_transition() {
     let brief_id = BriefId("brf_parallel_run_invalid".into());
+    use orchestrator_types::team::NodeId;
     let events = VecDeque::from(vec![
-        // Submitted state — `AcVerifierDone` is illegal here. The new
+        // Submitted state — `RoleDone` is illegal here. The new
         // fence transitions the brief into Failed{DaemonError} and
         // breaks the loop, so the trailing events below never run.
-        BriefEvent::AcVerifierDone {
+        BriefEvent::RoleDone {
+            node_id: NodeId("ac-verifier-test".into()),
             verdict: EventVerdict::Shipped,
-            role_name: "ac-verifier-test".to_owned(),
+            findings: vec![],
+            run_data: None,
         },
         BriefEvent::CoderStarted {
             agent_id: "agent-1".into(),
+            role_name: "coder-claude-agentry".into(),
             started_at: now(),
         },
-        BriefEvent::CoderDone {
+        BriefEvent::RoleDone {
+            node_id: NodeId("coder-claude-agentry".into()),
             verdict: EventVerdict::Failed,
+            findings: vec![],
+            run_data: None,
         },
     ]);
 
@@ -192,7 +271,8 @@ async fn projector_task_fails_brief_on_invalid_transition() {
         written: written.clone(),
     });
 
-    projector_task(brief_id, source, projector, None, no_gates())
+    let (walk_config, entry_node) = chain_walk();
+    projector_task(brief_id, source, projector, None, walk_config, entry_node)
         .await
         .expect("projector_task fences on invalid transition without erroring");
 
@@ -228,7 +308,8 @@ async fn projector_task_handles_empty_stream() {
         written: written.clone(),
     });
 
-    projector_task(brief_id, source, projector, None, no_gates())
+    let (walk_config, entry_node) = chain_walk();
+    projector_task(brief_id, source, projector, None, walk_config, entry_node)
         .await
         .expect("empty stream terminates cleanly");
 

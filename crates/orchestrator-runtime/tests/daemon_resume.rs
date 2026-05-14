@@ -17,6 +17,8 @@ use orchestrator_runtime::lifecycle::{
 use orchestrator_types::lifecycle::{
     BriefEvent, BriefState, BriefStateRecord, DisagreementSummary, Reason, RetryBudget,
 };
+use orchestrator_types::run_data::RunData;
+use orchestrator_types::team::NodeId;
 use orchestrator_types::{now, Brief, BriefId, Budget, EscalationMode, VersionedRef};
 use redis::aio::ConnectionManager;
 use redis::AsyncCommands;
@@ -259,9 +261,12 @@ async fn resume_marks_dead_container_failed() {
         seed_state(
             &mut conn,
             id,
-            BriefState::Authoring {
-                agent_id: "agt_does_not_exist_001".into(),
-                started_at: now(),
+            BriefState::Walking {
+                node_id: NodeId("coder-claude-agentry".into()),
+                evidence: std::collections::BTreeMap::new(),
+                run_data: RunData::Coder {
+                    agent_id: "agt_does_not_exist_001".into(),
+                },
                 retry: fresh_retry(),
             },
         )
@@ -446,9 +451,12 @@ async fn reattach_succeeds_for_live_container() {
         seed_state(
             &mut conn,
             id,
-            BriefState::Authoring {
-                agent_id: agent_id.into(),
-                started_at: now(),
+            BriefState::Walking {
+                node_id: NodeId("coder-claude-agentry".into()),
+                evidence: std::collections::BTreeMap::new(),
+                run_data: RunData::Coder {
+                    agent_id: agent_id.into(),
+                },
                 retry: fresh_retry(),
             },
         )
@@ -533,9 +541,12 @@ async fn reattach_failure_falls_through_to_failed() {
         seed_state(
             &mut conn,
             id,
-            BriefState::Authoring {
-                agent_id: agent_id.into(),
-                started_at: now(),
+            BriefState::Walking {
+                node_id: NodeId("coder-claude-agentry".into()),
+                evidence: std::collections::BTreeMap::new(),
+                run_data: RunData::Coder {
+                    agent_id: agent_id.into(),
+                },
                 retry: fresh_retry(),
             },
         )
@@ -628,8 +639,10 @@ async fn resume_reattaches_awaiting_captain_decision_brief() {
         seed_state(
             &mut conn,
             id,
-            BriefState::AwaitingCaptainDecision {
-                disagreements,
+            BriefState::Walking {
+                node_id: NodeId("coder-claude-agentry".into()),
+                evidence: std::collections::BTreeMap::new(),
+                run_data: RunData::OperatorDecision { disagreements },
                 retry: fresh_retry(),
             },
         )

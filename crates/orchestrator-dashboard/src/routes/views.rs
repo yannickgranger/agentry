@@ -84,9 +84,18 @@ pub(crate) async fn derive_active_briefs(store: &DashboardStore) -> anyhow::Resu
         if let Value::Object(map) = &mut v {
             map.insert(
                 "_dashboard_state".into(),
-                Value::String(state_kind(&record.state).to_owned()),
+                Value::String(state_kind(&record.state)),
             );
-            if let BriefState::AwaitingCaptainDecision { disagreements, .. } = &record.state {
+            // Post-#495b: AwaitingCaptainDecision collapsed into
+            // `Walking { run_data: RunData::OperatorDecision { disagreements } }`.
+            // Surface the disagreements payload so the index renderer
+            // can emit the amber "awaiting captain decision" affordance
+            // and the disagreements detail block.
+            if let BriefState::Walking {
+                run_data: orchestrator_types::run_data::RunData::OperatorDecision { disagreements },
+                ..
+            } = &record.state
+            {
                 if let Ok(d) = serde_json::to_value(disagreements) {
                     map.insert("_dashboard_disagreements".into(), d);
                 }
@@ -153,23 +162,18 @@ fn html_escape(s: &str) -> String {
     out
 }
 
-/// Discriminator string for a `BriefState` — matches the serde
-/// `tag = "kind", rename_all = "snake_case"` projection on the type
-/// so dashboard badge text aligns with what's persisted in `:state`.
-fn state_kind(state: &BriefState) -> &'static str {
+/// Discriminator string for a `BriefState` — post-#495b collapse, the
+/// 11-variant lifecycle reduces to 4: `Submitted | Walking | Shipped |
+/// Failed`. For `Walking` the operator-useful label is the current
+/// node's role name (`node_id.0`) — the topology declares the role
+/// names so the badge stays meaningful as roles evolve. The terminal
+/// dispositions use their lowercase tag name.
+fn state_kind(state: &BriefState) -> String {
     match state {
-        BriefState::Submitted => "submitted",
-        BriefState::Authoring { .. } => "authoring",
-        BriefState::Verifying { .. } => "verifying",
-        BriefState::Reviewing { .. } => "reviewing",
-        BriefState::Reworking { .. } => "reworking",
-        BriefState::Shipping { .. } => "shipping",
-        BriefState::Watching { .. } => "watching",
-        BriefState::Extension { .. } => "extension",
-        BriefState::AwaitingCaptainDecision { .. } => "awaiting_captain_decision",
-        BriefState::Walking { .. } => "walking",
-        BriefState::Shipped => "shipped",
-        BriefState::Failed { .. } => "failed",
+        BriefState::Submitted => "submitted".to_owned(),
+        BriefState::Walking { node_id, .. } => node_id.0.clone(),
+        BriefState::Shipped => "shipped".to_owned(),
+        BriefState::Failed { .. } => "failed".to_owned(),
     }
 }
 
@@ -214,20 +218,24 @@ pub async fn index(State(state): State<AppState>) -> Result<Html<String>, AppErr
             .get("_dashboard_state")
             .and_then(Value::as_str)
             .unwrap_or("");
-        let state_badge = if kind.is_empty() {
-            String::new()
-        } else if kind == "awaiting_captain_decision" {
+        // Post-#495b: the OperatorDecision sub-state of `Walking` is
+        // surfaced via the presence of `_dashboard_disagreements`
+        // rather than a distinguished `kind` string. The amber badge
+        // fires off that signal directly so a topology rename of the
+        // captain-decide node can't desync this affordance.
+        let disagreements_value = b.get("_dashboard_disagreements").and_then(Value::as_array);
+        let state_badge = if disagreements_value.is_some() {
             r#"<span class="ml-2 px-2 py-0.5 rounded text-xs font-semibold bg-amber-300 text-amber-950">⚠ AWAITING CAPTAIN DECISION</span>"#
                 .to_string()
+        } else if kind.is_empty() {
+            String::new()
         } else {
             format!(
                 r#"<span class="ml-2 px-2 py-0.5 rounded text-xs bg-slate-800 text-slate-300">{kind}</span>"#
             )
         };
 
-        let disagreements_section = b
-            .get("_dashboard_disagreements")
-            .and_then(Value::as_array)
+        let disagreements_section = disagreements_value
             .map(|items| render_disagreements(brief_id, items))
             .unwrap_or_default();
 

@@ -25,21 +25,71 @@ use orchestrator_types::{now, BriefId, Event, EventKind, EventVerdict};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
-fn no_gates() -> orchestrator_types::lifecycle::PhaseGates {
-    use orchestrator_types::lifecycle::{GateConfig, GatePolicy, PhaseGates};
-    // Non-empty expected roles: with the E/1 empty-phase auto-skip,
-    // empty/empty would short-circuit Authoring → Shipping and the
-    // multi-step trail asserted by these tests would be unreachable.
-    PhaseGates {
-        verifying: GateConfig {
-            expected_roles: vec!["ac-verifier-test".to_owned()],
+/// Build the canonical `coder → ac-verifier → reviewer → shipper →
+/// ci-watcher` chain `WalkConfig` and the entry NodeId used by these
+/// integration tests. After the #495-beta-b collapse, lifecycle tests
+/// stand up an explicit chain to exercise the FSM's `Walking`
+/// transitions across multiple downstream gates.
+fn chain_walk() -> (
+    orchestrator_types::lifecycle::WalkConfig,
+    orchestrator_types::team::NodeId,
+) {
+    use orchestrator_types::lifecycle::{GatePolicy, NodeConfig, WalkConfig};
+    use orchestrator_types::team::{NodeClass, NodeId};
+
+    let coder = NodeId("coder-claude-agentry".into());
+    let acv = NodeId("ac-verifier-test".into());
+    let reviewer = NodeId("reviewer-test".into());
+    let shipper = NodeId("shipper-agentry".into());
+    let ci = NodeId("ci-watcher-agentry".into());
+
+    let mut adjacency: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+    adjacency.insert(coder.clone(), vec![acv.clone()]);
+    adjacency.insert(acv.clone(), vec![reviewer.clone()]);
+    adjacency.insert(reviewer.clone(), vec![shipper.clone()]);
+    adjacency.insert(shipper.clone(), vec![ci.clone()]);
+
+    let class = NodeClass("container_bound".into());
+    let mut node_configs: HashMap<NodeId, NodeConfig> = HashMap::new();
+    node_configs.insert(
+        coder.clone(),
+        NodeConfig {
+            class: class.clone(),
+            expected_inbound: vec![],
             policy: GatePolicy::AllMustPass,
         },
-        reviewing: GateConfig {
-            expected_roles: vec!["reviewer-test".to_owned()],
-            policy: GatePolicy::AllMustPass,
-        },
+    );
+    for (n, upstream) in [
+        (&acv, &coder),
+        (&reviewer, &acv),
+        (&shipper, &reviewer),
+        (&ci, &shipper),
+    ] {
+        node_configs.insert(
+            n.clone(),
+            NodeConfig {
+                class: class.clone(),
+                expected_inbound: vec![upstream.clone()],
+                policy: GatePolicy::AllMustPass,
+            },
+        );
     }
+
+    (
+        WalkConfig {
+            adjacency,
+            node_configs,
+        },
+        coder,
+    )
+}
+
+fn chain_walk_arc() -> (
+    std::sync::Arc<orchestrator_types::lifecycle::WalkConfig>,
+    std::sync::Arc<orchestrator_types::team::NodeId>,
+) {
+    let (cfg, entry) = chain_walk();
+    (std::sync::Arc::new(cfg), std::sync::Arc::new(entry))
 }
 
 struct MemEventSource {
@@ -88,24 +138,32 @@ fn record_for(brief_id: &BriefId, state: BriefState) -> BriefStateRecord {
 /// Shipping) and that each write carries the synthetic trace id.
 #[tokio::test]
 async fn mem_adapters_drive_handle() {
+    use orchestrator_types::team::NodeId;
     let brief_id = BriefId("brf_lifecycle_mem".into());
     let mut source = MemEventSource {
         events: VecDeque::from(vec![
             BriefEvent::CoderStarted {
                 agent_id: "agent-1".into(),
+                role_name: "coder-claude-agentry".into(),
                 started_at: now(),
             },
-            BriefEvent::CoderDone {
-                verdict: EventVerdict::Shipped,
-            },
-            BriefEvent::AcVerifierDone {
-                verdict: EventVerdict::Shipped,
-                role_name: "ac-verifier-test".to_owned(),
-            },
-            BriefEvent::ReviewerDone {
+            BriefEvent::RoleDone {
+                node_id: NodeId("coder-claude-agentry".into()),
                 verdict: EventVerdict::Shipped,
                 findings: vec![],
-                role_name: "reviewer-test".to_owned(),
+                run_data: None,
+            },
+            BriefEvent::RoleDone {
+                node_id: NodeId("ac-verifier-test".into()),
+                verdict: EventVerdict::Shipped,
+                findings: vec![],
+                run_data: None,
+            },
+            BriefEvent::RoleDone {
+                node_id: NodeId("reviewer-test".into()),
+                verdict: EventVerdict::Shipped,
+                findings: vec![],
+                run_data: None,
             },
         ]),
     };
@@ -114,10 +172,11 @@ async fn mem_adapters_drive_handle() {
         written: written.clone(),
     };
 
+    let (walk_config, entry_node) = chain_walk();
     let mut state = BriefState::Submitted;
     let mut step: u64 = 0;
     while let Some(ev) = source.next().await.expect("mem next") {
-        state = handle(&state, &ev, &no_gates()).expect("legal transition");
+        state = handle(&state, &ev, &walk_config, &entry_node).expect("legal transition");
         step += 1;
         let trace_id = format!("0-{step}");
         projector
@@ -129,10 +188,14 @@ async fn mem_adapters_drive_handle() {
     let log = written.lock().expect("mutex").clone();
     assert_eq!(log.len(), 4, "one record per processed event");
 
-    assert!(matches!(log[0].0.state, BriefState::Authoring { .. }));
-    assert!(matches!(log[1].0.state, BriefState::Verifying { .. }));
-    assert!(matches!(log[2].0.state, BriefState::Reviewing { .. }));
-    assert!(matches!(log[3].0.state, BriefState::Shipping { .. }));
+    let assert_walking_at = |i: usize, name: &str| match &log[i].0.state {
+        BriefState::Walking { node_id, .. } => assert_eq!(node_id.0, name),
+        other => panic!("record {i} must be Walking at {name}, got {other:?}"),
+    };
+    assert_walking_at(0, "coder-claude-agentry");
+    assert_walking_at(1, "ac-verifier-test");
+    assert_walking_at(2, "reviewer-test");
+    assert_walking_at(3, "shipper-agentry");
 
     assert_eq!(log[3].1, "0-4");
     for (record, _) in &log {
@@ -151,17 +214,24 @@ async fn mem_adapters_carry_retry_budget_through_rework() {
         events: VecDeque::from(vec![
             BriefEvent::CoderStarted {
                 agent_id: "agent-1".into(),
+                role_name: "coder-claude-agentry".into(),
                 started_at: now(),
             },
-            BriefEvent::CoderDone {
+            BriefEvent::RoleDone {
+                node_id: orchestrator_types::team::NodeId("coder-claude-agentry".into()),
                 verdict: EventVerdict::Shipped,
+                findings: vec![],
+                run_data: None,
             },
-            BriefEvent::AcVerifierDone {
+            BriefEvent::RoleDone {
+                node_id: orchestrator_types::team::NodeId("ac-verifier-test".into()),
                 verdict: EventVerdict::ReworkNeeded,
-                role_name: "ac-verifier-test".to_owned(),
+                findings: vec![],
+                run_data: None,
             },
             BriefEvent::CoderStarted {
                 agent_id: "agent-2".into(),
+                role_name: "coder-claude-agentry".into(),
                 started_at: now(),
             },
         ]),
@@ -171,10 +241,11 @@ async fn mem_adapters_carry_retry_budget_through_rework() {
         written: written.clone(),
     };
 
+    let (walk_config, entry_node) = chain_walk();
     let mut state = BriefState::Submitted;
     let mut step: u64 = 0;
     while let Some(ev) = source.next().await.expect("mem next") {
-        state = handle(&state, &ev, &no_gates()).expect("legal transition");
+        state = handle(&state, &ev, &walk_config, &entry_node).expect("legal transition");
         step += 1;
         projector
             .write(&record_for(&brief_id, state.clone()), &format!("0-{step}"))
@@ -185,9 +256,16 @@ async fn mem_adapters_carry_retry_budget_through_rework() {
     let log = written.lock().expect("mutex").clone();
     let last = &log.last().expect("at least one record").0.state;
     match last {
-        BriefState::Authoring {
-            retry, agent_id, ..
+        BriefState::Walking {
+            node_id,
+            retry,
+            run_data: orchestrator_types::run_data::RunData::Coder { agent_id },
+            ..
         } => {
+            assert_eq!(
+                node_id.0, "coder-claude-agentry",
+                "rework re-entry lands back at the entry coder node"
+            );
             assert_eq!(agent_id, "agent-2", "rework re-entry pins the new agent id");
             assert_eq!(
                 *retry,
@@ -198,7 +276,7 @@ async fn mem_adapters_carry_retry_budget_through_rework() {
                 "rework loop bumps the attempt counter"
             );
         }
-        other => panic!("expected Authoring after rework loop, got {other:?}"),
+        other => panic!("expected Walking{{coder, Coder}} after rework loop, got {other:?}"),
     }
 }
 
@@ -277,8 +355,9 @@ async fn redis_round_trip_writes_three_keys_atomically() {
     let coder_done = source.next().await.expect("done");
     assert!(matches!(
         coder_done,
-        Some(BriefEvent::CoderDone {
-            verdict: EventVerdict::Shipped
+        Some(BriefEvent::RoleDone {
+            verdict: EventVerdict::Shipped,
+            ..
         })
     ));
 
@@ -422,7 +501,7 @@ fn translate_spawned_coder_claude_agentry_emits_coder_started() {
 }
 
 #[test]
-fn translate_done_from_coder_emits_coder_done() {
+fn translate_done_from_coder_emits_role_done() {
     let mut memo: HashMap<String, String> = HashMap::new();
     let _ = translate_trace_entry(
         &mut memo,
@@ -436,16 +515,20 @@ fn translate_done_from_coder_emits_coder_done() {
         done_event(EventVerdict::Shipped),
     )
     .expect("translate coder done");
-    assert!(matches!(
-        out,
-        Some(BriefEvent::CoderDone {
-            verdict: EventVerdict::Shipped
-        })
-    ));
+    match out {
+        Some(BriefEvent::RoleDone {
+            node_id,
+            verdict: EventVerdict::Shipped,
+            ..
+        }) => {
+            assert_eq!(node_id.0, "coder-claude-agentry");
+        }
+        other => panic!("expected RoleDone for coder, got {other:?}"),
+    }
 }
 
 #[test]
-fn translate_done_from_shipper_emits_shipper_done() {
+fn translate_done_from_shipper_emits_role_done() {
     let mut memo: HashMap<String, String> = HashMap::new();
     let _ = translate_trace_entry(
         &mut memo,
@@ -463,7 +546,16 @@ fn translate_done_from_shipper_emits_shipper_done() {
         done_event(EventVerdict::Shipped),
     )
     .expect("translate shipper done");
-    assert!(matches!(out, Some(BriefEvent::ShipperDone { .. })));
+    match out {
+        Some(BriefEvent::RoleDone {
+            node_id,
+            verdict: EventVerdict::Shipped,
+            ..
+        }) => {
+            assert_eq!(node_id.0, "shipper-agentry");
+        }
+        other => panic!("expected RoleDone for shipper, got {other:?}"),
+    }
 }
 
 #[test]
@@ -509,22 +601,33 @@ async fn lifecycle_driver_fails_brief_on_invalid_transition() {
 
     let bid = BriefId("brf_invalid_transition_fence".into());
     let written: Arc<Mutex<Vec<(BriefStateRecord, String)>>> = Arc::new(Mutex::new(Vec::new()));
+    // Submitted + RoleDone is not a legal pair (the legal-from-Submitted
+    // arms are CoderStarted plus the universal aborts) and is NOT in the
+    // late-RoleDone-in-Walking demotion bucket — the driver must record
+    // a terminal Failed{DaemonError}.
     let source: Box<dyn EventSource + Send> = Box::new(MemEventSource {
-        events: VecDeque::from(vec![BriefEvent::ShipperDone {
-            pr_number: 1,
-            head_sha: "h".into(),
+        events: VecDeque::from(vec![BriefEvent::RoleDone {
+            node_id: orchestrator_types::team::NodeId("shipper-agentry".into()),
+            verdict: EventVerdict::Shipped,
+            findings: vec![],
+            run_data: Some(orchestrator_types::run_data::RunData::PrTracking {
+                pr_number: 1,
+                head_sha: "h".into(),
+            }),
         }]),
     });
     let projector: Box<dyn StateProjector + Send> = Box::new(MemStateProjector {
         written: written.clone(),
     });
 
+    let (walk_config, entry_node) = chain_walk_arc();
     let result = projector_task(
         bid.clone(),
         source,
         projector,
         None,
-        std::sync::Arc::new(no_gates()),
+        walk_config,
+        entry_node,
     )
     .await;
     assert!(
@@ -553,89 +656,15 @@ async fn lifecycle_driver_fails_brief_on_invalid_transition() {
     std::env::remove_var("AGENTRY_WORKSPACE_ROOT");
 }
 
-/// F7 / #438: when reviewer-claude finishes first with `ReworkNeeded`
-/// the FSM lands in `Reworking { target: Coder }`. A second reviewer's
-/// later `ReviewerDone` is illegal in that state — Option C demotes
-/// that one rejection from a brief-killing `DaemonError` to a
-/// `tracing::warn!` and a continue. Other rejections stay terminal
-/// (covered by `lifecycle_driver_fails_brief_on_invalid_transition`).
-///
-/// This test drives `projector_task` to `Reworking { target: Coder }`
-/// via the canonical Reviewing-rework path, then yields one more
-/// `ReviewerDone { Shipped }` and asserts the brief stays in
-/// `Reworking` and no terminal record is written.
-#[tokio::test]
-async fn late_reviewer_done_in_reworking_is_dropped_not_failed() {
-    let bid = BriefId("brf_late_reviewer_in_reworking".into());
-    let written: Arc<Mutex<Vec<(BriefStateRecord, String)>>> = Arc::new(Mutex::new(Vec::new()));
-    let source: Box<dyn EventSource + Send> = Box::new(MemEventSource {
-        events: VecDeque::from(vec![
-            BriefEvent::CoderStarted {
-                agent_id: "agent-1".into(),
-                started_at: now(),
-            },
-            BriefEvent::CoderDone {
-                verdict: EventVerdict::Shipped,
-            },
-            BriefEvent::AcVerifierDone {
-                verdict: EventVerdict::Shipped,
-                role_name: "ac-verifier-test".to_owned(),
-            },
-            BriefEvent::ReviewerDone {
-                verdict: EventVerdict::ReworkNeeded,
-                findings: vec![],
-                role_name: "reviewer-test".to_owned(),
-            },
-            // Late ReviewerDone from a second reviewer arriving after
-            // the FSM has already left Reviewing for Reworking. The
-            // FSM rejects this; the driver must warn-and-drop.
-            BriefEvent::ReviewerDone {
-                verdict: EventVerdict::Shipped,
-                findings: vec![],
-                role_name: "reviewer-mechanical-test".to_owned(),
-            },
-        ]),
-    });
-    let projector: Box<dyn StateProjector + Send> = Box::new(MemStateProjector {
-        written: written.clone(),
-    });
-
-    let result = projector_task(
-        bid.clone(),
-        source,
-        projector,
-        None,
-        std::sync::Arc::new(no_gates()),
-    )
-    .await;
-    assert!(
-        result.is_ok(),
-        "projector_task must return Ok when the late ReviewerDone is dropped: {result:?}"
-    );
-
-    let log = written.lock().expect("mutex").clone();
-    // Four valid transitions: Authoring, Verifying, Reviewing,
-    // Reworking. The fifth event is dropped without writing a record.
-    assert_eq!(
-        log.len(),
-        4,
-        "late ReviewerDone in Reworking must not produce a state record"
-    );
-    match &log.last().expect("at least one record").0.state {
-        BriefState::Reworking { .. } => {}
-        other => panic!("expected last state Reworking, got {other:?}"),
-    }
-    for (record, _) in &log {
-        assert!(
-            !matches!(
-                record.state,
-                BriefState::Failed { .. } | BriefState::Shipped
-            ),
-            "no terminal record should be written: {:?}",
-            record.state
-        );
-    }
-}
+// F7 / #438: the late-`ReviewerDone`-in-`Reworking` demotion test was
+// removed in the #495-beta-b collapse — the FSM no longer has a
+// `Reworking` variant and the late-event fence is now generic across
+// every `Walking` transition, which the
+// `lifecycle_driver_fails_brief_on_invalid_transition` test exercises
+// via the `is_late_role_done` path. The original test asserted the
+// PhaseGates fan-in interaction with `Reviewing → Reworking`; that
+// behaviour is covered structurally by the new walker's late-event
+// reachability check (`is_late_event` in `orchestrator_types::lifecycle`).
 
 // --- zombie :state regression suite ---
 //
@@ -740,26 +769,36 @@ async fn reaper_budget_exhausted_drives_fsm_to_failed() {
 
     let bid = BriefId("brf_reaper_budget_exhausted_zombie".into());
     let written: Arc<Mutex<Vec<(BriefStateRecord, String)>>> = Arc::new(Mutex::new(Vec::new()));
+    use orchestrator_types::team::NodeId;
     let source: Box<dyn EventSource + Send> = Box::new(MemEventSource {
         events: VecDeque::from(vec![
             BriefEvent::CoderStarted {
                 agent_id: "agent-1".into(),
+                role_name: "coder-claude-agentry".into(),
                 started_at: now(),
             },
-            BriefEvent::CoderDone {
+            BriefEvent::RoleDone {
+                node_id: NodeId("coder-claude-agentry".into()),
                 verdict: EventVerdict::Shipped,
+                findings: vec![],
+                run_data: None,
             },
-            BriefEvent::AcVerifierDone {
+            BriefEvent::RoleDone {
+                node_id: NodeId("ac-verifier-test".into()),
                 verdict: EventVerdict::Shipped,
-                role_name: "ac-verifier-test".to_owned(),
+                findings: vec![],
+                run_data: None,
             },
-            BriefEvent::ReviewerDone {
+            BriefEvent::RoleDone {
+                node_id: NodeId("reviewer-test".into()),
                 verdict: EventVerdict::ReworkNeeded,
                 findings: vec![],
-                role_name: "reviewer-test".to_owned(),
+                run_data: None,
             },
-            // FSM is now in Reworking{Coder, 2/3}. The reaper observes
-            // the brief past its wall-clock budget and pushes this:
+            // FSM is now Walking back at the entry coder node with
+            // retry=2 (the post-collapse equivalent of `Reworking`).
+            // The reaper observes the brief past its wall-clock budget
+            // and pushes this:
             BriefEvent::BudgetExhausted,
         ]),
     });
@@ -767,12 +806,14 @@ async fn reaper_budget_exhausted_drives_fsm_to_failed() {
         written: written.clone(),
     });
 
+    let (walk_config, entry_node) = chain_walk_arc();
     let result = projector_task(
         bid.clone(),
         source,
         projector,
         None,
-        std::sync::Arc::new(no_gates()),
+        walk_config,
+        entry_node,
     )
     .await;
     assert!(
@@ -788,13 +829,19 @@ async fn reaper_budget_exhausted_drives_fsm_to_failed() {
         } => {}
         other => panic!("expected Failed{{BudgetExhausted}}, got {other:?}"),
     }
-    // The Reworking record must have been written BEFORE the terminal
-    // Failed — pre-fix the FSM was parked in Reworking with no terminal
-    // write ever following.
+    // The FSM must have passed through a rework restart (Walking back at
+    // entry with retry > 1) before terminating — pre-fix the FSM could
+    // park indefinitely in a non-terminal state without an exit path.
     assert!(
-        log.iter()
-            .any(|(r, _)| matches!(r.state, BriefState::Reworking { .. })),
-        "FSM must pass through Reworking before terminating",
+        log.iter().any(|(r, _)| matches!(
+            &r.state,
+            BriefState::Walking {
+                node_id,
+                retry,
+                ..
+            } if node_id.0 == "coder-claude-agentry" && retry.attempt >= 2
+        )),
+        "FSM must pass through a rework restart at the entry node before terminating",
     );
 
     std::env::remove_var("AGENTRY_WORKSPACE_ROOT");

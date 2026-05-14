@@ -14,6 +14,8 @@ use orchestrator_runtime::cli_decide::{run_accept, run_list, run_reject, DECIDE_
 use orchestrator_types::lifecycle::{
     BriefEvent, BriefState, BriefStateRecord, DisagreementSummary, Reason, RetryBudget,
 };
+use orchestrator_types::run_data::RunData;
+use orchestrator_types::team::NodeId;
 use orchestrator_types::{now, BriefId, Event, EventKind};
 use redis::aio::ConnectionManager;
 use redis::AsyncCommands;
@@ -49,12 +51,16 @@ fn fresh_retry() -> RetryBudget {
 }
 
 fn parked_state() -> BriefState {
-    BriefState::AwaitingCaptainDecision {
-        disagreements: vec![DisagreementSummary {
-            verb: "UPDATE foo.rs:10".into(),
-            applied_form: "UPDATE foo.rs:10 (widened)".into(),
-            rationale: "literal verb context too narrow".into(),
-        }],
+    BriefState::Walking {
+        node_id: NodeId("coder-claude-agentry".into()),
+        evidence: std::collections::BTreeMap::new(),
+        run_data: RunData::OperatorDecision {
+            disagreements: vec![DisagreementSummary {
+                verb: "UPDATE foo.rs:10".into(),
+                applied_form: "UPDATE foo.rs:10 (widened)".into(),
+                rationale: "literal verb context too narrow".into(),
+            }],
+        },
         retry: fresh_retry(),
     }
 }
@@ -271,7 +277,13 @@ async fn decide_list_finds_parked_briefs() {
                 let Some(raw) = raw else { continue };
                 let record: BriefStateRecord =
                     serde_json::from_str(&raw).expect("parse BriefStateRecord");
-                if matches!(record.state, BriefState::AwaitingCaptainDecision { .. }) {
+                if matches!(
+                    record.state,
+                    BriefState::Walking {
+                        run_data: RunData::OperatorDecision { .. },
+                        ..
+                    }
+                ) {
                     found.push(record.brief_id.0);
                 }
             }

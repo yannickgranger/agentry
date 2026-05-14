@@ -103,6 +103,7 @@ pub fn translate_trace_entry(
                         if kind == "coder" {
                             return Ok(Some(BriefEvent::CoderStarted {
                                 agent_id,
+                                role_name: role.to_string(),
                                 started_at: now(),
                             }));
                         }
@@ -130,6 +131,20 @@ pub fn translate_trace_entry(
             let Some(role_name) = role_by_agent.get(&agent_id).cloned() else {
                 return Ok(None);
             };
+            // Post-#495-beta-b: the translator emits a single generic
+            // `RoleDone` for every role's Done event, with two
+            // exceptions that the FSM consumes as distinct events:
+            //
+            //  - coder's `self_review_disagreed` cause → CoderDisagreed
+            //    (the FSM parks the Walking via OperatorDecision run_data)
+            //  - coder's no-op short-circuit cause → CoderDoneNoOp
+            //    (the FSM short-circuits Walking{coder} → Shipped)
+            //  - ci-watcher's Done → CiResult (the FSM consumes the
+            //    poll-shaped state, not a generic verdict)
+            //
+            // Everything else collapses to RoleDone — the walker reads
+            // `verdict` and updates Walking.evidence; node_id pins the
+            // event to the topology node for the late-event fence.
             match orchestrator_types::lifecycle::role_kind(&role_name) {
                 Some("coder") => {
                     if let Some(reason) = &reason {
@@ -147,35 +162,13 @@ pub fn translate_trace_entry(
                             reason: NO_OP_VERDICT_REASON.to_string(),
                         }));
                     }
-                    Ok(Some(BriefEvent::CoderDone { verdict }))
+                    Ok(Some(BriefEvent::RoleDone {
+                        node_id: orchestrator_types::NodeId(role_name),
+                        verdict,
+                        findings: vec![],
+                        run_data: None,
+                    }))
                 }
-                Some("ac-verifier") | Some("verifier") => {
-                    Ok(Some(BriefEvent::AcVerifierDone { verdict, role_name }))
-                }
-                Some("reviewer") => Ok(Some(BriefEvent::ReviewerDone {
-                    verdict,
-                    findings: vec![],
-                    role_name,
-                })),
-                // Shipper Done. Acceptance pr_number / head_sha ride
-                // separately on the trace stream as the shipper's own
-                // emit_message to ci-watcher; the FSM's
-                // Shipping → Watching arm carries the values that
-                // were already sealed into Shipping. Defaults are
-                // safe here — the existing FSM arm only reads the
-                // event's pr_number / head_sha, and the lifecycle
-                // driver overrides them at write time.
-                Some("shipper") => Ok(Some(BriefEvent::ShipperDone {
-                    pr_number: 0,
-                    head_sha: String::new(),
-                })),
-                // CI watcher Done. Map the agent verdict onto the
-                // poller-shaped CiState the FSM expects:
-                //   Shipped → Success, Failed → Failed, else Pending.
-                // The else arm covers Escalated / ReworkNeeded /
-                // Rejected, which the watcher does not normally emit
-                // but which the FSM treats as no-op Pending in the
-                // Watching state.
                 Some("ci-watcher") => {
                     let state = match verdict {
                         EventVerdict::Shipped => CiState::Success,
@@ -189,7 +182,13 @@ pub fn translate_trace_entry(
                         head_sha: String::new(),
                     }))
                 }
-                _ => Ok(None),
+                Some(_) => Ok(Some(BriefEvent::RoleDone {
+                    node_id: orchestrator_types::NodeId(role_name),
+                    verdict,
+                    findings: vec![],
+                    run_data: None,
+                })),
+                None => Ok(None),
             }
         }
         EventKind::RetryRequested { actor, reason } => {
