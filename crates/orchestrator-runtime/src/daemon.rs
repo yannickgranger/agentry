@@ -511,6 +511,89 @@ struct RoleRun {
     team_ctx: TeamContext,
 }
 
+/// FSM-side view of a brief's progression at iteration top of the
+/// team-orchestration loop in `handle_brief`. Returns
+/// `(shipped_set, fsm_retry_attempt)`:
+///
+/// - `shipped_set` is the union of the FSM-observed
+///   `Walking.evidence` (filtered to `EventVerdict::Shipped`) and the
+///   caller's in-process `shipped_roles` accumulator. Union is the
+///   safe-side default while the two data sources can transiently
+///   diverge (in-batch: handle_brief is ahead; on reattach: FSM is
+///   ahead from persisted state).
+///
+/// - `fsm_retry_attempt` is `Walking.retry.attempt` when the brief is
+///   in `Walking`, `None` otherwise (`Submitted`, terminal, or read
+///   error). The caller uses `local.max(fsm)` for the rework-budget
+///   threshold check so neither source can race past `team.max_retries`.
+///
+/// Read errors fall back to the in-process accumulator with a WARN
+/// log — a transient Redis hiccup must not crash a brief in flight.
+/// Terminal FSM state is logged at debug; the caller's terminal-
+/// disposition path remains responsible for the final state write
+/// until a later phase introduces an FSM-cursor sync barrier.
+///
+/// v2 finale (#539) helper — extracted from `handle_brief`'s outer
+/// loop in phase 3 so the loop body reads as plain DAG walk and the
+/// FSM-state read is one factored unit.
+async fn read_walking_view(
+    conn: &mut ConnectionManager,
+    brief_id: &BriefId,
+    team: &TeamTopology,
+    shipped_roles: &[RoleRef],
+) -> (HashSet<RoleRef>, Option<u32>) {
+    let fsm_state = match read_brief_state(conn, brief_id).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(
+                brief = %brief_id,
+                error = %e,
+                "FSM state read failed; falling back to in-process shipped_roles for this iteration"
+            );
+            None
+        }
+    };
+    match fsm_state.as_ref().map(|r| &r.state) {
+        Some(BriefState::Walking {
+            evidence, retry, ..
+        }) => {
+            // NodeId in `Walking.evidence` is constructed from
+            // `role.name.0` by the translator (lifecycle_ports.rs:165
+            // and the `Some(_)` arm at :185); the inverse lookup is
+            // name-keyed via team.roles.
+            let fsm: HashSet<RoleRef> = team
+                .roles
+                .iter()
+                .filter(|r| {
+                    evidence
+                        .get(&NodeId(r.name.0.clone()))
+                        .map(|v| matches!(v, EventVerdict::Shipped))
+                        .unwrap_or(false)
+                })
+                .cloned()
+                .collect();
+            let local: HashSet<RoleRef> = shipped_roles.iter().cloned().collect();
+            if fsm != local {
+                tracing::debug!(
+                    brief = %brief_id,
+                    fsm_count = fsm.len(),
+                    local_count = local.len(),
+                    "FSM shipped_set diverges from in-process accumulator (acceptable during transition between batches; later phase deletes the in-process side)"
+                );
+            }
+            (fsm.union(&local).cloned().collect(), Some(retry.attempt))
+        }
+        Some(BriefState::Shipped) | Some(BriefState::Failed { .. }) => {
+            tracing::debug!(
+                brief = %brief_id,
+                "FSM reports terminal state during team-orchestration loop; continuing to in-process terminal disposition"
+            );
+            (shipped_roles.iter().cloned().collect(), None)
+        }
+        _ => (shipped_roles.iter().cloned().collect(), None),
+    }
+}
+
 /// Handle a single brief end-to-end via DAG walk. Returns the brief's
 /// terminal-verdict kind (Shipped or Failed) so the caller can drive the DOL
 /// composer.
@@ -595,82 +678,16 @@ async fn handle_brief(
         // have not yet shipped themselves. Roles with zero inbound edges
         // are immediately ready.
         //
-        // v2 finale (#539 phase 1): the FSM's `Walking.evidence` is the
-        // canonical source of shipped-status. Read it at the top of the
-        // iteration via `read_brief_state`; the in-process `shipped_roles`
-        // accumulator is kept as a fallback for the first iteration
-        // (state == Submitted or :state key absent) and as a divergence
-        // probe during transition between batches (FSM driver is async
-        // relative to the team-orchestration loop). Subsequent phases
-        // delete the in-process accumulator entirely once a per-iteration
-        // FSM-sync barrier is in place.
-        let fsm_state = match read_brief_state(conn, &brief.id).await {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(
-                    brief = %brief.id,
-                    error = %e,
-                    "FSM state read failed; falling back to in-process shipped_roles for this iteration"
-                );
-                None
-            }
-        };
-        let (shipped_set, fsm_retry_attempt): (HashSet<RoleRef>, Option<u32>) = match fsm_state
-            .as_ref()
-            .map(|r| &r.state)
-        {
-            Some(BriefState::Walking {
-                evidence, retry, ..
-            }) => {
-                // NodeId in `Walking.evidence` is constructed from
-                // `role.name.0` by the translator (lifecycle_ports.rs:165
-                // and the `Some(_)` arm at :185); the inverse lookup is
-                // name-keyed via team.roles.
-                let fsm: HashSet<RoleRef> = team
-                    .roles
-                    .iter()
-                    .filter(|r| {
-                        evidence
-                            .get(&NodeId(r.name.0.clone()))
-                            .map(|v| matches!(v, EventVerdict::Shipped))
-                            .unwrap_or(false)
-                    })
-                    .cloned()
-                    .collect();
-                let local: HashSet<RoleRef> = shipped_roles.iter().cloned().collect();
-                if fsm != local {
-                    tracing::debug!(
-                        brief = %brief.id,
-                        fsm_count = fsm.len(),
-                        local_count = local.len(),
-                        "FSM shipped_set diverges from in-process accumulator (acceptable during transition between batches; later phase deletes the in-process side)"
-                    );
-                }
-                // Union for safety: if either source has the role
-                // marked shipped, treat it as shipped. The in-process
-                // accumulator can be ahead within a batch (we wrote
-                // to it before the FSM driver consumed the trace);
-                // the FSM can be ahead on reattach. Later phase
-                // introduces a sync barrier and drops the local side.
-                (fsm.union(&local).cloned().collect(), Some(retry.attempt))
-            }
-            // Terminal state on read: the FSM has decided the brief.
-            // Don't early-break here — let the existing terminal-
-            // disposition path at end-of-function reconcile against
-            // the FSM's verdict. The path is idempotent at the LUA-
-            // write boundary, so a second write of the same terminal
-            // state is harmless. A future commit will short-circuit
-            // this loop on terminal FSM state once the terminal-write
-            // path is FSM-aware.
-            Some(BriefState::Shipped) | Some(BriefState::Failed { .. }) => {
-                tracing::debug!(
-                    brief = %brief.id,
-                    "FSM reports terminal state during team-orchestration loop; continuing to in-process terminal disposition"
-                );
-                (shipped_roles.iter().cloned().collect(), None)
-            }
-            _ => (shipped_roles.iter().cloned().collect(), None),
-        };
+        // v2 finale (#539 phases 1+2): `read_walking_view` returns the
+        // FSM-observed `Walking.evidence` shipped set unioned with the
+        // in-process `shipped_roles` accumulator, plus the FSM's
+        // `Walking.retry.attempt` for the rework-budget threshold check.
+        // Union semantics keep correctness during the transition window
+        // where the two sources can diverge (in-batch: local ahead;
+        // on reattach: FSM ahead). Later phase introduces a sync
+        // barrier and drops the local side.
+        let (shipped_set, fsm_retry_attempt) =
+            read_walking_view(conn, &brief.id, &team, &shipped_roles).await;
         let ready: Vec<RoleRef> = team
             .roles
             .iter()
