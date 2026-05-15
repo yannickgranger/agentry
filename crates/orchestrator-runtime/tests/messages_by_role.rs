@@ -8,8 +8,10 @@
 //! nothing about the message path — see the 5a PR body).
 
 use chrono::{TimeZone, Utc};
-use orchestrator_runtime::daemon::group_messages_by_role;
-use orchestrator_types::{Event, EventKind, EventVerdict};
+use orchestrator_runtime::daemon::{group_messages_by_role, overrides_from_messages};
+use orchestrator_runtime::spawner::RoutedMessage;
+use orchestrator_types::team::{MessageEdge, TeamTopology};
+use orchestrator_types::{Event, EventKind, EventVerdict, RoleName, RoleRef, TeamName};
 use serde_json::json;
 
 fn ts(secs: i64) -> chrono::DateTime<chrono::Utc> {
@@ -239,4 +241,128 @@ fn clean_no_rework_brief_routes_zero_messages() {
         ("a3".to_string(), spawned("shipper-agentry")),
     ];
     assert!(group_messages_by_role(&entries).is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// #539 phase-6 fence — `daemon::overrides_from_messages` must resolve
+// the same `PermitOverrides` the deleted in-process `overrides_for`
+// HashMap did: walk inbound messages, match the `from→to` edge whose
+// `permit_overrides_from` names a payload key, deserialize it,
+// last-write-wins.
+// ---------------------------------------------------------------------------
+
+fn role(name: &str) -> RoleRef {
+    RoleRef {
+        name: RoleName(name.to_string()),
+        version: 1,
+    }
+}
+
+fn routed(from: &str, to: &str, payload: serde_json::Value, at_secs: i64) -> RoutedMessage {
+    RoutedMessage {
+        from: from.to_string(),
+        to: to.to_string(),
+        payload,
+        at: ts(at_secs),
+    }
+}
+
+/// Minimal team: `synthesizer → coder` edge carrying
+/// `permit_overrides_from = "permit_overrides"`.
+fn team_with_override_edge() -> TeamTopology {
+    TeamTopology {
+        name: TeamName("t".into()),
+        version: 1,
+        roles: vec![role("synthesizer-agentry"), role("coder-claude-agentry")],
+        message_graph: vec![MessageEdge {
+            from: role("synthesizer-agentry"),
+            to: role("coder-claude-agentry"),
+            permit_overrides_from: Some("permit_overrides".to_string()),
+            rework_target: None,
+            gate_policy: None,
+        }],
+        terminal_role: role("coder-claude-agentry"),
+        max_retries: 2,
+        node_classes: Default::default(),
+    }
+}
+
+#[test]
+fn override_extracted_from_matching_edge_key_payload() {
+    let team = team_with_override_edge();
+    let inbound = vec![routed(
+        "synthesizer-agentry",
+        "coder-claude-agentry",
+        json!({ "permit_overrides": { "fs_write": ["src/a.rs"] } }),
+        1,
+    )];
+    let got = overrides_from_messages(&team, "coder-claude-agentry", &inbound)
+        .expect("override resolved");
+    assert_eq!(got.fs_write, vec!["src/a.rs".to_string()]);
+}
+
+#[test]
+fn override_last_write_wins_matches_hashmap_insert() {
+    let team = team_with_override_edge();
+    let inbound = vec![
+        routed(
+            "synthesizer-agentry",
+            "coder-claude-agentry",
+            json!({ "permit_overrides": { "fs_write": ["first.rs"] } }),
+            1,
+        ),
+        routed(
+            "synthesizer-agentry",
+            "coder-claude-agentry",
+            json!({ "permit_overrides": { "fs_write": ["second.rs"] } }),
+            2,
+        ),
+    ];
+    let got = overrides_from_messages(&team, "coder-claude-agentry", &inbound)
+        .expect("override resolved");
+    assert_eq!(
+        got.fs_write,
+        vec!["second.rs".to_string()],
+        "later message wins, matching the deleted HashMap::insert order"
+    );
+}
+
+#[test]
+fn no_override_when_no_edge_or_key_or_wrong_target() {
+    let team = team_with_override_edge();
+    // Right edge, but payload lacks the key.
+    let no_key = vec![routed(
+        "synthesizer-agentry",
+        "coder-claude-agentry",
+        json!({ "something_else": 1 }),
+        1,
+    )];
+    assert!(overrides_from_messages(&team, "coder-claude-agentry", &no_key).is_none());
+
+    // Key present but message addressed to a role with no override edge.
+    let wrong_target = vec![routed(
+        "synthesizer-agentry",
+        "reviewer-claude-agentry",
+        json!({ "permit_overrides": { "fs_write": ["x.rs"] } }),
+        1,
+    )];
+    assert!(
+        overrides_from_messages(&team, "reviewer-claude-agentry", &wrong_target).is_none()
+    );
+
+    // No inbound at all.
+    assert!(overrides_from_messages(&team, "coder-claude-agentry", &[]).is_none());
+}
+
+#[test]
+fn malformed_override_payload_skipped_not_panicked() {
+    let team = team_with_override_edge();
+    // `permit_overrides` present but not a PermitOverrides shape.
+    let bad = vec![routed(
+        "synthesizer-agentry",
+        "coder-claude-agentry",
+        json!({ "permit_overrides": "not-an-object" }),
+        1,
+    )];
+    assert!(overrides_from_messages(&team, "coder-claude-agentry", &bad).is_none());
 }
