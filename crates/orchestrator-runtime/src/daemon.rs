@@ -546,15 +546,27 @@ struct RoleRun {
 /// this reconstruction is proven equivalent by
 /// `tests/messages_by_role.rs`.
 ///
-/// Equivalence invariant: every agent emits a `spawned` event carrying
-/// its `role_name` BEFORE any `Message` it sends (guaranteed by
-/// `spawner::run_agent`, which appends the spawn trace entry at
-/// container start and only later forwards agent stdout). The
-/// in-process write at spawner.rs:478-484 stamps
-/// `RoutedMessage.from = role.name.0`; the reconstruction recovers the
-/// same value from the memo. A `Message` from an agent with no prior
-/// `spawned` entry yields `from = ""` — divergence the test pins as a
-/// guarded precondition, never expected in a real trace.
+/// `from` resolution has two paths:
+///
+/// 1. **Agent messages** — every agent emits a `spawned` event carrying
+///    its `role_name` BEFORE any `Message` it sends (guaranteed by
+///    `spawner::run_agent`, which appends the spawn trace entry at
+///    container start and only later forwards agent stdout). The trace
+///    `agent` field is the agent's UUID; the memo maps UUID → role
+///    name, recovering the same value the in-process write at
+///    spawner.rs:478-484 stamped (`RoutedMessage.from = role.name.0`).
+/// 2. **Daemon-attributed messages** — `handle_brief` synthesizes the
+///    rework findings message and appends it to the trace with the
+///    `agent` field set to the *source role's name* (not a UUID),
+///    because no agent process emitted it. Such an `agent_id` is never
+///    in the spawned memo, so the fallback uses it directly as `from`.
+///    This reproduces the pre-5c in-process write
+///    `RoutedMessage { from: from_ref.name.0, .. }` exactly.
+///
+/// The two paths are unambiguous: agent UUIDs never collide with role
+/// names (UUIDs are `agt_<hex>`; role names are `coder-claude-agentry`
+/// etc.), and the spawned-first invariant guarantees a real agent
+/// message always hits the memo. `tests/messages_by_role.rs` pins both.
 ///
 /// Pure (no I/O) so it is unit-testable without a live Redis stream.
 /// `pub` for the integration test; graph-specs gates only
@@ -575,7 +587,14 @@ pub fn group_messages_by_role(
                 }
             }
             EventKind::Message { to, payload } => {
-                let from = role_by_agent.get(agent_id).cloned().unwrap_or_default();
+                // Memo hit → agent message (from = role name).
+                // Memo miss → daemon-attributed message; the daemon
+                // wrote the source role's name as `agent_id`, so use
+                // it directly as `from`.
+                let from = role_by_agent
+                    .get(agent_id)
+                    .cloned()
+                    .unwrap_or_else(|| agent_id.clone());
                 out.entry(to.clone()).or_default().push(RoutedMessage {
                     from,
                     to: to.clone(),
@@ -772,8 +791,15 @@ async fn handle_brief(
         return Err(Error::Config(format!("team {} has no roles", team.name.0)));
     }
 
-    // Accumulated outbox from all upstream roles; sliced per role on dispatch.
-    let mut all_messages: Vec<RoutedMessage> = Vec::new();
+    // #539 phase 5c: the in-process `all_messages` accumulator is
+    // GONE. The trace stream is the single source of routed messages —
+    // agent outboxes are trace-persisted at spawner.rs:489 and the
+    // rework synthetic findings message is appended to the trace at the
+    // rework dispatch site below. `TeamContext.messages` (per-iteration)
+    // and `finalize_shipped_team`'s chain-trigger both reconstruct from
+    // the trace via `messages_by_role_from_trace`. Pure-projection
+    // invariant satisfied: a brief's routed-message state is fully
+    // derivable from `(trace stream)`, no load-bearing in-process Vec.
     // Permit-narrowing overrides accumulated for a downstream role, keyed by role name.
     let mut overrides_for: HashMap<String, PermitOverrides> = HashMap::new();
     // Lazily allocated on first role that declares a `workspace_mount`.
@@ -961,7 +987,15 @@ async fn handle_brief(
                     }
                 }
             }
-            all_messages.extend(outcome.outbox);
+            // #539 phase 5c: `outcome.outbox` is NOT accumulated in
+            // process — every message it carries was already
+            // trace-persisted by `spawner::run_agent` at spawner.rs:489
+            // (`append_trace` on each `EventKind::Message`). The trace
+            // is the single source; `messages_by_role_from_trace`
+            // reconstructs the identical set (pinned by
+            // tests/messages_by_role.rs). The field is consumed only to
+            // move it out of `outcome`.
+            let _ = outcome.outbox;
 
             // F6 escalation: when the coder reports verdict=Failed with
             // cause=self_review_disagreed, the translator has emitted
@@ -1030,12 +1064,40 @@ async fn handle_brief(
             let upstream = resolve_rework_target(&from_ref, &team);
             match upstream {
                 Some(up) if effective_reworks_used < team.max_retries => {
-                    all_messages.push(RoutedMessage {
-                        from: from_ref.name.0.clone(),
+                    // #539 phase 5c: the rework findings message is
+                    // daemon-synthesized (no agent emitted it). Append
+                    // it to the trace stream with the trace `agent`
+                    // field set to the source role's NAME (not a UUID)
+                    // so `group_messages_by_role`'s daemon-attributed
+                    // fallback reconstructs `from = from_ref.name.0` —
+                    // exactly what the deleted in-process
+                    // `all_messages.push(RoutedMessage { from:
+                    // from_ref.name.0, .. })` produced. The trace is now
+                    // the single source: the next outer-loop iteration's
+                    // `messages_by_role_from_trace` delivers this into
+                    // the rewound upstream's `TeamContext.messages`
+                    // (post-#552 TeamContext reads only the trace, so
+                    // without this the findings would never reach the
+                    // rewound coder). `append_trace` is synchronous to
+                    // Redis, so the entry is visible to the next
+                    // iteration's XRANGE. A Redis error is logged WARN
+                    // and the rework still proceeds via the FSM rewind —
+                    // a degraded rework beats a crashed brief.
+                    let rework_msg = orchestrator_types::Event::new(EventKind::Message {
                         to: up.name.0.clone(),
                         payload: serde_json::json!({ "findings": findings }),
-                        at: now(),
                     });
+                    if let Err(e) =
+                        redis_io::append_trace(conn, &brief.id, &from_ref.name.0, &rework_msg).await
+                    {
+                        tracing::warn!(
+                            brief = %brief.id,
+                            from = %from_ref.name,
+                            to = %up.name,
+                            error = %e,
+                            "rework findings message append_trace failed; rework proceeds without the findings payload"
+                        );
+                    }
                     reworks_used += 1;
                     let route_kind = if team
                         .incoming(&from_ref)
@@ -1188,7 +1250,7 @@ async fn handle_brief(
     // <workspace>/planner-children/), so file reads must complete while the
     // workspace still exists. Destruction follows once every brief is parsed
     // into memory and submitted to Redis.
-    finalize_shipped_team(conn, brief, workspace.take(), &all_messages).await?;
+    finalize_shipped_team(conn, brief, workspace.take()).await?;
 
     Ok(VerdictKind::Shipped)
 }
@@ -1234,9 +1296,22 @@ async fn finalize_shipped_team(
     conn: &mut ConnectionManager,
     brief: &Brief,
     workspace: Option<BriefWorkspace>,
-    all_messages: &[RoutedMessage],
 ) -> Result<()> {
-    for next_ref in collect_chain_paths(&brief.payload, all_messages) {
+    // #539 phase 5c: chain-trigger paths are derived from the trace,
+    // not an in-process accumulator. `collect_chain_paths` scans the
+    // brief payload plus every routed-message payload for
+    // `next_brief_refs`; the routed messages are reconstructed from the
+    // trace (the canonical source — spawner.rs:489 trace-persists every
+    // agent `Message`, and the rework synthetic message is appended to
+    // the trace at the rework dispatch site above). The grouped map is
+    // flattened back to a flat `Vec<RoutedMessage>` since chain-path
+    // extraction does not care which role a message was addressed to.
+    let trace_messages: Vec<RoutedMessage> = messages_by_role_from_trace(conn, &brief.id)
+        .await
+        .into_values()
+        .flatten()
+        .collect();
+    for next_ref in collect_chain_paths(&brief.payload, &trace_messages) {
         if let Some(next_brief) = load_next_brief(&next_ref).await {
             redis_io::submit_brief(conn, &next_brief).await?;
             tracing::info!(
