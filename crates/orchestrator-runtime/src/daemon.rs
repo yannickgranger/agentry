@@ -534,6 +534,67 @@ struct RoleRun {
 /// caller falls back to the in-process slice. The XRANGE count is
 /// bounded at 4096 entries per scan, which exceeds any current
 /// brief's trace length by an order of magnitude.
+/// Pure trace→inbox reconstruction. Given trace entries as
+/// `(agent_id, Event)` pairs in stream order, memoize
+/// `agent_id → role_name` from `spawned` event payloads and group
+/// `EventKind::Message` events by destination role.
+///
+/// This is the #539 phase-5 fence. It must reproduce **exactly** what
+/// the in-process `all_messages` accumulator plus
+/// `.filter(|m| m.to == role).cloned()` would have produced — the
+/// deletion of `all_messages` in a later slice is only safe because
+/// this reconstruction is proven equivalent by
+/// `tests/messages_by_role.rs`.
+///
+/// Equivalence invariant: every agent emits a `spawned` event carrying
+/// its `role_name` BEFORE any `Message` it sends (guaranteed by
+/// `spawner::run_agent`, which appends the spawn trace entry at
+/// container start and only later forwards agent stdout). The
+/// in-process write at spawner.rs:478-484 stamps
+/// `RoutedMessage.from = role.name.0`; the reconstruction recovers the
+/// same value from the memo. A `Message` from an agent with no prior
+/// `spawned` entry yields `from = ""` — divergence the test pins as a
+/// guarded precondition, never expected in a real trace.
+///
+/// Pure (no I/O) so it is unit-testable without a live Redis stream.
+/// `pub` for the integration test; graph-specs gates only
+/// `pub struct/enum/trait/type`, so a `pub fn` needs no spec entry
+/// (same rationale as `default_work_root`).
+pub fn group_messages_by_role(
+    entries: &[(String, orchestrator_types::Event)],
+) -> HashMap<String, Vec<RoutedMessage>> {
+    let mut role_by_agent: HashMap<String, String> = HashMap::new();
+    let mut out: HashMap<String, Vec<RoutedMessage>> = HashMap::new();
+    for (agent_id, ev) in entries {
+        match &ev.kind {
+            EventKind::Event { payload } => {
+                if payload.get("agent_event").and_then(|v| v.as_str()) == Some("spawned") {
+                    if let Some(rn) = payload.get("role_name").and_then(|v| v.as_str()) {
+                        role_by_agent.insert(agent_id.clone(), rn.to_string());
+                    }
+                }
+            }
+            EventKind::Message { to, payload } => {
+                let from = role_by_agent.get(agent_id).cloned().unwrap_or_default();
+                out.entry(to.clone()).or_default().push(RoutedMessage {
+                    from,
+                    to: to.clone(),
+                    payload: payload.clone(),
+                    at: ev.at,
+                });
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Scan a brief's trace stream (XRANGE, bounded 4096) and return the
+/// per-role inbox map via [`group_messages_by_role`]. Trace read
+/// errors return an empty map with a WARN log — a transient Redis
+/// hiccup must not crash a brief in flight; the caller falls back to
+/// the in-process slice. See [`group_messages_by_role`] for the
+/// reconstruction semantics and the phase-5 equivalence invariant.
 async fn messages_by_role_from_trace(
     conn: &mut ConnectionManager,
     brief_id: &BriefId,
@@ -551,8 +612,7 @@ async fn messages_by_role_from_trace(
                 return HashMap::new();
             }
         };
-    let mut role_by_agent: HashMap<String, String> = HashMap::new();
-    let mut out: HashMap<String, Vec<RoutedMessage>> = HashMap::new();
+    let mut entries: Vec<(String, orchestrator_types::Event)> = Vec::with_capacity(reply.ids.len());
     for entry in reply.ids {
         let agent_id = entry
             .map
@@ -567,27 +627,9 @@ async fn messages_by_role_from_trace(
         let Ok(ev) = serde_json::from_str::<orchestrator_types::Event>(&body) else {
             continue;
         };
-        match &ev.kind {
-            EventKind::Event { payload } => {
-                if payload.get("agent_event").and_then(|v| v.as_str()) == Some("spawned") {
-                    if let Some(rn) = payload.get("role_name").and_then(|v| v.as_str()) {
-                        role_by_agent.insert(agent_id.clone(), rn.to_string());
-                    }
-                }
-            }
-            EventKind::Message { to, payload } => {
-                let from = role_by_agent.get(&agent_id).cloned().unwrap_or_default();
-                out.entry(to.clone()).or_default().push(RoutedMessage {
-                    from,
-                    to: to.clone(),
-                    payload: payload.clone(),
-                    at: ev.at,
-                });
-            }
-            _ => {}
-        }
+        entries.push((agent_id, ev));
     }
-    out
+    group_messages_by_role(&entries)
 }
 
 /// FSM-side view of a brief's progression at iteration top of the
