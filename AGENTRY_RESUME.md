@@ -8,6 +8,8 @@ A minimal orchestrator for ephemeral agent containers. Every containerised agent
 
 Full architectural read: `README.md` → `specs/concepts/*.md` (the DDD concept list enforced by `graph-specs-rust`).
 
+Brief contract + dispatch recipe: see [`docs/dogfood-protocol.md`](docs/dogfood-protocol.md).
+
 ## The cutoff rule
 
 `agentry` is built by `agentry`. Once issue #8 on `yg/agentry` merges, Claude cannot author code on `yg/agentry` directly. Every further change is a brief dispatched into the `agentry-self-host-v0` team defined in that PR (`coder-claude-agentry → reviewer-mechanical-agentry → shipper-agentry`).
