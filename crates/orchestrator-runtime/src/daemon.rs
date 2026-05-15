@@ -710,32 +710,27 @@ async fn messages_by_role_from_trace(
 /// team-orchestration loop in `handle_brief`. Returns
 /// `(shipped_set, fsm_retry_attempt)`:
 ///
-/// - `shipped_set` is the union of the FSM-observed
-///   `Walking.evidence` (filtered to `EventVerdict::Shipped`) and the
-///   caller's in-process `shipped_roles` accumulator. Union is the
-///   safe-side default while the two data sources can transiently
-///   diverge (in-batch: handle_brief is ahead; on reattach: FSM is
-///   ahead from persisted state).
+/// - `shipped_set` — roles `Shipped` in the FSM's `Walking.evidence`.
+///   The FSM is now the sole authority (phase 7b): the in-process
+///   `shipped_roles` accumulator + the union are gone. The
+///   `await_fsm_settled` barrier at the end of each loop iteration
+///   guarantees the driver has consumed the prior batch before this
+///   read, so there is no lag window to cover.
 ///
-/// - `fsm_retry_attempt` is `Walking.retry.attempt` when the brief is
-///   in `Walking`, `None` otherwise (`Submitted`, terminal, or read
-///   error). The caller uses `local.max(fsm)` for the rework-budget
-///   threshold check so neither source can race past `team.max_retries`.
+/// - `fsm_retry_attempt` — `Walking.retry.attempt` when in `Walking`,
+///   `None` otherwise (`Submitted`, terminal, or read error). The
+///   caller uses it directly as the rework-budget counter.
 ///
-/// Read errors fall back to the in-process accumulator with a WARN
-/// log — a transient Redis hiccup must not crash a brief in flight.
-/// Terminal FSM state is logged at debug; the caller's terminal-
-/// disposition path remains responsible for the final state write
-/// until a later phase introduces an FSM-cursor sync barrier.
+/// Read errors yield `(empty, None)` with a WARN — a transient Redis
+/// hiccup must not crash a brief; an empty shipped-set just means the
+/// next ready-set recompute re-fires from the entry node, which the
+/// FSM's own state will correct on the following settled iteration.
 ///
-/// v2 finale (#539) helper — extracted from `handle_brief`'s outer
-/// loop in phase 3 so the loop body reads as plain DAG walk and the
-/// FSM-state read is one factored unit.
+/// v2 finale (#539) helper.
 async fn read_walking_view(
     conn: &mut ConnectionManager,
     brief_id: &BriefId,
     team: &TeamTopology,
-    shipped_roles: &[RoleRef],
 ) -> (HashSet<RoleRef>, Option<u32>) {
     let fsm_state = match read_brief_state(conn, brief_id).await {
         Ok(s) => s,
@@ -743,7 +738,7 @@ async fn read_walking_view(
             tracing::warn!(
                 brief = %brief_id,
                 error = %e,
-                "FSM state read failed; falling back to in-process shipped_roles for this iteration"
+                "FSM state read failed; treating shipped-set as empty for this iteration"
             );
             None
         }
@@ -767,26 +762,56 @@ async fn read_walking_view(
                 })
                 .cloned()
                 .collect();
-            let local: HashSet<RoleRef> = shipped_roles.iter().cloned().collect();
-            if fsm != local {
-                tracing::debug!(
-                    brief = %brief_id,
-                    fsm_count = fsm.len(),
-                    local_count = local.len(),
-                    "FSM shipped_set diverges from in-process accumulator (acceptable during transition between batches; later phase deletes the in-process side)"
-                );
-            }
-            (fsm.union(&local).cloned().collect(), Some(retry.attempt))
+            (fsm, Some(retry.attempt))
         }
-        Some(BriefState::Shipped) | Some(BriefState::Failed { .. }) => {
-            tracing::debug!(
-                brief = %brief_id,
-                "FSM reports terminal state during team-orchestration loop; continuing to in-process terminal disposition"
-            );
-            (shipped_roles.iter().cloned().collect(), None)
-        }
-        _ => (shipped_roles.iter().cloned().collect(), None),
+        _ => (HashSet::new(), None),
     }
+}
+
+/// Bounded poll until the FSM driver has settled w.r.t. the
+/// just-completed batch (see [`fsm_settled`] for the per-outcome
+/// settle conditions). The team-orchestration loop calls this at the
+/// end of each iteration so the next iteration's `read_walking_view`
+/// reads FSM state that already reflects this batch — replacing the
+/// deleted in-process `shipped_roles`/`reworks_used` union.
+///
+/// `state_projector_cursor` cannot gate this (synthetic `step-N`, not
+/// a trace id — lifecycle_driver.rs:45-47), so the barrier is
+/// content-based via `fsm_settled`. Bounded at ~5s (50×100ms); on
+/// timeout it logs WARN and returns — the loop proceeds on whatever
+/// FSM state is current, degraded but not deadlocked (a stuck FSM
+/// driver is a separate failure the reaper/resume path handles).
+async fn await_fsm_settled(
+    conn: &mut ConnectionManager,
+    brief_id: &BriefId,
+    started_attempt: u32,
+    expect_shipped: &[RoleRef],
+    had_rework: bool,
+) {
+    for _ in 0..50 {
+        let state = match read_brief_state(conn, brief_id).await {
+            Ok(Some(rec)) => rec.state,
+            Ok(None) => BriefState::Submitted,
+            Err(e) => {
+                tracing::warn!(
+                    brief = %brief_id,
+                    error = %e,
+                    "await_fsm_settled state read failed; retrying"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+        if fsm_settled(&state, started_attempt, expect_shipped, had_rework) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    tracing::warn!(
+        brief = %brief_id,
+        had_rework,
+        "await_fsm_settled timed out after ~5s; FSM driver lagging — proceeding on current state"
+    );
 }
 
 /// Has the FSM driver "settled" with respect to a just-completed
@@ -924,30 +949,23 @@ async fn handle_brief(
     // `"reviewer-claude-agentry verdict=Failed"`). Operators reading the
     // `:state` key see WHY without grepping the trace stream.
     let mut team_failure_detail: Option<String> = None;
-    // Per-brief rework budget.
-    let mut reworks_used: u32 = 0;
-    // Roles whose Shipped outcome has appeared in the trace stream so
-    // far. The single source of truth for DAG progress is the trace —
-    // this local accumulator is the loop's slice of it. Reworks remove
-    // the rewound role and its downstream sub-DAG so they re-fire once
-    // the upstream re-ships.
-    let mut shipped_roles: Vec<RoleRef> = Vec::new();
-
     'outer: loop {
-        // Ready set: roles whose upstream roles are all shipped and that
-        // have not yet shipped themselves. Roles with zero inbound edges
-        // are immediately ready.
+        // Ready set: roles whose upstream roles are all shipped and
+        // that have not yet shipped themselves. Roles with zero
+        // inbound edges are immediately ready.
         //
-        // v2 finale (#539 phases 1+2): `read_walking_view` returns the
-        // FSM-observed `Walking.evidence` shipped set unioned with the
-        // in-process `shipped_roles` accumulator, plus the FSM's
-        // `Walking.retry.attempt` for the rework-budget threshold check.
-        // Union semantics keep correctness during the transition window
-        // where the two sources can diverge (in-batch: local ahead;
-        // on reattach: FSM ahead). Later phase introduces a sync
-        // barrier and drops the local side.
-        let (shipped_set, fsm_retry_attempt) =
-            read_walking_view(conn, &brief.id, &team, &shipped_roles).await;
+        // v2 finale (#539 phase 7b): the FSM's `Walking.evidence` is
+        // the SOLE authority for shipped-status and `retry.attempt`
+        // for the rework budget — the in-process `shipped_roles` /
+        // `reworks_used` accumulators and the union are deleted. The
+        // `await_fsm_settled` barrier at the end of each iteration
+        // guarantees the driver consumed the prior batch before this
+        // read, so there is no lag window. Rework is the ratified v2
+        // full-reset-to-entry model (FSM empties evidence + bumps
+        // retry on the ReworkNeeded RoleDone, lifecycle.rs:516-519);
+        // an empty shipped-set here ⇒ ready-set recomputes from the
+        // entry node ⇒ the chain re-fires from the coder.
+        let (shipped_set, fsm_retry_attempt) = read_walking_view(conn, &brief.id, &team).await;
         let ready: Vec<RoleRef> = team
             .roles
             .iter()
@@ -1132,34 +1150,26 @@ async fn handle_brief(
             }
         }
 
-        // Record this batch's Shipped outcomes.
-        for r in &shipped_in_batch {
-            shipped_roles.push(r.clone());
-        }
+        // #539 phase 7b: shipped-status is the FSM's `Walking.evidence`
+        // alone (read at loop top via `read_walking_view`); the
+        // in-process `shipped_roles` accumulator is deleted. The batch's
+        // Shipped roles are still tracked locally in `shipped_in_batch`
+        // — not as a source of truth, but as the `expect_shipped`
+        // argument to the end-of-iteration `await_fsm_settled` barrier.
 
-        // Reworks: each rewinds to its single upstream and resets that
-        // upstream + its downstream sub-DAG so the slice re-fires once
-        // the upstream re-ships.
-        // v2 finale (#539 phase 2): the FSM's `Walking.retry.attempt`
-        // (mirror of `team.max_retries` via `RetryBudget`) is the
-        // canonical rework counter. Take the max of FSM-observed and
-        // in-process counts so neither source can race ahead of the
-        // threshold. The local `reworks_used` still increments below
-        // for the in-batch increment that the FSM driver will catch up
-        // on async. Subsequent phase deletes `reworks_used` once an
-        // FSM-cursor sync barrier is in place.
-        let effective_reworks_used = reworks_used.max(fsm_retry_attempt.unwrap_or(0));
-        if fsm_retry_attempt
-            .map(|f| f != reworks_used)
-            .unwrap_or(false)
-        {
-            tracing::debug!(
-                brief = %brief.id,
-                fsm_attempt = ?fsm_retry_attempt,
-                local = reworks_used,
-                "FSM retry.attempt diverges from in-process reworks_used (acceptable during batch transition)"
-            );
-        }
+        // Reworks: rewind to the single upstream. v2 finale (#539
+        // phase 7b): the FSM's `Walking.retry.attempt` is the sole
+        // rework counter (the in-process `reworks_used` is deleted).
+        // The barrier guarantees `fsm_retry_attempt` reflects the prior
+        // batch, so it can be used directly without a max() against a
+        // local mirror.
+        let effective_reworks_used = fsm_retry_attempt.unwrap_or(0);
+        // Barrier inputs (#539 phase 7b): the FSM attempt observed at
+        // iteration top, whether this batch dispatched a rework, and
+        // the roles that shipped this batch — passed to
+        // `await_fsm_settled` at the end of the iteration.
+        let started_attempt = fsm_retry_attempt.unwrap_or(0);
+        let had_rework = !reworks.is_empty();
         let mut rewound_subdags: HashSet<RoleRef> = HashSet::new();
         for (from_ref, findings) in reworks {
             let upstream = resolve_rework_target(&from_ref, &team);
@@ -1199,7 +1209,6 @@ async fn handle_brief(
                             "rework findings message append_trace failed; rework proceeds without the findings payload"
                         );
                     }
-                    reworks_used += 1;
                     let route_kind = if team
                         .incoming(&from_ref)
                         .iter()
@@ -1215,16 +1224,26 @@ async fn handle_brief(
                         to = %up.name,
                         findings_count = findings.len(),
                         effective_reworks_used,
-                        reworks_used,
                         fsm_attempt = ?fsm_retry_attempt,
                         max_retries = team.max_retries,
                         route_kind = %route_kind,
-                        "rework requested — resetting upstream sub-DAG"
+                        "rework requested — FSM full-reset to entry node"
                     );
-                    shipped_roles.retain(|r| r != &up);
+                    // #539 phase 7b: the rewind itself is the FSM's job.
+                    // On the `ReworkNeeded`/`Failed` RoleDone the FSM
+                    // empties `Walking.evidence` and resets `node_id` to
+                    // the entry node (lifecycle.rs:516-519, ratified v2
+                    // full-reset model). The deleted
+                    // `shipped_roles.retain(up)` + downstream-subdag
+                    // retain implemented the OLD partial-rewind in
+                    // process; under FSM authority the next settled
+                    // iteration's empty evidence re-fires the whole
+                    // chain from the coder. `rewound_subdags` is still
+                    // populated so the failures-squash guard below knows
+                    // these roles are mid-rewind (a Failed verdict for a
+                    // role in the rewound set is not fatal — it re-runs).
                     rewound_subdags.insert(up.clone());
                     for r in downstream_subdag(&up, &team) {
-                        shipped_roles.retain(|x| x != &r);
                         rewound_subdags.insert(r);
                     }
                 }
@@ -1234,19 +1253,14 @@ async fn handle_brief(
                         role = %from_ref.name,
                         upstream = %up.name,
                         effective_reworks_used,
-                        reworks_used,
                         fsm_attempt = ?fsm_retry_attempt,
                         max_retries = team.max_retries,
                         "rework requested but retry budget exhausted"
                     );
                     team_shipped = false;
                     team_failure_detail = Some(format!(
-                        "{} rework budget exhausted (effective={}, local={}, fsm={:?}, max={})",
-                        from_ref.name,
-                        effective_reworks_used,
-                        reworks_used,
-                        fsm_retry_attempt,
-                        team.max_retries
+                        "{} rework budget exhausted (attempt={}, max={})",
+                        from_ref.name, effective_reworks_used, team.max_retries
                     ));
                     break 'outer;
                 }
@@ -1276,15 +1290,57 @@ async fn handle_brief(
                 break 'outer;
             }
         }
+
+        // #539 phase 7b sync barrier: wait until the FSM driver has
+        // consumed this batch before the next iteration's
+        // `read_walking_view` reads `Walking.evidence`. Without this
+        // the loop would read stale FSM state (the deleted in-process
+        // accumulators previously covered that lag window). Bounded;
+        // see `await_fsm_settled` / `fsm_settled`.
+        await_fsm_settled(
+            conn,
+            &brief.id,
+            started_attempt,
+            &shipped_in_batch,
+            had_rework,
+        )
+        .await;
     }
 
-    // Success requires the terminal role to have shipped.
-    if team_shipped && !shipped_roles.contains(&team.terminal_role) {
-        team_shipped = false;
-        team_failure_detail = Some(format!(
-            "terminal role {} did not ship",
-            team.terminal_role.name
-        ));
+    // Success requires the terminal role to have shipped — read from
+    // the FSM (the in-process `shipped_roles` is deleted, #539 7b).
+    // The walker only reaches `BriefState::Shipped` when the terminal
+    // node ships; a non-terminal `Walking` with the terminal role
+    // already `Shipped` in evidence is the equivalent pre-collapse
+    // success signal. Anything else (Failed, Submitted, Walking
+    // without the terminal role shipped) is a non-ship.
+    if team_shipped {
+        let terminal_shipped = match read_brief_state(conn, &brief.id).await {
+            Ok(Some(rec)) => match rec.state {
+                BriefState::Shipped => true,
+                BriefState::Walking { evidence, .. } => evidence
+                    .get(&NodeId(team.terminal_role.name.0.clone()))
+                    .map(|v| matches!(v, EventVerdict::Shipped))
+                    .unwrap_or(false),
+                _ => false,
+            },
+            Ok(None) => false,
+            Err(e) => {
+                tracing::warn!(
+                    brief = %brief.id,
+                    error = %e,
+                    "terminal-role FSM read failed; treating as non-ship"
+                );
+                false
+            }
+        };
+        if !terminal_shipped {
+            team_shipped = false;
+            team_failure_detail = Some(format!(
+                "terminal role {} did not ship",
+                team.terminal_role.name
+            ));
+        }
     }
 
     // Bail early on team failure — no chain-trigger. The workspace is
