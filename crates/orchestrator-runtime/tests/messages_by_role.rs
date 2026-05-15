@@ -346,9 +346,7 @@ fn no_override_when_no_edge_or_key_or_wrong_target() {
         json!({ "permit_overrides": { "fs_write": ["x.rs"] } }),
         1,
     )];
-    assert!(
-        overrides_from_messages(&team, "reviewer-claude-agentry", &wrong_target).is_none()
-    );
+    assert!(overrides_from_messages(&team, "reviewer-claude-agentry", &wrong_target).is_none());
 
     // No inbound at all.
     assert!(overrides_from_messages(&team, "coder-claude-agentry", &[]).is_none());
