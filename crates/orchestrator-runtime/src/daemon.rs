@@ -789,6 +789,63 @@ async fn read_walking_view(
     }
 }
 
+/// Has the FSM driver "settled" with respect to a just-completed
+/// batch? The team-orchestration loop and `lifecycle_driver::
+/// projector_task` are independent async tasks: the loop dispatches a
+/// batch and observes agent outcomes, while the driver independently
+/// consumes the trace and drives the FSM. Before the loop recomputes
+/// its ready-set from FSM `Walking.evidence` (phase 7b, FSM-only),
+/// it must wait until the driver has consumed this batch's terminal
+/// events — otherwise it reads stale evidence.
+///
+/// `state_projector_cursor` cannot serve as the barrier: it is a
+/// synthetic `step-N` counter (lifecycle_driver.rs:45-47,76-77 — the
+/// real trace-id cursor is L.3b-deferred), uncorrelatable with trace
+/// entry ids. So the barrier is **content-based** and must branch on
+/// the batch's outcome, which `handle_brief` knows:
+///
+/// - Terminal (`Shipped`/`Failed`) → the FSM has decided; settled.
+/// - Rework batch (`had_rework`) → the FSM resets evidence to empty
+///   and bumps `retry.attempt` on the `ReworkNeeded`/`Failed`
+///   `RoleDone` (lifecycle.rs:516-519). Emptied evidence is
+///   indistinguishable from "not yet consumed" by evidence alone, so
+///   the settle signal is `retry.attempt > started_attempt`.
+/// - Advance batch → settled when every role in `expect_shipped` is
+///   `Shipped` in `evidence`.
+/// - `Submitted` → never settled (the FSM has not started the walk).
+///
+/// Pure (no I/O) so the decision is unit-testable without a live
+/// Redis stream; the async poll wrapper (phase 7b) calls this each
+/// tick. `pub fn` → no graph-specs entry (only `pub struct/enum/
+/// trait/type` are gated, per specs/dialect.md — same as
+/// `default_work_root` / `group_messages_by_role`).
+#[must_use]
+pub fn fsm_settled(
+    state: &BriefState,
+    started_attempt: u32,
+    expect_shipped: &[RoleRef],
+    had_rework: bool,
+) -> bool {
+    match state {
+        BriefState::Shipped | BriefState::Failed { .. } => true,
+        BriefState::Submitted => false,
+        BriefState::Walking {
+            evidence, retry, ..
+        } => {
+            if had_rework {
+                retry.attempt > started_attempt
+            } else {
+                expect_shipped.iter().all(|r| {
+                    evidence
+                        .get(&NodeId(r.name.0.clone()))
+                        .map(|v| matches!(v, EventVerdict::Shipped))
+                        .unwrap_or(false)
+                })
+            }
+        }
+    }
+}
+
 /// Handle a single brief end-to-end via DAG walk. Returns the brief's
 /// terminal-verdict kind (Shipped or Failed) so the caller can drive the DOL
 /// composer.
