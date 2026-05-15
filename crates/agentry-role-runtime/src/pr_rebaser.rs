@@ -35,13 +35,13 @@ pub enum PayloadError {
 /// pr_number=$(jq -r '.brief.payload.pr_number // ""' <<<"$bundle")
 /// branch=$(jq -r '.brief.payload.branch // ""' <<<"$bundle")
 /// base_branch=$(jq -r '.brief.payload.base_branch // "develop"' <<<"$bundle")
-/// forge_host=$(jq -r '.brief.payload.forge_host // "agency.lab:3000"' <<<"$bundle")
+/// forge_host=$(jq -r '.brief.payload.forge_host // "forge.example.com:3000"' <<<"$bundle")
 /// ```
 ///
 /// Unlike the bash original, `forge_host` has NO inline default — phase-3
 /// daemon cascade through `agentry.toml [forge] default_host` is now the
 /// single source of truth. An absent / empty value falls back to the
-/// daemon-injected agentry default of `agency.lab:3000` (kept as a defensive
+/// daemon-injected agentry default of `forge.example.com:3000` (kept as a defensive
 /// fallback so the runner never panics on a malformed bundle, but the
 /// observable contract is that the daemon always populates this field).
 pub fn parse_rebaser_payload(bundle: &Value) -> Result<RebaserPayload, PayloadError> {
@@ -62,7 +62,7 @@ pub fn parse_rebaser_payload(bundle: &Value) -> Result<RebaserPayload, PayloadEr
         s => s.to_string(),
     };
     let forge_host = match pointer_str(bundle, "/brief/payload/forge_host") {
-        "" => "agency.lab:3000".to_string(),
+        "" => "forge.example.com:3000".to_string(),
         s => s.to_string(),
     };
 

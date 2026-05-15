@@ -170,7 +170,7 @@ enum Cmd {
         /// Branch to probe against. Defaults to `develop`.
         #[arg(long)]
         base_branch: Option<String>,
-        /// Forge host. Defaults to value of AGENTRY_FORGE_HOST env or `agency.lab:3000` from forge_host_from_env().
+        /// Forge host. Defaults to value of AGENTRY_FORGE_HOST env or `forge.example.com:3000` from forge_host_from_env().
         #[arg(long)]
         forge_host: Option<String>,
     },
@@ -354,7 +354,7 @@ struct CfdbListResponse {
 }
 
 const DEFAULT_TARGET_REV: &str = "develop";
-const DEFAULT_FORGE_HOST: &str = "agency.lab:3000";
+const DEFAULT_FORGE_HOST: &str = "forge.example.com:3000";
 
 fn target_repo_slug(target_repo: &str) -> String {
     target_repo.replace('/', "_")

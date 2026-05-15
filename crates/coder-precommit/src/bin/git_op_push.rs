@@ -42,7 +42,7 @@ async fn run() -> Result<()> {
         .payload
         .forge_host
         .clone()
-        .unwrap_or_else(|| "agency.lab:3000".into());
+        .unwrap_or_else(|| "forge.example.com:3000".into());
     let target_repo = bundle.brief.payload.target_repo.clone();
     let base_branch = bundle.brief.payload.base_branch.clone();
     let pr_title = bundle.brief.payload.pr_title.clone();

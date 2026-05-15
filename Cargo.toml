@@ -29,7 +29,7 @@ edition = "2021"
 rust-version = "1.85"
 authors = ["yg"]
 license = "MIT"
-repository = "https://agency.lab:3000/yg/agentry"
+repository = "https://github.com/yannickgranger/agentry"
 
 [workspace.dependencies]
 # Core
