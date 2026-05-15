@@ -608,6 +608,61 @@ pub fn group_messages_by_role(
     out
 }
 
+/// Resolve the permit-narrowing override for `target_role` from its
+/// trace-reconstructed inbound messages — the #539 phase-6 replacement
+/// for the in-process `overrides_for` HashMap.
+///
+/// Pre-5c the daemon walked each completed role's outbox and, for
+/// every edge carrying `permit_overrides_from = Some(key)`, stored
+/// `msg.payload[key]` deserialized as `PermitOverrides` keyed by the
+/// edge's `to` role (`HashMap::insert`, last-write-wins). This
+/// reconstructs the same fact from the trace: among the messages
+/// addressed to `target_role` (in trace/arrival order, as
+/// `group_messages_by_role` yields them), find each edge
+/// `msg.from → target_role` whose `permit_overrides_from` names a key
+/// present in `msg.payload`, deserialize it, and let the last one win
+/// — identical to the old `HashMap::insert` order semantics. A payload
+/// that fails to deserialize is logged WARN and skipped (same
+/// tolerance as the deleted in-process loop).
+///
+/// Pure (no I/O); `pub` for the integration test. graph-specs gates
+/// only `pub struct/enum/trait/type`, so a `pub fn` needs no spec
+/// entry (same rationale as `default_work_root`).
+pub fn overrides_from_messages(
+    team: &TeamTopology,
+    target_role: &str,
+    inbound: &[RoutedMessage],
+) -> Option<PermitOverrides> {
+    let mut resolved: Option<PermitOverrides> = None;
+    for msg in inbound {
+        for edge in team.message_graph.iter().filter(|e| {
+            e.from.name.0 == msg.from
+                && e.to.name.0 == target_role
+                && e.permit_overrides_from.is_some()
+        }) {
+            let key = edge
+                .permit_overrides_from
+                .as_ref()
+                .expect("filtered to is_some");
+            if let Some(value) = msg.payload.get(key) {
+                match serde_json::from_value::<PermitOverrides>(value.clone()) {
+                    Ok(po) => resolved = Some(po),
+                    Err(e) => {
+                        tracing::warn!(
+                            from = %msg.from,
+                            to = %target_role,
+                            key = %key,
+                            error = %e,
+                            "trace override message had override key but payload didn't deserialize"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    resolved
+}
+
 /// Scan a brief's trace stream (XRANGE, bounded 4096) and return the
 /// per-role inbox map via [`group_messages_by_role`]. Trace read
 /// errors return an empty map with a WARN log — a transient Redis
@@ -800,8 +855,9 @@ async fn handle_brief(
     // the trace via `messages_by_role_from_trace`. Pure-projection
     // invariant satisfied: a brief's routed-message state is fully
     // derivable from `(trace stream)`, no load-bearing in-process Vec.
-    // Permit-narrowing overrides accumulated for a downstream role, keyed by role name.
-    let mut overrides_for: HashMap<String, PermitOverrides> = HashMap::new();
+    // #539 phase 6: permit-narrowing overrides are NOT accumulated in
+    // process — `overrides_from_messages` resolves them per-role from
+    // the trace-reconstructed inbound messages at spawn time.
     // Lazily allocated on first role that declares a `workspace_mount`.
     let mut workspace: Option<BriefWorkspace> = None;
     // Track the final team-level outcome.
@@ -880,13 +936,25 @@ async fn handle_brief(
             }
 
             let mut permit = mint_permit(brief, &role)?;
-            if let Some(o) = overrides_for.get(&role.name.0) {
-                apply_overrides(&mut permit, o);
+            // #539 phase 6: permit-narrowing override resolved from the
+            // trace-reconstructed inbound messages (the per-iteration
+            // `trace_msgs_by_role` slice for this role), NOT an
+            // in-process `overrides_for` accumulator. Equivalence pinned
+            // by tests/messages_by_role.rs.
+            if let Some(o) = overrides_from_messages(
+                &team,
+                &role.name.0,
+                trace_msgs_by_role
+                    .get(&role.name.0)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]),
+            ) {
+                apply_overrides(&mut permit, &o);
                 tracing::info!(
                     brief = %brief.id,
                     role = %role_ref.name,
                     overrides = ?o,
-                    "applied permit overrides from upstream"
+                    "applied permit overrides from upstream (trace-derived)"
                 );
             }
             permit_mod::sign(&mut permit, signing_key)?;
@@ -960,41 +1028,17 @@ async fn handle_brief(
                 "role completed"
             );
 
-            for msg in &outcome.outbox {
-                for edge in team
-                    .message_graph
-                    .iter()
-                    .filter(|e| e.from.name == run.role.name && e.to.name.0 == msg.to)
-                {
-                    if let Some(key) = &edge.permit_overrides_from {
-                        if let Some(value) = msg.payload.get(key) {
-                            match serde_json::from_value::<PermitOverrides>(value.clone()) {
-                                Ok(po) => {
-                                    overrides_for.insert(edge.to.name.0.clone(), po);
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        brief = %brief.id,
-                                        from = %run.role.name,
-                                        to = %edge.to.name,
-                                        key = %key,
-                                        error = %e,
-                                        "upstream message had override key but payload didn't deserialize"
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            // #539 phase 5c: `outcome.outbox` is NOT accumulated in
-            // process — every message it carries was already
-            // trace-persisted by `spawner::run_agent` at spawner.rs:489
-            // (`append_trace` on each `EventKind::Message`). The trace
-            // is the single source; `messages_by_role_from_trace`
-            // reconstructs the identical set (pinned by
-            // tests/messages_by_role.rs). The field is consumed only to
-            // move it out of `outcome`.
+            // #539 phase 5c + 6: `outcome.outbox` is NOT walked or
+            // accumulated in process. Every message it carries was
+            // already trace-persisted by `spawner::run_agent` at
+            // spawner.rs:489 (`append_trace` on each
+            // `EventKind::Message`). Inbox reconstruction
+            // (`messages_by_role_from_trace`) and permit-override
+            // resolution (`overrides_from_messages`, phase 6) both read
+            // the trace; the edge/`permit_overrides_from` extraction
+            // that used to live here now happens in
+            // `overrides_from_messages` at spawn time. The field is
+            // consumed only to move it out of `outcome`.
             let _ = outcome.outbox;
 
             // F6 escalation: when the coder reports verdict=Failed with
