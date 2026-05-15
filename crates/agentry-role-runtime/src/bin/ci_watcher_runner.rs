@@ -78,7 +78,11 @@ fn main() {
 
     let brief_id = pointer_str_or(&bundle, "/brief/id", "");
     let target_repo = pointer_str_or(&bundle, "/brief/payload/target_repo", "yg/agentry");
-    let forge_host = pointer_str_or(&bundle, "/brief/payload/forge_host", "agency.lab:3000");
+    let forge_host = pointer_str_or(
+        &bundle,
+        "/brief/payload/forge_host",
+        "forge.example.com:3000",
+    );
     let (owner, repo_name) = split_target_repo(&target_repo);
     let host_workspace = format!("{HOST_WORKSPACE_PREFIX}/{brief_id}");
 

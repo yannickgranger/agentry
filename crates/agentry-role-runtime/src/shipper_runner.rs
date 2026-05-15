@@ -235,7 +235,7 @@ pub struct ShipperPayload {
 /// base_branch=$(jq -r '.brief.payload.base_branch // "develop"' <<<"$bundle")
 /// pr_title=$(jq -r '.brief.payload.pr_title // ("auto(" + .brief.id + ")")' <<<"$bundle")
 /// pr_body=$(jq -r '.brief.payload.pr_body // "Agentry-produced PR. ..."' <<<"$bundle")
-/// forge_host=$(jq -r '.brief.payload.forge_host // "agency.lab:3000"' <<<"$bundle")
+/// forge_host=$(jq -r '.brief.payload.forge_host // "forge.example.com:3000"' <<<"$bundle")
 /// ```
 pub fn parse_shipper_payload(bundle: &Value) -> ShipperPayload {
     let brief_id = crate::pointer_str(bundle, "/brief/id").to_string();
@@ -248,7 +248,11 @@ pub fn parse_shipper_payload(bundle: &Value) -> ShipperPayload {
         "/brief/payload/pr_body",
         "Agentry-produced PR. See brief trace stream.",
     );
-    let forge_host = crate::pointer_str_or(bundle, "/brief/payload/forge_host", "agency.lab:3000");
+    let forge_host = crate::pointer_str_or(
+        bundle,
+        "/brief/payload/forge_host",
+        "forge.example.com:3000",
+    );
     let redeploy_required = bundle
         .pointer("/brief/redeploy_required")
         .filter(|v| !v.is_null())

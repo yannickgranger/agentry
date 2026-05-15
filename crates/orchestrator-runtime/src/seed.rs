@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 
 /// Derive the `net:allow:<host>` permit for the configured forge from
 /// `cfg.forge.default_host`. The port suffix (if any) is stripped so a
-/// `default_host = "agency.lab:3000"` still produces `"net:allow:agency.lab"`
+/// `default_host = "forge.example.com:3000"` still produces `"net:allow:forge.example.com"`
 /// — byte-for-byte equivalent to the literal that lived in seed.rs before
 /// phase 4 of #330. Returns `Error::Config` when `default_host` is unset.
 pub fn derive_forge_net_allow(cfg: &Config) -> Result<String> {

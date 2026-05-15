@@ -253,7 +253,7 @@ pub async fn run(
                         .forge
                         .default_host
                         .as_deref()
-                        .unwrap_or("agency.lab:3000");
+                        .unwrap_or("forge.example.com:3000");
                     let clone_url = target_repo.clone_url(forge_host);
                     let extract_req = intake_validation::EnsureExtractedRequest {
                         target_repo: target_repo_str.clone(),

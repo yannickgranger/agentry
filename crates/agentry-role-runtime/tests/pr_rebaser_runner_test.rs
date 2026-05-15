@@ -18,7 +18,7 @@ fn parse_rebaser_payload_happy_path() {
                 "pr_number": 42,
                 "branch": "auto/brf_work_1_foo",
                 "base_branch": "develop",
-                "forge_host": "agency.lab:3000",
+                "forge_host": "forge.example.com:3000",
             }
         }
     });
@@ -30,7 +30,7 @@ fn parse_rebaser_payload_happy_path() {
             pr_number: 42,
             branch: "auto/brf_work_1_foo".into(),
             base_branch: "develop".into(),
-            forge_host: "agency.lab:3000".into(),
+            forge_host: "forge.example.com:3000".into(),
         }
     );
 }
@@ -51,7 +51,7 @@ fn parse_rebaser_payload_applies_defaults() {
     assert_eq!(p.pr_number, 0);
     assert_eq!(p.branch, "auto/feature-x");
     assert_eq!(p.base_branch, "develop");
-    assert_eq!(p.forge_host, "agency.lab:3000");
+    assert_eq!(p.forge_host, "forge.example.com:3000");
 }
 
 #[test]
@@ -103,8 +103,11 @@ fn parse_rebaser_payload_empty_branch_is_error() {
 
 #[test]
 fn compose_remote_url_shape() {
-    let url = compose_remote_url("agency.lab:3000", "yg/agentry", "abc123");
-    assert_eq!(url, "https://oauth2:abc123@agency.lab:3000/yg/agentry.git",);
+    let url = compose_remote_url("forge.example.com:3000", "yg/agentry", "abc123");
+    assert_eq!(
+        url,
+        "https://oauth2:abc123@forge.example.com:3000/yg/agentry.git",
+    );
 }
 
 #[test]
