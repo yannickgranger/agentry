@@ -132,19 +132,65 @@ fn equivalence_with_in_process_filter_semantics() {
     assert_eq!(out.len(), 2, "exactly two destination roles");
 }
 
-/// Guarded precondition: `spawner::run_agent` appends the `spawned`
-/// trace entry at container start, before forwarding any agent
-/// stdout — so every `Message` is preceded by its sender's `spawned`.
-/// If that invariant regressed (spawn entry dropped), `from` degrades
-/// to `""`. Pinned so the regression is caught, not silently shipped.
+/// #539 phase 5c — daemon-attributed message. The daemon synthesizes
+/// the rework findings message and appends it to the trace with the
+/// trace `agent` field set to the SOURCE ROLE'S NAME (not a UUID),
+/// because no agent process emitted it. That `agent_id` is never in
+/// the spawned memo, so the fallback uses it directly as `from`. This
+/// reproduces exactly the pre-5c in-process write
+/// `RoutedMessage { from: from_ref.name.0, .. }`.
 #[test]
-fn message_without_prior_spawned_yields_empty_from_guarded_precondition() {
+fn daemon_attributed_message_uses_agent_id_as_from() {
+    // Agent UUIDs (`agt_<hex>`) never collide with role names
+    // (`reviewer-claude-agentry`), so a memo miss unambiguously means
+    // "daemon synthesized this; the agent field IS the from-role".
     let entries = vec![(
-        "orphan_agent".to_string(),
-        message("coder-claude-agentry", json!({ "x": 1 }), 0),
+        "reviewer-claude-agentry".to_string(),
+        message(
+            "coder-claude-agentry",
+            json!({ "findings": [{ "severity": "blocker" }] }),
+            0,
+        ),
     )];
     let out = group_messages_by_role(&entries);
-    assert_eq!(out["coder-claude-agentry"][0].from, "");
+    assert_eq!(
+        out["coder-claude-agentry"][0].from,
+        "reviewer-claude-agentry"
+    );
+}
+
+/// Rework round-trip: the reviewer ran (its `spawned` is in the trace
+/// under a UUID), then the daemon appends the synthetic findings
+/// message attributed to the reviewer's ROLE NAME. The memo holds
+/// `uuid → reviewer-claude-agentry` but the synthetic message's
+/// `agent_id` is the role name (memo miss → fallback). Both the
+/// agent's own messages and the daemon message resolve `from` to the
+/// reviewer's role name — identical to the deleted in-process path.
+#[test]
+fn rework_findings_round_trip_via_daemon_attribution() {
+    let entries = vec![
+        ("agt_rev01".to_string(), spawned("reviewer-claude-agentry")),
+        (
+            "reviewer-claude-agentry".to_string(),
+            message(
+                "coder-claude-agentry",
+                json!({ "findings": ["blocker: unapplied verb"] }),
+                7,
+            ),
+        ),
+    ];
+    let out = group_messages_by_role(&entries);
+    let inbox = out
+        .get("coder-claude-agentry")
+        .expect("rewound coder inbox");
+    assert_eq!(inbox.len(), 1);
+    assert_eq!(inbox[0].from, "reviewer-claude-agentry");
+    assert_eq!(inbox[0].to, "coder-claude-agentry");
+    assert_eq!(
+        inbox[0].payload,
+        json!({ "findings": ["blocker: unapplied verb"] })
+    );
+    assert_eq!(inbox[0].at, ts(7));
 }
 
 /// Non-Message events (Log, Done, etc.) never enter an inbox.
