@@ -768,6 +768,19 @@ async fn read_walking_view(
     }
 }
 
+/// Poll interval and total budget for [`await_fsm_settled`]. The
+/// pre-fix budget of 50×100ms = 5s was empirically too short for the
+/// projector's observed settle latency on `agentry-self-host-v0`
+/// briefs (orchestratord log on every trivial-doc brief 2026-05-15
+/// showed `await_fsm_settled timed out after ~5s` between coder
+/// `Shipped` and a respawn of the same role 6+ minutes later, which
+/// the second-run coder correctly emitted `no_changes` on — discarding
+/// the first run's commit). The budget is raised here to comfortably
+/// exceed observed settle times; timeout is now a hard failure of the
+/// brief (see [`await_fsm_settled`]).
+const AWAIT_FSM_SETTLED_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+const AWAIT_FSM_SETTLED_BUDGET_TICKS: u32 = 3000; // 200ms × 3000 = 600s (10min)
+
 /// Bounded poll until the FSM driver has settled w.r.t. the
 /// just-completed batch (see [`fsm_settled`] for the per-outcome
 /// settle conditions). The team-orchestration loop calls this at the
@@ -777,18 +790,26 @@ async fn read_walking_view(
 ///
 /// `state_projector_cursor` cannot gate this (synthetic `step-N`, not
 /// a trace id — lifecycle_driver.rs:45-47), so the barrier is
-/// content-based via `fsm_settled`. Bounded at ~5s (50×100ms); on
-/// timeout it logs WARN and returns — the loop proceeds on whatever
-/// FSM state is current, degraded but not deadlocked (a stuck FSM
-/// driver is a separate failure the reaper/resume path handles).
+/// content-based via `fsm_settled`. Bounded by
+/// [`AWAIT_FSM_SETTLED_BUDGET_TICKS`] × [`AWAIT_FSM_SETTLED_POLL_INTERVAL`]
+/// = ~10 minutes total. Returns `true` when the FSM has settled,
+/// `false` on timeout.
+///
+/// On timeout the caller MUST fail the brief: proceeding to the next
+/// `read_walking_view` with stale `Walking.evidence` causes the loop
+/// to respawn an already-`Shipped` role (the FSM has not yet recorded
+/// the verdict), and the second run correctly judges `no_changes` and
+/// fails the team — discarding the first run's valid commit. That
+/// pre-fix behavior was the root cause of every trivial-doc brief
+/// failure on `agentry-self-host-v0` after #559 landed.
 async fn await_fsm_settled(
     conn: &mut ConnectionManager,
     brief_id: &BriefId,
     started_attempt: u32,
     expect_shipped: &[RoleRef],
     had_rework: bool,
-) {
-    for _ in 0..50 {
+) -> bool {
+    for _ in 0..AWAIT_FSM_SETTLED_BUDGET_TICKS {
         let state = match read_brief_state(conn, brief_id).await {
             Ok(Some(rec)) => rec.state,
             Ok(None) => BriefState::Submitted,
@@ -798,20 +819,21 @@ async fn await_fsm_settled(
                     error = %e,
                     "await_fsm_settled state read failed; retrying"
                 );
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                tokio::time::sleep(AWAIT_FSM_SETTLED_POLL_INTERVAL).await;
                 continue;
             }
         };
         if fsm_settled(&state, started_attempt, expect_shipped, had_rework) {
-            return;
+            return true;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        tokio::time::sleep(AWAIT_FSM_SETTLED_POLL_INTERVAL).await;
     }
     tracing::warn!(
         brief = %brief_id,
         had_rework,
-        "await_fsm_settled timed out after ~5s; FSM driver lagging — proceeding on current state"
+        "await_fsm_settled timed out after ~10min; FSM driver did not settle — caller will fail brief"
     );
+    false
 }
 
 /// Has the FSM driver "settled" with respect to a just-completed
@@ -1297,7 +1319,15 @@ async fn handle_brief(
         // the loop would read stale FSM state (the deleted in-process
         // accumulators previously covered that lag window). Bounded;
         // see `await_fsm_settled` / `fsm_settled`.
-        await_fsm_settled(
+        //
+        // On timeout the brief MUST fail: proceeding with stale
+        // `Walking.evidence` causes the loop to respawn already-shipped
+        // roles, whose second-run coder correctly emits `no_changes`
+        // and fails the team — discarding the first run's valid
+        // commit. That was the root cause of every trivial-doc brief
+        // failure on `agentry-self-host-v0` between #559 landing and
+        // this fix.
+        let settled = await_fsm_settled(
             conn,
             &brief.id,
             started_attempt,
@@ -1305,6 +1335,15 @@ async fn handle_brief(
             had_rework,
         )
         .await;
+        if !settled {
+            team_shipped = false;
+            team_failure_detail = Some(format!(
+                "fsm_settled barrier timeout after ~10min (started_attempt={started_attempt} \
+                 had_rework={had_rework} shipped_in_batch={shipped_in_batch_count})",
+                shipped_in_batch_count = shipped_in_batch.len()
+            ));
+            break 'outer;
+        }
     }
 
     // Success requires the terminal role to have shipped — read from
