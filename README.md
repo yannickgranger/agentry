@@ -155,6 +155,7 @@ orchestrator submit <brief.json>           # send work
 orchestrator team list / register / show   # manage workflows
 orchestrator role list / show              # inspect agents
 orchestrator verdicts                      # last N outcomes
+orchestrator abort --all / <brief-id>      # kill all briefs, or one
 orchestrator agents list                   # inspect the running fleet (NDJSON)
 orchestrator agents query <sql>            # read-only SELECT on the agent index
 orchestrator agents trace <agent-id>       # see what an agent did
