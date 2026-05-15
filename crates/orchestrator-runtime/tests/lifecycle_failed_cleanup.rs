@@ -29,6 +29,36 @@ use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+/// Build a minimal `WalkConfig` + entry `NodeId` pair for tests that only
+/// exercise paths through `BriefEvent::BudgetExhausted` / `AbortRequested`
+/// (universal-abort arms in `handle`). The single-node topology is
+/// sufficient: `entry_node = "coder-claude-agentry"` with empty
+/// `expected_inbound` and an empty adjacency table.
+fn no_gates() -> (
+    std::sync::Arc<orchestrator_types::lifecycle::WalkConfig>,
+    std::sync::Arc<orchestrator_types::team::NodeId>,
+) {
+    use orchestrator_types::lifecycle::{GatePolicy, NodeConfig, WalkConfig};
+    use orchestrator_types::team::{NodeClass, NodeId};
+    use std::collections::HashMap;
+
+    let entry = NodeId("coder-claude-agentry".into());
+    let mut node_configs = HashMap::new();
+    node_configs.insert(
+        entry.clone(),
+        NodeConfig {
+            class: NodeClass("container_bound".into()),
+            expected_inbound: vec![],
+            policy: GatePolicy::AllMustPass,
+        },
+    );
+    let cfg = WalkConfig {
+        adjacency: HashMap::new(),
+        node_configs,
+    };
+    (std::sync::Arc::new(cfg), std::sync::Arc::new(entry))
+}
+
 fn brief(id: &str) -> BriefId {
     BriefId(id.into())
 }
@@ -269,9 +299,17 @@ async fn projector_task_cleans_up_on_terminal_failed() {
         written: written.clone(),
     });
 
-    projector_task(bid.clone(), source, projector, None)
-        .await
-        .expect("projector_task");
+    let (walk_config, entry_node) = no_gates();
+    projector_task(
+        bid.clone(),
+        source,
+        projector,
+        None,
+        walk_config,
+        entry_node,
+    )
+    .await
+    .expect("projector_task");
 
     let log = written.lock().expect("mutex").clone();
     assert_eq!(log.len(), 1, "one record per legal transition");

@@ -22,9 +22,10 @@
 //! - `commits/<sha>/status`: `success` → POST merge with up to 6 retries
 //!   on transient 405/409 (10×attempt seconds backoff capped at 60, plus
 //!   0..=9s jitter via [`rand_jitter`]); `failure|error` → emit Blocker
-//!   finding with first failing context (via [`first_failing_context`])
-//!   and `done rework_needed`; `pending|unknown|""` → sleep 15s and
-//!   re-poll; any other state → `done failed`.
+//!   finding with the full list of failing contexts (via
+//!   [`all_failing_contexts`]) and `done rework_needed`;
+//!   `pending|unknown|""` → sleep 15s and re-poll; any other state →
+//!   `done failed`.
 //!
 //! Loop exhausted → `done failed`.
 //!
@@ -36,7 +37,7 @@ use std::thread;
 use std::time::Duration;
 
 use agentry_role_runtime::ci_watcher_runner::{
-    find_shipper_message, first_failing_context, rand_jitter, run_merge_retry_loop, AttemptResult,
+    all_failing_contexts, find_shipper_message, rand_jitter, run_merge_retry_loop, AttemptResult,
     MergeRetryOutcome,
 };
 use agentry_role_runtime::{
@@ -68,6 +69,7 @@ fn main() {
                 Some(DoneReason {
                     cause: "bundle_parse_failed".into(),
                     exit_code: None,
+                    disagreements: Vec::new(),
                 }),
             );
             return;
@@ -76,7 +78,11 @@ fn main() {
 
     let brief_id = pointer_str_or(&bundle, "/brief/id", "");
     let target_repo = pointer_str_or(&bundle, "/brief/payload/target_repo", "yg/agentry");
-    let forge_host = pointer_str_or(&bundle, "/brief/payload/forge_host", "agency.lab:3000");
+    let forge_host = pointer_str_or(
+        &bundle,
+        "/brief/payload/forge_host",
+        "forge.example.com:3000",
+    );
     let (owner, repo_name) = split_target_repo(&target_repo);
     let host_workspace = format!("{HOST_WORKSPACE_PREFIX}/{brief_id}");
 
@@ -236,17 +242,20 @@ fn main() {
                     .and_then(Value::as_array)
                     .cloned()
                     .unwrap_or_default();
-                let ctx =
-                    first_failing_context(&statuses).unwrap_or_else(|| "(no context)".to_string());
+                let mut failing = all_failing_contexts(&statuses);
+                if failing.is_empty() {
+                    failing.push("(no context)".to_string());
+                }
+                let joined = failing.join(", ");
                 emit_event(json!({
                     "msg": "CI red — emitting rework_needed for coder loop-back",
                     "state": state,
-                    "failing_context": ctx,
+                    "failing_contexts": failing,
                 }));
                 emit_finding(&mech_finding(
                     "ci-watcher",
                     "ci",
-                    &format!("CI red on {ctx}"),
+                    &format!("CI red on failing checks: [{joined}]"),
                 ));
                 emit_done(EventVerdict::ReworkNeeded, None);
                 return;
@@ -285,7 +294,17 @@ fn split_target_repo(target_repo: &str) -> (String, String) {
 fn http_get_json(url: &str, token: &str) -> Result<Value, String> {
     let auth = format!("Authorization: token {token}");
     let out = Command::new("curl")
-        .args(["-sS", "-k", "-H", &auth, url])
+        .args([
+            "-sS",
+            "--connect-timeout",
+            "10",
+            "--max-time",
+            "30",
+            "-k",
+            "-H",
+            &auth,
+            url,
+        ])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -310,6 +329,10 @@ fn http_post(url: &str, token: &str, body: &str) -> Result<(String, String), Str
     let out = Command::new("curl")
         .args([
             "-sS",
+            "--connect-timeout",
+            "10",
+            "--max-time",
+            "30",
             "-k",
             "-X",
             "POST",

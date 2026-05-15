@@ -7,9 +7,15 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[lib]
+
 [[bin]]
 name = "quality-fast"
 path = "src/main.rs"
+
+[[bin]]
+name = "quality-mech"
+path = "src/bin/quality-mech.rs"
 
 [dependencies]
 anyhow = "1"

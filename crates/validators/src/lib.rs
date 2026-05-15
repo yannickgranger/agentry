@@ -8,7 +8,7 @@
 #![forbid(unsafe_code)]
 
 use async_trait::async_trait;
-use orchestrator_types::BriefKind;
+use orchestrator_types::ValidatorPipeline;
 use serde::Serialize;
 use std::path::PathBuf;
 
@@ -98,35 +98,37 @@ pub trait Validator: Send + Sync {
 /// Order is the order validators run in (sequential; the ship tool may choose
 /// to run them in parallel via `JoinSet` — order here is informational).
 #[must_use]
-pub fn registry_for(kind: BriefKind) -> Vec<&'static dyn Validator> {
+pub fn registry_for(pipeline: ValidatorPipeline) -> Vec<&'static dyn Validator> {
     use impls::{ARCH_CHECK, CLIPPY_SCOPED, CLIPPY_WORKSPACE, FMT_CHECK, TEST_WORKSPACE};
     use stubs::{
         BDD_REAL_INFRA, COMPLEXITY_NO_REGRESSION, MARKDOWN_LINT, NO_BEHAVIOR_CHANGE, NO_NEW_PUB,
         REGRESSION_TEST, REPORT_ONLY, SELF_HOST_SMOKE, SPECS_ARCH_CHECK,
     };
-    match kind {
-        BriefKind::Mechanical => vec![&FMT_CHECK, &CLIPPY_SCOPED, &NO_BEHAVIOR_CHANGE, &ARCH_CHECK],
-        BriefKind::Refactor => vec![
+    match pipeline {
+        ValidatorPipeline::Mechanical => {
+            vec![&FMT_CHECK, &CLIPPY_SCOPED, &NO_BEHAVIOR_CHANGE, &ARCH_CHECK]
+        }
+        ValidatorPipeline::Refactor => vec![
             &CLIPPY_WORKSPACE,
             &TEST_WORKSPACE,
             &ARCH_CHECK,
             &COMPLEXITY_NO_REGRESSION,
             &NO_NEW_PUB,
         ],
-        BriefKind::Debug => vec![&REGRESSION_TEST, &TEST_WORKSPACE, &ARCH_CHECK],
-        BriefKind::NewFeature => vec![
+        ValidatorPipeline::BugFix => vec![&REGRESSION_TEST, &TEST_WORKSPACE, &ARCH_CHECK],
+        ValidatorPipeline::Feature => vec![
             &BDD_REAL_INFRA,
             &TEST_WORKSPACE,
             &ARCH_CHECK,
             &CLIPPY_WORKSPACE,
         ],
-        BriefKind::Substrate => vec![
+        ValidatorPipeline::Substrate => vec![
             &SELF_HOST_SMOKE,
             &TEST_WORKSPACE,
             &ARCH_CHECK,
             &CLIPPY_WORKSPACE,
         ],
-        BriefKind::Audit => vec![&REPORT_ONLY],
-        BriefKind::Doc => vec![&MARKDOWN_LINT, &SPECS_ARCH_CHECK],
+        ValidatorPipeline::Triage => vec![&REPORT_ONLY],
+        ValidatorPipeline::TrivialDoc => vec![&MARKDOWN_LINT, &SPECS_ARCH_CHECK],
     }
 }

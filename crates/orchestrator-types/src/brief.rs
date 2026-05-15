@@ -3,26 +3,11 @@
 //! Submitted on the `agentry:briefs` Redis stream. Immutable after submission.
 //! Scope changes = a new Brief with `parent_brief` set.
 
+use crate::target_repo::TargetRepo;
 use crate::{now, Ts, VersionedRef};
 use serde::{Deserialize, Serialize};
 use std::fmt;
-
-/// Logical kind of a brief — selects the validator pipeline.
-///
-/// Optional on `Brief`: existing payloads that don't set it deserialize to
-/// `None`. Brief 4 wires the ship tool to dispatch validators per-kind via
-/// `validators::registry_for`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum BriefKind {
-    Refactor,
-    Debug,
-    Mechanical,
-    NewFeature,
-    Substrate,
-    Audit,
-    Doc,
-}
+use std::str::FromStr;
 
 /// Brief identifier: `brf_<uuidv7>`. Sortable by creation time.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -68,6 +53,17 @@ pub struct Budget {
 /// opaque to the orchestrator.
 pub type Payload = serde_json::Value;
 
+/// Redeploy targets a brief may require after merge. The captain CLI's
+/// `redeploy` subcommand (F8b) reads this field and runs the appropriate
+/// rebuild for each listed target.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RedeployTarget {
+    Daemon,
+    OrchestratorCli,
+    CaptainCli,
+}
+
 /// A Brief — the unit of work.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Brief {
@@ -79,10 +75,19 @@ pub struct Brief {
     pub topology: VersionedRef,
     /// Opaque payload — the team interprets it.
     pub payload: Payload,
-    /// Logical kind of brief — dispatches the validator pipeline. Optional
-    /// for backwards compatibility; existing payloads deserialize to `None`.
+    /// Captain-authored task shape. Optional for backwards compatibility;
+    /// existing payloads deserialize to `None`. The daemon translates this
+    /// into a `crate::pipeline::ValidatorPipeline` via the `From` impl in
+    /// `pipeline.rs` before dispatching validators.
     #[serde(default)]
-    pub kind: Option<BriefKind>,
+    pub kind: Option<crate::kind::TaskShape>,
+    /// Optional validation contract authored by the captain. When
+    /// `kind.requires_contract()` is true and `contract` is None, the daemon
+    /// logs a WARN at intake (B3) and will reject at intake in a later slice
+    /// (B6). Existing briefs without this field deserialize with
+    /// `contract: None`.
+    #[serde(default)]
+    pub contract: Option<crate::contract::Contract>,
     /// Hard budget; runtime enforces.
     #[serde(default)]
     pub budget: Budget,
@@ -98,6 +103,12 @@ pub struct Brief {
     /// selectors use these to address subsets of the agent fleet.
     #[serde(default)]
     pub cohort_labels: Vec<String>,
+    /// Targets that must be redeployed after this brief merges. F8b's
+    /// captain `redeploy` subcommand reads this and runs the rebuild;
+    /// F8a only carries the data. Empty (and skipped on the wire) for
+    /// briefs that don't touch redeployable code.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub redeploy_required: Vec<RedeployTarget>,
     /// Who submitted this brief (opaque identifier of the client).
     pub submitted_by: String,
     /// Submission time.
@@ -114,10 +125,12 @@ impl Brief {
             topology,
             payload,
             kind: None,
+            contract: None,
             budget: Budget::default(),
             escalation: EscalationMode::default(),
             parent_brief: None,
             cohort_labels: Vec::new(),
+            redeploy_required: Vec::new(),
             submitted_by: submitted_by.into(),
             submitted_at: now(),
         }
@@ -145,5 +158,19 @@ impl Brief {
     pub fn with_cohort_labels(mut self, labels: Vec<String>) -> Self {
         self.cohort_labels = labels;
         self
+    }
+
+    /// Lazy accessor for the brief's `target_repo` routing key.
+    ///
+    /// Reads `payload.target_repo` as a JSON string and parses it through
+    /// [`TargetRepo::from_str`]. Returns `None` when the field is absent,
+    /// non-string, or fails parse validation. Every call re-parses; no
+    /// caching.
+    #[must_use]
+    pub fn target_repo(&self) -> Option<TargetRepo> {
+        self.payload
+            .get("target_repo")
+            .and_then(|v| v.as_str())
+            .and_then(|s| TargetRepo::from_str(s).ok())
     }
 }

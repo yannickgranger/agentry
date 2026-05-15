@@ -4,6 +4,7 @@ members = [
     "crates/agentry-role-runtime",
     "crates/coder-precommit",
     "crates/orchestrator-dashboard",
+    "crates/orchestrator-infra",
     "crates/orchestrator-runtime",
     "crates/orchestrator-types",
     "crates/quality-fast",
@@ -16,6 +17,7 @@ default-members = [
     "crates/agentry-role-runtime",
     "crates/coder-precommit",
     "crates/orchestrator-dashboard",
+    "crates/orchestrator-infra",
     "crates/orchestrator-runtime",
     "crates/orchestrator-types",
     "crates/validators",
@@ -27,7 +29,7 @@ edition = "2021"
 rust-version = "1.85"
 authors = ["yg"]
 license = "MIT"
-repository = "https://agency.lab:3000/yg/agentry"
+repository = "https://github.com/yannickgranger/agentry"
 
 [workspace.dependencies]
 # Core
@@ -64,7 +66,12 @@ clap = { version = "4", features = ["derive"] }
 
 # Config (typed, layered: defaults + TOML + env overlay)
 figment = { version = "0.10", features = ["toml", "env"] }
+toml = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# Persistence + encoding
+rusqlite = { version = "0.32", features = ["bundled", "chrono"] }
+base64 = "0.22"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

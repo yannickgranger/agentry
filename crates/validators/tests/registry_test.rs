@@ -1,10 +1,10 @@
-use orchestrator_types::BriefKind;
+use orchestrator_types::ValidatorPipeline;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use validators::{stubs, BriefCtx, Finding, Severity, Validator, ValidatorReport};
 
-fn names(kind: BriefKind) -> Vec<&'static str> {
-    validators::registry_for(kind)
+fn names(pipeline: ValidatorPipeline) -> Vec<&'static str> {
+    validators::registry_for(pipeline)
         .iter()
         .map(|v| v.name())
         .collect()
@@ -13,7 +13,7 @@ fn names(kind: BriefKind) -> Vec<&'static str> {
 #[test]
 fn test_mechanical_dispatch() {
     assert_eq!(
-        names(BriefKind::Mechanical),
+        names(ValidatorPipeline::Mechanical),
         vec![
             "fmt_check",
             "clippy_scoped",
@@ -26,7 +26,7 @@ fn test_mechanical_dispatch() {
 #[test]
 fn test_refactor_dispatch() {
     assert_eq!(
-        names(BriefKind::Refactor),
+        names(ValidatorPipeline::Refactor),
         vec![
             "clippy_workspace",
             "test_workspace",
@@ -38,17 +38,17 @@ fn test_refactor_dispatch() {
 }
 
 #[test]
-fn test_debug_dispatch() {
+fn test_bug_fix_dispatch() {
     assert_eq!(
-        names(BriefKind::Debug),
+        names(ValidatorPipeline::BugFix),
         vec!["regression_test", "test_workspace", "arch_check"]
     );
 }
 
 #[test]
-fn test_new_feature_dispatch() {
+fn test_feature_dispatch() {
     assert_eq!(
-        names(BriefKind::NewFeature),
+        names(ValidatorPipeline::Feature),
         vec![
             "bdd_real_infra",
             "test_workspace",
@@ -61,7 +61,7 @@ fn test_new_feature_dispatch() {
 #[test]
 fn test_substrate_dispatch() {
     assert_eq!(
-        names(BriefKind::Substrate),
+        names(ValidatorPipeline::Substrate),
         vec![
             "self_host_smoke",
             "test_workspace",
@@ -72,27 +72,27 @@ fn test_substrate_dispatch() {
 }
 
 #[test]
-fn test_audit_dispatch() {
-    assert_eq!(names(BriefKind::Audit), vec!["report_only"]);
+fn test_triage_dispatch() {
+    assert_eq!(names(ValidatorPipeline::Triage), vec!["report_only"]);
 }
 
 #[test]
-fn test_doc_dispatch() {
+fn test_trivial_doc_dispatch() {
     assert_eq!(
-        names(BriefKind::Doc),
+        names(ValidatorPipeline::TrivialDoc),
         vec!["markdown_lint", "specs_arch_check"]
     );
 }
 
-fn all_kinds() -> Vec<BriefKind> {
+fn all_kinds() -> Vec<ValidatorPipeline> {
     vec![
-        BriefKind::Refactor,
-        BriefKind::Debug,
-        BriefKind::Mechanical,
-        BriefKind::NewFeature,
-        BriefKind::Substrate,
-        BriefKind::Audit,
-        BriefKind::Doc,
+        ValidatorPipeline::Refactor,
+        ValidatorPipeline::BugFix,
+        ValidatorPipeline::Mechanical,
+        ValidatorPipeline::Feature,
+        ValidatorPipeline::Substrate,
+        ValidatorPipeline::Triage,
+        ValidatorPipeline::TrivialDoc,
     ]
 }
 
@@ -101,7 +101,7 @@ fn test_all_kinds_have_at_least_one_validator() {
     for k in all_kinds() {
         assert!(
             !validators::registry_for(k).is_empty(),
-            "kind {k:?} has empty validator pipeline"
+            "pipeline {k:?} has empty validator pipeline"
         );
     }
 }

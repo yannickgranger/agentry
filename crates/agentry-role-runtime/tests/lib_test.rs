@@ -11,8 +11,8 @@
 
 use agentry_role_runtime::{
     changed_rs_files, drop_empty_blocker_findings, head_bytes, mech_finding, parse_allowed_tools,
-    parse_findings, parse_severity, pointer_str_or, slice_json_array, strip_fences, tail_bytes,
-    tail_lines,
+    parse_findings, parse_severity, pointer_str_or, slice_json_array, slice_last_json_array,
+    strip_fences, tail_bytes, tail_lines,
 };
 use chrono::Utc;
 use orchestrator_types::{Event, EventKind, FindingOrigin, Severity};
@@ -254,6 +254,54 @@ fn parse_findings_salvages_when_sliced_text_is_not_array() {
     let v = parse_findings("prelude [{\"x\":1}] postscript", "agt-5");
     assert_eq!(v.len(), 1);
     assert_eq!(v[0].category, "other"); // {x:1} has no category — defaults
+}
+
+#[test]
+fn parse_findings_handles_prose_with_brackets_then_empty_array() {
+    // Brief 477 reproduction: prose containing literal `[]` brackets BEFORE
+    // a clean trailing JSON array. The first-pass slice captures the whole
+    // prose (which fails to parse); the line-anchored fallback finds the
+    // trailing `[]` and the verdict correctly resolves to zero findings.
+    let response = "[ignore]'d. `noeviction` is the correct policy.\nNo concerns triggered.\n[]";
+    let v = parse_findings(response, "agt-477");
+    assert_eq!(v.len(), 0);
+}
+
+#[test]
+fn parse_findings_handles_prose_with_brackets_then_real_findings() {
+    let response = "Some [ignored] prose mentioning [arrays] in text.\n\
+        [{\"severity\":\"blocker\",\"category\":\"foo\",\"message\":\"bar\"}]";
+    let v = parse_findings(response, "agt-fb-real");
+    assert_eq!(v.len(), 1);
+    assert!(matches!(v[0].severity, Severity::Blocker));
+    assert_eq!(v[0].category, "foo");
+    assert_eq!(v[0].message, "bar");
+}
+
+#[test]
+fn parse_findings_unchanged_for_clean_array_at_start() {
+    // Existing parse_findings_empty_array_yields_zero behavior preserved.
+    let v = parse_findings("[]", "agt-clean");
+    assert_eq!(v.len(), 0);
+}
+
+#[test]
+fn parse_findings_unchanged_for_clean_array_with_fences() {
+    // strip_fences runs first, so the fenced empty array still parses on
+    // the primary path.
+    let v = parse_findings("```json\n[]\n```", "agt-fenced");
+    assert_eq!(v.len(), 0);
+}
+
+#[test]
+fn slice_last_json_array_finds_trailing_array() {
+    assert_eq!(
+        slice_last_json_array("preamble [foo] more text\n[{\"x\":1}]"),
+        Some("[{\"x\":1}]")
+    );
+    assert_eq!(slice_last_json_array("no array here"), None);
+    // `[` at byte position 0 satisfies the line-anchored rule.
+    assert_eq!(slice_last_json_array("[]"), Some("[]"));
 }
 
 #[test]

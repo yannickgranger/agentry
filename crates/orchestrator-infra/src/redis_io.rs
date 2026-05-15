@@ -1,13 +1,15 @@
 //! Redis operations: brief submission, stream reads, verdict appends, trace writes.
 
 use crate::{Error, Result};
+use base64::Engine;
 use orchestrator_types::lifecycle::MAXIMUM_ATTEMPT_CAP;
 use orchestrator_types::{
-    AgentRole, Brief, BriefId, Event, Project, RoleName, TeamName, TeamTopology, Verdict,
-    VersionedRef,
+    parse_profile_toml, AgentRole, Brief, BriefId, Event, Profile, ProfileParseError, Project,
+    RoleName, TargetRepo, TeamName, TeamTopology, ToolPack, Verdict, VersionedRef,
 };
 use redis::aio::ConnectionManager;
 use redis::AsyncCommands;
+use std::str::FromStr;
 
 /// Stream names.
 pub const STREAM_BRIEFS: &str = "agentry:briefs";
@@ -42,8 +44,14 @@ pub async fn submit_brief(conn: &mut ConnectionManager, brief: &Brief) -> Result
         let _: () = conn.sadd(&pending_key, brief.id.0.as_str()).await?;
     }
 
-    let id: String = conn
-        .xadd(STREAM_BRIEFS, "*", &[("brief", body.as_str())])
+    let id: String = redis::cmd("XADD")
+        .arg(STREAM_BRIEFS)
+        .arg("MAXLEN")
+        .arg("~")
+        .arg(10000)
+        .arg("*")
+        .arg(&[("brief", body.as_str())])
+        .query_async(conn)
         .await?;
     Ok(id)
 }
@@ -214,6 +222,61 @@ pub async fn list_teams(conn: &mut ConnectionManager) -> Result<Vec<(TeamName, u
     Ok(out)
 }
 
+/// Save a tool pack under `agentry:tool_pack:<name>:v<version>`. Mirrors
+/// [`save_role`] / [`save_team`]: overwrites any pre-existing key so seed
+/// passes are idempotent.
+pub async fn seed_pack(conn: &mut ConnectionManager, pack: &ToolPack) -> Result<()> {
+    let key = format!("agentry:tool_pack:{}:v{}", pack.name, pack.version);
+    let body = serde_json::to_string(pack)?;
+    let _: () = conn.set(&key, body).await?;
+    Ok(())
+}
+
+/// Fetch a previously-seeded tool pack by `(name, version)`. Returns
+/// [`Error::NotFound`] when the key is absent.
+pub async fn fetch_pack(
+    conn: &mut ConnectionManager,
+    name: &str,
+    version: u32,
+) -> Result<ToolPack> {
+    let key = format!("agentry:tool_pack:{name}:v{version}");
+    let raw: Option<String> = conn.get(&key).await?;
+    let raw = raw.ok_or_else(|| Error::NotFound {
+        kind: "tool_pack",
+        key: key.clone(),
+    })?;
+    Ok(serde_json::from_str(&raw)?)
+}
+
+/// Scan the tool-pack catalog and return every `(name, version)` pair
+/// currently registered, sorted by name then version ascending. Mirrors
+/// [`list_roles`] / [`list_teams`].
+pub async fn list_packs(conn: &mut ConnectionManager) -> Result<Vec<(String, u32)>> {
+    let mut out: Vec<(String, u32)> = Vec::new();
+    let mut cursor: u64 = 0;
+    loop {
+        let (next, batch): (u64, Vec<String>) = redis::cmd("SCAN")
+            .arg(cursor)
+            .arg("MATCH")
+            .arg("agentry:tool_pack:*:v*")
+            .arg("COUNT")
+            .arg(100)
+            .query_async(conn)
+            .await?;
+        for key in batch {
+            if let Some((name, version)) = parse_versioned_key(&key, "tool_pack") {
+                out.push((name, version));
+            }
+        }
+        cursor = next;
+        if cursor == 0 {
+            break;
+        }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    Ok(out)
+}
+
 /// Scan the role catalog and return every `(name, version)` pair currently
 /// registered, sorted by name then version ascending.
 pub async fn list_roles(conn: &mut ConnectionManager) -> Result<Vec<(RoleName, u32)>> {
@@ -277,11 +340,7 @@ pub async fn read_next_brief(
     for k in r.keys {
         for entry in k.ids {
             let sid = entry.id;
-            let body: Option<String> = entry.map.get("brief").and_then(|v| match v {
-                redis::Value::BulkString(b) => std::str::from_utf8(b).ok().map(String::from),
-                redis::Value::SimpleString(s) => Some(s.clone()),
-                _ => None,
-            });
+            let body: Option<String> = entry.map.get("brief").and_then(redis_value_as_str);
             if let Some(b) = body {
                 let brief: Brief = serde_json::from_str(&b)?;
                 return Ok(Some((sid, brief)));
@@ -291,6 +350,127 @@ pub async fn read_next_brief(
     Ok(None)
 }
 
+/// Decode a redis::Value into Option<String>. Handles BulkString and
+/// SimpleString; everything else maps to None. Pre-existing private
+/// copies in lifecycle_redis.rs / projector.rs / watchdog.rs /
+/// cli_agents.rs (orchestrator-runtime) and store.rs (orchestrator-
+/// dashboard) all delegate here.
+pub fn redis_value_as_str(v: &redis::Value) -> Option<String> {
+    match v {
+        redis::Value::BulkString(b) => std::str::from_utf8(b).ok().map(String::from),
+        redis::Value::SimpleString(s) => Some(s.clone()),
+        _ => None,
+    }
+}
+
 /// Hint that we're skipping fields (silences dead-code warnings on unused helper types).
 #[allow(dead_code)]
 fn _unused(_: TeamName) {}
+
+// ---------------------------------------------------------------------------
+// Profile fetcher (slice I/2b).
+//
+// At brief dispatch the daemon issues a forge contents API GET for
+// `.agentry/profile.toml` from the target_repo at the brief's base_branch.
+// 404 means "no profile, use defaults"; 200 + valid TOML produces a
+// `Profile`; other statuses are surfaced as `ProfileFetchError::Http` so the
+// caller can log and proceed with defaults. Composing the resolved profile
+// with role.tool_packs at spawn time is slice I/2c.
+// ---------------------------------------------------------------------------
+
+/// Errors returned by [`fetch_profile`].
+#[derive(Debug, thiserror::Error)]
+pub enum ProfileFetchError {
+    /// Reserved for callers that prefer an explicit not-found variant; the
+    /// 404 branch in [`fetch_profile`] returns `Ok(None)` instead, so this
+    /// variant is currently unused at the call site. Kept for forward-compat
+    /// in case operator tooling wants to distinguish explicit absence.
+    #[error("profile not found")]
+    NotFound,
+    #[error("forge http {status}: {body}")]
+    Http { status: u16, body: String },
+    #[error("profile toml parse: {0}")]
+    Parse(toml::de::Error),
+    #[error("profile content base64 decode: {0}")]
+    Base64(#[from] base64::DecodeError),
+    #[error("forge network: {0}")]
+    Network(#[from] reqwest::Error),
+    #[error("malformed target_repo (expected `<owner>/<repo>`): {0}")]
+    MalformedTargetRepo(String),
+}
+
+/// Fetch `.agentry/profile.toml` from the target_repo via the forge contents
+/// API. 404 → `Ok(None)` (profile is optional). 200 → base64-decode the
+/// response's `content` field and parse it as a [`Profile`]. Other statuses
+/// surface as [`ProfileFetchError::Http`].
+///
+/// `forge_host` is the bare host[:port] without scheme — the URL is built as
+/// `https://<forge_host>/api/v1/repos/<owner>/<repo>/contents/.agentry/profile.toml?ref=<base_branch>`.
+///
+/// `tls_insecure` disables TLS certificate validation on the underlying
+/// reqwest client; production callers pass `false`, lab-internal callers
+/// running against a self-signed forge cert pass `true`.
+pub async fn fetch_profile(
+    target_repo: &str,
+    base_branch: &str,
+    forge_host: &str,
+    forge_token: &str,
+    tls_insecure: bool,
+) -> std::result::Result<Option<Profile>, ProfileFetchError> {
+    let parsed_target = TargetRepo::from_str(target_repo)
+        .map_err(|_| ProfileFetchError::MalformedTargetRepo(target_repo.to_string()))?;
+    let owner = parsed_target.owner();
+    let repo = parsed_target.repo();
+    let url = format!(
+        "https://{forge_host}/api/v1/repos/{owner}/{repo}/contents/.agentry/profile.toml?ref={base_branch}"
+    );
+    fetch_profile_url(&url, forge_token, tls_insecure).await
+}
+
+/// Fetch a profile from an explicit URL. Production callers use
+/// [`fetch_profile`] which constructs the canonical `https://...` URL; this
+/// lower-level entry point exists so integration tests can point at a mock
+/// HTTP server (where the hardcoded `https://` of [`fetch_profile`] would
+/// require self-signed-cert plumbing on top of `wiremock`).
+pub async fn fetch_profile_url(
+    url: &str,
+    forge_token: &str,
+    tls_insecure: bool,
+) -> std::result::Result<Option<Profile>, ProfileFetchError> {
+    let mut builder = reqwest::Client::builder();
+    if tls_insecure {
+        builder = builder.danger_accept_invalid_certs(true);
+    }
+    let client = builder
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
+    let resp = client
+        .get(url)
+        .header("Authorization", format!("token {forge_token}"))
+        .send()
+        .await?;
+
+    let status = resp.status();
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if !status.is_success() {
+        let code = status.as_u16();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(ProfileFetchError::Http { status: code, body });
+    }
+
+    let body: serde_json::Value = resp.json().await?;
+    let content_b64 = body
+        .get("content")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    // Forge content fields commonly arrive line-wrapped (60-char chunks);
+    // strip whitespace before decode.
+    let cleaned: String = content_b64.chars().filter(|c| !c.is_whitespace()).collect();
+    let decoded = base64::engine::general_purpose::STANDARD.decode(cleaned.as_bytes())?;
+    let text = String::from_utf8_lossy(&decoded);
+    let profile = parse_profile_toml(&text)
+        .map_err(|ProfileParseError::Toml(e)| ProfileFetchError::Parse(e))?;
+    Ok(Some(profile))
+}

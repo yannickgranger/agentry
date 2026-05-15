@@ -138,6 +138,23 @@ clock, event count, and first/last timestamps. Cheap to compute on every
 request because transcripts are small. Returned by
 `GET /briefs/{id}/transcript/summary`.
 
+## AppState
+
+The dashboard's request-handler state: a `DashboardStore` clone for Redis
+access plus the optional webhook shared secret resolved at startup. Defined
+in the dashboard library crate (rather than the binary `main.rs`) so route
+modules in `routes::views` can name it as their `State<...>` extractor type
+— the binary crate cannot expose its own types to its own lib. Constructed
+only in `main()`, threaded into the router via `with_state`.
+
+## AppError
+
+The dashboard's handler error wrapper: a thin `anyhow::Error` newtype that
+implements `IntoResponse` so handlers can use `?`. Logs the underlying error
+at `error` level and returns an `INTERNAL_SERVER_ERROR` body with the
+rendered message. Lives in the library crate alongside `AppState` so
+`routes::views` handlers can name it.
+
 ## BriefsState
 
 The dashboard's brief-routes state: the transcripts root directory under
@@ -145,6 +162,43 @@ which `<brief>[.<role>].jsonl` files are read. Constructed with a
 production default of `/var/lib/agentry/transcripts` and overridable in
 integration tests so the routes can be exercised against a tempdir
 without touching the host filesystem.
+
+## TraceQuery
+
+The deserialised query string for `GET /sse/brief/{id}/trace`. Single
+optional `from` parameter — when set to `"0-0"` the SSE handler prepends
+the most recent 200 historical events from the brief's Redis trace stream
+before tailing live broadcasts. Any other value (or unset) skips history
+and only tails live events.
+
+## RoleForm
+
+The form payload for `POST /roles`. Mirrors the registry's `AgentRole`
+shape in the wire format the dashboard's HTML form renders: name and image
+as plain strings, substrate class and package manager as enum-string
+selects, binaries / tool-allowlist / passthru-env as comma-separated
+values, permit scope and bind mounts as line-delimited blobs, mcp-servers
+as a JSON array. The handler parses and validates each field, mints the
+next version via `DashboardStore::next_version`, and saves the constructed
+`AgentRole`.
+
+## TeamForm
+
+The form payload for `POST /teams`. Carries the team name, comma-separated
+role list (each token optionally `name@vN`), line-delimited message graph
+(`from -> to` with optional `:overrides_key` suffix), terminal role token,
+and `max_retries`. The handler parses each field through the per-edge and
+per-role-ref helpers, mints the next version, and saves the constructed
+`TeamTopology`.
+
+## ProjectForm
+
+The form payload for `POST /projects`. Carries slug, display name,
+line-delimited forge entries, default and steward topology names, and the
+standing-orders fields (tokens/day, usd/day, default escalation,
+line-delimited priorities and forbidden lists). The handler parses and
+saves the constructed `Project` at version 1 — projects use the unversioned
+key shape `agentry:project:{slug}` (see `DashboardStore`).
 
 ## DashboardStore
 

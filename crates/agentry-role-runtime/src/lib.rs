@@ -28,8 +28,13 @@ pub mod ci_watcher_runner;
 pub mod claude;
 pub mod planner;
 pub mod pr_rebaser;
+pub mod precommit_gate;
 pub mod shipper_runner;
-pub use claude::{stream_claude, StreamErr};
+pub use claude::{stream_claude, stream_claude_via_stdin, StreamErr};
+pub use precommit_gate::{
+    decide_gate, derive_fqn, is_orphan_pub_item, orphan_pub_item_finding, parse_allowlist_toml,
+    parse_new_pub_items, GateDecision, NewPubItem, PublicApiAllowlist, GATE_CATEGORY, GATE_SOURCE,
+};
 
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -168,6 +173,7 @@ impl Drop for DoneGuard {
                 Some(DoneReason {
                     cause: "unexpected_exit".into(),
                     exit_code: None,
+                    disagreements: Vec::new(),
                 }),
             );
         }
@@ -440,27 +446,64 @@ pub fn slice_json_array(text: &str) -> Option<&str> {
     Some(&text[start..=end])
 }
 
+/// Find the last LINE-ANCHORED JSON array in text (a `[` that begins a line,
+/// plus its matching `]`). Used by parse_findings as a fallback when the
+/// first-pass naive slice (`slice_json_array`) captures prose containing
+/// literal `[]` brackets before the actual JSON findings.
+pub fn slice_last_json_array(text: &str) -> Option<&str> {
+    let bytes = text.as_bytes();
+    let mut start: Option<usize> = None;
+    for i in (0..bytes.len()).rev() {
+        if bytes[i] == b'[' && (i == 0 || bytes[i - 1] == b'\n') {
+            start = Some(i);
+            break;
+        }
+    }
+    let s = start?;
+    let mut depth: i32 = 0;
+    for (j, &b) in bytes[s..].iter().enumerate() {
+        if b == b'[' {
+            depth += 1;
+        } else if b == b']' {
+            depth -= 1;
+            if depth == 0 {
+                return Some(&text[s..s + j + 1]);
+            }
+        }
+    }
+    None
+}
+
 /// Strip optional code fences, slice between first `[` and last `]`, parse
 /// as a JSON array of finding-shape objects. On any failure, salvage the
 /// reply as a single `format_deviation` Blocker finding so the rework loop
 /// has a concrete handle. Returns the emit-ready findings.
 pub fn parse_findings(response: &str, agent_id: &str) -> Vec<ReviewFinding> {
     let cleaned = strip_fences(response);
-    let sliced = match slice_json_array(&cleaned) {
-        Some(s) => s,
-        None => {
-            return vec![salvage_format_deviation(&cleaned, agent_id)];
+    let primary = slice_json_array(&cleaned);
+    if let Some(s) = primary {
+        if let Ok(Value::Array(a)) = serde_json::from_str::<Value>(s) {
+            return a
+                .into_iter()
+                .map(|v| convert_finding(&v, agent_id))
+                .collect();
         }
-    };
-    let arr: Vec<Value> = match serde_json::from_str::<Value>(sliced) {
-        Ok(Value::Array(a)) => a,
-        _ => {
-            return vec![salvage_format_deviation(sliced, agent_id)];
+    }
+    let fallback = slice_last_json_array(&cleaned);
+    if let Some(fb) = fallback {
+        if let Ok(Value::Array(a)) = serde_json::from_str::<Value>(fb) {
+            emit_event(json!({
+                "msg": "reviewer parser: salvaged trailing JSON array after first-pass slice failed",
+                "primary_bytes": primary.map(|p| p.len()).unwrap_or(0),
+                "fallback_bytes": fallback.unwrap_or("").len(),
+            }));
+            return a
+                .into_iter()
+                .map(|v| convert_finding(&v, agent_id))
+                .collect();
         }
-    };
-    arr.into_iter()
-        .map(|v| convert_finding(&v, agent_id))
-        .collect()
+    }
+    vec![salvage_format_deviation(&cleaned, agent_id)]
 }
 
 /// Drop reviewer-emitted Blocker findings whose `message`, `requirements`,
@@ -574,26 +617,38 @@ pub enum Threshold {
 
 /// The fence policy table. Adding a sixth fence is one row addition.
 pub const FENCE_MATRIX: &[(FenceKind, Threshold, Severity)] = &[
+    // Metric fences (clones / complexity / unwraps) run on whole CHANGED
+    // FILES, not new lines only. Without a diff-scope filter they flag
+    // pre-existing code in any file the brief touches — guaranteed to
+    // block briefs that edit functions inside files with legacy debt
+    // (e.g. handle() with 29 prod clones, projector_task with complexity
+    // 39). Demoted to Warn until the fence learns scope-by-diff
+    // (separate brief / cfdb-rule). The LLM reviewer's design-feedback
+    // path still surfaces real defects in new code with proper scope.
     (
         FenceKind::ClonesInLoop,
         Threshold::GreaterThan(0),
-        Severity::Blocker,
+        Severity::Warn,
     ),
     (
         FenceKind::CloneProd,
         Threshold::GreaterThan(0),
-        Severity::Blocker,
+        Severity::Warn,
     ),
     (
         FenceKind::Complexity,
         Threshold::GreaterThan(15),
-        Severity::Blocker,
+        Severity::Warn,
     ),
     (
         FenceKind::Unwraps,
         Threshold::SeverityAtLeast(UnwrapSeverity::High),
-        Severity::Blocker,
+        Severity::Warn,
     ),
+    // CallersZero stays Blocker — it's a new-pub-with-zero-callers
+    // split-brain signal, NOT a metric on pre-existing code. Only
+    // fires when ra-query's worktree pre-pass succeeded (already
+    // demoted to Warn-on-ROFS earlier in this file).
     (
         FenceKind::CallersZero,
         Threshold::EqualTo(0),
@@ -678,12 +733,38 @@ pub fn run_fence(workspace: &Path, base_branch: &str) -> Vec<ReviewFinding> {
 
     // Callers fence (Y.4): for each new pub item introduced by the diff,
     // ask ra-query who calls it. Zero callers in workspace is a Blocker
-    // (split-brain candidate). Pre-diff worktree creation failure and any
-    // ra-query failure inside the fence are fail-closed (Y.5). Cleanup
-    // after the fence is best-effort and does not override findings.
+    // (split-brain candidate). Pre-diff worktree creation failure is a
+    // SUBSTRATE issue (the reviewer-claude container mounts the workspace
+    // read-only by design, so `.git/worktrees/` writes fail with ROFS) —
+    // emit a single Warn and skip the callers fence rather than tanking
+    // the whole brief with a Blocker. ra-query call failures inside the
+    // fence still fail-closed (those indicate ra-query is genuinely
+    // broken, not a substrate-by-design issue). Cleanup after the fence
+    // is best-effort and does not override findings.
     let pre = match create_pre_diff_worktree(workspace, base_branch) {
         Ok(p) => p,
-        Err(e) => return fail_closed("git_worktree_failed", &format!("git worktree add: {e}")),
+        Err(e) => {
+            findings.push(ReviewFinding {
+                file: None,
+                line: None,
+                severity: Severity::Warn,
+                origin: FindingOrigin::Mechanical {
+                    tool: "ra-query".into(),
+                    rule: Some("callers_fence_skipped".into()),
+                },
+                category: "fence".into(),
+                message: format!(
+                    "callers fence skipped: pre-diff worktree creation failed (git worktree add: {e}). \
+                     Likely a read-only workspace mount; clones/complexity/unwraps fences still ran. \
+                     Restore writability of `.git/worktrees/` in the reviewer container to re-enable \
+                     the callers-zero check."
+                ),
+                suggested_fix: None,
+                prohibitions: Vec::new(),
+                requirements: Vec::new(),
+            });
+            return findings;
+        }
     };
     let callers_result: Result<Vec<ReviewFinding>, (&'static str, String)> = (|| {
         let mut out = Vec::new();
@@ -1195,6 +1276,245 @@ pub fn build_review_prompt(
     s
 }
 
+// ---------- ra-query pre-pass (Phase 2.2 #87) ----------
+
+/// Outcome of [`ra_query_pre_pass`]. Carries Warn-severity informational
+/// findings (`unwraps`/`complexity`/`callers`) on success, or a
+/// `skipped_reason` when the pre-pass could not run (binary missing,
+/// ra-query call failed). Skip is non-blocking — the runner emits a
+/// `ra-query pre-pass skipped` event and continues to LLM-only review.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct RaQueryPrePass {
+    pub findings: Vec<ReviewFinding>,
+    pub skipped_reason: Option<String>,
+}
+
+/// Pre-pass parser for `ra-query unwraps --severity high --format json`.
+/// Mirrors [`unwraps_to_findings`] but emits Warn-severity findings tagged
+/// `category = "unwraps"` so the LLM-prompt summary distinguishes them.
+pub fn prepass_unwraps_to_findings(file: &str, json: &Value) -> Vec<ReviewFinding> {
+    let mut out = unwraps_to_findings(file, json);
+    for f in &mut out {
+        f.severity = Severity::Warn;
+        f.category = "unwraps".into();
+    }
+    out
+}
+
+/// Pre-pass parser for `ra-query complexity --threshold 15 --format json`.
+/// Emits Warn-severity findings tagged `category = "complexity"`.
+pub fn prepass_complexity_to_findings(file: &str, json: &Value) -> Vec<ReviewFinding> {
+    let mut out = complexity_to_findings(file, json);
+    for f in &mut out {
+        f.severity = Severity::Warn;
+        f.category = "complexity".into();
+    }
+    out
+}
+
+/// Pre-pass parser for one `ra-query callers <pos> -f json` response. Emits
+/// a single zero-callers Warn finding when the response lists no callers,
+/// or an empty vec otherwise. Accepts either `{"callers": [...]}` or a bare
+/// JSON array — same shapes the [`run_fence`] callers helper handles.
+pub fn prepass_callers_to_findings(
+    file: &str,
+    item_name: &str,
+    line: u32,
+    json: &Value,
+) -> Vec<ReviewFinding> {
+    let count = json
+        .get("callers")
+        .and_then(Value::as_array)
+        .map(|a| a.len())
+        .or_else(|| json.as_array().map(|a| a.len()))
+        .unwrap_or(0);
+    if count != 0 {
+        return Vec::new();
+    }
+    vec![ReviewFinding {
+        file: Some(file.to_string()),
+        line: Some(line),
+        severity: Severity::Warn,
+        origin: FindingOrigin::Mechanical {
+            tool: "ra-query".into(),
+            rule: Some("callers_zero".into()),
+        },
+        category: "callers".into(),
+        message: format!("pub item `{item_name}` has zero callers in workspace"),
+        suggested_fix: None,
+        prohibitions: Vec::new(),
+        requirements: Vec::new(),
+    }]
+}
+
+/// Format pre-pass findings as a multi-line summary for the reviewer
+/// prompt — one line per finding shaped `severity:category:file:line:message`.
+/// Returns the literal string `(none)` for an empty slice so the prompt
+/// section has a stable shape regardless of pre-pass outcome.
+pub fn format_mechanical_findings_summary(findings: &[ReviewFinding]) -> String {
+    if findings.is_empty() {
+        return "(none)".into();
+    }
+    findings
+        .iter()
+        .map(|f| {
+            let sev = match f.severity {
+                Severity::Blocker => "blocker",
+                Severity::Warn => "warn",
+            };
+            let line = f.line.map(|l| l.to_string()).unwrap_or_default();
+            let file = f.file.as_deref().unwrap_or("");
+            format!("{sev}:{}:{file}:{line}:{}", f.category, f.message)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Build the strict reviewer prompt with an extra "mechanical findings"
+/// section appended. The `mechanical_findings_summary` is the output of
+/// [`format_mechanical_findings_summary`] (or `(none)` when the pre-pass
+/// found nothing or was skipped). The base prompt body is produced by
+/// [`build_review_prompt`] verbatim — the section is purely additive so
+/// LLM-only review (skipped pre-pass) reads identically aside from a
+/// `(none)` summary.
+pub fn build_review_prompt_with_mechanical_findings(
+    base_branch: &str,
+    issue_title: &str,
+    issue_body: &str,
+    diff_text: &str,
+    mechanical_findings_summary: &str,
+) -> String {
+    let mut s = build_review_prompt(base_branch, issue_title, issue_body, diff_text);
+    s.push_str(&format!(
+        "\nMechanical findings already detected (do not re-flag, but consider them in your architectural review):\n{mechanical_findings_summary}\n",
+    ));
+    s
+}
+
+/// Run the ra-query pre-pass against `workspace`'s diff vs `base_branch`.
+/// For each changed `*.rs` file outside `tests/`, calls `ra-query unwraps`,
+/// `ra-query complexity`, and (per pub item from `ra-query pub-surface`)
+/// `ra-query callers`, folding the results into Warn-severity findings.
+///
+/// Skip-friendly (Phase 2.2): missing binary or any ra-query failure
+/// returns a [`RaQueryPrePass`] with `skipped_reason` populated and an
+/// empty `findings` vec — the caller emits `{"msg":"ra-query pre-pass
+/// skipped","reason":"<short>"}` and continues with LLM-only review. This
+/// is intentionally distinct from the fail-closed [`run_fence`] which
+/// blocks on substrate failure: the pre-pass is informational, the fence
+/// is gatekeeping.
+pub fn ra_query_pre_pass(workspace: &Path, base_branch: &str) -> RaQueryPrePass {
+    if !ra_query_present() {
+        return RaQueryPrePass {
+            findings: Vec::new(),
+            skipped_reason: Some("ra-query binary missing".into()),
+        };
+    }
+    let changed = match prepass_changed_rs_files(workspace, base_branch) {
+        Ok(v) => v,
+        Err(e) => {
+            return RaQueryPrePass {
+                findings: Vec::new(),
+                skipped_reason: Some(format!("git diff failed: {e}")),
+            };
+        }
+    };
+    let workspace_s = workspace.to_string_lossy().into_owned();
+    let mut findings = Vec::new();
+    for f in &changed {
+        let abs = workspace.join(f);
+        if !abs.is_file() {
+            continue;
+        }
+        let abs_s = abs.to_string_lossy().into_owned();
+
+        match run_ra_query(&["unwraps", &abs_s, "--severity", "high", "--format", "json"]) {
+            Ok(j) => findings.extend(prepass_unwraps_to_findings(f, &j)),
+            Err(e) => {
+                return RaQueryPrePass {
+                    findings: Vec::new(),
+                    skipped_reason: Some(format!("ra-query unwraps failed: {e}")),
+                };
+            }
+        }
+
+        match run_ra_query(&[
+            "complexity",
+            &abs_s,
+            "--threshold",
+            "15",
+            "--format",
+            "json",
+        ]) {
+            Ok(j) => findings.extend(prepass_complexity_to_findings(f, &j)),
+            Err(e) => {
+                return RaQueryPrePass {
+                    findings: Vec::new(),
+                    skipped_reason: Some(format!("ra-query complexity failed: {e}")),
+                };
+            }
+        }
+
+        let items = match pub_surface_at(workspace, f) {
+            Ok(items) => items,
+            Err(e) => {
+                return RaQueryPrePass {
+                    findings: Vec::new(),
+                    skipped_reason: Some(format!("ra-query pub-surface failed: {e}")),
+                };
+            }
+        };
+        for item in items {
+            if item.col == 0 {
+                continue;
+            }
+            let pos = format!("{}:{}:{}", abs_s, item.line, item.col);
+            match run_ra_query(&["callers", &pos, "-p", &workspace_s, "-f", "json"]) {
+                Ok(j) => findings.extend(prepass_callers_to_findings(
+                    f,
+                    &item.name,
+                    item.line as u32,
+                    &j,
+                )),
+                Err(e) => {
+                    return RaQueryPrePass {
+                        findings: Vec::new(),
+                        skipped_reason: Some(format!("ra-query callers failed: {e}")),
+                    };
+                }
+            }
+        }
+    }
+    RaQueryPrePass {
+        findings,
+        skipped_reason: None,
+    }
+}
+
+fn prepass_changed_rs_files(workspace: &Path, base_branch: &str) -> Result<Vec<String>, String> {
+    let range = format!("{base_branch}...HEAD");
+    let out = Command::new("git")
+        .arg("diff")
+        .arg("--name-only")
+        .arg(&range)
+        .current_dir(workspace)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| format!("spawn git diff: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("git diff exit {:?}", out.status.code()));
+    }
+    let s = String::from_utf8_lossy(&out.stdout);
+    Ok(s.lines()
+        .filter(|line| {
+            line.ends_with(".rs") && !line.starts_with("tests/") && !line.contains("/tests/")
+        })
+        .map(|l| l.to_string())
+        .collect())
+}
+
 // ---------- coder-binary helpers (extracted from coder_claude_runner, brief X.7c) ----------
 
 /// Issue-body byte budget used by [`build_self_review_prompt`].
@@ -1225,11 +1545,76 @@ pub struct BriefContext {
     pub allowed_tools: Vec<String>,
 }
 
+/// One unapplied verb surfaced by self-review. `applied_form` and
+/// `rationale` are optional (empty string ⇒ unset) so legacy coders that
+/// emit only a string verb description still parse.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct UnappliedVerb {
+    pub verb: String,
+    #[serde(default)]
+    pub applied_form: String,
+    #[serde(default)]
+    pub rationale: String,
+}
+
+impl UnappliedVerb {
+    pub fn applied_form_or_dash(&self) -> &str {
+        if self.applied_form.is_empty() {
+            "—"
+        } else {
+            &self.applied_form
+        }
+    }
+    pub fn rationale_or_dash(&self) -> &str {
+        if self.rationale.is_empty() {
+            "—"
+        } else {
+            &self.rationale
+        }
+    }
+}
+
 /// Parsed self-review JSON object (`{all_applied, unapplied}`).
 #[derive(Debug, PartialEq, Eq)]
 pub struct SelfReviewResult {
     pub all_applied: bool,
-    pub unapplied: Vec<String>,
+    pub unapplied: Vec<UnappliedVerb>,
+}
+
+/// Classification of the `unapplied` set surfaced when `all_applied=false`.
+/// `Disagreement` when EVERY entry carries both `applied_form` AND `rationale`
+/// non-empty — the coder is flagging deliberate divergence from the literal
+/// verb wording, so the FSM should park the brief in `AwaitingCaptainDecision`
+/// via `BriefEvent::CoderDisagreed`. `BareFailure` when at least one entry is
+/// missing applied_form or rationale (current `self_review_unapplied` path —
+/// findings + Failed verdict).
+#[derive(Debug, PartialEq, Eq)]
+pub enum SelfReviewClassification {
+    Disagreement(Vec<orchestrator_types::lifecycle::DisagreementSummary>),
+    BareFailure,
+}
+
+/// Pure classifier for the unapplied-verb set. Caller is responsible for the
+/// associated I/O (emit_event / emit_done / emit_finding) so tests can pin
+/// the decision without mocking the trace stream.
+#[must_use]
+pub fn classify_self_review_unapplied(unapplied: &[UnappliedVerb]) -> SelfReviewClassification {
+    let all_have_disagreement_fields = unapplied
+        .iter()
+        .all(|v| !v.applied_form.is_empty() && !v.rationale.is_empty());
+    if all_have_disagreement_fields && !unapplied.is_empty() {
+        let disagreements = unapplied
+            .iter()
+            .map(|v| orchestrator_types::lifecycle::DisagreementSummary {
+                verb: v.verb.clone(),
+                applied_form: v.applied_form.clone(),
+                rationale: v.rationale.clone(),
+            })
+            .collect();
+        SelfReviewClassification::Disagreement(disagreements)
+    } else {
+        SelfReviewClassification::BareFailure
+    }
 }
 
 /// Build a [`BriefContext`] from a startup bundle JSON value.
@@ -1443,16 +1828,29 @@ pub fn build_self_review_prompt(issue_body: &str, staged_diff: &str) -> String {
          {staged_diff}\n\
          \n\
          For each verb declared in the task body, check whether it has been applied\n\
-         in the diff at the named location. Output EXACTLY a JSON object — no\n\
-         markdown fences, no prose:\n\
+         in the diff at the named location. Output EXACTLY a JSON object — no markdown fences, no prose:\n\
          \n\
          {{\n\
          \x20\x20\"all_applied\": true,\n\
          \x20\x20\"unapplied\": []\n\
          }}\n\
          \n\
-         If any verb is missing, set all_applied:false and list each missing verb\n\
-         as a short description (max 200 chars each, max 6 entries).\n\
+         When all verbs were applied as specified, set all_applied:true and leave\n\
+         unapplied empty. When a verb was NOT applied, OR was applied with a\n\
+         deliberate variant (different file content, different naming, different\n\
+         structure than the brief literally specified), include it in unapplied\n\
+         as an object:\n\
+         \n\
+         {{\n\
+         \x20\x20\"verb\": \"<short verb description, max 200 chars>\",\n\
+         \x20\x20\"applied_form\": \"<what was actually done in the diff, max 200 chars>\",\n\
+         \x20\x20\"rationale\": \"<why the applied form differs, max 300 chars; empty when the verb was simply not done>\"\n\
+         }}\n\
+         \n\
+         Maximum 6 entries. The rationale field is the most important: when you\n\
+         deliberately deviated from the brief because it would conflict with project\n\
+         convention or produce broken output, EXPLAIN why. The captain reads this\n\
+         to decide accept/reject; an empty rationale signals an honest miss.\n\
          \n\
          Your response, right now, starting with {{ and ending with }}:\n",
     )
@@ -1477,7 +1875,34 @@ pub fn parse_self_review_object(raw: &str) -> Option<SelfReviewResult> {
         .and_then(Value::as_array)
         .map(|arr| {
             arr.iter()
-                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .filter_map(|x| {
+                    // Object form (new): {verb, applied_form, rationale}
+                    if let Some(obj) = x.as_object() {
+                        let verb = obj.get("verb").and_then(Value::as_str)?.to_string();
+                        let applied_form = obj
+                            .get("applied_form")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        let rationale = obj
+                            .get("rationale")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        Some(UnappliedVerb {
+                            verb,
+                            applied_form,
+                            rationale,
+                        })
+                    // String form (legacy): just the verb description
+                    } else {
+                        x.as_str().map(|s| UnappliedVerb {
+                            verb: s.to_string(),
+                            applied_form: String::new(),
+                            rationale: String::new(),
+                        })
+                    }
+                })
                 .collect()
         })
         .unwrap_or_default();
@@ -1672,6 +2097,34 @@ pub fn smell_wc_l_without_cfg_test(cmd: &str) -> Option<ReviewFinding> {
     ))
 }
 
+/// `DoneReason.cause` discriminant emitted by preflight-criterion-runner
+/// when one of the blocking smell heuristics (smell-1 or smell-2) fires.
+/// The daemon-side trace translator (wired in 84b-2) folds this into
+/// `BriefEvent::PreflightSmellDetected`, which the FSM transitions into
+/// `BriefState::Failed { reason: Reason::PreflightSmell }`. Smell-3 stays
+/// Warn-only and does NOT emit this cause.
+pub const PREFLIGHT_SMELL_CAUSE: &str = "preflight_smell";
+
+/// Returns the first blocking preflight-criterion smell finding for the
+/// given criterion, or `None` if neither smell-1 nor smell-2 fires. The
+/// runner emits the returned finding (Warn severity, operator-visible
+/// trace) and then `done failed` with cause [`PREFLIGHT_SMELL_CAUSE`].
+///
+/// Order is deliberate and contractual: smell-1 (huge baseline + zero
+/// expected) is checked before smell-2 (canonical `grep -v 'mod tests'`)
+/// so a criterion that trips both surfaces the more specific
+/// false-positive signal first. Smell-3 (`wc -l` without `#[cfg(test)]`)
+/// is excluded — it stays advisory and the runner handles it separately
+/// after the blocking-smell short-circuit.
+pub fn first_blocking_preflight_smell(
+    cmd: &str,
+    baseline: &str,
+    expected: &str,
+) -> Option<ReviewFinding> {
+    smell_huge_baseline_zero_expected(cmd, baseline, expected)
+        .or_else(|| smell_grep_v_mod_tests(cmd))
+}
+
 fn preflight_warn_finding(message: String) -> ReviewFinding {
     ReviewFinding {
         file: None,
@@ -1691,4 +2144,200 @@ fn preflight_warn_finding(message: String) -> ReviewFinding {
 
 fn is_ascii_digits(s: &str) -> bool {
     !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+// ---------- auditor ra-query helpers (brief #87 phase2) ----------
+//
+// These are the parser primitives behind the auditor-claude-runner's two
+// finding-emitting stages: `ra_query_unwraps_stage` (every unwrap site
+// becomes one Warn finding) and `ra_query_callers_pubsurface_stage` (each
+// new pub item with zero callers becomes one Warn `orphan_pub` finding).
+// Both stages are best-effort: a missing `ra-query` binary, a parse error,
+// or a non-zero exit shorts out the stage with a `*_skipped` event rather
+// than failing the auditor.
+
+/// Tool name embedded in `FindingOrigin::Mechanical` for findings emitted
+/// by the ra-query-driven stages.
+pub const RA_QUERY_TOOL: &str = "ra-query";
+
+/// Category for the per-unwrap Warn finding stream (auditor stage 1 of 2
+/// added in brief #87 phase2). The daemon never gates on Warns; this is
+/// purely informational.
+pub const UNWRAPS_CATEGORY: &str = "unwraps";
+
+/// Category for the per-orphan-pub Warn finding stream (auditor stage 2
+/// of 2 added in brief #87 phase2). A pub item is "orphan" iff it was
+/// added in this brief (vs base_branch) AND has zero workspace callers.
+pub const ORPHAN_PUB_CATEGORY: &str = "orphan_pub";
+
+/// Parse one `ra-query unwraps <file> --format json` response into a list
+/// of `Severity::Warn` findings, one per unwrap site. The `file` arg
+/// names the source file ra-query was invoked on; the JSON's top-level
+/// `file` field is preferred when present (and falls back to `file`).
+///
+/// Each finding's message is `<file>:<line>:<fqn>` per the brief, with
+/// the unwrap method and severity appended in parens for triage. The
+/// origin is `Mechanical { tool: "ra-query", rule: Some("unwraps") }`.
+///
+/// Returns an empty vec on any of: missing `functions` array, missing
+/// `unwraps` array per function, or unparseable line numbers — the
+/// caller treats absence of findings as "this file is clean".
+pub fn parse_unwraps_findings(file: &str, json: &Value) -> Vec<ReviewFinding> {
+    let mut out = Vec::new();
+    let functions = match json.get("functions").and_then(Value::as_array) {
+        Some(a) => a,
+        None => return out,
+    };
+    let json_file = json
+        .get("file")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| file.to_string());
+    for fn_v in functions {
+        let fn_name = fn_v
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("?")
+            .to_string();
+        let unwraps = match fn_v.get("unwraps").and_then(Value::as_array) {
+            Some(a) => a,
+            None => continue,
+        };
+        for u in unwraps {
+            let line_u64 = u.get("line").and_then(Value::as_u64).unwrap_or(0);
+            let line: u32 = line_u64.try_into().unwrap_or(u32::MAX);
+            let method = u.get("method").and_then(Value::as_str).unwrap_or("unwrap");
+            let severity_str = u.get("severity").and_then(Value::as_str).unwrap_or("low");
+            let message =
+                format!("{json_file}:{line}:{fn_name} ({method}, severity={severity_str})");
+            out.push(ReviewFinding {
+                file: Some(json_file.clone()),
+                line: Some(line),
+                severity: Severity::Warn,
+                origin: FindingOrigin::Mechanical {
+                    tool: RA_QUERY_TOOL.into(),
+                    rule: Some(UNWRAPS_CATEGORY.into()),
+                },
+                category: UNWRAPS_CATEGORY.into(),
+                message,
+                suggested_fix: None,
+                prohibitions: Vec::new(),
+                requirements: Vec::new(),
+            });
+        }
+    }
+    out
+}
+
+/// Parse `ra-query callers <pos> --format json` to a single caller count.
+/// Mirrors the existing pub-surface stage's `.callers | length` jq
+/// expression — a missing or non-array `callers` field reads as zero so
+/// "shape we did not recognise" cannot turn into a Blocker downstream.
+pub fn parse_callers_count(json: &Value) -> u64 {
+    json.get("callers")
+        .and_then(Value::as_array)
+        .map(|a| a.len() as u64)
+        .unwrap_or(0)
+}
+
+/// Build a single Warn finding for an orphan pub item (the
+/// `ra_query_callers_pubsurface_stage` output unit). `file:line:fqn` is
+/// the canonical message format shared with the unwraps stage.
+pub fn orphan_pub_finding(file: &str, line: u32, fqn: &str, kind: &str) -> ReviewFinding {
+    ReviewFinding {
+        file: Some(file.to_string()),
+        line: Some(line),
+        severity: Severity::Warn,
+        origin: FindingOrigin::Mechanical {
+            tool: RA_QUERY_TOOL.into(),
+            rule: Some(ORPHAN_PUB_CATEGORY.into()),
+        },
+        category: ORPHAN_PUB_CATEGORY.into(),
+        message: format!("{file}:{line}:{fqn} (new pub {kind} with zero callers)"),
+        suggested_fix: None,
+        prohibitions: Vec::new(),
+        requirements: Vec::new(),
+    }
+}
+
+/// Parse a `git diff --unified=0 <range>` text into a map from new-file
+/// path to the set of new-file line numbers added by the diff. Used by
+/// the orphan-pub stage to filter pub-surface output down to items
+/// actually introduced by this brief.
+///
+/// Hunk headers carry the new-file start line as `+c[,d]`; with `-U0`
+/// there are no context lines, so each `+`-prefixed line is at the
+/// running counter and `-`-prefixed lines do not advance it.
+pub fn parse_diff_added_lines(
+    diff: &str,
+) -> std::collections::BTreeMap<String, std::collections::BTreeSet<u32>> {
+    let mut map: std::collections::BTreeMap<String, std::collections::BTreeSet<u32>> =
+        std::collections::BTreeMap::new();
+    let mut cur_file: Option<String> = None;
+    let mut cur_line: u32 = 0;
+    for raw in diff.lines() {
+        if let Some(rest) = raw.strip_prefix("+++ b/") {
+            cur_file = Some(rest.to_string());
+            continue;
+        }
+        if raw.starts_with("+++ /dev/null") {
+            cur_file = None;
+            continue;
+        }
+        if raw.starts_with("@@") {
+            // "@@ -a[,b] +c[,d] @@ ..." — extract c.
+            let plus_idx = match raw.find('+') {
+                Some(i) => i,
+                None => continue,
+            };
+            let after = &raw[plus_idx + 1..];
+            let token: String = after
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || *c == ',')
+                .collect();
+            let start: u32 = token
+                .split(',')
+                .next()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            cur_line = start;
+            continue;
+        }
+        if cur_file.is_none() {
+            continue;
+        }
+        // Skip diff metadata lines that happen to start with '+' or '-'.
+        if raw.starts_with("+++") || raw.starts_with("---") {
+            continue;
+        }
+        if let Some(file) = &cur_file {
+            if let Some(byte) = raw.as_bytes().first() {
+                match *byte {
+                    b'+' => {
+                        map.entry(file.clone()).or_default().insert(cur_line);
+                        cur_line = cur_line.saturating_add(1);
+                    }
+                    b'-' => {
+                        // Removal — does not advance new-file counter.
+                    }
+                    _ => {
+                        // With --unified=0 there are no context lines, but be
+                        // permissive: treat anything else as a context line.
+                        cur_line = cur_line.saturating_add(1);
+                    }
+                }
+            }
+        }
+    }
+    map
+}
+
+/// Build the `*_skipped` event payload that both ra-query stages emit
+/// when they short-circuit (missing binary, git failure, parse error).
+/// Stage label is verbatim in `msg` so dashboards can filter on it.
+pub fn ra_query_skipped_event(stage: &str, reason: &str) -> Value {
+    json!({
+        "msg": format!("ra-query {stage} skipped"),
+        "reason": reason,
+    })
 }

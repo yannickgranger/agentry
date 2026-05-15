@@ -20,6 +20,7 @@ use orchestrator_types::{
     TeamTopology, ToolAllowlist,
 };
 use redis::AsyncCommands;
+use std::collections::HashMap;
 
 fn test_redis_url() -> Option<String> {
     std::env::var("AGENTRY_TEST_REDIS_URL").ok()
@@ -47,6 +48,7 @@ fn topo(name: &str, version: u32, role: &str) -> TeamTopology {
         message_graph: vec![],
         terminal_role: role_ref,
         max_retries: 0,
+        node_classes: HashMap::new(),
     }
 }
 
@@ -221,6 +223,7 @@ async fn fetch_role_resolves_exact_version() {
         workspace_mount: None,
         sccache: false,
         extra_bootstrap: vec![],
+        tool_packs: vec![],
     };
     let mut v2 = v1.clone();
     v2.version = 2;

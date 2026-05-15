@@ -63,9 +63,10 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 use agentry_role_runtime::{
-    build_review_prompt, drop_empty_blocker_findings, emit_done, emit_event, emit_finding,
-    parse_allowed_tools, parse_findings, pointer_str, read_bundle_value, run_fence, stream_claude,
-    tail_lines, workspace_is_git_repo, DoneGuard, StreamErr,
+    build_review_prompt_with_mechanical_findings, drop_empty_blocker_findings, emit_done,
+    emit_event, emit_finding, format_mechanical_findings_summary, parse_allowed_tools,
+    parse_findings, pointer_str, ra_query_pre_pass, read_bundle_value, run_fence,
+    stream_claude_via_stdin, tail_lines, workspace_is_git_repo, DoneGuard, StreamErr,
 };
 use orchestrator_types::{DoneReason, EventVerdict, Severity};
 use serde_json::json;
@@ -160,9 +161,36 @@ fn main() {
         "has_blocker": fence_has_blocker,
     }));
 
-    let prompt = build_review_prompt(&base_branch, &issue_title, &issue_body, &diff_text);
+    // Phase 2.2 #87: ra-query informational pre-pass. Mechanical findings
+    // (unwraps, complexity, dead pub items) caught structurally so the LLM
+    // can focus on architectural review and avoid re-flagging them by
+    // file:line. Skip-friendly: substrate failure does NOT block.
+    let pre_pass = ra_query_pre_pass(Path::new(WORKSPACE_DIR), &base_branch);
+    if let Some(reason) = pre_pass.skipped_reason.as_deref() {
+        emit_event(json!({
+            "msg": "ra-query pre-pass skipped",
+            "reason": reason,
+        }));
+    } else {
+        emit_event(json!({
+            "msg": "ra-query pre-pass complete",
+            "findings_count": pre_pass.findings.len(),
+        }));
+    }
+    for f in &pre_pass.findings {
+        emit_finding(f);
+    }
+    let mech_summary = format_mechanical_findings_summary(&pre_pass.findings);
 
-    let response = match stream_claude(&brief_id, ".reviewer", &prompt) {
+    let prompt = build_review_prompt_with_mechanical_findings(
+        &base_branch,
+        &issue_title,
+        &issue_body,
+        &diff_text,
+        &mech_summary,
+    );
+
+    let response = match stream_claude_via_stdin(&brief_id, ".reviewer", &prompt) {
         Ok(r) => r,
         Err(StreamErr::ClaudeFailed { exit_code, detail }) => {
             emit_event(json!({
@@ -232,6 +260,7 @@ fn fail_reason(cause: &str, exit_code: Option<i32>) -> Option<DoneReason> {
     Some(DoneReason {
         cause: cause.into(),
         exit_code,
+        disagreements: Vec::new(),
     })
 }
 

@@ -12,7 +12,7 @@
 //!    `pr-rebaser_brief.json` payload (target_repo, pr_number, branch,
 //!    base_branch, forge_host). `forge_host` arrives via the phase-3
 //!    daemon cascade through `agentry.toml [forge] default_host` — the
-//!    bash literal `// "agency.lab:3000"` fallback is gone.
+//!    bash literal `// "forge.example.com:3000"` fallback is gone.
 //! 2. Workspace must be a git repo — missing `.git` → `done failed`.
 //! 3. `cd /workspace`, set git user.email/user.name (idempotent).
 //! 4. `git fetch origin <base_branch>`; failure → `done failed`.
@@ -68,6 +68,7 @@ fn main() {
                 Some(DoneReason {
                     cause: "bundle_parse_failed".into(),
                     exit_code: None,
+                    disagreements: Vec::new(),
                 }),
             );
             return;

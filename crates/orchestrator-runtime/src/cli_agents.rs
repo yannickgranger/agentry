@@ -3,6 +3,7 @@
 
 use crate::state::State;
 use crate::Result;
+use orchestrator_infra::redis_io::redis_value_as_str;
 use redis::aio::ConnectionManager;
 use redis::AsyncCommands;
 use serde_json::Value as JsonValue;
@@ -103,12 +104,4 @@ pub async fn recent_status(
         .collect();
     let drop = filtered.len().saturating_sub(count);
     Ok(filtered.into_iter().skip(drop).collect())
-}
-
-fn redis_value_as_str(v: &redis::Value) -> Option<String> {
-    match v {
-        redis::Value::BulkString(b) => std::str::from_utf8(b).ok().map(String::from),
-        redis::Value::SimpleString(s) => Some(s.clone()),
-        _ => None,
-    }
 }

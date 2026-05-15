@@ -10,8 +10,9 @@
 //! to flag.
 
 use agentry_role_runtime::{
-    pointer_str, smell_grep_v_mod_tests, smell_huge_baseline_zero_expected,
-    smell_wc_l_without_cfg_test, split_criterion, PREFLIGHT_CATEGORY, PREFLIGHT_TOOL,
+    first_blocking_preflight_smell, pointer_str, smell_grep_v_mod_tests,
+    smell_huge_baseline_zero_expected, smell_wc_l_without_cfg_test, split_criterion,
+    PREFLIGHT_CATEGORY, PREFLIGHT_SMELL_CAUSE, PREFLIGHT_TOOL,
 };
 use orchestrator_types::{FindingOrigin, Severity};
 use serde_json::json;
@@ -203,4 +204,93 @@ fn all_smell_findings_use_mechanical_origin_with_preflight_tool() {
         assert!(f.prohibitions.is_empty());
         assert!(f.requirements.is_empty());
     }
+}
+
+// -- brief 84b-1b: smell promotion to terminal Failed -----------------
+//
+// These tests pin the runner-level decision: which smells block (1+2),
+// which stay advisory (3), which order applies (1 before 2), and that
+// the `DoneReason.cause` discriminant the runner emits is exactly the
+// string the daemon's trace translator will fold into
+// `BriefEvent::PreflightSmellDetected`.
+
+#[test]
+fn preflight_smell_cause_constant_is_preflight_smell() {
+    // The daemon's trace translator (84b-2) matches on this exact
+    // string. Pin it so a rename here forces the translator update.
+    assert_eq!(PREFLIGHT_SMELL_CAUSE, "preflight_smell");
+}
+
+#[test]
+fn smell_1_fires_done_failed_with_preflight_smell_cause() {
+    // Fixture criterion `rg ... | wc -l : 0` against a workspace that
+    // produces baseline=200. Smell-1 (huge baseline + zero expected)
+    // fires; the runner emits this finding then `done failed` with
+    // cause "preflight_smell".
+    let f = first_blocking_preflight_smell("rg unwrap src | wc -l", "200", "0")
+        .expect("smell-1 must fire on baseline=200, expected=0, wc -l cmd");
+    assert_eq!(f.severity, Severity::Warn);
+    assert_eq!(f.category, PREFLIGHT_CATEGORY);
+    assert!(f.message.contains("baseline (200)"));
+    assert!(f.message.contains("expected (0)"));
+    match &f.origin {
+        FindingOrigin::Mechanical { tool, .. } => assert_eq!(tool, PREFLIGHT_TOOL),
+        _ => panic!("smell-1 finding must be Mechanical-origin"),
+    }
+    // Cause string the runner pairs with this finding.
+    assert_eq!(PREFLIGHT_SMELL_CAUSE, "preflight_smell");
+}
+
+#[test]
+fn smell_2_fires_done_failed_with_preflight_smell_cause() {
+    // Fixture criterion containing literal `grep -v 'mod tests'`.
+    // Smell-2 fires (smell-1 silent: baseline=5 ≤ 100); the runner
+    // emits this finding then `done failed` with cause
+    // "preflight_smell".
+    let f = first_blocking_preflight_smell("rg unwrap src | grep -v 'mod tests' | wc -l", "5", "0")
+        .expect("smell-2 must fire on canonical broken filter when smell-1 is silent");
+    assert_eq!(f.severity, Severity::Warn);
+    assert_eq!(f.category, PREFLIGHT_CATEGORY);
+    assert!(f.message.contains("grep -v 'mod tests'"));
+    assert_eq!(PREFLIGHT_SMELL_CAUSE, "preflight_smell");
+}
+
+#[test]
+fn clean_criterion_emits_baseline_match_then_done_shipped() {
+    // Fixture criterion with no smells. `first_blocking_preflight_smell`
+    // returns None, so the runner skips the failed-emit branch and
+    // proceeds to `emit_done(Shipped, None)`. NO Warn finding is
+    // emitted (smell-3 is also silent here — `echo` does not contain
+    // `wc -l`). This pins the happy path the v2 attempt regressed.
+    assert!(first_blocking_preflight_smell("echo ok", "ok", "ok").is_none());
+    // Smell-3 (advisory) stays silent on a criterion without `wc -l`.
+    assert!(smell_wc_l_without_cfg_test("echo ok").is_none());
+}
+
+#[test]
+fn first_smell_wins() {
+    // Criterion matching BOTH smell-1 (wc -l + huge baseline + zero
+    // expected) AND smell-2 (`grep -v 'mod tests'`). Runner checks
+    // smell-1 first per the existing order, so the helper returns
+    // smell-1's finding — the runner emits exactly ONE finding then
+    // returns without ever evaluating smell-2.
+    let cmd = "rg unwrap src | grep -v 'mod tests' | wc -l";
+    // Both helpers detect their respective smells in isolation.
+    assert!(smell_huge_baseline_zero_expected(cmd, "200", "0").is_some());
+    assert!(smell_grep_v_mod_tests(cmd).is_some());
+    // The blocking-smell decision returns smell-1's finding (its
+    // message is the baseline-vs-expected wording, not the
+    // grep-v-mod-tests wording).
+    let f = first_blocking_preflight_smell(cmd, "200", "0")
+        .expect("at least one blocking smell must fire");
+    assert!(
+        f.message.contains("baseline (200)"),
+        "smell-1 must win — got: {}",
+        f.message
+    );
+    assert!(
+        !f.message.contains("grep -v 'mod tests'"),
+        "smell-2's finding must not be returned when smell-1 fires first — got: {}",
+        f.message
+    );
 }

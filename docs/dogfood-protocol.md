@@ -152,6 +152,31 @@ Before writing the payload:
    are forbidden — they give the coder too much latitude and make the
    mechanical reviewer's acceptance command the only real spec.
 
+## Topology selection for big Rust projects
+
+For briefs targeting big Rust projects (workspace with many crates,
+where running cargo workspace-wide blows the brief budget), use the
+agentry-bugfix-v0 topology and quality-mech acceptance:
+
+```
+topology: { name: "agentry-bugfix-v0", version: 1 }
+payload.acceptance: "cargo run -p quality-fast --bin quality-mech --release --quiet && bash scripts/arch-check.sh"
+```
+
+Why agentry-bugfix-v0:
+- 4-role linear pipeline (coder → reviewer-mechanical → shipper → ci-watcher); no LLM verifier ensemble
+- Per-brief LLM container count: 1 (coder), down from 5 in agentry-self-host-v0 (1 coder + 3 ac-verifiers + 1 reviewer-claude)
+- reviewer-mechanical (Rust binary) runs the brief's acceptance command in an isolated CARGO_TARGET_DIR=/tmp/review-target as the cargo correctness gate
+
+Why quality-mech:
+- Scopes cargo clippy + cargo test to changed crates plus their reverse-dep closure (computed via cargo metadata)
+- Falls back to full workspace on root-level changes (Cargo.toml / Cargo.lock / rust-toolchain.toml) — no scope-cheating soft fence
+- sccache covers cold-start; on warm cache the scoped pair runs an order of magnitude faster than `cargo clippy --workspace --all-targets && cargo test --workspace`
+
+When to NOT use this combination:
+- Briefs touching FSM logic, lifecycle, or other cross-context invariants where the LLM ensemble's cross-checking adds real safety. Use agentry-self-host-v0 for those.
+- Briefs where the workspace is small enough that workspace-wide cargo fits the budget — quality-mech adds metadata-walking overhead with no gain.
+
 ## Brief payload
 
 ```json
@@ -163,7 +188,7 @@ Before writing the payload:
     "issue_number": <N>,
     "issue_title": "...",
     "issue_body": "CREATE crates/foo/src/bar.rs: pub struct Baz { ... }\nUPDATE crates/foo/src/lib.rs:42: re-export Baz",
-    "acceptance": "cargo clippy --workspace -- -D warnings && cargo test --workspace && scripts/arch-check.sh",
+    "acceptance": "cargo run -p quality-fast --bin quality-mech --release --quiet && bash scripts/arch-check.sh",
     "target_repo": "yg/agentry",
     "base_branch": "develop",
     "pr_title": "feat(<context>): <summary> (closes #<N>)",
@@ -178,6 +203,18 @@ Before writing the payload:
   "submitted_at": "<iso-8601>"
 }
 ```
+
+`quality-mech` (introduced in PR #403) runs `cargo clippy -p <crate>
+--all-targets -- -D warnings` and `cargo test -p <crate>` on the
+closure of changed crates and their reverse-dep closure (computed via
+cargo metadata). For big Rust projects this scopes the reviewer's
+compile and test cost to changed work plus what depends on it; sccache
+covers cold-start. Falls back to full workspace on root-level changes
+(`Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`) — the scoping fence
+does not skip when the change could affect the whole workspace. For
+briefs targeting tiny projects or where scoping has no benefit, the
+workspace-wide pair `cargo clippy --workspace --all-targets -- -D
+warnings && cargo test --workspace` remains valid.
 
 `max_wall_seconds` covers the full role-by-role sequential run — coder
 (claude prompt + cargo check) + reviewer (clippy + test) + shipper

@@ -24,25 +24,31 @@
 //!    of stderr.
 //! 7. Compare baseline vs expected; emit `baseline_match` event with
 //!    baseline / expected / match / exit_code / stderr_tail.
-//! 8. Apply heuristic smell-tests:
+//! 8. Apply heuristic smell-tests in order; smell-1 and smell-2 are
+//!    blocking (first-smell-wins):
 //!    - Smell 1: `expected == "0"`, baseline numeric > 100, cmd
-//!      contains `wc -l` → Warn finding (likely false positives).
-//!    - Smell 2: cmd contains `grep -v 'mod tests'` → Warn finding
-//!      (canonical broken filter from #51).
+//!      contains `wc -l` → emit Warn finding, then `done failed` with
+//!      `cause: "preflight_smell"`. Return.
+//!    - Smell 2: cmd contains `grep -v 'mod tests'` → emit Warn
+//!      finding, then `done failed` with `cause: "preflight_smell"`.
+//!      Return.
 //!    - Smell 3: cmd contains `wc -l` AND not `#[cfg(test)]` → Warn
-//!      finding (test-scope exclusion missing).
-//! 9. emit_done shipped — smells are Warn-only signal, never block.
+//!      finding only (test-scope exclusion missing); does NOT block.
+//! 9. emit_done shipped — only when no blocking smell fired and the
+//!    criterion ran cleanly.
 //!
 //! ## Verdict-routing parity with bash heredoc
 //!
 //! - Missing/empty success_criteria → Failed (matches bash).
 //! - Missing space-colon-space separator → Failed (matches bash).
 //! - cd /workspace failure → Failed (matches bash).
-//! - Otherwise → Shipped, regardless of criterion exit code or smells
-//!   (matches bash — non-zero exit is reported in the event payload but
-//!   does not gate; smells are Warn findings, not Blockers).
-//!
-//! No intentional deviation from the bash variant routing.
+//! - Smell-1 or smell-2 fires → Failed with cause `"preflight_smell"`
+//!   (intentional divergence from bash, brief 84b-1b: the daemon's
+//!   trace translator folds this into
+//!   `BriefEvent::PreflightSmellDetected` so the FSM transitions to
+//!   `Failed { reason: Reason::PreflightSmell }`).
+//! - Otherwise → Shipped, regardless of criterion exit code or smell-3
+//!   (smell-3 remains a Warn-only signal).
 //!
 //! `DoneGuard` covers any unwound path so the daemon always sees a
 //! terminal `done` event (EPIC #161 B0 invariant).
@@ -50,11 +56,11 @@
 use std::process::{Command, Stdio};
 
 use agentry_role_runtime::{
-    emit_done, emit_event, emit_finding, pointer_str, read_bundle_value, smell_grep_v_mod_tests,
-    smell_huge_baseline_zero_expected, smell_wc_l_without_cfg_test, split_criterion, tail_bytes,
-    DoneGuard, CRITERION_OUTPUT_TAIL,
+    emit_done, emit_event, emit_finding, first_blocking_preflight_smell, pointer_str,
+    read_bundle_value, smell_wc_l_without_cfg_test, split_criterion, tail_bytes, DoneGuard,
+    CRITERION_OUTPUT_TAIL, PREFLIGHT_SMELL_CAUSE,
 };
-use orchestrator_types::EventVerdict;
+use orchestrator_types::{DoneReason, EventVerdict};
 use serde_json::json;
 
 const WORKSPACE_DIR: &str = "/workspace";
@@ -124,12 +130,25 @@ fn main() {
         "stderr_tail": stderr_tail,
     }));
 
-    if let Some(f) = smell_huge_baseline_zero_expected(&cmd, &baseline, &expected) {
+    // Brief 84b-1b: smell-1 and smell-2 are terminal Failed. Emit the
+    // existing Warn finding so the operator sees WHICH smell fired,
+    // then emit `done failed` with cause "preflight_smell" and return —
+    // first-smell-wins, do not continue processing further smells.
+    if let Some(f) = first_blocking_preflight_smell(&cmd, &baseline, &expected) {
         emit_finding(&f);
+        emit_done(
+            EventVerdict::Failed,
+            Some(DoneReason {
+                cause: PREFLIGHT_SMELL_CAUSE.into(),
+                exit_code: None,
+                disagreements: Vec::new(),
+            }),
+        );
+        return;
     }
-    if let Some(f) = smell_grep_v_mod_tests(&cmd) {
-        emit_finding(&f);
-    }
+
+    // Smell-3 stays Warn-only — surfaces the test-scope-exclusion gap
+    // without blocking the brief.
     if let Some(f) = smell_wc_l_without_cfg_test(&cmd) {
         emit_finding(&f);
     }

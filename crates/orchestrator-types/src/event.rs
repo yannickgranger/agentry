@@ -4,7 +4,7 @@
 //! runner mirrors every event to `agentry:brief:{id}:trace`. The permit broker
 //! subscribes and enforces tool allowlists.
 
-use crate::{now, review::ReviewFinding, Ts};
+use crate::{lifecycle::DisagreementSummary, now, review::ReviewFinding, Ts};
 use serde::{Deserialize, Serialize};
 
 /// Verdict emitted by an agent at the end of its run. Distinct from the
@@ -42,6 +42,14 @@ pub struct DoneReason {
     /// explicitly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
+    /// Coder-flagged disagreements for the F6b path. Populated by the
+    /// coder runner when self_review found unapplied verbs but every
+    /// miss carries applied_form + rationale (deliberate disagreement,
+    /// not failure). Carried via the Done event so the daemon's
+    /// translator can emit BriefEvent::CoderDisagreed without reading
+    /// a separate redis key. Empty when cause != "self_review_disagreed".
+    #[serde(default)]
+    pub disagreements: Vec<DisagreementSummary>,
 }
 
 /// A tool call attempt — content that the permit broker inspects.

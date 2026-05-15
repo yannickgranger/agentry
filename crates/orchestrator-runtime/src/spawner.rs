@@ -13,117 +13,20 @@
 use crate::{delivery, permit as permit_mod, redis_io, workspace::BriefWorkspace, Error, Result};
 use async_trait::async_trait;
 use ed25519_dalek::VerifyingKey;
+pub use orchestrator_infra::runtime_registry::{kill, workspace_path};
+use orchestrator_infra::runtime_registry::{register_running_with_guard, ContainerHandle};
 use orchestrator_types::{
-    AgentRole, Brief, BriefId, Event, EventKind, PackageManager, Verdict, VerdictKind, WorkPermit,
+    merge_role_with_packs, AgentRole, Brief, BriefId, Event, EventKind, PackageManager, Profile,
+    Verdict, VerdictKind, WorkPermit,
 };
 use redis::aio::ConnectionManager;
 use redis::AsyncCommands;
 use serde::Serialize;
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::borrow::Cow;
 use std::process::Stdio;
-use std::sync::{OnceLock, RwLock};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
-
-/// Process-wide registry of running role containers, keyed by `BriefId`.
-///
-/// The dashboard's `POST /briefs/{id}/kill` and `GET
-/// /briefs/{id}/workspace/path` routes look up the container handle here to
-/// signal SIGTERM or surface the workspace path. Guarded by a `RwLock` so
-/// reads (the common case from the dashboard) don't block the daemon's
-/// concurrent spawns.
-///
-/// CRITICAL: every insert-on-spawn is paired with a `Drop`-fired removal via
-/// `RegistrationGuard`. A manual `unregister_running` call positioned after
-/// `child.wait()` would leak the entry on any `?`-bubbled error between
-/// spawn and wait.
-#[derive(Debug, Clone)]
-pub struct ContainerHandle {
-    pub container_name: String,
-    pub workspace_path: Option<PathBuf>,
-}
-
-fn registry() -> &'static RwLock<HashMap<BriefId, ContainerHandle>> {
-    static R: OnceLock<RwLock<HashMap<BriefId, ContainerHandle>>> = OnceLock::new();
-    R.get_or_init(|| RwLock::new(HashMap::new()))
-}
-
-fn register_running(brief_id: &BriefId, handle: ContainerHandle) {
-    let mut g = registry()
-        .write()
-        .expect("running-container registry poisoned");
-    g.insert(brief_id.clone(), handle);
-}
-
-fn unregister_running(brief_id: &BriefId) {
-    let mut g = registry()
-        .write()
-        .expect("running-container registry poisoned");
-    g.remove(brief_id);
-}
-
-/// RAII guard: registers the container on construction, removes the entry
-/// on `Drop`. Holding the guard across the spawn-to-wait window guarantees
-/// the registry never leaks an entry, even when an early `?` returns out of
-/// the spawner.
-struct RegistrationGuard {
-    brief_id: BriefId,
-}
-
-impl RegistrationGuard {
-    fn new(brief_id: BriefId, handle: ContainerHandle) -> Self {
-        register_running(&brief_id, handle);
-        Self { brief_id }
-    }
-}
-
-impl Drop for RegistrationGuard {
-    fn drop(&mut self) {
-        unregister_running(&self.brief_id);
-    }
-}
-
-/// SIGTERM the running container associated with `brief_id`, returning
-/// `Ok(())` on signaled, `Error::NotFound` if no container is registered, or
-/// a Podman error if the kill itself fails. The container's exitpoint
-/// script (when configured) runs.
-pub async fn kill(brief_id: &BriefId) -> Result<()> {
-    let name = {
-        let g = registry()
-            .read()
-            .expect("running-container registry poisoned");
-        g.get(brief_id).map(|h| h.container_name.clone())
-    };
-    let name = name.ok_or_else(|| Error::NotFound {
-        kind: "running container",
-        key: brief_id.0.clone(),
-    })?;
-    let out = tokio::process::Command::new("podman")
-        .args(["kill", "--signal", "SIGTERM", &name])
-        .output()
-        .await
-        .map_err(|e| Error::Podman(format!("kill {name}: {e}")))?;
-    if !out.status.success() {
-        return Err(Error::Podman(format!(
-            "podman kill {name}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        )));
-    }
-    Ok(())
-}
-
-/// Look up the host workspace path of a brief's running container.
-/// Returns `None` if the brief has no live container, or if the container
-/// runs without a workspace mount.
-#[must_use]
-pub fn workspace_path(brief_id: &BriefId) -> Option<PathBuf> {
-    let g = registry()
-        .read()
-        .expect("running-container registry poisoned");
-    g.get(brief_id).and_then(|h| h.workspace_path.clone())
-}
 
 /// Startup bundle passed to the agent via stdin (one JSON document).
 #[derive(Serialize)]
@@ -180,6 +83,11 @@ pub struct RunAgentCtx<'a> {
     /// `role.workspace_mount.is_some()`. `None` is valid for briefs whose
     /// team has no workspace-using roles.
     pub workspace: Option<&'a BriefWorkspace>,
+    /// Resolved `.agentry/profile.toml` for the brief's target_repo (slice
+    /// I/2c). When present and the role's kind is `coder` or `reviewer`,
+    /// the profile's matching `tool_packs` are appended to the role's
+    /// declared `tool_packs` before pack resolution.
+    pub profile: Option<&'a Profile>,
 }
 
 #[async_trait]
@@ -228,9 +136,37 @@ impl Spawner for PodmanSpawner {
             verifying_key,
             team_context,
             workspace,
+            profile,
         } = ctx;
         // Defence in depth: verify the permit we're about to hand out.
         permit_mod::verify(permit, verifying_key)?;
+
+        // Slice I/2c — augment the role's tool_packs with the resolved
+        // profile's matching section (coder ↔ profile.coder, reviewer ↔
+        // profile.reviewer). Other role kinds and the no-profile path
+        // borrow the role unchanged.
+        let role_kind = orchestrator_types::lifecycle::role_kind(&role.name.0);
+        let augmented_role = augment_role_with_profile(role, role_kind, profile);
+        if let Cow::Owned(_) = &augmented_role {
+            tracing::info!(
+                brief = %brief.id,
+                role = %augmented_role.name,
+                role_kind = ?role_kind,
+                profile_packs = ?role_kind.and_then(|k| match k {
+                    "coder" => profile.map(|p| &p.coder.tool_packs),
+                    "reviewer" => profile.map(|p| &p.reviewer.tool_packs),
+                    _ => None,
+                }),
+                "augmented role with profile tool_packs"
+            );
+        }
+
+        // Resolve tool packs once, up front. The rest of the spawn logic
+        // operates on the merged role (binaries, allowed_tools,
+        // system_prompt, entrypoint_script all reflect pack contributions).
+        // For roles without `tool_packs`, this is a cheap clone.
+        let resolved_role = resolve_role_with_packs(augmented_role.as_ref(), conn).await?;
+        let role = &resolved_role;
 
         let agent_id = &permit.agent_id;
         let name = Self::container_name(agent_id);
@@ -301,6 +237,28 @@ impl Spawner for PodmanSpawner {
             cmd.arg("--env")
                 .arg("SCCACHE_REDIS_ENDPOINT=redis://agentry-sccache-redis:6379");
             cmd.arg("--env").arg("SCCACHE_REDIS_KEY_PREFIX=agentry");
+        }
+        // Issue #506 Option B: when the brief's target_repo lives on the
+        // agency.lab forge (self-signed TLS), every role needs git/cargo to
+        // bypass cert verification or fetching git deps fails inside the
+        // container. Injected BEFORE `role.passthru_env` so a role-declared
+        // override of these vars can still win. Option C (`profile.toml`
+        // `container_env`) is the planned long-term replacement.
+        let ssl_bypass = agency_lab_ssl_bypass_env_args(brief);
+        if !ssl_bypass.is_empty() {
+            let target_repo_str = brief
+                .payload
+                .get("target_repo")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            tracing::info!(
+                target_repo = %target_repo_str,
+                role = %role.name,
+                "injected GIT_SSL_NO_VERIFY+CARGO_NET_GIT_FETCH_WITH_CLI for agency.lab forge"
+            );
+            for kv in &ssl_bypass {
+                cmd.arg("--env").arg(kv);
+            }
         }
         // Pass through declared env vars from orchestratord's own env.
         // Missing vars are logged and skipped — role doesn't get what it wanted.
@@ -451,7 +409,7 @@ impl Spawner for PodmanSpawner {
         // (kill, workspace-path lookup). The guard's Drop unregisters on
         // every exit path of this scope — including any `?`-bubbled error
         // before `child.wait()` returns.
-        let _registration = RegistrationGuard::new(
+        let _registration = register_running_with_guard(
             brief.id.clone(),
             ContainerHandle {
                 container_name: name.clone(),
@@ -635,13 +593,18 @@ fn compute_verdict(
     exit_code: Option<i32>,
     accumulated_findings: Vec<orchestrator_types::ReviewFinding>,
 ) -> Verdict {
-    let (event_verdict, refusal_count) = match terminal_event.map(|e| &e.kind) {
+    let (event_verdict, refusal_count, event_cause) = match terminal_event.map(|e| &e.kind) {
         Some(EventKind::Done {
             verdict,
             refusal_count,
+            reason,
             ..
-        }) => (Some(*verdict), *refusal_count),
-        _ => (None, 0),
+        }) => (
+            Some(*verdict),
+            *refusal_count,
+            reason.as_ref().map(|r| r.cause.clone()),
+        ),
+        _ => (None, 0, None),
     };
     let (kind, reason) = if timed_out {
         (
@@ -658,7 +621,20 @@ fn compute_verdict(
                 },
                 None,
             ),
-            Some(v) => (VerdictKind::from(v), None),
+            // Propagate the Done event's reason.cause (when present) onto
+            // the Verdict.reason free-text field, prefixed with `cause:`
+            // for unambiguous parsing by downstream consumers. This is
+            // how the daemon detects the coder's `self_review_disagreed`
+            // outcome — without the propagation, the cause string is
+            // dropped here and the daemon classifies the verdict as a
+            // generic team failure (pre-empting the FSM's
+            // CoderDisagreed → Walking{OperatorDecision} transition).
+            Some(v) => (
+                VerdictKind::from(v),
+                event_cause
+                    .filter(|c| !c.is_empty())
+                    .map(|c| format!("cause:{c}")),
+            ),
             None => (
                 VerdictKind::Failed,
                 Some(format!(
@@ -703,21 +679,22 @@ async fn append_audit(
 }
 
 /// Build the `KEY=VALUE` strings injected as universal brief context env
-/// vars on every role spawn. Kept as a free function so the snake_case
-/// kind serialization round-trip with `BriefKind`'s serde tag is unit-testable
+/// vars on every role spawn. Kept as a free function so the kebab-case
+/// kind serialization round-trip with `TaskShape`'s serde tag is unit-testable
 /// without spawning podman.
 ///
 /// Order: `AGENTRY_BRIEF_ID`, `AGENTRY_BRIEF_KIND`, `AGENTRY_BASE_BRANCH`.
-/// `kind` falls back to `new_feature` (the safe default — fullest pipeline)
-/// when the brief omits it. `base_branch` is read from the JSON payload
-/// (`brief.payload.base_branch`) and falls back to `develop`.
+/// `kind` falls back to `feature` (the safe default — `TaskShape::Feature`,
+/// which maps to the fullest validator pipeline) when the brief omits it.
+/// `base_branch` is read from the JSON payload (`brief.payload.base_branch`)
+/// and falls back to `develop`.
 fn brief_env_args(brief: &Brief) -> Vec<String> {
     let kind_str = brief
         .kind
         .as_ref()
         .and_then(|k| serde_json::to_value(k).ok())
         .and_then(|v| v.as_str().map(String::from))
-        .unwrap_or_else(|| "new_feature".to_string());
+        .unwrap_or_else(|| "feature".to_string());
     let base = brief
         .payload
         .get("base_branch")
@@ -728,6 +705,53 @@ fn brief_env_args(brief: &Brief) -> Vec<String> {
         format!("AGENTRY_BRIEF_KIND={kind_str}"),
         format!("AGENTRY_BASE_BRANCH={base}"),
     ]
+}
+
+/// True when `forge_host` identifies the agency.lab forge (with or without a
+/// `:PORT` suffix). The agency.lab forge serves a self-signed TLS cert, so
+/// every role container spawned against a brief whose `target_repo` lives on
+/// it needs `GIT_SSL_NO_VERIFY=1` and `CARGO_NET_GIT_FETCH_WITH_CLI=true` or
+/// cargo's git-fetch step fails on cert verification (issue #506).
+///
+/// Option-B-default mechanism per issue #506: the spawner injects the bypass
+/// env unconditionally for every role on every agency.lab brief. Option C
+/// (per-target `container_env` in `.agentry/profile.toml`) is the planned
+/// long-term replacement and lands in a follow-up brief.
+///
+/// `pub` so the peer test in `tests/spawner_test.rs` can drive it directly
+/// (matching the visibility-promotion pattern of `augment_role_with_profile`
+/// and `resolve_role_with_packs`); the arch ban on inline `#[cfg(test)]`
+/// items in `src/` forbids the embedded-tests alternative.
+#[must_use]
+pub fn forge_host_is_agency_lab(forge_host: &str) -> bool {
+    let host_only = forge_host.split(':').next().unwrap_or(forge_host);
+    host_only == "agency.lab"
+}
+
+/// Compute the `KEY=VALUE` env strings the spawner must inject ahead of
+/// `role.passthru_env` when the brief targets the agency.lab forge.
+///
+/// Reads `brief.payload.forge_host` (the field the daemon's intake-time forge
+/// resolver populates from `cfg.forge.default_host` cascade). Returns an empty
+/// vec for any non-agency forge, so a brief targeting `github.com` or any
+/// other forge gets nothing injected. Kept as a free function so the peer
+/// test in `tests/spawner_test.rs` can drive it without standing up a
+/// `RunAgentCtx` or podman.
+#[must_use]
+pub fn agency_lab_ssl_bypass_env_args(brief: &Brief) -> Vec<String> {
+    let forge_host = brief
+        .payload
+        .get("forge_host")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if forge_host_is_agency_lab(forge_host) {
+        vec![
+            "GIT_SSL_NO_VERIFY=1".into(),
+            "CARGO_NET_GIT_FETCH_WITH_CLI=true".into(),
+        ]
+    } else {
+        Vec::new()
+    }
 }
 
 /// Roles whose coder-tooling bind-mounts (ra-query, dead-pub-check, ship) may
@@ -806,6 +830,86 @@ fn effective_binaries(role: &AgentRole) -> Vec<String> {
         out.push("sccache".into());
     }
     out
+}
+
+/// Slice I/2c — append the matching section's `tool_packs` from `profile`
+/// onto `role.tool_packs`, deduplicating against entries already declared
+/// by the role. Augmentation applies only to coder and reviewer kinds; all
+/// other kinds (and the no-profile path, and the empty-section path)
+/// return `Cow::Borrowed(role)` so no clone is performed.
+///
+/// This helper is kept pure so the peer test suite can exercise it
+/// directly without standing up a `RunAgentCtx`.
+#[must_use]
+pub fn augment_role_with_profile<'a>(
+    role: &'a AgentRole,
+    role_kind: Option<&str>,
+    profile: Option<&Profile>,
+) -> Cow<'a, AgentRole> {
+    let Some(profile) = profile else {
+        return Cow::Borrowed(role);
+    };
+    let extra_packs: &[String] = match role_kind {
+        Some("coder") => &profile.coder.tool_packs,
+        Some("reviewer") => &profile.reviewer.tool_packs,
+        _ => return Cow::Borrowed(role),
+    };
+    if extra_packs.is_empty() {
+        return Cow::Borrowed(role);
+    }
+    let mut role_clone = role.clone();
+    for pack in extra_packs {
+        if !role_clone.tool_packs.contains(pack) {
+            role_clone.tool_packs.push(pack.clone());
+        }
+    }
+    if role_clone.tool_packs == role.tool_packs {
+        return Cow::Borrowed(role);
+    }
+    Cow::Owned(role_clone)
+}
+
+/// Resolve and merge tool packs for a role. Fetches each pack named in
+/// `role.tool_packs` from Redis (latest seeded version) and applies
+/// [`merge_role_with_packs`]. If `role.tool_packs` is empty, returns the role
+/// cloned unchanged (cheap fast path).
+///
+/// Errors propagate from the fetch — a missing pack reference is a daemon
+/// misconfiguration and fails the brief at spawn time rather than silently
+/// dropping the role's tool requirements.
+///
+/// # Latest-version transient
+///
+/// "Latest seeded version" is computed by scanning [`redis_io::list_packs`]
+/// and picking the highest `version` for each requested name. This is a
+/// known transient: slice I/2's profile-driven roles will pin
+/// `(name, version)` pairs in `profile.toml` so a pack update doesn't
+/// silently change role behavior.
+pub async fn resolve_role_with_packs(
+    role: &AgentRole,
+    conn: &mut ConnectionManager,
+) -> Result<AgentRole> {
+    if role.tool_packs.is_empty() {
+        return Ok(role.clone());
+    }
+
+    let registry = redis_io::list_packs(conn).await?;
+    let mut packs: Vec<orchestrator_types::ToolPack> = Vec::with_capacity(role.tool_packs.len());
+    for name in &role.tool_packs {
+        let latest = registry
+            .iter()
+            .filter(|(n, _)| n == name)
+            .map(|(_, v)| *v)
+            .max()
+            .ok_or_else(|| Error::NotFound {
+                kind: "tool_pack",
+                key: name.clone(),
+            })?;
+        let pack = redis_io::fetch_pack(conn, name, latest).await?;
+        packs.push(pack);
+    }
+
+    Ok(merge_role_with_packs(role, &packs))
 }
 
 fn bootstrap_command(

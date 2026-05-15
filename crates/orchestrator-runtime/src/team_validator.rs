@@ -91,7 +91,15 @@ fn check_reference_integrity(
     let registered_set: HashSet<(&RoleName, u32)> =
         registered.iter().map(|(n, v)| (n, *v)).collect();
     for (i, role) in topology.roles.iter().enumerate() {
-        if !registered_set.contains(&(&role.name, role.version)) {
+        // Operator-gated nodes are pure topology vertices: they do not
+        // spawn containers and therefore do not need a registered
+        // AgentRole. The exemption is keyed on the literal string
+        // "operator_gated" — the wire-form value.
+        let is_operator_gated = topology
+            .node_classes
+            .get(&role.name)
+            .is_some_and(|c| c.0 == "operator_gated");
+        if !is_operator_gated && !registered_set.contains(&(&role.name, role.version)) {
             out.push(TeamValidationViolation {
                 path: format!("roles[{i}]"),
                 kind: ViolationKind::Reference,
@@ -305,10 +313,20 @@ fn check_single_terminal(topology: &TeamTopology, out: &mut Vec<TeamValidationVi
             has_outbound.insert(&edge.from);
         }
     }
+    // Operator-gated nodes may be sinks (no outgoing edges) without being
+    // the topology's terminal_role. Exempt them from the multiple-terminals
+    // accounting. The exemption is keyed on the literal string
+    // "operator_gated" — the wire-form value.
     let sinks: Vec<&RoleRef> = topology
         .roles
         .iter()
         .filter(|r| !has_outbound.contains(r))
+        .filter(|r| {
+            topology
+                .node_classes
+                .get(&r.name)
+                .is_none_or(|c| c.0 != "operator_gated")
+        })
         .collect();
     if sinks.len() > 1 {
         let names: Vec<String> = sinks

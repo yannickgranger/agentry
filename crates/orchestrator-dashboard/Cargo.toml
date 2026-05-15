@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [lib]
 name = "orchestrator_dashboard"
@@ -16,14 +17,14 @@ path = "src/main.rs"
 
 [dependencies]
 orchestrator-types = { path = "../orchestrator-types" }
-orchestrator-runtime = { path = "../orchestrator-runtime" }
+orchestrator-infra = { path = "../orchestrator-infra" }
 trace-query = { path = "../trace-query" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-stream = { version = "0.1", features = ["sync"] }
-futures = "0.3"
+futures = { workspace = true }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 redis.workspace = true

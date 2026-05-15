@@ -102,11 +102,34 @@ host, allowed owners, or sccache endpoint into source.
 Identifier for a team topology. Lowercase + hyphens, unique within the
 registry.
 
+## NodeClass
+
+Tag attached to a topology vertex via `TeamTopology.node_classes`, keyed
+by `RoleName`. Wire-form is a bare string (a newtype, not a Rust enum)
+so new classes are addable by editing topology JSON only. The literal
+value `"operator_gated"` exempts a node from the registered-AgentRole
+reference check and from the single-terminal accounting — operator-gated
+nodes are pure topology vertices that do not spawn containers. Read-only
+in alpha (#494); beta (#495) wires it into per-node reattach policy.
+
+## NodeId
+
+Stable identifier for a node in the lifecycle DAG. Wire-form is a bare
+string (a newtype, not a Rust enum) keyed off the role name so
+`NodeId("coder-claude-agentry")` resolves directly to the
+`coder-claude-agentry` topology vertex. Derives `PartialOrd`/`Ord` so
+it can key a `BTreeMap` — the evidence multiset carried by
+`BriefState::Walking` is keyed by `NodeId` and traversed in stable
+iteration order. Beta-a (#495 part 1) introduces it alongside the
+legacy phase enum; beta-b's walker consumes it.
+
 ## MessageEdge
 
 A directed routing edge in a team's message graph: from one role to another,
 optionally naming a payload key whose contents become `PermitOverrides` on
-the downstream role's permit.
+the downstream role's permit. Optionally carries a per-edge `gate_policy`
+override (read-only in alpha #494; beta #495 wires it into per-edge gate
+evaluation).
 
 ## PermitOverrides
 

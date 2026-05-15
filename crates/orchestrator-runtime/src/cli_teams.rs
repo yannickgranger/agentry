@@ -24,6 +24,12 @@ pub async fn list(conn: &mut ConnectionManager) -> Result<()> {
 }
 
 /// `orchestrator team show <name> <version>` — pretty-printed `TeamTopology`.
+///
+/// The serialized output is the full `TeamTopology` shape, which since
+/// brief #494 alpha includes the top-level `node_classes` map (when
+/// non-empty) and each `message_graph[i].gate_policy` value (when set).
+/// Both fields are additive: existing consumers continue to see the
+/// pre-#494 keys unchanged.
 pub async fn show(conn: &mut ConnectionManager, name: &str, version: u32) -> Result<()> {
     let r = VersionedRef::new(name, version);
     let team = redis_io::fetch_team(conn, &r).await?;

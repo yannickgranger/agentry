@@ -5,7 +5,8 @@
 //! messages. The orchestrator runs the graph; the team's composition *is*
 //! the methodology.
 
-use crate::role::RoleRef;
+use crate::lifecycle::GatePolicy;
+use crate::role::{RoleName, RoleRef};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -20,6 +21,22 @@ impl fmt::Display for TeamName {
         f.write_str(&self.0)
     }
 }
+
+/// Topology-node class tag, written into `TeamTopology.node_classes`.
+/// Newtype over String (not a Rust enum) by design: new classes must be
+/// addable by editing topology JSON only, not by editing Rust.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(transparent)]
+pub struct NodeClass(pub String);
+
+/// Stable identifier for a node in the lifecycle DAG. PartialOrd/Ord are
+/// derived so NodeId can key a BTreeMap (the evidence map carried by
+/// BriefState::Walking).
+#[derive(
+    Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(transparent)]
+pub struct NodeId(pub String);
 
 /// A directed edge in the message graph: "from's outbox messages routed to to's inbox".
 /// The optional `permit_overrides_from` names a contract-field set that `to` inherits.
@@ -43,6 +60,11 @@ pub struct MessageEdge {
     /// the vocabulary and validation.
     #[serde(default)]
     pub rework_target: Option<RoleRef>,
+    /// Per-edge gate fan-in policy override. Read-only in alpha (#494);
+    /// beta (#495) wires this into per-edge gate evaluation at the
+    /// daemon. None = inherit team-level policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_policy: Option<GatePolicy>,
 }
 
 /// Narrowing constraints that can be inherited from an upstream contract message.
@@ -80,6 +102,12 @@ pub struct TeamTopology {
     /// Max retries on failure before the team verdict becomes `failed`. 0 = no retry.
     #[serde(default)]
     pub max_retries: u32,
+    /// Per-node class metadata, sibling to `roles`. Keys must appear in
+    /// `roles` (or be operator-gated topology vertices that do not
+    /// require a registered AgentRole). Read-only in alpha (#494); beta
+    /// (#495) consumes this to drive per-node reattach policy.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub node_classes: HashMap<RoleName, NodeClass>,
 }
 
 impl TeamTopology {

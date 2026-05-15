@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [[bin]]
 name = "orchestratord"
@@ -18,8 +19,13 @@ path = "src/bin/orchestrator.rs"
 name = "agentry-workspace"
 path = "src/bin/agentry-workspace.rs"
 
+[[bin]]
+name = "captain"
+path = "src/bin/captain.rs"
+
 [dependencies]
 orchestrator-types = { path = "../orchestrator-types" }
+orchestrator-infra = { path = "../orchestrator-infra" }
 schemars = { workspace = true }
 serde.workspace = true
 serde_json.workspace = true
@@ -37,14 +43,20 @@ ed25519-dalek.workspace = true
 rand_core.workspace = true
 hex.workspace = true
 figment.workspace = true
-reqwest.workspace = true
+reqwest = { workspace = true, features = ["blocking"] }
 anyhow = "1.0.102"
-rusqlite = { version = "0.32", features = ["bundled", "chrono"] }
+rusqlite = { workspace = true }
 humantime = "2"
+base64 = { workspace = true }
+toml = { workspace = true }
+tempfile = "3.14"
+regex = "1"
 
 [dev-dependencies]
-tempfile = "3.14"
 filetime = "0.2"
+wiremock = "0.6"
+assert_cmd = "2"
+predicates = "3"
 
 [lints]
 workspace = true

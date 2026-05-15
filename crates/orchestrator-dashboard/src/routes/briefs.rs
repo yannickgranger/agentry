@@ -12,7 +12,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
-use orchestrator_runtime::transcript::{self, TranscriptTimes};
+use orchestrator_infra::transcript::{self, TranscriptTimes};
 use orchestrator_types::BriefId;
 use serde::Deserialize;
 use std::path::{Path as StdPath, PathBuf};
@@ -238,7 +238,7 @@ async fn get_workspace_path(State(_state): State<BriefsState>, Path(id): Path<St
         return e.into_response();
     }
     let bid = BriefId(id);
-    match orchestrator_runtime::spawner::workspace_path(&bid) {
+    match orchestrator_infra::runtime_registry::workspace_path(&bid) {
         Some(p) => (
             StatusCode::OK,
             [(
@@ -257,9 +257,9 @@ async fn post_kill(State(_state): State<BriefsState>, Path(id): Path<String>) ->
         return e.into_response();
     }
     let bid = BriefId(id);
-    match orchestrator_runtime::spawner::kill(&bid).await {
+    match orchestrator_infra::runtime_registry::kill(&bid).await {
         Ok(()) => (StatusCode::ACCEPTED, "SIGTERM signaled").into_response(),
-        Err(orchestrator_runtime::Error::NotFound { .. }) => {
+        Err(orchestrator_infra::Error::NotFound { .. }) => {
             (StatusCode::NOT_FOUND, "no running container for brief").into_response()
         }
         Err(e) => {

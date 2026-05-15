@@ -145,3 +145,19 @@ a non-concept heading.
   L.3a-wired daemon, restart cold. There is no rolling upgrade —
   in-flight briefs are re-projected from their trace streams on the
   fresh daemon's first read.
+
+#### Retention bounds (not enforced by graph-specs)
+
+Submit-time MAXLEN: `agentry:briefs` is trimmed to ~10000 entries via
+`XADD MAXLEN ~ N` at submit time. Approximate trim is ~5x cheaper than
+exact, and the consumer-side projector doesn't need historical entries
+— the trace stream and the per-brief state key are the authoritative
+substrate for any post-hoc reconstruction.
+
+Terminal TTL: when `cleanup_failed_brief` or
+`cleanup_shipped_no_op_brief` runs, every `agentry:brief:{id}:*`
+sibling key gets a 30-day TTL. Operator forensics window preserved;
+long-tail leak prevented. Tunable via constant in
+`lifecycle_driver.rs` (no env var, no allowlist — single source of
+truth per `CLAUDE.md`'s "no metric ratchets" rule generalised to
+retention).

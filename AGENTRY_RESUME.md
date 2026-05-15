@@ -8,6 +8,8 @@ A minimal orchestrator for ephemeral agent containers. Every containerised agent
 
 Full architectural read: `README.md` → `specs/concepts/*.md` (the DDD concept list enforced by `graph-specs-rust`).
 
+Brief contract + dispatch recipe: see [`docs/dogfood-protocol.md`](docs/dogfood-protocol.md).
+
 ## The cutoff rule
 
 `agentry` is built by `agentry`. Once issue #8 on `yg/agentry` merges, Claude cannot author code on `yg/agentry` directly. Every further change is a brief dispatched into the `agentry-self-host-v0` team defined in that PR (`coder-claude-agentry → reviewer-mechanical-agentry → shipper-agentry`).
@@ -31,6 +33,7 @@ If `merged: true` — cutoff is live, no direct commits. If still open — the p
 | Resource | Endpoint | Owner |
 |---|---|---|
 | Dev Redis (briefs, verdicts, trace, audit, registry) | `127.0.0.1:6380` inside `agentry-dev-redis` podman container | `just dev-redis-up` |
+| Dashboard | `http://localhost:7800` | `./target/release/orchestrator-dashboard` |
 | sccache backend | `agentry-sccache-redis:6379` on `agentry-net` network (no host port) | `just agentry-net-up` |
 | Ed25519 signing key | `~/.config/agentry/signing.key` (0600) | `orchestrator key-gen` |
 | Redis password | `~/.config/agentry/redis.password` (0600) | `just dev-redis-up` generates it once |

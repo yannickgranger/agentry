@@ -1,20 +1,20 @@
 {
   "name": "coder-claude-agentry",
   "version": 1,
+  "tool_packs": ["quality-fast"],
   "model": "claude-max",
   "system_prompt": null,
   "image": "docker.io/library/rust:1.93",
   "substrate_class": "podman",
   "package_manager": "apt",
   "entrypoint_script": "#!/bin/sh\nexport CARGO_NET_GIT_FETCH_WITH_CLI=true\nexec /usr/local/bin/coder-claude-runner\n",
-  "binaries": ["git", "curl", "ca-certificates", "quality-fast"],
+  "binaries": ["git", "curl", "ca-certificates"],
   "mcp_servers": [],
   "tool_allowlist": [],
   "allowed_tools": [
     "Read",
     "Edit",
     "Write",
-    "Bash(*)",
     "Bash(git status:*)",
     "Bash(git diff:*)",
     "Bash(rg:*)",
@@ -95,7 +95,7 @@
     "rustup component add rustfmt clippy",
     "git config --global http.sslVerify false",
     "CARGO_NET_GIT_FETCH_WITH_CLI=true cargo install --git https://oauth2:${GITEA_TOKEN}@agency.lab:3000/yg/quality-architecture.git --bin quality-hygiene --root /usr/local --locked --quiet || true",
-    "CARGO_NET_GIT_FETCH_WITH_CLI=true cargo install --git https://oauth2:${GITEA_TOKEN}@agency.lab:3000/yg/cfdb.git --rev 02c5a45 --root /usr/local --locked --quiet cfdb-cli || true",
-    "CARGO_NET_GIT_FETCH_WITH_CLI=true cargo install --git https://oauth2:${GITEA_TOKEN}@agency.lab:3000/yg/graph-specs-rust.git --rev ecaedb9 --root /usr/local --locked --quiet application || true"
+    "cargo install --git https://github.com/yannickgranger/cfdb.git --rev 02c5a45 --root /usr/local --locked --quiet cfdb-cli || true",
+    "cargo install --git https://github.com/yannickgranger/graph-specs.git --rev ecaedb9 --root /usr/local --locked --quiet application || true"
   ]
 }

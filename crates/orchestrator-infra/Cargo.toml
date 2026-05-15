@@ -1,0 +1,26 @@
+[package]
+name = "orchestrator-infra"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+orchestrator-types = { path = "../orchestrator-types" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+redis.workspace = true
+figment.workspace = true
+rusqlite = { workspace = true }
+reqwest.workspace = true
+toml = { workspace = true }
+chrono.workspace = true
+base64 = { workspace = true }
+
+[lints]
+workspace = true

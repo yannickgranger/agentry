@@ -10,11 +10,12 @@
 //! invariants so the regression cannot recur.
 
 use agentry_role_runtime::shipper_runner::{
-    build_pr_create_body, classify_pre_push_rebase, git_fetch_argv, git_push_argv,
+    build_pr_create_body, classify_pre_push_rebase, compose_pr_body, git_fetch_argv, git_push_argv,
     parse_pr_response, parse_shipper_payload, push_url_credential_free, scrub_token,
     split_target_repo, tail_stderr_scrubbed, PrCreateResponse, PrePushRebaseDecision,
     ShipperPayload,
 };
+use orchestrator_types::RedeployTarget;
 use serde_json::json;
 
 const FAKE_TOKEN: &str = "ghs_FAKE_TOKEN_abcdef0123456789";
@@ -29,7 +30,7 @@ fn parse_shipper_payload_happy_path() {
                 "base_branch": "develop",
                 "pr_title": "feat: thing",
                 "pr_body": "body text",
-                "forge_host": "agency.lab:3000",
+                "forge_host": "forge.example.com:3000",
             },
         },
     });
@@ -42,7 +43,8 @@ fn parse_shipper_payload_happy_path() {
             base_branch: "develop".into(),
             pr_title: "feat: thing".into(),
             pr_body: "body text".into(),
-            forge_host: "agency.lab:3000".into(),
+            forge_host: "forge.example.com:3000".into(),
+            redeploy_required: vec![],
         }
     );
 }
@@ -61,12 +63,12 @@ fn parse_shipper_payload_uses_defaults() {
     assert_eq!(p.base_branch, "develop");
     assert_eq!(p.pr_title, "auto(brf_x)");
     assert_eq!(p.pr_body, "Agentry-produced PR. See brief trace stream.");
-    assert_eq!(p.forge_host, "agency.lab:3000");
+    assert_eq!(p.forge_host, "forge.example.com:3000");
 }
 
 #[test]
 fn parse_shipper_payload_missing_forge_host_falls_back_to_default() {
-    // Verifies the bash `// "agency.lab:3000"` fall-through is preserved
+    // Verifies the bash `// "forge.example.com:3000"` fall-through is preserved
     // — empty forge_host on the bundle does NOT crash; defaults apply.
     let bundle = json!({
         "brief": {
@@ -77,7 +79,7 @@ fn parse_shipper_payload_missing_forge_host_falls_back_to_default() {
         },
     });
     let p = parse_shipper_payload(&bundle);
-    assert_eq!(p.forge_host, "agency.lab:3000");
+    assert_eq!(p.forge_host, "forge.example.com:3000");
 }
 
 #[test]
@@ -85,8 +87,8 @@ fn remote_url_does_not_contain_token() {
     // v1 BLOCKER regression test: the credential-free URL must never
     // embed `oauth2:TOKEN@` (or any other token-bearing form) so a git
     // push failure cannot echo the token in stderr.
-    let url = push_url_credential_free("agency.lab:3000", "yg/agentry");
-    assert_eq!(url, "https://agency.lab:3000/yg/agentry.git");
+    let url = push_url_credential_free("forge.example.com:3000", "yg/agentry");
+    assert_eq!(url, "https://forge.example.com:3000/yg/agentry.git");
     assert!(
         !url.contains("oauth2:"),
         "remote URL must not contain `oauth2:` prefix: {url}"
@@ -107,7 +109,7 @@ fn extraheader_argv_shape() {
     // entries (verbatim port of the bash heredoc's auth mechanism). The
     // URL argv entry must NOT contain `:TOKEN@` — the token lives in
     // argv via the extraheader, not in any URL.
-    let url = push_url_credential_free("agency.lab:3000", "yg/agentry");
+    let url = push_url_credential_free("forge.example.com:3000", "yg/agentry");
     let argv = git_push_argv(FAKE_TOKEN, &url, "auto/brf_test");
 
     let extraheader = format!("http.extraheader=Authorization: token {FAKE_TOKEN}");
@@ -149,7 +151,7 @@ fn tail_stderr_scrubs_token() {
     // output), it must be redacted before the bytes hit any emitted
     // event.
     let stderr = format!(
-        "fatal: unable to access 'https://oauth2:{FAKE_TOKEN}@agency.lab:3000/yg/agentry.git/': SSL error",
+        "fatal: unable to access 'https://oauth2:{FAKE_TOKEN}@forge.example.com:3000/yg/agentry.git/': SSL error",
     );
     let scrubbed = tail_stderr_scrubbed(stderr.as_bytes(), 4096, FAKE_TOKEN);
     assert!(
@@ -193,14 +195,14 @@ fn build_pr_create_body_shape() {
 #[test]
 fn parse_pr_response_happy_path() {
     let resp = json!({
-        "html_url": "https://agency.lab:3000/yg/agentry/pulls/42",
+        "html_url": "https://forge.example.com:3000/yg/agentry/pulls/42",
         "number": 42,
     });
     assert_eq!(
         parse_pr_response(&resp),
         Some(PrCreateResponse {
             pr_number: 42,
-            pr_url: "https://agency.lab:3000/yg/agentry/pulls/42".into(),
+            pr_url: "https://forge.example.com:3000/yg/agentry/pulls/42".into(),
         }),
     );
 }
@@ -230,7 +232,7 @@ fn pre_push_fetch_argv_uses_extraheader() {
     // Pre-push fetch uses the same `-c http.extraheader=Authorization: token <T>`
     // mechanism as push — token NEVER in the URL. Closes the same v1
     // BLOCKER class for the new fetch step.
-    let url = push_url_credential_free("agency.lab:3000", "yg/agentry");
+    let url = push_url_credential_free("forge.example.com:3000", "yg/agentry");
     let argv = git_fetch_argv(FAKE_TOKEN, &url, "develop");
 
     let extraheader = format!("http.extraheader=Authorization: token {FAKE_TOKEN}");
@@ -249,7 +251,7 @@ fn pre_push_fetch_argv_uses_extraheader() {
         .iter()
         .find(|s| s.starts_with("https://"))
         .expect("argv must include the fetch URL");
-    assert_eq!(url_entry, "https://agency.lab:3000/yg/agentry.git");
+    assert_eq!(url_entry, "https://forge.example.com:3000/yg/agentry.git");
     assert!(
         !url_entry.contains(FAKE_TOKEN),
         "fetch URL argv entry must not contain the token: {url_entry}",
@@ -280,4 +282,88 @@ fn pre_push_clean_rebase_proceeds_to_push() {
     // Rebase exit 0 with empty porcelain -> Proceed (push step is reached).
     let decision = classify_pre_push_rebase(0, "");
     assert_eq!(decision, PrePushRebaseDecision::Proceed);
+}
+
+#[test]
+fn compose_pr_body_empty_redeploy_returns_unchanged() {
+    assert_eq!(compose_pr_body("hello body", &[]), "hello body");
+}
+
+#[test]
+fn compose_pr_body_single_daemon_appends_block() {
+    let composed = compose_pr_body("orig", &[RedeployTarget::Daemon]);
+    assert!(
+        composed.ends_with(
+            "\n- `daemon`\n\nRun `captain redeploy --target <target>` (or `--target all`) to rebuild."
+        ),
+        "composed body must end with the daemon bullet + closing instruction: {composed}",
+    );
+    assert!(
+        composed.contains("\n\n## Redeploy required"),
+        "composed body must contain the heading after a blank-line separator: {composed}",
+    );
+}
+
+#[test]
+fn compose_pr_body_multiple_targets_lists_all_in_order() {
+    let composed = compose_pr_body(
+        "orig",
+        &[
+            RedeployTarget::Daemon,
+            RedeployTarget::OrchestratorCli,
+            RedeployTarget::CaptainCli,
+        ],
+    );
+    let daemon_idx = composed.find("- `daemon`").expect("daemon bullet present");
+    let orch_idx = composed
+        .find("- `orchestrator-cli`")
+        .expect("orchestrator-cli bullet present");
+    let cap_idx = composed
+        .find("- `captain-cli`")
+        .expect("captain-cli bullet present");
+    assert!(
+        daemon_idx < orch_idx && orch_idx < cap_idx,
+        "bullets must appear in input order daemon < orchestrator-cli < captain-cli: {composed}",
+    );
+}
+
+#[test]
+fn parse_shipper_payload_extracts_redeploy_required_from_top_level_brief() {
+    let bundle = json!({
+        "brief": {
+            "id": "brf_redep",
+            "redeploy_required": ["daemon"],
+            "payload": {
+                "target_repo": "yg/agentry",
+                "base_branch": "develop",
+                "pr_title": "feat: thing",
+                "pr_body": "body",
+                "forge_host": "forge.example.com:3000",
+            },
+        },
+    });
+    let p = parse_shipper_payload(&bundle);
+    assert_eq!(p.redeploy_required, vec![RedeployTarget::Daemon]);
+}
+
+#[test]
+fn parse_shipper_payload_defaults_redeploy_required_to_empty_when_absent() {
+    let bundle = json!({
+        "brief": {
+            "id": "brf_no_redep",
+            "payload": {
+                "target_repo": "yg/agentry",
+                "base_branch": "develop",
+                "pr_title": "feat: thing",
+                "pr_body": "body",
+                "forge_host": "forge.example.com:3000",
+            },
+        },
+    });
+    let p = parse_shipper_payload(&bundle);
+    assert!(
+        p.redeploy_required.is_empty(),
+        "redeploy_required must default to empty when absent: {:?}",
+        p.redeploy_required,
+    );
 }

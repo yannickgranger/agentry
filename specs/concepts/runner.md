@@ -72,3 +72,24 @@ already present at that key and was left untouched — the caller did not
 win the race. Returned by `redis_io::register_team_strict`; the CLI maps
 `AlreadyExists` to a non-zero exit so duplicate-register attempts are
 visible in shell pipelines.
+
+## SelfReviewClassification
+
+Pure classifier for the `unapplied` set surfaced by the coder's
+self-review claude call when `all_applied=false`. Two variants:
+`Disagreement(Vec<DisagreementSummary>)` when EVERY entry in `unapplied`
+carries both `applied_form` AND `rationale` non-empty (the coder is
+flagging deliberate divergence from the literal verb wording, not a
+failure); and `BareFailure` when at least one entry is missing
+applied_form or rationale (the existing `self_review_unapplied` Failed
+path — emit findings + Done with cause `self_review_unapplied`).
+
+`classify_self_review_unapplied` is the pure helper that produces the
+classification; the coder runner consumes the result to decide whether
+to emit Done with cause `self_review_disagreed` (carrying the
+disagreements vector via `DoneReason.disagreements`, picked up by the
+daemon translator and lifted into `BriefEvent::CoderDisagreed`) or the
+existing bare-failure path. Pure so the I/O (emit_event, emit_done,
+emit_finding) stays in the runner and the decision is independently
+testable. Empty `unapplied` is `BareFailure` by construction — there is
+nothing to disagree about.

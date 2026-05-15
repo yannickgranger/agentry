@@ -23,7 +23,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use orchestrator_runtime::redis_io;
+use orchestrator_infra::redis_io;
+use orchestrator_infra::redis_io::redis_value_as_str;
 use orchestrator_types::{Brief, Verdict};
 use redis::aio::ConnectionManager;
 use redis::streams::{StreamReadOptions, StreamReadReply};
@@ -114,7 +115,7 @@ impl DashboardStore {
             .await?;
         let mut out = Vec::with_capacity(reply.ids.len());
         for entry in reply.ids {
-            if let Some(body) = entry.map.get("verdict").and_then(redis_value_to_str) {
+            if let Some(body) = entry.map.get("verdict").and_then(redis_value_as_str) {
                 if let Ok(v) = serde_json::from_str(&body) {
                     out.push(v);
                 }
@@ -145,7 +146,7 @@ impl DashboardStore {
             .xrevrange_count(VERDICTS_STREAM, "+", "-", scan_count)
             .await?;
         for entry in reply.ids {
-            if let Some(body) = entry.map.get("verdict").and_then(redis_value_to_str) {
+            if let Some(body) = entry.map.get("verdict").and_then(redis_value_as_str) {
                 if let Ok(v) = serde_json::from_str::<Verdict>(&body) {
                     if v.brief.0 == brief_id {
                         return Ok(Some(v));
@@ -164,7 +165,7 @@ impl DashboardStore {
             conn.xrevrange_count(BRIEFS_STREAM, "+", "-", count).await?;
         let mut out = Vec::with_capacity(reply.ids.len());
         for entry in reply.ids {
-            if let Some(body) = entry.map.get("brief").and_then(redis_value_to_str) {
+            if let Some(body) = entry.map.get("brief").and_then(redis_value_as_str) {
                 if let Ok(v) = serde_json::from_str(&body) {
                     out.push(v);
                 }
@@ -190,7 +191,7 @@ impl DashboardStore {
             conn.xrange_count(&stream, "-", "+", count).await?;
         let mut out = Vec::with_capacity(reply.ids.len());
         for entry in reply.ids {
-            if let Some(body) = entry.map.get("event").and_then(redis_value_to_str) {
+            if let Some(body) = entry.map.get("event").and_then(redis_value_as_str) {
                 if let Ok(v) = serde_json::from_str(&body) {
                     out.push(v);
                 }
@@ -309,11 +310,10 @@ impl DashboardStore {
     /// spawning the tail loop on first call. The mutex is held only for
     /// the HashMap lookup/insert — never across `.await`.
     fn subscribe_stream(&self, stream: String, field: &'static str) -> broadcast::Receiver<String> {
-        let mut map = self
-            .inner
-            .fanouts
-            .lock()
-            .expect("fanout map mutex poisoned");
+        let mut map = self.inner.fanouts.lock().unwrap_or_else(|poison| {
+            tracing::warn!(lock = "dashboard_fanout", "recovering from poisoned mutex");
+            poison.into_inner()
+        });
         if let Some(tx) = map.get(&stream) {
             return tx.subscribe();
         }
@@ -446,7 +446,7 @@ async fn tail_stream(
                 for k in reply.keys {
                     for entry in k.ids {
                         last_id = entry.id.clone();
-                        if let Some(body) = entry.map.get(field).and_then(redis_value_to_str) {
+                        if let Some(body) = entry.map.get(field).and_then(redis_value_as_str) {
                             // `send` errors only when there are no
                             // receivers; the Sender stays alive because
                             // the fanout map holds a clone, so we keep
@@ -471,7 +471,10 @@ async fn tail_stream(
         } else {
             let started = *idle_since.get_or_insert_with(Instant::now);
             if started.elapsed() >= inner.eviction_grace {
-                let mut map = inner.fanouts.lock().expect("fanout map mutex poisoned");
+                let mut map = inner.fanouts.lock().unwrap_or_else(|poison| {
+                    tracing::warn!(lock = "dashboard_fanout", "recovering from poisoned mutex");
+                    poison.into_inner()
+                });
                 // Re-check under the lock — a subscriber could have
                 // arrived in the gap between `elapsed()` and the lock
                 // acquisition. If so, leave the entry, clear the timer,
@@ -487,13 +490,5 @@ async fn tail_stream(
                 idle_since = None;
             }
         }
-    }
-}
-
-fn redis_value_to_str(v: &redis::Value) -> Option<String> {
-    match v {
-        redis::Value::BulkString(b) => std::str::from_utf8(b).ok().map(String::from),
-        redis::Value::SimpleString(s) => Some(s.clone()),
-        _ => None,
     }
 }

@@ -46,10 +46,12 @@ fn make_brief(id: &str) -> Brief {
         topology: VersionedRef::new("zz-test-topo", 1),
         payload: serde_json::json!({"hello": "world"}),
         kind: None,
+        contract: None,
         budget: Budget::default(),
         escalation: EscalationMode::default(),
         parent_brief: None,
         cohort_labels: vec![],
+        redeploy_required: vec![],
         submitted_by: "test".into(),
         submitted_at: Utc::now(),
     }

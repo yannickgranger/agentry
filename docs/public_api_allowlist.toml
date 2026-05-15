@@ -1,0 +1,14 @@
+# Public API allowlist for coder-claude-agentry's pre-commit callers gate.
+# Add fully-qualified names of pub items that have NO in-repo callers but
+# are documented external API or cross-crate consumed. Format:
+#
+#   [allowed]
+#   names = [
+#     "agentry_role_runtime::DoneGuard",
+#     "orchestrator_types::Brief",
+#   ]
+#
+# Empty list rejects all new orphan pubs.
+
+[allowed]
+names = []

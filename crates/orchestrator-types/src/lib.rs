@@ -1,31 +1,47 @@
 //! Pure types for the agentry orchestrator.
 //!
-//! Four data records (Brief, AgentRole, TeamTopology, Project) plus the runtime
+//! Data records (Brief, AgentRole, TeamTopology, Project, Contract), task-shape
+//! and validator descriptors (TaskShape, ValidatorPipeline), plus the runtime
 //! bookkeeping types (WorkPermit, Verdict, Event). No logic here — only shapes
 //! and serde round-trip.
 
 #![forbid(unsafe_code)]
 
 pub mod brief;
+pub mod contract;
 pub mod event;
+pub mod kind;
 pub mod lifecycle;
 pub mod permit;
+pub mod pipeline;
+pub mod profile;
 pub mod project;
 pub mod review;
 pub mod role;
+pub mod run_data;
+pub mod target_repo;
 pub mod team;
 pub mod verdict;
 
-pub use brief::{Brief, BriefId, BriefKind, Budget, EscalationMode, Payload};
+pub use brief::{Brief, BriefId, Budget, EscalationMode, Payload, RedeployTarget};
+pub use contract::{Assertion, AssertionAnchor, AssertionId, Contract};
 pub use event::{DoneReason, Event, EventKind, EventVerdict, ToolCall};
+pub use kind::TaskShape;
 pub use permit::{PermitScope, ToolAllowlist, WorkPermit};
+pub use pipeline::ValidatorPipeline;
+pub use profile::{
+    parse_profile_toml, Profile, ProfileAcceptanceSection, ProfileMethodologySection,
+    ProfileParseError, ProfileRoleSection,
+};
 pub use project::{Project, ProjectSlug, StandingOrders};
 pub use review::{FindingOrigin, ReviewFinding, Severity};
 pub use role::{
-    AgentRole, AllowedTools, Mount, PackageManager, RoleName, RoleRef, SubstrateClass,
-    WorkspaceMount,
+    merge_role_with_packs, AgentRole, AllowedTools, Mount, PackageManager, RoleName, RoleRef,
+    SubstrateClass, ToolPack, WorkspaceMount,
 };
-pub use team::{MessageEdge, PermitOverrides, TeamName, TeamTopology};
+pub use run_data::RunData;
+pub use target_repo::{TargetRepo, TargetRepoParseError};
+pub use team::{MessageEdge, NodeClass, NodeId, PermitOverrides, TeamName, TeamTopology};
 
 /// Apply a `PermitOverrides` payload to an already-minted permit, in place.
 ///

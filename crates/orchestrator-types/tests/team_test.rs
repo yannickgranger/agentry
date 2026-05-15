@@ -1,4 +1,5 @@
 use orchestrator_types::{MessageEdge, PermitOverrides, RoleName, RoleRef, TeamName, TeamTopology};
+use std::collections::HashMap;
 
 fn rr(s: &str) -> RoleRef {
     RoleRef {
@@ -25,28 +26,33 @@ fn team_roundtrip_json() {
                 to: rr("prescriber"),
                 permit_overrides_from: None,
                 rework_target: None,
+                gate_policy: None,
             },
             MessageEdge {
                 from: rr("prescriber"),
                 to: rr("coder-rust"),
                 permit_overrides_from: Some("permit_overrides".into()),
                 rework_target: None,
+                gate_policy: None,
             },
             MessageEdge {
                 from: rr("coder-rust"),
                 to: rr("reviewer"),
                 permit_overrides_from: None,
                 rework_target: None,
+                gate_policy: None,
             },
             MessageEdge {
                 from: rr("reviewer"),
                 to: rr("shipper"),
                 permit_overrides_from: None,
                 rework_target: None,
+                gate_policy: None,
             },
         ],
         terminal_role: rr("shipper"),
         max_retries: 2,
+        node_classes: HashMap::new(),
     };
     let s = serde_json::to_string_pretty(&t).expect("ser");
     let back: TeamTopology = serde_json::from_str(&s).expect("de");
@@ -63,6 +69,7 @@ fn echo_team_minimal() {
         message_graph: vec![],
         terminal_role: rr("echo-agent"),
         max_retries: 0,
+        node_classes: HashMap::new(),
     };
     assert!(t.outgoing(&rr("echo-agent")).is_empty());
     assert!(t.incoming(&rr("echo-agent")).is_empty());
@@ -82,22 +89,26 @@ fn inbound_roles_dedup_and_order() {
                 to: rr("c"),
                 permit_overrides_from: None,
                 rework_target: None,
+                gate_policy: None,
             },
             MessageEdge {
                 from: rr("b"),
                 to: rr("c"),
                 permit_overrides_from: None,
                 rework_target: None,
+                gate_policy: None,
             },
             MessageEdge {
                 from: rr("a"),
                 to: rr("c"),
                 permit_overrides_from: Some("k".into()),
                 rework_target: None,
+                gate_policy: None,
             },
         ],
         terminal_role: rr("c"),
         max_retries: 0,
+        node_classes: HashMap::new(),
     };
     let upstreams = t.inbound_roles(&rr("c"));
     assert_eq!(upstreams.len(), 2);

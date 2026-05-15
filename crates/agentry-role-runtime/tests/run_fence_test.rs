@@ -32,7 +32,7 @@ fn clones_emits_in_loop_finding() {
     assert_eq!(v.len(), 1);
     assert_eq!(v[0].file.as_deref(), Some("src/foo.rs"));
     assert_eq!(v[0].line, Some(42));
-    assert_eq!(v[0].severity, Severity::Blocker);
+    assert_eq!(v[0].severity, Severity::Warn);
     match &v[0].origin {
         FindingOrigin::Mechanical { tool, rule } => {
             assert_eq!(tool, "ra-query");
@@ -88,7 +88,7 @@ fn complexity_emits_one_per_function() {
     let v = complexity_to_findings("src/foo.rs", &json);
     assert_eq!(v.len(), 2);
     for f in &v {
-        assert_eq!(f.severity, Severity::Blocker);
+        assert_eq!(f.severity, Severity::Warn);
         match &f.origin {
             FindingOrigin::Mechanical { rule, tool } => {
                 assert_eq!(rule.as_deref(), Some("complexity"));

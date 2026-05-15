@@ -26,9 +26,87 @@ use orchestrator_runtime::lifecycle::{
 use orchestrator_runtime::lifecycle_driver::projector_task;
 use orchestrator_types::lifecycle::{BriefEvent, BriefState, BriefStateRecord, CiState, Reason};
 use orchestrator_types::review::{FindingOrigin, ReviewFinding, Severity};
-use orchestrator_types::{BriefId, EventVerdict};
+use orchestrator_types::{now, BriefId, EventVerdict};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
+
+/// Build the chain topology used by the premature-shipped tests:
+/// `coder → ac-verifier → reviewer → shipper → ci-watcher`, with each
+/// node's `expected_inbound` set to its single upstream. Pinning the
+/// chain explicitly (rather than reusing the production self-host
+/// topology) keeps the test focused on the FSM trail invariant rather
+/// than on the production fan-out shape.
+fn chain_walk() -> (
+    std::sync::Arc<orchestrator_types::lifecycle::WalkConfig>,
+    std::sync::Arc<orchestrator_types::team::NodeId>,
+) {
+    use orchestrator_types::lifecycle::{GatePolicy, NodeConfig, WalkConfig};
+    use orchestrator_types::team::{NodeClass, NodeId};
+    use std::collections::HashMap;
+
+    let coder = NodeId("coder-claude-agentry".into());
+    let acv = NodeId("ac-verifier-test".into());
+    let reviewer = NodeId("reviewer-test".into());
+    let shipper = NodeId("shipper-agentry".into());
+    let ci = NodeId("ci-watcher-agentry".into());
+
+    let mut adjacency: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+    adjacency.insert(coder.clone(), vec![acv.clone()]);
+    adjacency.insert(acv.clone(), vec![reviewer.clone()]);
+    adjacency.insert(reviewer.clone(), vec![shipper.clone()]);
+    adjacency.insert(shipper.clone(), vec![ci.clone()]);
+
+    let class = NodeClass("container_bound".into());
+    let mut node_configs: HashMap<NodeId, NodeConfig> = HashMap::new();
+    node_configs.insert(
+        coder.clone(),
+        NodeConfig {
+            class: class.clone(),
+            expected_inbound: vec![],
+            policy: GatePolicy::AllMustPass,
+        },
+    );
+    node_configs.insert(
+        acv.clone(),
+        NodeConfig {
+            class: class.clone(),
+            expected_inbound: vec![coder.clone()],
+            policy: GatePolicy::AllMustPass,
+        },
+    );
+    node_configs.insert(
+        reviewer.clone(),
+        NodeConfig {
+            class: class.clone(),
+            expected_inbound: vec![acv.clone()],
+            policy: GatePolicy::AllMustPass,
+        },
+    );
+    node_configs.insert(
+        shipper.clone(),
+        NodeConfig {
+            class: class.clone(),
+            expected_inbound: vec![reviewer.clone()],
+            policy: GatePolicy::AllMustPass,
+        },
+    );
+    node_configs.insert(
+        ci.clone(),
+        NodeConfig {
+            class,
+            expected_inbound: vec![shipper.clone()],
+            policy: GatePolicy::AllMustPass,
+        },
+    );
+
+    (
+        std::sync::Arc::new(WalkConfig {
+            adjacency,
+            node_configs,
+        }),
+        std::sync::Arc::new(coder),
+    )
+}
 
 struct MemEventSource {
     events: VecDeque<BriefEvent>,
@@ -71,7 +149,8 @@ async fn run_to_completion(
     let projector: Box<dyn StateProjector + Send> = Box::new(MemStateProjector {
         written: written.clone(),
     });
-    projector_task(brief_id, source, projector, None)
+    let (walk_config, entry_node) = chain_walk();
+    projector_task(brief_id, source, projector, None, walk_config, entry_node)
         .await
         .expect("projector_task");
     let log = written.lock().expect("mutex").clone();
@@ -98,23 +177,40 @@ fn count_terminal(log: &[(BriefStateRecord, String)]) -> (usize, usize) {
 #[tokio::test]
 async fn projector_emits_one_shipped_terminal_on_happy_path() {
     let brief_id = BriefId("brf_premature_shipped_happy".into());
+    use orchestrator_types::run_data::RunData;
+    use orchestrator_types::team::NodeId;
     let events = vec![
         BriefEvent::CoderStarted {
             agent_id: "agent-1".into(),
+            role_name: "coder-claude-agentry".into(),
+            started_at: now(),
         },
-        BriefEvent::CoderDone {
-            verdict: EventVerdict::Shipped,
-        },
-        BriefEvent::AcVerifierDone {
-            verdict: EventVerdict::Shipped,
-        },
-        BriefEvent::ReviewerDone {
+        BriefEvent::RoleDone {
+            node_id: NodeId("coder-claude-agentry".into()),
             verdict: EventVerdict::Shipped,
             findings: vec![],
+            run_data: None,
         },
-        BriefEvent::ShipperDone {
-            pr_number: 1,
-            head_sha: "abc123".into(),
+        BriefEvent::RoleDone {
+            node_id: NodeId("ac-verifier-test".into()),
+            verdict: EventVerdict::Shipped,
+            findings: vec![],
+            run_data: None,
+        },
+        BriefEvent::RoleDone {
+            node_id: NodeId("reviewer-test".into()),
+            verdict: EventVerdict::Shipped,
+            findings: vec![],
+            run_data: None,
+        },
+        BriefEvent::RoleDone {
+            node_id: NodeId("shipper-agentry".into()),
+            verdict: EventVerdict::Shipped,
+            findings: vec![],
+            run_data: Some(RunData::PrTracking {
+                pr_number: 1,
+                head_sha: "abc123".into(),
+            }),
         },
         BriefEvent::CiResult {
             state: CiState::Success,
@@ -129,11 +225,19 @@ async fn projector_emits_one_shipped_terminal_on_happy_path() {
         6,
         "one record per legal transition through the full trail"
     );
-    assert!(matches!(log[0].0.state, BriefState::Authoring { .. }));
-    assert!(matches!(log[1].0.state, BriefState::Verifying { .. }));
-    assert!(matches!(log[2].0.state, BriefState::Reviewing { .. }));
-    assert!(matches!(log[3].0.state, BriefState::Shipping { .. }));
-    assert!(matches!(log[4].0.state, BriefState::Watching { .. }));
+    let expect_node = |i: usize, name: &str| match &log[i].0.state {
+        BriefState::Walking { node_id, .. } => assert_eq!(
+            node_id.0, name,
+            "record {i} must be Walking at {name}, got {:?}",
+            node_id.0
+        ),
+        other => panic!("record {i} must be Walking, got {other:?}"),
+    };
+    expect_node(0, "coder-claude-agentry");
+    expect_node(1, "ac-verifier-test");
+    expect_node(2, "reviewer-test");
+    expect_node(3, "shipper-agentry");
+    expect_node(4, "ci-watcher-agentry");
     assert!(matches!(log[5].0.state, BriefState::Shipped));
 
     let (shipped, failed) = count_terminal(&log);
@@ -168,22 +272,33 @@ async fn premature_shipped_event_does_not_yield_shipped_terminal() {
         prohibitions: vec![],
         requirements: vec![],
     };
+    use orchestrator_types::team::NodeId;
     let events = vec![
         BriefEvent::CoderStarted {
             agent_id: "agent-1".into(),
+            role_name: "coder-claude-agentry".into(),
+            started_at: now(),
         },
         // Premature-shipped claim: pre-#307 a parallel emission site
         // could turn this into a Shipped verdict. The FSM walks it to
-        // Verifying instead.
-        BriefEvent::CoderDone {
+        // the downstream gate instead.
+        BriefEvent::RoleDone {
+            node_id: NodeId("coder-claude-agentry".into()),
             verdict: EventVerdict::Shipped,
+            findings: vec![],
+            run_data: None,
         },
-        BriefEvent::AcVerifierDone {
+        BriefEvent::RoleDone {
+            node_id: NodeId("ac-verifier-test".into()),
             verdict: EventVerdict::Shipped,
+            findings: vec![],
+            run_data: None,
         },
-        BriefEvent::ReviewerDone {
+        BriefEvent::RoleDone {
+            node_id: NodeId("reviewer-test".into()),
             verdict: EventVerdict::ReworkNeeded,
             findings: vec![blocker],
+            run_data: None,
         },
         // Universal handler short-circuits any non-terminal state to
         // Failed{BudgetExhausted}.
@@ -193,10 +308,15 @@ async fn premature_shipped_event_does_not_yield_shipped_terminal() {
     let log = run_to_completion(brief_id, events).await;
 
     assert_eq!(log.len(), 5, "one record per legal transition");
-    assert!(matches!(log[0].0.state, BriefState::Authoring { .. }));
-    assert!(matches!(log[1].0.state, BriefState::Verifying { .. }));
-    assert!(matches!(log[2].0.state, BriefState::Reviewing { .. }));
-    assert!(matches!(log[3].0.state, BriefState::Reworking { .. }));
+    let assert_walking_at = |i: usize, name: &str| match &log[i].0.state {
+        BriefState::Walking { node_id, .. } => assert_eq!(node_id.0, name),
+        other => panic!("record {i} must be Walking at {name}, got {other:?}"),
+    };
+    assert_walking_at(0, "coder-claude-agentry");
+    assert_walking_at(1, "ac-verifier-test");
+    assert_walking_at(2, "reviewer-test");
+    // ReworkNeeded restarts the walker at the entry node with the retry budget bumped.
+    assert_walking_at(3, "coder-claude-agentry");
     match &log[4].0.state {
         BriefState::Failed {
             reason: Reason::BudgetExhausted,

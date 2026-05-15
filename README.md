@@ -64,6 +64,21 @@ authoring, deliberation, implementation, and enforcement.
 - Not a single-shot tool. agentry holds the loop: change → review →
   commit → push → CI → on-failure route back to coder, repeat.
 
+## Project Profiles
+
+Each target_repo ships its own `.agentry/profile.toml` declaring which tool packs the coder and reviewer consume, the canonical brief acceptance command, and methodology gates. The substrate fetches the profile at brief dispatch and augments the spawned role's effective config — N projects with N requirements without N hardcoded role copies.
+
+- **Profile-driven roles (Phase 1+2 shipped 2026-05-07):** target repos declare their tool requirements in `.agentry/profile.toml`; the substrate is generic across projects. See `specs/concepts/profile.md` and `specs/concepts/tool_pack.md`. Agentry's own profile lives at `.agentry/profile.toml`.
+- **rtk substrate fix validated 2026-05-07T21:17Z** — coder containers now have rtk available at /usr/local/bin/rtk via ~/.local/bin/rtk symlink; PreToolUse hook resolves cleanly.
+- **Dogfood loop verification 2026-05-07T23:05Z** — second consecutive healthcheck Shipped through coder + reviewer-mech + shipper + ci-watcher; substrate reconciliation in PR #420.
+- **Captain doctrine foundation 2026-05-08** — typed Contract / Assertion / TaskShape / ValidatorPipeline + log-only daemon contract observer (B1-B3). Captain authoring discipline encoded as types, not prose.
+
+## Big Rust Projects
+
+- Big-rust workflow ready: dispatch briefs against `agentry-bugfix-v0` topology with `quality-mech` as the acceptance command for scoped reviewer cargo cost. See `docs/dogfood-protocol.md` for the recipe.
+
+agentry's reviewer-mechanical scopes cargo clippy + cargo test to changed crates plus their reverse-dep closure (via quality-mech), and the leaner agentry-bugfix-v0 topology drops the LLM ac-verifier ensemble. Together, brief LLM container count drops from 5 to 1 and cargo cost drops from workspace-wide to scoped — making agentry suitable for big Rust workspaces where the workspace-wide pair blows the brief budget.
+
 ## Shape
 
 ```mermaid
@@ -92,7 +107,7 @@ flowchart LR
     sub -.->|must-decide-human| you
 ```
 
-> Note: `/grill-me` and the specialist council run on the user's Claude Code host — they are not provided by this repository.
+> Note: `/grill-me` and the specialist council run on the user's Claude Code host — they are not provided by this repository. The `/grill-me` skill is the public one from [mattpocock/skills](https://github.com/mattpocock/skills); the council pattern is described in `docs/architectural-control-loop.md`.
 
 The pieces:
 
@@ -140,7 +155,11 @@ orchestrator submit <brief.json>           # send work
 orchestrator team list / register / show   # manage workflows
 orchestrator role list / show              # inspect agents
 orchestrator verdicts                      # last N outcomes
+orchestrator abort --all / <brief-id>      # kill all briefs, or one
+orchestrator agents list                   # inspect the running fleet (NDJSON)
+orchestrator agents query <sql>            # read-only SELECT on the agent index
 orchestrator agents trace <agent-id>       # see what an agent did
+orchestrator agents recent-status <agent-id> # last Status verdicts for an agent
 agentry-workspace list / gc                # workspace cleanup
 ```
 

@@ -1,0 +1,861 @@
+//! captain — captain-side authoring CLI.
+//!
+//! `captain new-brief` emits a typed Brief JSON template to stdout, with
+//! `kind` + `contract` placed at the correct top-level fields. Authoring a
+//! brief from this template (instead of from memory) prevents the silent
+//! "field nested under payload" failure mode and the stale-binary "field
+//! dropped on re-serialize" failure mode: the template is produced by a
+//! binary that imports `orchestrator_types::Brief` and round-trips through
+//! serde_json, so the field names and locations always match the schema the
+//! daemon parses.
+
+use anyhow::{anyhow, Context, Result};
+use clap::{Parser, Subcommand};
+use orchestrator_runtime::captain_dispatch_env::populate_env_from_disk;
+use orchestrator_runtime::captain_ground::{render_grounding_sheet, CfdbItem, SpecMatch};
+use orchestrator_runtime::captain_ground_cache::captain_ground_cache_dir;
+use orchestrator_runtime::{cli_decide, Config};
+use orchestrator_types::{
+    now, Assertion, AssertionAnchor, AssertionId, Brief, BriefId, Budget, Contract, EscalationMode,
+    TaskShape, VersionedRef,
+};
+use serde::Deserialize;
+use serde_json::{json, Value};
+use std::io;
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
+
+#[derive(Parser, Debug)]
+#[command(name = "captain", version)]
+struct Cli {
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Subcommand, Debug)]
+enum Cmd {
+    /// Emit a typed Brief JSON template to stdout.
+    NewBrief {
+        /// Task shape (kebab-case wire form, e.g. `trivial-doc`, `bug-fix`).
+        #[arg(long)]
+        kind: String,
+        /// Forge shorthand for the target repo, e.g. `yg/agentry`.
+        #[arg(long)]
+        target_repo: String,
+        /// Topology reference, formatted `name:version` (e.g.
+        /// `agentry-bugfix-v0:1`).
+        #[arg(long)]
+        topology: String,
+        /// PR title used in the emitted payload.
+        #[arg(long)]
+        pr_title: String,
+        /// Issue title used in the emitted payload.
+        #[arg(long)]
+        issue_title: String,
+        /// Emit a Contract with three Behavior anchors instead of the default
+        /// single Cfdb-TODO anchor. Greenfield projects with no existing
+        /// qname surface get a discoverable, doctrine-aligned default.
+        #[arg(long, default_value_t = false)]
+        bootstrap: bool,
+        /// Optional brief id. Defaults to `BriefId::fresh()`.
+        #[arg(long)]
+        id: Option<String>,
+        /// Optional issue body. Default: a one-line placeholder.
+        #[arg(long)]
+        issue_body: Option<String>,
+        /// Optional PR body. Default: a one-line placeholder.
+        #[arg(long)]
+        pr_body: Option<String>,
+        /// Acceptance command. Required when --target-repo is not yg/agentry;
+        /// the agentry self-host default is only applied when --target-repo
+        /// points at agentry's own repo.
+        #[arg(long)]
+        acceptance: Option<String>,
+        /// Optional base branch. Default: `develop`.
+        #[arg(long)]
+        base_branch: Option<String>,
+        /// Optional submitter id. Default: `captain-cli`.
+        #[arg(long)]
+        submitted_by: Option<String>,
+    },
+    /// Emit a grounding sheet for a directive by combining cfdb and specs.
+    Ground {
+        /// Target repo workspace root. Mutually exclusive with
+        /// `--target-repo`; exactly one must be set.
+        #[arg(
+            long,
+            conflicts_with = "target_repo",
+            required_unless_present = "target_repo"
+        )]
+        workspace: Option<PathBuf>,
+        /// Forge shorthand (e.g. `yg/glean`) for a remote target repo.
+        /// Captain runs `cfdb extract --rev <url>@<rev>` into a per-
+        /// `(target_repo, rev)` cache under `$XDG_CACHE_HOME/captain/ground/`.
+        /// Mutually exclusive with `--workspace`.
+        #[arg(
+            long,
+            conflicts_with = "workspace",
+            required_unless_present = "workspace"
+        )]
+        target_repo: Option<String>,
+        /// Branch name or commit sha for `--target-repo`. Defaults to
+        /// `develop` when `--target-repo` is set; ignored otherwise.
+        #[arg(long)]
+        rev: Option<String>,
+        /// Free-form directive describing the intended brief.
+        #[arg(long)]
+        directive: String,
+        /// openCypher regex applied to cfdb item names.
+        #[arg(long)]
+        name_pattern: String,
+        /// Optional comma-separated cfdb item kinds (passed through to cfdb).
+        #[arg(long)]
+        kinds: Option<String>,
+        /// Optional specs directory; defaults to `<workspace>/specs/concepts`
+        /// in `--workspace` mode, and is skipped in `--target-repo` mode
+        /// unless explicitly provided.
+        #[arg(long)]
+        specs_dir: Option<PathBuf>,
+        /// Optional pre-extracted cfdb db dir. When omitted, captain runs
+        /// `cfdb extract` into a tempdir (or per-`(target_repo, rev)` cache
+        /// in `--target-repo` mode). When given, captain assumes the
+        /// keyspace name is `ground` inside that db directory.
+        #[arg(long)]
+        keyspace_db: Option<PathBuf>,
+    },
+    /// Validate a brief file against the Brief schema and shell out to
+    /// `orchestrator submit`. The dispatch summary is emitted on stderr to
+    /// keep stdout clean for downstream pipe consumers.
+    ///
+    /// Required configuration is resolved in this order — the operator
+    /// sees every missing piece in one block, not one error at a time:
+    ///
+    /// 1. `AGENTRY_REDIS_PASSWORD` — env, falling back to
+    ///    `~/.config/agentry/redis.password`.
+    /// 2. `AGENTRY_REDIS__URL` — env, falling back to
+    ///    `redis://:<password>@127.0.0.1:6380` built from the resolved
+    ///    password.
+    /// 3. `AGENTRY_SIGNING__KEY_PATH` — env, falling back to
+    ///    `~/.config/agentry/signing.key`.
+    /// 4. `orchestrator` binary — `$PATH`, falling back to
+    ///    `/var/mnt/workspaces/agentry/target/release/orchestrator`.
+    Dispatch {
+        /// Path to the brief JSON file to validate and dispatch.
+        brief_file: PathBuf,
+        /// Validate only — do not invoke `orchestrator submit`.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Emit a graph-specs-compliant `specs/concepts/<concept>.md` skeleton
+    /// to stdout, with a stderr REMINDER about graph-specs equivalence.
+    NewSpec {
+        /// CamelCase concept name (e.g. `ScanReport`). Must match a Rust
+        /// type, function, or trait of the same name in `target_repo`.
+        #[arg(long)]
+        concept: String,
+        /// Forge shorthand for the target repo, e.g. `yg/glean`.
+        #[arg(long)]
+        target_repo: String,
+    },
+    /// Probe file:line refs cited in a forge issue body against
+    /// target_repo@base_branch. Reports each ref as OK / MISSING /
+    /// LINE_OUT_OF_RANGE. Exit 0 when all OK; exit 1 when any non-OK.
+    Freshness {
+        /// Forge shorthand for the target repo whose develop branch to probe, e.g. `yg/agentry`.
+        #[arg(long)]
+        target_repo: String,
+        /// Issue number on the forge.
+        #[arg(long)]
+        issue: u64,
+        /// Branch to probe against. Defaults to `develop`.
+        #[arg(long)]
+        base_branch: Option<String>,
+        /// Forge host. Defaults to value of AGENTRY_FORGE_HOST env or `forge.example.com:3000` from forge_host_from_env().
+        #[arg(long)]
+        forge_host: Option<String>,
+    },
+    /// Rebuild release binaries listed by a brief's `redeploy_required`.
+    Redeploy {
+        /// Comma-separated list of targets to rebuild. Accepted values
+        /// (matching `orchestrator_types::brief::RedeployTarget`):
+        /// `daemon`, `orchestrator-cli`, `captain-cli`. Use `all` to
+        /// rebuild every known target.
+        #[arg(long, default_value = "all")]
+        target: String,
+        /// Skip the actual cargo build; just print what would be run.
+        /// Useful for dry-run inspection in CI logs and demos.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+    },
+    /// Resolve a brief parked in `AwaitingCaptainDecision` (coder flagged a
+    /// deliberate disagreement via `BriefEvent::CoderDisagreed`).
+    Decide {
+        #[command(subcommand)]
+        action: DecideAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum DecideAction {
+    /// Accept a parked disagreement — the brief proceeds through the post-coder phase chain.
+    Accept {
+        /// Brief id whose AwaitingCaptainDecision state to clear.
+        brief_id: String,
+    },
+    /// Reject a parked disagreement — the brief transitions to Failed{CaptainRejectedDisagreement}.
+    Reject {
+        /// Brief id whose AwaitingCaptainDecision state to clear.
+        brief_id: String,
+        /// Captain's prose explanation of the rejection (audit trail).
+        #[arg(long)]
+        reason: String,
+    },
+    /// List all briefs currently parked in AwaitingCaptainDecision state.
+    List,
+}
+
+fn parse_kind(s: &str) -> Result<TaskShape> {
+    serde_json::from_value::<TaskShape>(Value::String(s.to_string()))
+        .with_context(|| format!("unknown --kind value: {s}"))
+}
+
+fn parse_topology(s: &str) -> Result<VersionedRef> {
+    let (name, version) = s
+        .rsplit_once(':')
+        .ok_or_else(|| anyhow!("--topology must be of the form name:version (got `{s}`)"))?;
+    if name.is_empty() {
+        return Err(anyhow!("--topology name component is empty in `{s}`"));
+    }
+    let version: u32 = version
+        .parse()
+        .with_context(|| format!("--topology version must be a u32 (got `{version}`)"))?;
+    Ok(VersionedRef::new(name, version))
+}
+
+const DEFAULT_PLACEHOLDER_BODY: &str =
+    "TODO: replace with verb-structured CREATE / UPDATE / REPLACE / DELETE / MOVE lines.";
+const DEFAULT_ACCEPTANCE: &str =
+    "cargo run -p quality-fast --bin quality-mech --release --quiet && bash scripts/arch-check.sh";
+const DEFAULT_BASE_BRANCH: &str = "develop";
+const AGENTRY_SELF_HOST_TARGET_REPO: &str = "yg/agentry";
+const DEFAULT_SUBMITTED_BY: &str = "captain-cli";
+const TODO_QNAME: &str = "TODO::replace_with_real_qname";
+
+fn stub_contract(brief_id: &BriefId) -> Contract {
+    Contract {
+        brief_id: brief_id.clone(),
+        assertions: vec![Assertion {
+            id: AssertionId("A1".into()),
+            prose: "TODO: fill in assertion prose; the anchor below points at a TODO marker that you MUST replace with a real cfdb qname or spec section before dispatching.".into(),
+            anchor: AssertionAnchor::Cfdb {
+                qname: TODO_QNAME.into(),
+            },
+        }],
+        precursor_artifacts: Vec::new(),
+    }
+}
+
+fn bootstrap_contract(brief_id: &BriefId) -> Contract {
+    Contract {
+        brief_id: brief_id.clone(),
+        assertions: vec![
+            Assertion {
+                id: AssertionId("A1".into()),
+                prose: "TODO: replace with the test that this brief makes pass.".into(),
+                anchor: AssertionAnchor::Behavior {
+                    live_target: "TODO: e.g. \"test crates/<crate>/tests/<test_file>.rs::<test_fn> passes\"".into(),
+                },
+            },
+            Assertion {
+                id: AssertionId("A2".into()),
+                prose: "TODO: replace with the user-facing output invariant this brief delivers.".into(),
+                anchor: AssertionAnchor::Behavior {
+                    live_target: "TODO: e.g. \"output of <command> contains <substring>\" or \"file <path> exists with <property>\"".into(),
+                },
+            },
+            Assertion {
+                id: AssertionId("A3".into()),
+                prose: "TODO: replace with the structural invariant this brief preserves.".into(),
+                anchor: AssertionAnchor::Behavior {
+                    live_target: "TODO: e.g. \"no destructive filesystem operations in <module>\" or \"no panics in the request handler path\"".into(),
+                },
+            },
+        ],
+        precursor_artifacts: Vec::new(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_brief(
+    kind_str: &str,
+    target_repo: &str,
+    topology_str: &str,
+    pr_title: &str,
+    issue_title: &str,
+    bootstrap: bool,
+    id: Option<String>,
+    issue_body: Option<String>,
+    pr_body: Option<String>,
+    acceptance: Option<String>,
+    base_branch: Option<String>,
+    submitted_by: Option<String>,
+) -> Result<Brief> {
+    let kind = parse_kind(kind_str)?;
+    let topology = parse_topology(topology_str)?;
+    let id = id.map_or_else(BriefId::fresh, BriefId);
+
+    if target_repo != AGENTRY_SELF_HOST_TARGET_REPO && acceptance.is_none() {
+        return Err(anyhow!(
+            "--acceptance is required when target_repo ({target_repo}) is not {AGENTRY_SELF_HOST_TARGET_REPO}. The default acceptance command `{DEFAULT_ACCEPTANCE}` references agentry-specific binaries (quality-fast, scripts/arch-check.sh) that do not exist in other target repos. Either pass --acceptance with a command appropriate for the target, or dispatch through a topology whose role defaults already encode the target-specific acceptance."
+        ));
+    }
+
+    let payload = json!({
+        "issue_number": Value::Null,
+        "issue_title": issue_title,
+        "issue_body": issue_body.unwrap_or_else(|| DEFAULT_PLACEHOLDER_BODY.to_string()),
+        "acceptance": acceptance.unwrap_or_else(|| DEFAULT_ACCEPTANCE.to_string()),
+        "target_repo": target_repo,
+        "base_branch": base_branch.unwrap_or_else(|| DEFAULT_BASE_BRANCH.to_string()),
+        "pr_title": pr_title,
+        "pr_body": pr_body.unwrap_or_else(|| DEFAULT_PLACEHOLDER_BODY.to_string()),
+    });
+
+    let contract = if kind.requires_contract() {
+        Some(if bootstrap {
+            bootstrap_contract(&id)
+        } else {
+            stub_contract(&id)
+        })
+    } else {
+        None
+    };
+
+    Ok(Brief {
+        id,
+        project: None,
+        topology,
+        payload,
+        kind: Some(kind),
+        contract,
+        budget: Budget::default(),
+        escalation: EscalationMode::Autonomous,
+        parent_brief: None,
+        cohort_labels: Vec::new(),
+        redeploy_required: vec![],
+        submitted_by: submitted_by.unwrap_or_else(|| DEFAULT_SUBMITTED_BY.to_string()),
+        submitted_at: now(),
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct CfdbListResponse {
+    rows: Vec<CfdbItem>,
+}
+
+const DEFAULT_TARGET_REV: &str = "develop";
+const DEFAULT_FORGE_HOST: &str = "forge.example.com:3000";
+
+fn target_repo_slug(target_repo: &str) -> String {
+    target_repo.replace('/', "_")
+}
+
+fn forge_host_from_env() -> String {
+    std::env::var("AGENTRY_FORGE_HOST").unwrap_or_else(|_| DEFAULT_FORGE_HOST.to_string())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_ground(
+    workspace: Option<PathBuf>,
+    target_repo: Option<String>,
+    rev: Option<String>,
+    directive: String,
+    name_pattern: String,
+    kinds: Option<String>,
+    specs_dir: Option<PathBuf>,
+    keyspace_db: Option<PathBuf>,
+) -> Result<()> {
+    let _tempdir_guard;
+    let (db_path, keyspace): (PathBuf, String) = match (&workspace, &target_repo) {
+        (Some(ws), None) => match keyspace_db.clone() {
+            Some(p) => (p, "ground".to_string()),
+            None => {
+                let tmp = tempfile::TempDir::new()
+                    .context("failed to allocate tempdir for cfdb extract")?;
+                let tmp_str = tmp.path().display().to_string();
+                let workspace_str = ws.display().to_string();
+                let extract_out = Command::new("cfdb")
+                    .args([
+                        "extract",
+                        "--workspace",
+                        &workspace_str,
+                        "--db",
+                        &tmp_str,
+                        "--keyspace",
+                        "ground",
+                    ])
+                    .output()
+                    .context("failed to spawn cfdb extract")?;
+                if !extract_out.status.success() {
+                    let code = extract_out
+                        .status
+                        .code()
+                        .map_or_else(|| "?".to_string(), |c| c.to_string());
+                    let stderr = String::from_utf8_lossy(&extract_out.stderr);
+                    return Err(anyhow!("cfdb extract failed (status {code}): {stderr}"));
+                }
+                let path = tmp.path().to_path_buf();
+                _tempdir_guard = Some(tmp);
+                (path, "ground".to_string())
+            }
+        },
+        (None, Some(repo)) => match keyspace_db.clone() {
+            Some(p) => (p, "ground".to_string()),
+            None => {
+                let slug = target_repo_slug(repo);
+                let rev_value = rev
+                    .clone()
+                    .unwrap_or_else(|| DEFAULT_TARGET_REV.to_string());
+                let xdg = std::env::var("XDG_CACHE_HOME").ok();
+                let home = std::env::var("HOME").ok();
+                let cache_dir = captain_ground_cache_dir(&slug, &rev_value, xdg, home);
+                let cache_db_file = cache_dir.join(format!("{slug}.json"));
+                let cache_hit = cache_db_file
+                    .metadata()
+                    .map(|m| m.is_file() && m.len() > 0)
+                    .unwrap_or(false);
+                if !cache_hit {
+                    std::fs::create_dir_all(&cache_dir).with_context(|| {
+                        format!("failed to create cache dir {}", cache_dir.display())
+                    })?;
+                    let forge_host = forge_host_from_env();
+                    let url = format!("https://{forge_host}/{repo}.git@{rev_value}");
+                    let cache_str = cache_dir.display().to_string();
+                    let extract_out = Command::new("cfdb")
+                        .args([
+                            "extract",
+                            "--rev",
+                            &url,
+                            "--db",
+                            &cache_str,
+                            "--keyspace",
+                            &slug,
+                        ])
+                        .output()
+                        .context("failed to spawn cfdb extract --rev")?;
+                    if !extract_out.status.success() {
+                        let code = extract_out
+                            .status
+                            .code()
+                            .map_or_else(|| "?".to_string(), |c| c.to_string());
+                        let stderr = String::from_utf8_lossy(&extract_out.stderr);
+                        return Err(anyhow!(
+                            "cfdb extract --rev failed (status {code}): {stderr}"
+                        ));
+                    }
+                } else {
+                    eprintln!(
+                        "// captain ground: cache hit at {} (skipping cfdb extract)",
+                        cache_dir.display()
+                    );
+                }
+                _tempdir_guard = None;
+                (cache_dir, slug)
+            }
+        },
+        _ => {
+            return Err(anyhow!(
+                "captain ground: exactly one of --workspace or --target-repo must be set"
+            ));
+        }
+    };
+
+    let db_str = db_path.display().to_string();
+    let mut list_args: Vec<String> = vec![
+        "list-items-matching".to_string(),
+        "--db".to_string(),
+        db_str,
+        "--keyspace".to_string(),
+        keyspace,
+        "--name-pattern".to_string(),
+        name_pattern,
+    ];
+    if let Some(k) = kinds {
+        list_args.push("--kinds".to_string());
+        list_args.push(k);
+    }
+    let list_out = Command::new("cfdb")
+        .args(&list_args)
+        .output()
+        .context("failed to spawn cfdb list-items-matching")?;
+    if !list_out.status.success() {
+        let code = list_out
+            .status
+            .code()
+            .map_or_else(|| "?".to_string(), |c| c.to_string());
+        let stderr = String::from_utf8_lossy(&list_out.stderr);
+        return Err(anyhow!(
+            "cfdb list-items-matching failed (status {code}): {stderr}"
+        ));
+    }
+    let parsed: CfdbListResponse = serde_json::from_slice(&list_out.stdout)
+        .context("failed to parse cfdb list-items-matching output as JSON")?;
+    let items = parsed.rows;
+
+    let resolved_specs_dir =
+        specs_dir.or_else(|| workspace.as_ref().map(|w| w.join("specs/concepts")));
+    let mut spec_matches: Vec<SpecMatch> = Vec::new();
+    match resolved_specs_dir {
+        Some(dir) if dir.is_dir() => {
+            let directive_tokens: Vec<String> = directive
+                .split_whitespace()
+                .map(str::to_lowercase)
+                .collect();
+            let entries = std::fs::read_dir(&dir)
+                .with_context(|| format!("failed to read specs dir {}", dir.display()))?;
+            let mut paths: Vec<PathBuf> = entries
+                .filter_map(std::result::Result::ok)
+                .map(|e| e.path())
+                .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("md"))
+                .collect();
+            paths.sort();
+            for path in paths {
+                let body = std::fs::read_to_string(&path)
+                    .with_context(|| format!("failed to read {}", path.display()))?;
+                let mut matched_headings: Vec<String> = Vec::new();
+                for line in body.lines() {
+                    let trimmed = line.trim_start();
+                    let hash_count = trimmed.chars().take_while(|c| *c == '#').count();
+                    if hash_count == 0 {
+                        continue;
+                    }
+                    let after_hashes = &trimmed[hash_count..];
+                    if !after_hashes.starts_with(' ') {
+                        continue;
+                    }
+                    let heading = after_hashes[1..].trim_end().to_string();
+                    let lower = heading.to_lowercase();
+                    if directive_tokens.iter().any(|tok| lower.contains(tok)) {
+                        matched_headings.push(heading);
+                    }
+                }
+                if !matched_headings.is_empty() {
+                    let display_path =
+                        match workspace.as_ref().and_then(|w| path.strip_prefix(w).ok()) {
+                            Some(rel) => rel.display().to_string(),
+                            None => path.display().to_string(),
+                        };
+                    spec_matches.push(SpecMatch {
+                        file: display_path,
+                        headings: matched_headings,
+                    });
+                }
+            }
+        }
+        Some(dir) => {
+            eprintln!("// WARN: specs dir not found at {}", dir.display());
+        }
+        None => {}
+    }
+
+    let sheet = render_grounding_sheet(&directive, &items, &spec_matches);
+    println!("{sheet}");
+    if items.is_empty() && spec_matches.is_empty() {
+        eprintln!(
+            "// WARN: no cfdb matches and no spec matches; consider broadening --name-pattern or --directive"
+        );
+    }
+    Ok(())
+}
+
+// Returns the exit code captain dispatch should terminate with. The actual
+// `std::process::exit` call happens in `main` to satisfy the
+// arch-ban-process-exit-outside-bin rule (only the bin entry point's `main`
+// may terminate the process; library/non-main code propagates via Result).
+fn cmd_dispatch(brief_file: PathBuf, dry_run: bool) -> Result<i32> {
+    populate_env_from_disk()?;
+    let raw = std::fs::read_to_string(&brief_file)
+        .with_context(|| format!("failed to read brief file {}", brief_file.display()))?;
+    let brief: Brief = serde_json::from_str(&raw)
+        .with_context(|| format!("failed to parse {} as Brief", brief_file.display()))?;
+
+    let brief_id = brief.id.0.clone();
+    let kind = brief.kind;
+    let contract_present = brief.contract.is_some();
+    let assertion_count = brief
+        .contract
+        .as_ref()
+        .map(|c| c.assertions.len())
+        .unwrap_or(0);
+    let target_repo = brief
+        .payload
+        .get("target_repo")
+        .and_then(|v| v.as_str())
+        .unwrap_or("<unset>");
+    let topology_name = brief.topology.name.clone();
+    let topology_version = brief.topology.version;
+
+    eprintln!(
+        "// dispatch: validated {brief_id} kind={kind:?} contract_present={contract_present} assertions={assertion_count} target_repo={target_repo} topology={topology_name}:{topology_version}"
+    );
+
+    if kind.map(TaskShape::requires_contract).unwrap_or(false) && !contract_present {
+        eprintln!(
+            "// WARN: kind {kind:?} requires contract per TaskShape::requires_contract — daemon B3 observer will log a warning at intake"
+        );
+    }
+
+    if dry_run {
+        return Ok(0);
+    }
+
+    let brief_file_str = brief_file.display().to_string();
+    let canonical_orchestrator = "/var/mnt/workspaces/agentry/target/release/orchestrator";
+    let spawn = |bin: &str| -> std::io::Result<std::process::ExitStatus> {
+        Command::new(bin)
+            .args(["submit", &brief_file_str])
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+    };
+    let status = match spawn("orchestrator") {
+        Ok(s) => {
+            eprintln!("// dispatch: spawned `orchestrator` from PATH");
+            s
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            eprintln!(
+                "// dispatch: `orchestrator` not on PATH; falling back to canonical local build at {canonical_orchestrator}"
+            );
+            spawn(canonical_orchestrator).with_context(|| {
+                format!(
+                    "failed to spawn `orchestrator`; the orchestrator binary must be on PATH (canonical local build path: {canonical_orchestrator})"
+                )
+            })?
+        }
+        Err(e) => {
+            return Err(anyhow::Error::from(e).context(format!(
+                "failed to spawn `orchestrator`; the orchestrator binary must be on PATH (canonical local build path: {canonical_orchestrator})"
+            )));
+        }
+    };
+    Ok(status.code().unwrap_or(1))
+}
+
+fn target_build_command(target: &str) -> Result<(Vec<&'static str>, &'static str)> {
+    match target {
+        "daemon" => Ok((
+            vec!["build", "--release", "-p", "orchestrator-runtime", "--bin", "orchestratord"],
+            "target/release/orchestratord",
+        )),
+        "orchestrator-cli" => Ok((
+            vec!["build", "--release", "-p", "orchestrator-runtime", "--bin", "orchestrator"],
+            "target/release/orchestrator",
+        )),
+        "captain-cli" => Ok((
+            vec!["build", "--release", "-p", "orchestrator-runtime", "--bin", "captain"],
+            "target/release/captain",
+        )),
+        other => Err(anyhow!("unknown redeploy target: {other} (expected daemon, orchestrator-cli, captain-cli, or all)")),
+    }
+}
+
+fn cmd_redeploy(target: &str, dry_run: bool) -> Result<()> {
+    let targets: Vec<&str> = if target == "all" {
+        vec!["daemon", "orchestrator-cli", "captain-cli"]
+    } else {
+        target.split(',').map(str::trim).collect()
+    };
+
+    for t in &targets {
+        let (args, bin_path) = target_build_command(t)?;
+        eprintln!(
+            "// captain redeploy: target={t} cmd=cargo {}",
+            args.join(" ")
+        );
+        if dry_run {
+            eprintln!("// captain redeploy: dry-run; skipping build");
+            continue;
+        }
+        let status = std::process::Command::new("cargo")
+            .args(&args)
+            .status()
+            .with_context(|| format!("spawn cargo for target {t}"))?;
+        if !status.success() {
+            return Err(anyhow!(
+                "cargo build failed for target {t} (exit {})",
+                status.code().unwrap_or(-1)
+            ));
+        }
+        eprintln!("// captain redeploy: built {t} at {bin_path}");
+    }
+
+    if !dry_run {
+        // Operator-facing next-step hints. Not executed automatically —
+        // the captain doctrine keeps deploy as a deliberate human-mediated
+        // step. F8c (future) may add atomic binary swap + daemon restart.
+        eprintln!();
+        eprintln!("// next steps (operator-mediated):");
+        eprintln!("//   1. Verify the new binaries built into target/release/");
+        eprintln!("//   2. For daemon redeploy: kill the running orchestratord pid,");
+        eprintln!(
+            "//      restart with the same AGENTRY_REDIS__URL / AGENTRY_SIGNING__KEY_PATH env."
+        );
+        eprintln!("//   3. For CLI redeploys (orchestrator, captain): the new binaries are");
+        eprintln!("//      live the moment they finish building — no restart needed.");
+    }
+
+    Ok(())
+}
+
+fn cmd_freshness(
+    target_repo: String,
+    issue: u64,
+    base_branch: String,
+    forge_host: String,
+) -> Result<i32> {
+    orchestrator_runtime::captain_freshness::run_freshness(
+        &target_repo,
+        issue,
+        &base_branch,
+        &forge_host,
+    )
+}
+
+fn cmd_decide(action: DecideAction) -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("failed to build tokio runtime for captain decide")?;
+    runtime.block_on(async move {
+        let cfg = Config::load().map_err(|e| anyhow!("failed to load config: {e}"))?;
+        match action {
+            DecideAction::Accept { brief_id } => cli_decide::run_accept(&cfg, &brief_id)
+                .await
+                .map_err(|e| anyhow!("captain decide accept failed: {e}")),
+            DecideAction::Reject { brief_id, reason } => {
+                cli_decide::run_reject(&cfg, &brief_id, &reason)
+                    .await
+                    .map_err(|e| anyhow!("captain decide reject failed: {e}"))
+            }
+            DecideAction::List => cli_decide::run_list(&cfg)
+                .await
+                .map_err(|e| anyhow!("captain decide list failed: {e}")),
+        }
+    })
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    match cli.cmd {
+        Cmd::NewBrief {
+            kind,
+            target_repo,
+            topology,
+            pr_title,
+            issue_title,
+            bootstrap,
+            id,
+            issue_body,
+            pr_body,
+            acceptance,
+            base_branch,
+            submitted_by,
+        } => {
+            let brief = build_brief(
+                &kind,
+                &target_repo,
+                &topology,
+                &pr_title,
+                &issue_title,
+                bootstrap,
+                id,
+                issue_body,
+                pr_body,
+                acceptance,
+                base_branch,
+                submitted_by,
+            )?;
+            println!("{}", serde_json::to_string_pretty(&brief)?);
+            if bootstrap {
+                eprintln!();
+                eprintln!("REMINDER: bootstrap mode emitted three Behavior anchors. Behavior anchors are pass-through");
+                eprintln!("at intake — the daemon does not verify them. Use this for greenfield projects with no existing");
+                eprintln!("qname surface. As the project grows and stable types/functions/specs exist, replace Behavior");
+                eprintln!("anchors with Cfdb {{ qname: \"...\" }} or SpecConcept {{ path, section }} anchors so the daemon can");
+                eprintln!("validate them at intake. See docs/captain-doctrine.md for guidance.");
+            } else if brief.contract.is_some() {
+                eprintln!(
+                    "// REMINDER: replace `{TODO_QNAME}` and the placeholder assertion prose with a real anchor before dispatching."
+                );
+            }
+        }
+        Cmd::Ground {
+            workspace,
+            target_repo,
+            rev,
+            directive,
+            name_pattern,
+            kinds,
+            specs_dir,
+            keyspace_db,
+        } => {
+            cmd_ground(
+                workspace,
+                target_repo,
+                rev,
+                directive,
+                name_pattern,
+                kinds,
+                specs_dir,
+                keyspace_db,
+            )?;
+        }
+        Cmd::Dispatch {
+            brief_file,
+            dry_run,
+        } => {
+            let code = cmd_dispatch(brief_file, dry_run)?;
+            std::process::exit(code);
+        }
+        Cmd::NewSpec {
+            concept,
+            target_repo,
+        } => {
+            let skeleton = orchestrator_runtime::captain_new_spec::render_spec_skeleton(
+                &concept,
+                &target_repo,
+            );
+            print!("{skeleton}");
+            eprintln!();
+            eprintln!(
+                "REMINDER: graph-specs convention requires the level-2 heading (## <Concept>) to match"
+            );
+            eprintln!(
+                "a Rust type, function, or trait of the same name in the target_repo's source tree."
+            );
+            eprintln!(
+                "Use CamelCase concept names. Level-4 (####) headings are local subsections and do not"
+            );
+            eprintln!("need to match code Items. The graph-specs check enforces this at PR time.");
+        }
+        Cmd::Freshness {
+            target_repo,
+            issue,
+            base_branch,
+            forge_host,
+        } => {
+            let code = cmd_freshness(
+                target_repo,
+                issue,
+                base_branch.unwrap_or_else(|| DEFAULT_BASE_BRANCH.to_string()),
+                forge_host.unwrap_or_else(forge_host_from_env),
+            )?;
+            std::process::exit(code);
+        }
+        Cmd::Redeploy { target, dry_run } => cmd_redeploy(&target, dry_run)?,
+        Cmd::Decide { action } => cmd_decide(action)?,
+    }
+    Ok(())
+}

@@ -52,6 +52,8 @@ pub async fn projector_task(
     mut source: Box<dyn EventSource + Send>,
     mut projector: Box<dyn StateProjector + Send>,
     mut verdict_conn: Option<ConnectionManager>,
+    walk_config: std::sync::Arc<orchestrator_types::lifecycle::WalkConfig>,
+    entry_node: std::sync::Arc<orchestrator_types::NodeId>,
 ) -> Result<()> {
     let mut state = BriefState::Submitted;
     let mut step: u64 = 0;
@@ -73,7 +75,8 @@ pub async fn projector_task(
         }
         step = step.saturating_add(1);
         let cursor = format!("step-{step}");
-        match handle(&state, &event) {
+
+        match handle(&state, &event, &walk_config, &entry_node) {
             Ok(new_state) => {
                 let record = BriefStateRecord {
                     brief_id: brief_id.clone(),
@@ -110,12 +113,55 @@ pub async fn projector_task(
                 }
             }
             Err(invalid) => {
-                tracing::warn!(
+                // Late-event fence: a RoleDone for a node that was
+                // already passed by the walker is silently dropped at
+                // the FSM layer (handle() returns state unchanged via
+                // is_late_event). If the FSM rejects a RoleDone with
+                // InvalidTransition, that's a genuinely-late event
+                // arriving when the walker has progressed past its
+                // dependent gate — warn and continue rather than fail.
+                let is_late_role_done = matches!(invalid.event, BriefEvent::RoleDone { .. })
+                    && matches!(invalid.from, BriefState::Walking { .. });
+                if is_late_role_done {
+                    tracing::warn!(
+                        brief = %brief_id.0,
+                        from = ?invalid.from,
+                        event = ?invalid.event,
+                        outcome = "dropped_late_role_done_in_walking",
+                        "FSM rejected late RoleDone in Walking; dropping event without state transition"
+                    );
+                    continue;
+                }
+                tracing::error!(
                     brief = %brief_id.0,
                     from = ?invalid.from,
                     event = ?invalid.event,
-                    "FSM rejected event for current state; skipping"
+                    "FSM rejected event; failing brief with DaemonError"
                 );
+                let detail = format!(
+                    "FSM rejected event {:?} in state {:?}",
+                    invalid.event, invalid.from
+                );
+                let failed_state = BriefState::Failed {
+                    reason: orchestrator_types::lifecycle::Reason::DaemonError { detail },
+                };
+                let record = BriefStateRecord {
+                    brief_id: brief_id.clone(),
+                    state: failed_state.clone(),
+                    parent_brief_id: None,
+                    composition_role: None,
+                    at: now(),
+                };
+                projector
+                    .write(&record, &cursor)
+                    .await
+                    .map_err(|e| Error::Config(format!("state projector: {e}")))?;
+                state = failed_state;
+                if let Some(ref mut conn) = verdict_conn {
+                    emit_terminal_verdict(conn, &brief_id, &state, no_op_reason.as_deref()).await?;
+                }
+                cleanup_failed_brief(&brief_id, verdict_conn.as_mut()).await;
+                break;
             }
         }
     }
@@ -275,6 +321,7 @@ pub async fn cleanup_shipped_no_op_brief_at(
 /// field of the Redis trace event — the workspace dir teardown,
 /// idempotency, and error-swallowing behavior are identical across
 /// dispositions.
+#[tracing::instrument(skip_all, fields(brief = %brief_id.0, disposition = %disposition.label()))]
 async fn cleanup_brief_at(
     brief_id: &BriefId,
     root: &Path,
@@ -320,5 +367,158 @@ async fn cleanup_brief_at(
                 "trace append for workspace-cleanup event failed"
             );
         }
+        apply_terminal_ttl(conn, brief_id).await;
+    }
+}
+
+/// Retention window applied to every `agentry:brief:{id}:*` sibling key
+/// when a brief reaches a terminal disposition (Failed or no-op
+/// Shipped). 30 days = 2_592_000 seconds. Long enough for operator
+/// forensics, short enough to keep Redis bounded in steady state.
+/// Single source of truth per the "no metric ratchets" rule generalised
+/// to retention: tunable here, no env var, no allowlist.
+pub const TERMINAL_BRIEF_TTL_SECONDS: usize = 30 * 24 * 60 * 60;
+
+/// Best-effort TTL pass over every `agentry:brief:{brief_id}:*` sibling
+/// key. Discovers keys via `SCAN` (future-proof against new sibling keys
+/// landing without an audit of this list) and sets `EXPIRE` on each to
+/// [`TERMINAL_BRIEF_TTL_SECONDS`]. Failures (key already gone, transient
+/// Redis blip) are logged at DEBUG and skipped — TTL is best-effort and
+/// must not block the FSM driver's terminal step.
+#[tracing::instrument(skip_all, fields(brief = %brief_id.0))]
+async fn apply_terminal_ttl(conn: &mut ConnectionManager, brief_id: &BriefId) {
+    let pattern = format!("agentry:brief:{}:*", brief_id.0);
+    let mut cursor: u64 = 0;
+    loop {
+        let scan: redis::RedisResult<(u64, Vec<String>)> = redis::cmd("SCAN")
+            .arg(cursor)
+            .arg("MATCH")
+            .arg(&pattern)
+            .arg("COUNT")
+            .arg(100)
+            .query_async(conn)
+            .await;
+        let (next, batch) = match scan {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::debug!(
+                    brief = %brief_id.0,
+                    error = %e,
+                    "terminal TTL SCAN failed; skipping remainder"
+                );
+                return;
+            }
+        };
+        for key in batch {
+            let res: redis::RedisResult<i64> = redis::cmd("EXPIRE")
+                .arg(&key)
+                .arg(TERMINAL_BRIEF_TTL_SECONDS)
+                .query_async(conn)
+                .await;
+            if let Err(e) = res {
+                tracing::debug!(
+                    brief = %brief_id.0,
+                    key = %key,
+                    error = %e,
+                    "terminal TTL EXPIRE failed; skipping"
+                );
+            }
+        }
+        cursor = next;
+        if cursor == 0 {
+            break;
+        }
+    }
+}
+
+/// Project a team's topology into the per-node `WalkConfig` consumed by
+/// the lifecycle DAG walker. Beta-b deleted the legacy `build_phase_gates`
+/// helper and routes the FSM through the walker built from this output.
+///
+/// Adjacency: walks `team.message_graph` and groups each `MessageEdge` by
+/// `from`, with the `to` collected as `NodeId(to.name.0)`.
+///
+/// Per-node configs: walks `team.roles`, then for each role
+///   - `class` is `team.node_classes.get(role.name)`, falling back to
+///     `NodeClass("container_bound")` when the role is not pinned in
+///     `node_classes` (legacy topologies and operator-gated vertices);
+///   - `expected_inbound` is the deduplicated upstream role list from
+///     `team.inbound_roles`, mapped to `NodeId`;
+///   - `policy` is the first inbound edge's `gate_policy` if any are
+///     pinned, falling back to `GatePolicy::AllMustPass` (the legacy
+///     hardcoded default that beta-a's `build_phase_gates` already
+///     applies for both phases).
+#[must_use]
+pub fn build_walk_config(
+    team: &orchestrator_types::TeamTopology,
+) -> orchestrator_types::lifecycle::WalkConfig {
+    use orchestrator_types::lifecycle::{GatePolicy, NodeConfig, WalkConfig};
+    use orchestrator_types::team::NodeClass;
+    use orchestrator_types::NodeId;
+    use std::collections::HashMap;
+
+    let mut adjacency: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+    for edge in &team.message_graph {
+        let from = NodeId(edge.from.name.0.clone());
+        let to = NodeId(edge.to.name.0.clone());
+        adjacency.entry(from).or_default().push(to);
+    }
+
+    let default_class = NodeClass("container_bound".to_string());
+    let mut node_configs: HashMap<NodeId, NodeConfig> = HashMap::new();
+    for role in &team.roles {
+        let class = team
+            .node_classes
+            .get(&role.name)
+            .cloned()
+            .unwrap_or_else(|| default_class.clone());
+        let expected_inbound: Vec<NodeId> = team
+            .inbound_roles(role)
+            .into_iter()
+            .map(|r| NodeId(r.name.0.clone()))
+            .collect();
+        let policy = team
+            .incoming(role)
+            .iter()
+            .find_map(|e| e.gate_policy.clone())
+            .unwrap_or(GatePolicy::AllMustPass);
+        node_configs.insert(
+            NodeId(role.name.0.clone()),
+            NodeConfig {
+                class,
+                expected_inbound,
+                policy,
+            },
+        );
+    }
+
+    WalkConfig {
+        adjacency,
+        node_configs,
+    }
+}
+
+/// Derive the topology root from a `WalkConfig` — the unique node whose
+/// `expected_inbound` is empty. Returns `Err(Reason::TopologyInvalid)`
+/// when no such node exists or when more than one does (a topology-data
+/// bug that the projector flags by failing the brief rather than
+/// silently routing through an arbitrary node).
+pub fn derive_entry_node(
+    walk_config: &orchestrator_types::lifecycle::WalkConfig,
+) -> std::result::Result<orchestrator_types::NodeId, orchestrator_types::lifecycle::Reason> {
+    let mut roots: Vec<&orchestrator_types::NodeId> = walk_config
+        .node_configs
+        .iter()
+        .filter(|(_, cfg)| cfg.expected_inbound.is_empty())
+        .map(|(id, _)| id)
+        .collect();
+    match roots.len() {
+        0 => Err(orchestrator_types::lifecycle::Reason::TopologyInvalid {
+            detail: "no entry vertex (every node has at least one expected_inbound)".to_string(),
+        }),
+        1 => Ok(roots.pop().expect("len==1 just checked").clone()),
+        n => Err(orchestrator_types::lifecycle::Reason::TopologyInvalid {
+            detail: format!("expected exactly one entry vertex, found {n}"),
+        }),
     }
 }
