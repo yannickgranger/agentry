@@ -865,34 +865,23 @@ async fn handle_brief(
             }
             permit_mod::sign(&mut permit, signing_key)?;
 
+            // v2 finale (#539 phase 5b): the role's inbox is now read
+            // from the trace stream (via the per-iteration
+            // `trace_msgs_by_role` derivation), NOT the in-process
+            // `all_messages` accumulator. The equivalence is pinned by
+            // `tests/messages_by_role.rs` (#539 phase 5a) — the
+            // trace-derived slice reproduces exactly what
+            // `all_messages.iter().filter(|m| m.to == role).cloned()`
+            // produced. `all_messages` is still WRITTEN below (rework
+            // synthetic findings message + `finalize_shipped_team`
+            // chain-trigger consume it); phase 5c migrates those two
+            // off it and deletes the Vec.
             let team_ctx = TeamContext {
-                messages: all_messages
-                    .iter()
-                    .filter(|m| m.to == role.name.0)
+                messages: trace_msgs_by_role
+                    .get(&role.name.0)
                     .cloned()
-                    .collect(),
+                    .unwrap_or_default(),
             };
-            // v2 finale (#539 phase 4): probe trace-derived inbox vs
-            // the in-process slice above. Empty `trace_msgs_by_role`
-            // means the scan returned no Message events for any role
-            // — expected on the first iteration of any brief. Counts
-            // diverging mid-flight indicates the trace and the
-            // accumulator are out of sync; later phase swaps the
-            // authoritative source after a sync barrier guarantees
-            // they cannot drift.
-            let trace_slice = trace_msgs_by_role
-                .get(&role.name.0)
-                .cloned()
-                .unwrap_or_default();
-            if trace_slice.len() != team_ctx.messages.len() {
-                tracing::debug!(
-                    brief = %brief.id,
-                    role = %role.name,
-                    trace_count = trace_slice.len(),
-                    local_count = team_ctx.messages.len(),
-                    "trace-derived inbox diverges from in-process all_messages slice (acceptable while in-process is authoritative)"
-                );
-            }
 
             runs.push(RoleRun {
                 role_ref: role_ref.clone(),
