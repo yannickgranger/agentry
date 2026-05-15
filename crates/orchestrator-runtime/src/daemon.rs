@@ -708,7 +708,10 @@ async fn messages_by_role_from_trace(
 
 /// FSM-side view of a brief's progression at iteration top of the
 /// team-orchestration loop in `handle_brief`. Returns
-/// `(shipped_set, fsm_retry_attempt)`:
+/// `Some((shipped_set, fsm_retry_attempt))` while the FSM is in a
+/// non-terminal state (`Walking` or transient `Submitted` / read
+/// error), or `None` when the FSM has reached `Shipped`/`Failed` and
+/// the caller MUST exit the outer loop.
 ///
 /// - `shipped_set` — roles `Shipped` in the FSM's `Walking.evidence`.
 ///   The FSM is now the sole authority (phase 7b): the in-process
@@ -718,20 +721,34 @@ async fn messages_by_role_from_trace(
 ///   read, so there is no lag window to cover.
 ///
 /// - `fsm_retry_attempt` — `Walking.retry.attempt` when in `Walking`,
-///   `None` otherwise (`Submitted`, terminal, or read error). The
-///   caller uses it directly as the rework-budget counter.
+///   `None` otherwise (`Submitted` or transient error). The caller
+///   uses it directly as the rework-budget counter.
 ///
-/// Read errors yield `(empty, None)` with a WARN — a transient Redis
-/// hiccup must not crash a brief; an empty shipped-set just means the
-/// next ready-set recompute re-fires from the entry node, which the
-/// FSM's own state will correct on the following settled iteration.
+/// Terminal discriminator (issue #562): the pre-fix `_ => (empty,
+/// None)` arm collapsed `Submitted` (transient, entry-node should
+/// fire) and terminal `Shipped`/`Failed` (FSM is done, the outer
+/// loop should stop) into the same empty-set return. The caller
+/// could not tell them apart, so on terminal `Shipped` it kept
+/// computing a ready-set from an empty `shipped_set` and respawned
+/// the entry role into a workspace where the brief's commit had
+/// already been merged — the respawn returned `no_changes`, and the
+/// terminal `:state` was atomically rewritten from `Shipped` to
+/// `Failed`. The actual work landed on `develop` (the shipper had
+/// already opened + merged the auto/ PR before the post-terminal
+/// respawn fired) but the dashboard's terminal-verdict view was
+/// corrupted. `None` is now an explicit "stop the loop" signal.
+///
+/// Read errors yield `Some((empty, None))` with a WARN — a transient
+/// Redis hiccup must not crash a brief; the empty-shipped-set path
+/// fires the entry node, which the FSM's own state will correct on
+/// the following settled iteration.
 ///
 /// v2 finale (#539) helper.
 async fn read_walking_view(
     conn: &mut ConnectionManager,
     brief_id: &BriefId,
     team: &TeamTopology,
-) -> (HashSet<RoleRef>, Option<u32>) {
+) -> Option<(HashSet<RoleRef>, Option<u32>)> {
     let fsm_state = match read_brief_state(conn, brief_id).await {
         Ok(s) => s,
         Err(e) => {
@@ -762,9 +779,10 @@ async fn read_walking_view(
                 })
                 .cloned()
                 .collect();
-            (fsm, Some(retry.attempt))
+            Some((fsm, Some(retry.attempt)))
         }
-        _ => (HashSet::new(), None),
+        Some(BriefState::Shipped) | Some(BriefState::Failed { .. }) => None,
+        _ => Some((HashSet::new(), None)),
     }
 }
 
@@ -987,7 +1005,17 @@ async fn handle_brief(
         // retry on the ReworkNeeded RoleDone, lifecycle.rs:516-519);
         // an empty shipped-set here ⇒ ready-set recomputes from the
         // entry node ⇒ the chain re-fires from the coder.
-        let (shipped_set, fsm_retry_attempt) = read_walking_view(conn, &brief.id, &team).await;
+        // `read_walking_view` returns `None` when the FSM has reached
+        // a terminal state (`Shipped` / `Failed`); the outer loop must
+        // exit on `None` so a post-terminal iteration does not respawn
+        // the entry role into a workspace whose commit has already
+        // been merged (issue #562). The verdict-kind read after
+        // `'outer` derives the final return.
+        let Some((shipped_set, fsm_retry_attempt)) =
+            read_walking_view(conn, &brief.id, &team).await
+        else {
+            break 'outer;
+        };
         let ready: Vec<RoleRef> = team
             .roles
             .iter()
