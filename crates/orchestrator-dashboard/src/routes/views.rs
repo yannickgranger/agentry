@@ -106,6 +106,59 @@ pub(crate) async fn derive_active_briefs(store: &DashboardStore) -> anyhow::Resu
     Ok(out)
 }
 
+/// Recent briefs for the index history panel — the last `limit`
+/// `agentry:brief:*:state` records by timestamp, terminal **included**.
+///
+/// `derive_active_briefs` filters terminal records out, so when the
+/// system is idle the index shows only "No briefs in flight" + raw
+/// verdict one-liners — no persistent, clickable per-brief state
+/// history. This fills that gap: a lightweight (no body mget, no
+/// metric badges) `(brief_id, state_kind, at_rfc3339)` list, each row
+/// linking to the brief's `/brief/{id}` trace view. Records that fail
+/// to deserialise are skipped (same tolerance as
+/// `derive_active_briefs` — a malformed key must not blank the page).
+pub(crate) async fn derive_recent_briefs(
+    store: &DashboardStore,
+    limit: usize,
+) -> anyhow::Result<Vec<(String, String, String)>> {
+    let mut conn = redis_io::connect(store.redis_url())
+        .await
+        .map_err(|e| anyhow::anyhow!("redis connect: {e}"))?;
+
+    let mut state_keys: Vec<String> = Vec::new();
+    {
+        let mut iter = conn
+            .scan_match::<_, String>("agentry:brief:*:state")
+            .await?;
+        while let Some(k) = iter.next_item().await {
+            state_keys.push(k);
+        }
+    }
+
+    let mut recs: Vec<BriefStateRecord> = Vec::new();
+    for key in &state_keys {
+        let raw: Option<String> = conn.get(key).await?;
+        let Some(s) = raw else { continue };
+        let Ok(record) = serde_json::from_str::<BriefStateRecord>(&s) else {
+            continue;
+        };
+        recs.push(record);
+    }
+
+    recs.sort_by(|a, b| b.at.cmp(&a.at));
+    recs.truncate(limit);
+    Ok(recs
+        .into_iter()
+        .map(|r| {
+            (
+                r.brief_id.0.clone(),
+                state_kind(&r.state),
+                r.at.to_rfc3339(),
+            )
+        })
+        .collect())
+}
+
 /// Render the disagreements block for a parked brief — one row per
 /// `DisagreementSummary` plus a one-line resolution hint pointing at
 /// the `captain decide` CLI. Coder-supplied strings are html-escaped
@@ -255,6 +308,36 @@ pub async fn index(State(state): State<AppState>) -> Result<Html<String>, AppErr
             .push_str(r#"<li class="text-slate-500 italic text-sm">No briefs in flight.</li>"#);
     }
 
+    // Recent briefs (terminal included) — persistent clickable history
+    // so the page is useful when idle. Best-effort: a scan error
+    // collapses to an empty list rather than failing the whole index.
+    let recent = derive_recent_briefs(&state.store, 20)
+        .await
+        .unwrap_or_default();
+    let mut recent_items = String::new();
+    for (brief_id, kind, at) in &recent {
+        let badge = if kind == "shipped" {
+            "bg-emerald-900 text-emerald-200"
+        } else if kind == "failed" {
+            "bg-rose-900 text-rose-200"
+        } else if kind == "submitted" {
+            "bg-slate-800 text-slate-300"
+        } else {
+            // Walking: kind is the current node's role name.
+            "bg-indigo-900 text-indigo-200"
+        };
+        recent_items.push_str(&format!(
+            r#"<li class="py-1 border-b border-slate-800 last:border-0">
+  <a class="text-indigo-300 hover:text-indigo-200 font-mono text-sm" href="/brief/{brief_id}">{brief_id}</a>
+  <span class="mx-2 px-2 py-0.5 rounded text-xs {badge}">{kind}</span>
+  <span class="text-slate-500 text-xs">{at}</span>
+</li>"#
+        ));
+    }
+    if recent_items.is_empty() {
+        recent_items.push_str(r#"<li class="text-slate-500 italic text-sm">No briefs yet.</li>"#);
+    }
+
     let initial_verdicts = serde_json::to_string(&verdicts).unwrap_or_else(|_| "[]".into());
 
     Ok(Html(page(
@@ -264,6 +347,11 @@ pub async fn index(State(state): State<AppState>) -> Result<Html<String>, AppErr
 <section class="mb-8">
   <h2 class="text-lg font-semibold text-slate-200 mb-2">Briefs in flight</h2>
   <ul id="active-briefs">{active_items}</ul>
+</section>
+
+<section class="mb-8">
+  <h2 class="text-lg font-semibold text-slate-200 mb-2">Recent briefs</h2>
+  <ul id="recent-briefs">{recent_items}</ul>
 </section>
 
 <section>
